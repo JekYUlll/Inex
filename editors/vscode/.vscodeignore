@@ -1,5 +1,8 @@
 src/**
 tsconfig.json
 esbuild.mjs
+esbuild.integration.mjs
 pnpm-lock.yaml
+test/**
+dist/test/**
 **/*.map

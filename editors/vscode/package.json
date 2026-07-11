@@ -27,7 +27,9 @@
   "main": "./dist/extension.js",
   "activationEvents": [
     "onCustomEditor:inex.markdownEditor",
-    "onCommand:inex.showSecurityStatus"
+    "onView:inex.vault",
+    "onCommand:inex.showSecurityStatus",
+    "onCommand:inex.unlockVault"
   ],
   "contributes": {
     "commands": [
@@ -46,8 +48,38 @@
       {
         "command": "inex.search",
         "title": "Inex: Search Encrypted Vault"
+      },
+      {
+        "command": "inex.refreshTree",
+        "title": "Inex: Refresh Vault Tree"
       }
     ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "inex",
+          "title": "Inex",
+          "icon": "resources/inex.svg"
+        }
+      ]
+    },
+    "views": {
+      "inex": [
+        {
+          "id": "inex.vault",
+          "name": "Encrypted Vault"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "inex.refreshTree",
+          "when": "view == inex.vault",
+          "group": "navigation"
+        }
+      ]
+    },
     "customEditors": [
       {
         "viewType": "inex.markdownEditor",
@@ -68,14 +100,6 @@
           "default": "",
           "scope": "machine",
           "description": "Optional absolute path to an audited inexd binary. Empty uses the extension-bundled binary."
-        },
-        "inex.sessionIdleMinutes": {
-          "type": "number",
-          "default": 15,
-          "minimum": 1,
-          "maximum": 1440,
-          "scope": "window",
-          "description": "Lock an idle session after this many minutes when no encrypted documents are open."
         }
       }
     }
@@ -83,10 +107,17 @@
   "scripts": {
     "build": "node esbuild.mjs",
     "check": "tsc --noEmit",
-    "test": "pnpm run check"
+    "test": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --experimental-strip-types --test src/*.test.ts test/*.test.mjs",
+    "test:extension:build": "node esbuild.integration.mjs",
+    "test:extension:prepare": "pnpm build && pnpm test:extension:build && cargo build --manifest-path ../../Cargo.toml -p inex-cli -p inex-daemon",
+    "test:extension:local": "pnpm test:extension:prepare && xvfb-run -a node test/runIntegration.mjs --vscode=/usr/share/code/code",
+    "test:extension:1.125": "pnpm test:extension:prepare && xvfb-run -a node test/runIntegration.mjs --version=1.125.0",
+    "test:extension:1.126": "pnpm test:extension:prepare && xvfb-run -a node test/runIntegration.mjs --version=1.126.0"
   },
   "devDependencies": {
+    "@types/node": "26.1.1",
     "@types/vscode": "1.125.0",
+    "@vscode/test-electron": "3.0.0",
     "esbuild": "0.28.1",
     "typescript": "7.0.2"
   },
