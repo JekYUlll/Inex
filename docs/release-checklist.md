@@ -27,10 +27,10 @@ Status terms in this document mean:
 
 | Area | Status | Evidence and exact boundary |
 |------|--------|-----------------------------|
-| Linux Rust workspace | verified checkpoint | 262/262 workspace tests after rename/modify hardening, plus rustfmt, all-features pedantic Clippy with warnings denied, rustdoc warnings denied, and whitespace checks |
+| Linux Rust workspace | verified source checkpoint | 285/285 workspace tests after index-CAS v4 hardening, plus rustfmt, all-target/all-feature pedantic Clippy with warnings denied, rustdoc warnings denied, and whitespace checks |
 | EDRY/vault compatibility | checkpoint | Frozen v1 fixture rebuild/unlock/decrypt and broad format/path/tamper tests pass on Linux; Windows GNU compiles and earlier Wine suites pass, but this is not native Windows evidence |
 | Import | verified checkpoint | Copy-only absent-destination staging, re-open/seal/allowlist/publication, source-preservation, and failure-class tests pass. The final clean Linux x64 artifact also imports a five-document synthetic tree including exact 16 MiB content, preserves every source hash, and produces no plaintext Markdown in the vault; publication ambiguity and native-platform fault cases remain pending |
-| Git | verified checkpoint | Locked-safe driver, local installer, real-repository plumbing, encrypted diff3, unresolved flag, versioned plaintext-free journals, fixed tree provenance, full-width SHA-1/SHA-256 validation, detected/split rename/modify, owner drift rejection, and v1/v2/v3 recovery regressions pass on Linux; native Windows power-loss and a true cross-process index CAS remain pending |
+| Git | verified Linux source checkpoint | Locked-safe driver, local installer, encrypted diff3, fixed tree provenance, full-width SHA-1/SHA-256, detected/split rename/modify, and legacy v1/v2/v3 recovery pass. New v4 transactions bind an alternate candidate to the old index and hold the real `.git/index.lock`; Linux real-repository regressions cover pre-lock winner, lock-held Git failure, marker/candidate/published recovery, target drift, and foreign-lock preservation. Native Windows abrupt-kill/power-loss, ref-only concurrency, and legacy recovery CAS remain pending |
 | VS Code unit/bundle | verified checkpoint | Strict TypeScript, 23/23 Node tests, production bundle, and integration bundle pass |
 | VS Code Extension Host | partial | The current local build and 1.125.0 directly drive the production create/folder-create/file-rename/file-delete actions plus encrypted backup/recovery against the daemon/custom editor. Close refusal, rename collision, Unix delete-I/O failure recovery, command registration, and isolated-root residue pass. InputBox/QuickPick mouse interaction is not automated, and test-mode workbench storage is in-memory, so persistent cross-process restore/Local History is unproven |
 | Sublime current source | partial | Pure-Python tests pass 61/61. An exact Build 4200 normal E2E drives unlock/open/edit/save/close and real-panel New Folder/New Markdown/rename/etag-delete through registered commands. Authenticated tree checks pass after each mutation; `folder_created`, `markdown_created`, `renamed`, and `deleted` are present, `crud_complete=true`, `vault_envelope=EDRY`, and `root_scan_hits=0`. The plugin-host SIGKILL probe remains `PASS_WITH_DOCUMENTED_BOUNDARY`: the visible buffer is copyable, the host does not restart in-process, a full Sublime restart is required, `vault_envelope=EDRY`, and roots scanned after application exit remain clean. Its `crud_complete=false` is intentional because the crash branch kills after open/edit/save; this is not crash-time plaintext erasure. The full packaged matrix is pending |
@@ -53,10 +53,12 @@ These are not documentation polish items; each changes the release decision:
 3. Complete the exact Sublime Build 4200 packaged open/edit/save/close/crash,
    macro/export/clipboard, draft, project/non-project, and canary residue matrix
    on every advertised OS.
-4. Close the GA Git transaction boundary. Authenticated rename/modify now passes
-   Linux source and real-repository tests, but native Windows power-loss remains
-   unproven and external Git porcelain is forbidden because the final verified
-   index snapshot and `update-index` do not share a cross-process CAS/held lock.
+4. Close the remaining GA Git transaction boundary. New v4 index updates have
+   a held-lock expected-old CAS on Linux, but native Windows NTFS/ReFS
+   abrupt-kill/power-loss remains unproven; legacy v1/v2/v3 recovery and
+   concurrent ref-only mutation are not covered by the v4 index lock. Keep the
+   supported operational rule that other Git is stopped until those cases have
+   binding evidence.
 5. Build and smoke all four intended platform artifacts on their native target:
    Linux x64/arm64 and Windows x64/arm64. Verify executable architecture and
    dynamic/static native-library expectations, not only archive names.
@@ -195,9 +197,10 @@ directory explicitly after triage.
 - [x] Rename/modify is implemented for exact detected and split Git shapes,
       with fixed tree provenance, source-aware recovery, ambiguity rejection,
       and Linux real-repository tests for both renamed sides.
-- [ ] Native supported filesystems reproduce rename recovery and power-loss
-      behavior; the no-parallel-Git boundary is either retained in supported
-      scope or replaced by a real index CAS before GA.
+- [ ] Native supported filesystems reproduce v4 marker/candidate/index
+      publication and rename recovery under abrupt termination/power loss;
+      ref-only concurrency and legacy-journal recovery are either serialized or
+      retained as explicit no-parallel-Git scope before GA.
 - [ ] Plaintext/password/query/token canaries are absent from Git argv,
       environment, stderr, object/journal/index/worktree artifacts, hooks, and
       helper processes.

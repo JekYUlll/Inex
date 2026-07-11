@@ -114,11 +114,16 @@ rollback protection against replacing the repository with an older valid
 state.
 
 Stop every editor-integrated or command-line Git operation before running
-`inex git merge` or `inex git recover`. Inex rechecks exact stages, worktree
-digests, authenticated owners, and fixed merge provenance, but Git provides no
-cross-process compare-and-swap between the last verified index snapshot and
-`update-index`. Concurrent external Git porcelain is outside the checkpoint
-guarantee and remains a GA transaction-boundary item.
+`inex git merge` or `inex git recover` in the supported release workflow. New
+transactions now generate and verify an alternate index, install an
+Inex-owned marker at the real `.git/index.lock`, bind old/candidate index
+digests in journal v4, and publish the candidate only after the locked
+worktree/owner/provenance recheck. A normal Git index writer either wins before
+that lock or fails while it is held. This does not serialize ref-only commands,
+legacy v1/v2/v3 journal recovery, or a same-OS-user process that directly
+unlinks or rewrites transaction files. Native Windows abrupt-kill and
+power-loss behavior is also not yet binding evidence, so deliberate concurrent
+Git remains outside the supported checkpoint.
 
 Password add/change/remove operations rewrap the same stable master key; they
 are not master-key rotation. A person who retains an older `vault.json` from Git

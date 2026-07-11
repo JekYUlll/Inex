@@ -77,6 +77,9 @@ Phase 7 — 跨平台验证、打包与发布准备
 - [ ] 跑通格式、性质、RPC、编辑器、Git、Unicode/长路径/换行的验证矩阵
 - [x] 闭合 binding Git rename/modify 源码契约：detected 形态、split 两侧 rename、精确 tree provenance、v2/v3 journal 与恢复负测均通过
 - [ ] 在原生支持平台复验 Git rename/power-loss，并在 GA 前保留“禁止并行 Git porcelain”边界或实现真正的 index CAS
+  - [x] 实现 alternate-index candidate、Inex 自持真实 `.git/index.lock`、old/candidate digest 绑定与 create-only journal v4
+  - [x] 用真实临时 Git 仓库覆盖 foreign lock、并行 porcelain、marker/candidate/published crash states 与 SHA-1/SHA-256
+  - [ ] 原生 Windows NTFS/ReFS 复验 replace/write-through/power-loss，并由绑定证据决定是否取消 no-parallel-Git 边界
 - [x] 配置 Linux/Windows x64/arm64 CI、Rust 二进制、VSIX 与 Sublime 包产物；远端 hosted jobs 尚待执行
 - [x] 完成 threat model、用户指南、安全配置、迁移/升级与故障恢复文档
 - [ ] 审计磁盘明文残留、日志秘密、依赖许可与发布清单
@@ -112,6 +115,8 @@ Phase 7 — 跨平台验证、打包与发布准备
 | Git rename 只由唯一 merge-base 与固定 HEAD/MERGE_HEAD tree entry 证明 | 新 nonce 让密文相似度无意义，file-id 相同也可能是历史副本；detected/split 都必须绑定完整 provenance 与 source-aware journal |
 | Git OID 宽度绑定仓库 object format，恢复按 v1/v2/v3 严格 schema | SHA-256 Git 会把 40 位唯一前缀交给 `cat-file` 解析；journal 必须在任何变更前拒绝缩写/混宽 OID，并固定可跨 merge commit 验证的 provenance |
 | Binding release 只在独立、独占、静止 checkout 与可信不变工具链上形成 | 首尾 blob/config/identity 复核是有界采样而非 OS 锁；同主体并发写者可在样本间改写并恢复，manifest source identity 也不等于生成物 build attestation |
+| 新 Git merge 事务使用 v4 物理 index CAS，旧 v1/v2/v3 仅作恢复兼容 | Git porcelain 无 expected-old CAS；只有 alternate candidate + 真实 `index.lock` + old/candidate digest 才能把最后语义校验、worktree 前滚和 index 发布收缩为一个 fail-closed 事务 |
+| verified-file namespace move 保持协作式同用户边界 | Linux/Windows 的最终 rename/MoveFileEx 都是路径操作；句柄身份重验和真实 Git lock 可排斥正常 writer，但不能构成抵抗同一 OS 用户直接 rebind 路径的内核级 handle-bound CAS |
 
 ## Errors Encountered
 
@@ -211,6 +216,11 @@ Phase 7 — 跨平台验证、打包与发布准备
 | First strict local-config allowlist omitted checkout-managed `gc.auto=0` and used POSIX fileMode semantics on Windows | 1 | Permit only exact `gc.auto=0`, branch fileMode by OS, require no EOL conversion, and add the matching package-workflow step/regression |
 | Attribute-isolation patch used a non-matching f-string context | 1 | No partial write occurred; patch the exact Git command and environment dictionaries separately, then rerun the provenance test |
 | Exact manifest audit did not validate install format or strict JSON parser semantics | 1 | Require exact schemas/install format, strict UTF-8, no duplicate keys and integer schema 1; cover wrong/missing/ambiguous forms and re-audit the real artifact |
+| Combined CAS planning-file patch used a non-matching quoted findings context | 1 | No partial write occurred; patch the three planning files against their exact current lines and continue from the clean Git checkpoint |
+| Initial full-index check treated empty `git rev-parse --shared-index-path` output as malformed and failed 23 Git tests | 1 | Accept the documented empty output as the normal full-index state, still reject every non-empty shared-index path, and rerun the complete Git suite |
+| Wine replace returned `AccessDenied` while the verified destination handle remained open | 1 | Consume and release both verified handles immediately before the path-based replace, document the cooperative same-user boundary, and rerun the Windows GNU/Wine tests |
+| A truncated reserved v4 journal staging file could leave an exact pre-journal marker/candidate reservation wedged | 1 | When the stable journal is absent, remove only the exact regular deterministic staging name paired with an authenticated reservation, then clean marker/candidate and add a truncated-staging recovery regression |
+| Full workspace Clippy passed product code but rejected two newly extended test functions at 105/100 and 101/100 lines | 1 | Split the parent-ancestor and durability scenarios into focused regression tests, apply canonical rustfmt, and restart the strict Clippy gate |
 
 ## Notes
 

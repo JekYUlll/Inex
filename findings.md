@@ -158,6 +158,12 @@
 - “Standalone checkout” 包括直接 object database 与单体 index：linked/sibling worktree、index symlink、split `sharedindex.*`、objects/info alternates 和 worktree config 均被拒绝。Windows 不模拟 POSIX physical execute 位；Git status 在 Windows 固定 `core.fileMode=false`，但仍绑定 commit tree mode与真实 blob bytes，并要求 `core.autocrlf=false`。
 - 跨平台 release checkout 的 EOL 策略必须在 materialization 前生效；checkout 后才写 `core.autocrlf=false` 只能让异常 fail-closed，不能防止转换。根 `.gitattributes` 现以 `* -text` 禁止全树 Git EOL 转换，package workflow 仍显式 pin false，actual blob hash 作为最后门禁。
 - “Exact manifest schema” 同时要求 exact keys、语义值与 parser 一致性：直接 `json.loads(bytes)` 会接受 UTF-16/32、重复键 last-wins，以及把 `true`/`1.0` 与整数 1 等同比较。artifact audit 现先 strict UTF-8 decode、递归拒绝重复键、要求非 bool 整数 schemaVersion=1，并精确验证三类 `installFormat`。
+- Git index CAS 的最小安全单元不是延长 `git update-index` 子进程，而是四个可认证物理状态：原 `.git/index` 完整摘要、alternate `GIT_INDEX_FILE` 生成的候选索引摘要、Inex 专属随机 marker 的真实 `.git/index.lock`，以及内层 v1/v2/v3 语义 payload 的 v4 journal。worktree 只能在 lock 存在、old digest/owner/provenance 重验通过且 v4 已 fsync 后前滚；候选只能以 `candidate -> index.lock -> index` 两次原子 namespace move 发布。
+- v4 不应删除或覆盖无法认证的现有 `index.lock`。发布前崩溃的 Inex lock 必须用完整 magic+random token marker 区分；空文件、部分 marker、摘要不符的 candidate 或任意其他 lock 都 fail closed。为避免 create+write 在崩溃后留下不可识别的空 lock，marker 应先在私有目录完整写入/fsync，再用跨平台 no-replace move 争用 `index.lock`。
+- create-only v4 可以由精确物理摘要推断 crash phase，不需要为安全性原地改写 phase；任何 published phase 在“publish 已成功、phase 尚未更新”的崩溃点仍要读物理状态，且额外 journal replace 会增加新窗口。恢复必须枚举 old/final index、marker/candidate/absent lock、original/final worktree 的全矩阵；原生 Windows NTFS/ReFS 的 replace/write-through/power-loss 仍是独立发布证据。
+- stable v4 journal 不能直接 create+write：崩溃留下的 partial JSON 会阻断后续 recovery。安全路径是先在 token 派生的私有 staging 完整写入并 fsync，再 no-replace 发布；只有 stable journal 缺失、reservation marker/candidate 精确认证且 staging 是预留 regular file 时，恢复才可删除该残片。
+- Windows `MoveFileExW` 在 Wine 下不允许替换一个仍由调用方持句柄打开的 destination；最终 path/handle identity 复核后必须释放句柄再执行路径替换。该选择可满足真实 Git `index.lock` 的协作式排他模型，但公共 helper 和架构必须明确它不是抵抗同用户直接 namespace swap 的内核级 compare-exchange。
+- v4 的 `object_format` 不仅约束 stage/result OID 宽度，还必须与 v2/v3 内层 rename provenance 格式一致，并在无 Git 的 journal 结构校验阶段拒绝三个 commit OID 的错误宽度或非 canonical hex；运行期 tree/provenance 重验仍是第二道语义边界。
 
 ## Issues Encountered
 

@@ -248,9 +248,12 @@ explicitly.
 Preserve `.git`, worktree ciphertext, and `.vault-local`. Ambiguous rename
 provenance, rename/rename, multiple merge bases, split index, mode, attribute,
 object-format, owner, concurrent-change, or journal facts fail closed. Stop all
-other Git porcelain before retrying. If `inex git recover` reports a conflict,
-do not delete the journal or force stage zero; compare current OIDs/digests and
-the recorded fixed provenance against a copy and the
+other Git porcelain before retrying. New v4 transactions also reject a foreign
+`.git/index.lock`, a changed old/candidate index digest, or a target result that
+was changed after publication. Legacy v1/v2/v3 recovery still requires an
+exclusive Git worktree. If `inex git recover` reports a conflict, do not delete
+the journal, candidate, or lock and do not force stage zero; compare current
+OIDs/digests and the recorded fixed provenance against a copy and the
 [Git recovery contract](spec/git-merge-v1.md).
 
 ### Git reports a conflict in `vault.json`

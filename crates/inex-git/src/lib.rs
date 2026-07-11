@@ -18,11 +18,14 @@ use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use inex_core::atomic::{
-    CurrentTarget, GIT_ATTRIBUTES_FILE, GIT_IGNORE_FILE, ParentSyncStatus, VAULT_LOCAL_DIRECTORY,
-    VaultMutationGuard, WriteCondition, open_file_matches_path_and_is_single_link,
-    path_is_supported_local_filesystem, sync_directory,
+    AtomicFileMoveOutcome, CurrentTarget, GIT_ATTRIBUTES_FILE, GIT_IGNORE_FILE, ParentSyncStatus,
+    VAULT_LOCAL_DIRECTORY, VaultMutationGuard, WriteCondition,
+    atomic_move_verified_file_no_replace, atomic_replace_verified_file,
+    open_file_matches_path_and_is_single_link, path_is_supported_local_filesystem, sync_directory,
 };
 use inex_core::crypto::{DecryptedDocument, EncryptedDocument};
 use inex_core::format;
@@ -30,9 +33,11 @@ use inex_core::path::{LogicalPath, MAX_LOGICAL_PATH_BYTES};
 use inex_core::tree::{self, TreeEntryKind};
 use inex_core::vault::{MAX_EDRY_ENVELOPE_BYTES, Vault, VaultError};
 use inex_core::vault_config::{KdfPolicy, MAX_VAULT_JSON_BYTES, VaultConfig};
-use serde::{Deserialize, Serialize};
+use serde::de::{self, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use uuid::Uuid;
 use zeroize::Zeroizing;
 
 /// Exact repository attribute installed for encrypted Markdown objects.
@@ -43,12 +48,17 @@ pub const IGNORE_RULE: &str = "/.vault-local/";
 
 const DRIVER_NAME: &str = "Inex encrypted Markdown (locked-safe)";
 const JOURNAL_FILE: &str = "git-merge-journal-v1.json";
+const JOURNAL_STAGING_PREFIX: &str = "git-merge-journal-stage-v4-";
+const INDEX_CANDIDATE_PREFIX: &str = "git-index-candidate-v4-";
+const INDEX_MARKER_PREFIX: &str = "git-index-lock-marker-v4-";
+const INDEX_LOCK_MARKER_MAGIC: &[u8] = b"INEXIDX4\0";
 const MAX_GIT_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_REPOSITORY_METADATA_BYTES: usize = 1024 * 1024;
 const MAX_JOURNAL_BYTES: usize = 64 * 1024;
 const MAX_CONFLICTS: usize = 100_000;
 const MAX_GIT_PATH_BYTES: usize = MAX_LOGICAL_PATH_BYTES + ".enc".len();
 const MINIMUM_GIT_VERSION: (u32, u32) = (2, 36);
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_mins(1);
 // Windows CreateProcess limits the complete command line to 32,767 UTF-16
 // code units. Keep a 50% margin for platform quoting and implementation
 // details, and budget each argument for its worst-case quoting expansion.
@@ -322,7 +332,13 @@ pub fn recover(vault: &Vault) -> Result<RecoveryReport, GitError> {
 /// oversized, truncated, or fails the strict versioned schema.
 pub fn has_pending_recovery(vault_root: &Path) -> Result<bool, GitError> {
     let _guard = VaultMutationGuard::acquire(vault_root).map_err(map_atomic_error)?;
-    Ok(read_journal(vault_root)?.is_some())
+    if read_journal(vault_root)?.is_some() {
+        return Ok(true);
+    }
+    Ok(!matches!(
+        inspect_abandoned_cas_reservation(vault_root)?,
+        AbandonedCasReservation::None
+    ))
 }
 
 /// Resolve all currently unmerged encrypted Markdown paths in memory.
@@ -578,11 +594,141 @@ struct DetectedRenameJournal {
     result_sha256: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(
+    deny_unknown_fields,
+    tag = "kind",
+    content = "payload",
+    rename_all = "snake_case"
+)]
+enum MergeJournalPayload {
+    InPlace(MergeJournal),
+    Rename(RenameMergeJournal),
+    DetectedRename(DetectedRenameJournal),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CasMergeJournal {
+    version: u32,
+    object_format: GitObjectFormat,
+    lock_token: String,
+    lock_marker_sha256: String,
+    candidate_file: String,
+    expected_index_sha256: String,
+    expected_index_size: u64,
+    candidate_index_sha256: String,
+    candidate_index_size: u64,
+    transaction: MergeJournalPayload,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum PendingMergeJournal {
     InPlace(MergeJournal),
     Rename(RenameMergeJournal),
     DetectedRename(DetectedRenameJournal),
+    Cas(CasMergeJournal),
+}
+
+struct PreparedIndexCas {
+    root: PathBuf,
+    object_format: GitObjectFormat,
+    lock_token: String,
+    lock_marker_sha256: String,
+    candidate_file: String,
+    expected_index_sha256: String,
+    expected_index_size: u64,
+    candidate_index_sha256: String,
+    candidate_index_size: u64,
+    armed: bool,
+}
+
+struct PreLockPrivateFiles {
+    paths: Vec<PathBuf>,
+    armed: bool,
+}
+
+impl PreLockPrivateFiles {
+    fn new(paths: Vec<PathBuf>) -> Self {
+        Self { paths, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PreLockPrivateFiles {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        for path in &self.paths {
+            let _ = remove_reserved_regular_file(path);
+        }
+    }
+}
+
+impl PreparedIndexCas {
+    fn journal(&self, transaction: MergeJournalPayload) -> CasMergeJournal {
+        CasMergeJournal {
+            version: 4,
+            object_format: self.object_format,
+            lock_token: self.lock_token.clone(),
+            lock_marker_sha256: self.lock_marker_sha256.clone(),
+            candidate_file: self.candidate_file.clone(),
+            expected_index_sha256: self.expected_index_sha256.clone(),
+            expected_index_size: self.expected_index_size,
+            candidate_index_sha256: self.candidate_index_sha256.clone(),
+            candidate_index_size: self.candidate_index_size,
+            transaction,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PreparedIndexCas {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let marker = index_lock_marker_bytes(
+            &self.lock_token,
+            self.expected_index_size,
+            &self.expected_index_sha256,
+            self.candidate_index_size,
+            &self.candidate_index_sha256,
+        );
+        if matches!(
+            remove_regular_file_if_exact(&index_lock_path(&self.root), &marker),
+            Ok(true)
+        ) {
+            let candidate = index_candidate_path(&self.root, &self.candidate_file);
+            let _ = remove_regular_file_if_digest(
+                &candidate,
+                self.candidate_index_size,
+                &self.candidate_index_sha256,
+            );
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum IndexMutation<'a> {
+    Upsert {
+        physical_path: &'a str,
+        mode: &'a str,
+        oid: &'a str,
+    },
+    Rename {
+        source_physical_path: &'a str,
+        destination_physical_path: &'a str,
+        mode: &'a str,
+        oid: &'a str,
+    },
 }
 
 struct AuthenticatedRenameRecovery {
@@ -604,15 +750,11 @@ struct AuthenticatedDetectedRenameRecovery {
     file_id: String,
 }
 
-#[derive(Deserialize)]
-struct JournalVersion {
-    version: u32,
-}
-
 struct Git {
     executable: PathBuf,
     root: PathBuf,
     object_format: GitObjectFormat,
+    index_file: Option<PathBuf>,
 }
 
 impl Git {
@@ -634,6 +776,7 @@ impl Git {
             executable: discover_git_executable()?,
             root,
             object_format: GitObjectFormat::Sha1,
+            index_file: None,
         };
         git.ensure_supported_version()?;
         let object_format = git.run(
@@ -682,6 +825,24 @@ impl Git {
         Ok(())
     }
 
+    fn with_index_file(&self, index_file: PathBuf) -> Result<Self, GitError> {
+        if !index_file.is_absolute() || index_file.parent().is_none() {
+            return Err(GitError::UnsafeRepositoryMetadata);
+        }
+        Ok(Self {
+            executable: self.executable.clone(),
+            root: self.root.clone(),
+            object_format: self.object_format,
+            index_file: Some(index_file),
+        })
+    }
+
+    fn index_path(&self) -> PathBuf {
+        self.index_file
+            .clone()
+            .unwrap_or_else(|| self.root.join(".git").join("index"))
+    }
+
     fn ensure_full_index(&self) -> Result<(), GitError> {
         let configured = self.run(
             GitOperation::ConfigureRepository,
@@ -699,6 +860,15 @@ impl Git {
             "false" => {}
             "true" => return Err(GitError::SplitIndexUnsupported),
             _ => return Err(GitError::MalformedGitOutput),
+        }
+        let shared_index = self.run(
+            GitOperation::ReadIndex,
+            ["rev-parse", "--shared-index-path"],
+            None,
+            MAX_GIT_PATH_BYTES,
+        )?;
+        if !matches!(shared_index.as_slice(), b"" | b"\n" | b"\r\n") {
+            return Err(GitError::SplitIndexUnsupported);
         }
         let git_directory = self.root.join(".git");
         let entries = fs::read_dir(&git_directory)
@@ -1021,6 +1191,28 @@ impl Git {
     }
 
     fn update_index(&self, physical_path: &str, mode: &str, oid: &str) -> Result<(), GitError> {
+        if self.index_file.is_none()
+            && let Some(PendingMergeJournal::Cas(journal)) = read_journal(&self.root)?
+        {
+            return publish_cas_index(
+                self,
+                &journal,
+                IndexMutation::Upsert {
+                    physical_path,
+                    mode,
+                    oid,
+                },
+            );
+        }
+        self.update_index_direct(physical_path, mode, oid)
+    }
+
+    fn update_index_direct(
+        &self,
+        physical_path: &str,
+        mode: &str,
+        oid: &str,
+    ) -> Result<(), GitError> {
         validate_physical_path(physical_path)?;
         validate_mode(mode)?;
         self.validate_oid(oid)?;
@@ -1043,6 +1235,30 @@ impl Git {
     }
 
     fn update_index_rename(
+        &self,
+        source_physical_path: &str,
+        destination_physical_path: &str,
+        mode: &str,
+        oid: &str,
+    ) -> Result<(), GitError> {
+        if self.index_file.is_none()
+            && let Some(PendingMergeJournal::Cas(journal)) = read_journal(&self.root)?
+        {
+            return publish_cas_index(
+                self,
+                &journal,
+                IndexMutation::Rename {
+                    source_physical_path,
+                    destination_physical_path,
+                    mode,
+                    oid,
+                },
+            );
+        }
+        self.update_index_rename_direct(source_physical_path, destination_physical_path, mode, oid)
+    }
+
+    fn update_index_rename_direct(
         &self,
         source_physical_path: &str,
         destination_physical_path: &str,
@@ -1106,10 +1322,11 @@ impl Git {
 
     fn sync_index(&self) -> Result<(), GitError> {
         self.ensure_full_index()?;
-        let git_directory = self.root.join(".git");
-        validate_local_directory(&git_directory)?;
-        sync_regular_file(&git_directory.join("index"), MAX_GIT_OUTPUT_BYTES)?;
-        sync_directory(&git_directory).map_err(|_| GitError::DurabilityNotConfirmed)
+        let index = self.index_path();
+        let parent = index.parent().ok_or(GitError::DurabilityNotConfirmed)?;
+        validate_local_directory(parent)?;
+        sync_regular_file(&index, MAX_GIT_OUTPUT_BYTES)?;
+        sync_directory(parent).map_err(|_| GitError::DurabilityNotConfirmed)
     }
 
     fn sync_configuration(&self) -> Result<(), GitError> {
@@ -1130,6 +1347,7 @@ impl Git {
         self.run_os(operation, &arguments, input, maximum_output)
     }
 
+    #[allow(clippy::too_many_lines)] // Keep bounded subprocess teardown in one audited path.
     fn run_os(
         &self,
         operation: GitOperation,
@@ -1140,7 +1358,11 @@ impl Git {
         let mut command = Command::new(&self.executable);
         command
             .current_dir(&self.root)
-            .args(GIT_COMMAND_PREFIX_ARGUMENTS)
+            .args(GIT_COMMAND_PREFIX_ARGUMENTS);
+        if self.index_file.is_some() {
+            command.args(["-c", "core.splitIndex=false"]);
+        }
+        command
             .args(arguments)
             .env_clear()
             .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -1159,17 +1381,29 @@ impl Git {
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        if let Some(index_file) = &self.index_file {
+            command.env("GIT_INDEX_FILE", index_file);
+        }
         copy_platform_process_environment(&mut command);
         let mut child = command
             .spawn()
             .map_err(|error| io_error(GitIoOperation::SpawnGit, &error))?;
-        let mut stdout = child.stdout.take().ok_or(GitError::Io {
+        let stdout = child.stdout.take().ok_or(GitError::Io {
             operation: GitIoOperation::CommunicateGit,
             kind: io::ErrorKind::BrokenPipe,
         })?;
         let mut child_stdin = child.stdin.take();
-        let mut output = Vec::with_capacity(maximum_output.min(64 * 1024));
-        let read_result = std::thread::scope(|scope| {
+        let output_too_large = AtomicBool::new(false);
+        let (read_result, write_result, status, timed_out) = std::thread::scope(|scope| {
+            let reader = scope.spawn(|| {
+                let mut stdout = stdout;
+                let mut output = Vec::with_capacity(maximum_output.min(64 * 1024));
+                let result = read_bounded(&mut stdout, &mut output, maximum_output);
+                if matches!(result, Err(ReadBoundedError::TooLarge)) {
+                    output_too_large.store(true, Ordering::Release);
+                }
+                (result, output)
+            });
             let writer = input.map(|bytes| {
                 let stdin = child_stdin.take();
                 scope.spawn(move || -> io::Result<()> {
@@ -1181,18 +1415,42 @@ impl Git {
                 })
             });
 
-            let read = read_bounded(&mut stdout, &mut output, maximum_output);
-            if matches!(read, Err(ReadBoundedError::TooLarge)) {
-                let _ = child.kill();
-            }
+            let deadline = Instant::now() + GIT_COMMAND_TIMEOUT;
+            let (status, timed_out) = loop {
+                if output_too_large.load(Ordering::Acquire) {
+                    let _ = child.kill();
+                    let status = child
+                        .wait()
+                        .map_err(|error| io_error(GitIoOperation::CommunicateGit, &error))?;
+                    break (status, false);
+                }
+                if let Some(status) = child
+                    .try_wait()
+                    .map_err(|error| io_error(GitIoOperation::CommunicateGit, &error))?
+                {
+                    break (status, false);
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let status = child
+                        .wait()
+                        .map_err(|error| io_error(GitIoOperation::CommunicateGit, &error))?;
+                    break (status, true);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let read = reader.join().map_err(|_| GitError::Io {
+                operation: GitIoOperation::CommunicateGit,
+                kind: io::ErrorKind::Other,
+            })?;
             let write = writer.map(std::thread::ScopedJoinHandle::join).transpose();
-            (read, write)
-        });
-        let status = child
-            .wait()
-            .map_err(|error| io_error(GitIoOperation::CommunicateGit, &error))?;
-
-        match read_result.0 {
+            Ok::<_, GitError>((read, write, status, timed_out))
+        })?;
+        let (read_result, output) = read_result;
+        if timed_out {
+            return Err(GitError::GitCommandFailed { operation });
+        }
+        match read_result {
             Ok(()) => {}
             Err(ReadBoundedError::TooLarge) => {
                 return Err(GitError::GitOutputTooLarge { operation });
@@ -1201,10 +1459,11 @@ impl Git {
                 return Err(io_error(GitIoOperation::CommunicateGit, &error));
             }
         }
-        let written = read_result.1.map_err(|_| GitError::Io {
+        let written = write_result.map_err(|_| GitError::Io {
             operation: GitIoOperation::CommunicateGit,
             kind: io::ErrorKind::Other,
-        })?;
+        });
+        let written = written?;
         if let Some(written) = written {
             written.map_err(|error| io_error(GitIoOperation::CommunicateGit, &error))?;
         }
@@ -2503,6 +2762,1052 @@ fn expected_worktree_digest(prepared: &PreparedResult) -> Option<[u8; 32]> {
         .map(|bytes| digest(bytes))
 }
 
+fn index_path(root: &Path) -> PathBuf {
+    root.join(".git").join("index")
+}
+
+fn index_lock_path(root: &Path) -> PathBuf {
+    root.join(".git").join("index.lock")
+}
+
+fn index_candidate_path(root: &Path, candidate_file: &str) -> PathBuf {
+    root.join(VAULT_LOCAL_DIRECTORY).join(candidate_file)
+}
+
+fn index_marker_staging_path(root: &Path, lock_token: &str) -> PathBuf {
+    root.join(VAULT_LOCAL_DIRECTORY)
+        .join(format!("{INDEX_MARKER_PREFIX}{lock_token}"))
+}
+
+fn index_lock_marker_bytes(
+    lock_token: &str,
+    expected_index_size: u64,
+    expected_index_sha256: &str,
+    candidate_index_size: u64,
+    candidate_index_sha256: &str,
+) -> Vec<u8> {
+    let mut marker = Vec::with_capacity(INDEX_LOCK_MARKER_MAGIC.len() + 256);
+    marker.extend_from_slice(INDEX_LOCK_MARKER_MAGIC);
+    marker.extend_from_slice(lock_token.as_bytes());
+    marker.push(b'\n');
+    marker.extend_from_slice(expected_index_size.to_string().as_bytes());
+    marker.push(b'\n');
+    marker.extend_from_slice(expected_index_sha256.as_bytes());
+    marker.push(b'\n');
+    marker.extend_from_slice(candidate_index_size.to_string().as_bytes());
+    marker.push(b'\n');
+    marker.extend_from_slice(candidate_index_sha256.as_bytes());
+    marker.push(b'\n');
+    marker
+}
+
+struct ParsedIndexLockMarker {
+    lock_token: String,
+    expected_index_size: u64,
+    expected_index_sha256: String,
+    candidate_index_size: u64,
+    candidate_index_sha256: String,
+}
+
+fn parse_index_lock_marker(bytes: &[u8]) -> Result<ParsedIndexLockMarker, GitError> {
+    let body = bytes
+        .strip_prefix(INDEX_LOCK_MARKER_MAGIC)
+        .ok_or(GitError::InvalidJournal)?;
+    let text = std::str::from_utf8(body).map_err(|_| GitError::InvalidJournal)?;
+    let mut lines = text.split('\n');
+    let lock_token = lines.next().ok_or(GitError::InvalidJournal)?.to_owned();
+    validate_lock_token(&lock_token)?;
+    let expected_size_text = lines.next().ok_or(GitError::InvalidJournal)?;
+    let expected_index_sha256 = lines.next().ok_or(GitError::InvalidJournal)?.to_owned();
+    let candidate_size_text = lines.next().ok_or(GitError::InvalidJournal)?;
+    let candidate_index_sha256 = lines.next().ok_or(GitError::InvalidJournal)?.to_owned();
+    if lines.next() != Some("") || lines.next().is_some() {
+        return Err(GitError::InvalidJournal);
+    }
+    let expected_index_size = expected_size_text
+        .parse::<u64>()
+        .map_err(|_| GitError::InvalidJournal)?;
+    let candidate_index_size = candidate_size_text
+        .parse::<u64>()
+        .map_err(|_| GitError::InvalidJournal)?;
+    if expected_size_text != expected_index_size.to_string()
+        || candidate_size_text != candidate_index_size.to_string()
+        || expected_index_size == 0
+        || candidate_index_size == 0
+        || expected_index_size > u64::try_from(MAX_GIT_OUTPUT_BYTES).unwrap_or(u64::MAX)
+        || candidate_index_size > u64::try_from(MAX_GIT_OUTPUT_BYTES).unwrap_or(u64::MAX)
+        || expected_index_sha256 == candidate_index_sha256
+    {
+        return Err(GitError::InvalidJournal);
+    }
+    parse_hex_digest(&expected_index_sha256)?;
+    parse_hex_digest(&candidate_index_sha256)?;
+    Ok(ParsedIndexLockMarker {
+        lock_token,
+        expected_index_size,
+        expected_index_sha256,
+        candidate_index_size,
+        candidate_index_sha256,
+    })
+}
+
+struct IndexSnapshot {
+    bytes: Vec<u8>,
+    size: u64,
+    sha256: String,
+}
+
+fn read_regular_exact(path: &Path, expected_size: usize) -> Result<Vec<u8>, GitError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| io_error(GitIoOperation::ReadMetadata, &error))?;
+    if is_link_or_reparse_point(&metadata)
+        || !metadata.file_type().is_file()
+        || metadata.len() != u64::try_from(expected_size).unwrap_or(u64::MAX)
+    {
+        return Err(GitError::IndexChanged);
+    }
+    let mut file =
+        File::open(path).map_err(|error| io_error(GitIoOperation::ReadMetadata, &error))?;
+    if !open_file_matches_path_and_is_single_link(path, &file)
+        .map_err(|error| io_error(GitIoOperation::InspectMetadata, &error))?
+    {
+        return Err(GitError::IndexChanged);
+    }
+    let mut bytes = Vec::with_capacity(expected_size);
+    (&mut file)
+        .take(
+            u64::try_from(expected_size)
+                .unwrap_or(u64::MAX)
+                .saturating_add(1),
+        )
+        .read_to_end(&mut bytes)
+        .map_err(|error| io_error(GitIoOperation::ReadMetadata, &error))?;
+    if bytes.len() != expected_size {
+        return Err(GitError::IndexChanged);
+    }
+    Ok(bytes)
+}
+
+fn remove_regular_file_if_exact(path: &Path, expected: &[u8]) -> Result<bool, GitError> {
+    let actual = match read_regular_exact(path, expected.len()) {
+        Ok(actual) => actual,
+        Err(GitError::Io {
+            kind: io::ErrorKind::NotFound,
+            ..
+        }) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if actual != expected {
+        return Ok(false);
+    }
+    fs::remove_file(path).map_err(|error| io_error(GitIoOperation::SyncGitState, &error))?;
+    if let Some(parent) = path.parent() {
+        sync_directory(parent).map_err(|_| GitError::DurabilityNotConfirmed)?;
+    }
+    Ok(true)
+}
+
+fn remove_regular_file_if_digest(
+    path: &Path,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> Result<bool, GitError> {
+    let actual = match read_index_snapshot(path) {
+        Ok(actual) => actual,
+        Err(GitError::Io {
+            kind: io::ErrorKind::NotFound,
+            ..
+        }) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if actual.size != expected_size || actual.sha256 != expected_sha256 {
+        return Ok(false);
+    }
+    fs::remove_file(path).map_err(|error| io_error(GitIoOperation::SyncGitState, &error))?;
+    if let Some(parent) = path.parent() {
+        sync_directory(parent).map_err(|_| GitError::DurabilityNotConfirmed)?;
+    }
+    Ok(true)
+}
+
+fn remove_reserved_regular_file(path: &Path) -> Result<bool, GitError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(io_error(GitIoOperation::InspectMetadata, &error)),
+    };
+    if is_link_or_reparse_point(&metadata) || !metadata.file_type().is_file() {
+        return Ok(false);
+    }
+    let file = File::open(path).map_err(|error| io_error(GitIoOperation::ReadMetadata, &error))?;
+    if !open_file_matches_path_and_is_single_link(path, &file)
+        .map_err(|error| io_error(GitIoOperation::InspectMetadata, &error))?
+    {
+        return Ok(false);
+    }
+    drop(file);
+    fs::remove_file(path).map_err(|error| io_error(GitIoOperation::SyncGitState, &error))?;
+    if let Some(parent) = path.parent() {
+        sync_directory(parent).map_err(|_| GitError::DurabilityNotConfirmed)?;
+    }
+    Ok(true)
+}
+
+fn appended_lock_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
+fn read_index_snapshot(path: &Path) -> Result<IndexSnapshot, GitError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| io_error(GitIoOperation::ReadMetadata, &error))?;
+    if is_link_or_reparse_point(&metadata)
+        || !metadata.file_type().is_file()
+        || metadata.len() == 0
+        || metadata.len() > u64::try_from(MAX_GIT_OUTPUT_BYTES).unwrap_or(u64::MAX)
+    {
+        return Err(GitError::IndexChanged);
+    }
+    let file = File::open(path).map_err(|error| io_error(GitIoOperation::ReadMetadata, &error))?;
+    if !open_file_matches_path_and_is_single_link(path, &file)
+        .map_err(|error| io_error(GitIoOperation::InspectMetadata, &error))?
+    {
+        return Err(GitError::IndexChanged);
+    }
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len())
+            .unwrap_or(MAX_GIT_OUTPUT_BYTES)
+            .min(MAX_GIT_OUTPUT_BYTES),
+    );
+    (&file)
+        .take(
+            u64::try_from(MAX_GIT_OUTPUT_BYTES)
+                .unwrap_or(u64::MAX)
+                .saturating_add(1),
+        )
+        .read_to_end(&mut bytes)
+        .map_err(|error| io_error(GitIoOperation::ReadMetadata, &error))?;
+    if bytes.len() > MAX_GIT_OUTPUT_BYTES
+        || u64::try_from(bytes.len()).unwrap_or(u64::MAX) != metadata.len()
+    {
+        return Err(GitError::IndexChanged);
+    }
+    Ok(IndexSnapshot {
+        size: metadata.len(),
+        sha256: hex_digest(digest(&bytes)),
+        bytes,
+    })
+}
+
+fn validate_lock_token(lock_token: &str) -> Result<(), GitError> {
+    if lock_token.len() != 32
+        || !lock_token
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(GitError::InvalidJournal);
+    }
+    Ok(())
+}
+
+fn validate_candidate_file(lock_token: &str, candidate_file: &str) -> Result<(), GitError> {
+    validate_lock_token(lock_token)?;
+    if candidate_file == format!("{INDEX_CANDIDATE_PREFIX}{lock_token}") {
+        Ok(())
+    } else {
+        Err(GitError::InvalidJournal)
+    }
+}
+
+fn validate_payload(payload: &MergeJournalPayload) -> Result<(), GitError> {
+    match payload {
+        MergeJournalPayload::InPlace(journal) => validate_journal(journal),
+        MergeJournalPayload::Rename(journal) => validate_rename_journal(journal),
+        MergeJournalPayload::DetectedRename(journal) => validate_detected_rename_journal(journal),
+    }
+}
+
+fn payload_oids(payload: &MergeJournalPayload) -> Vec<&str> {
+    match payload {
+        MergeJournalPayload::InPlace(journal) => journal
+            .stages
+            .iter()
+            .flatten()
+            .map(|entry| entry.oid.as_str())
+            .chain(std::iter::once(journal.result_oid.as_str()))
+            .collect(),
+        MergeJournalPayload::Rename(journal) => journal
+            .source_stages
+            .iter()
+            .flatten()
+            .map(|entry| entry.oid.as_str())
+            .chain(std::iter::once(journal.destination_stage.oid.as_str()))
+            .chain(std::iter::once(journal.result_oid.as_str()))
+            .collect(),
+        MergeJournalPayload::DetectedRename(journal) => journal
+            .stages
+            .iter()
+            .flatten()
+            .map(|entry| entry.oid.as_str())
+            .chain(std::iter::once(journal.result_oid.as_str()))
+            .collect(),
+    }
+}
+
+fn payload_rename_provenance(payload: &MergeJournalPayload) -> Option<&RenameProvenance> {
+    match payload {
+        MergeJournalPayload::InPlace(_) => None,
+        MergeJournalPayload::Rename(journal) => Some(&journal.provenance),
+        MergeJournalPayload::DetectedRename(journal) => Some(&journal.provenance),
+    }
+}
+
+fn validate_cas_journal(journal: &CasMergeJournal) -> Result<(), GitError> {
+    if journal.version != 4 {
+        return Err(GitError::InvalidJournal);
+    }
+    validate_candidate_file(&journal.lock_token, &journal.candidate_file)?;
+    let marker = index_lock_marker_bytes(
+        &journal.lock_token,
+        journal.expected_index_size,
+        &journal.expected_index_sha256,
+        journal.candidate_index_size,
+        &journal.candidate_index_sha256,
+    );
+    if journal.lock_marker_sha256 != hex_digest(digest(&marker)) {
+        return Err(GitError::InvalidJournal);
+    }
+    parse_hex_digest(&journal.expected_index_sha256)?;
+    parse_hex_digest(&journal.candidate_index_sha256)?;
+    if journal.expected_index_sha256 == journal.candidate_index_sha256
+        || journal.expected_index_size == 0
+        || journal.candidate_index_size == 0
+        || journal.expected_index_size > u64::try_from(MAX_GIT_OUTPUT_BYTES).unwrap_or(u64::MAX)
+        || journal.candidate_index_size > u64::try_from(MAX_GIT_OUTPUT_BYTES).unwrap_or(u64::MAX)
+    {
+        return Err(GitError::InvalidJournal);
+    }
+    validate_payload(&journal.transaction)?;
+    let oid_width = journal.object_format.oid_hex_len();
+    if payload_oids(&journal.transaction)
+        .iter()
+        .any(|oid| oid.len() != oid_width)
+    {
+        return Err(GitError::InvalidJournal);
+    }
+    if let Some(provenance) = payload_rename_provenance(&journal.transaction) {
+        if provenance.object_format != journal.object_format {
+            return Err(GitError::InvalidJournal);
+        }
+        for oid in [
+            &provenance.ours_commit,
+            &provenance.theirs_commit,
+            &provenance.base_commit,
+        ] {
+            validate_oid(oid).map_err(|_| GitError::InvalidJournal)?;
+            if oid.len() != oid_width {
+                return Err(GitError::InvalidJournal);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn index_entry_map(git: &Git) -> Result<BTreeMap<(String, u8), StageEntry>, GitError> {
+    let mut map = BTreeMap::new();
+    for (stage, entry, path) in git.staged_entries()? {
+        if map.insert((path, stage), entry).is_some() {
+            return Err(GitError::MalformedGitOutput);
+        }
+    }
+    Ok(map)
+}
+
+fn apply_payload_to_index(git: &Git, payload: &MergeJournalPayload) -> Result<(), GitError> {
+    match payload {
+        MergeJournalPayload::InPlace(journal) => git.update_index_direct(
+            &journal.physical_path,
+            &journal.result_mode,
+            &journal.result_oid,
+        ),
+        MergeJournalPayload::Rename(journal) => git.update_index_rename_direct(
+            &journal.source_physical_path,
+            &journal.destination_physical_path,
+            &journal.result_mode,
+            &journal.result_oid,
+        ),
+        MergeJournalPayload::DetectedRename(journal) => git.update_index_direct(
+            &journal.destination_physical_path,
+            &journal.result_mode,
+            &journal.result_oid,
+        ),
+    }
+}
+
+fn verify_candidate_index(
+    git: &Git,
+    payload: &MergeJournalPayload,
+    before: &BTreeMap<(String, u8), StageEntry>,
+) -> Result<(), GitError> {
+    let mut expected = before.clone();
+    let (source, destination, mode, oid) = match payload {
+        MergeJournalPayload::InPlace(journal) => (
+            None,
+            journal.physical_path.as_str(),
+            journal.result_mode.as_str(),
+            journal.result_oid.as_str(),
+        ),
+        MergeJournalPayload::Rename(journal) => (
+            Some(journal.source_physical_path.as_str()),
+            journal.destination_physical_path.as_str(),
+            journal.result_mode.as_str(),
+            journal.result_oid.as_str(),
+        ),
+        MergeJournalPayload::DetectedRename(journal) => (
+            None,
+            journal.destination_physical_path.as_str(),
+            journal.result_mode.as_str(),
+            journal.result_oid.as_str(),
+        ),
+    };
+    expected.retain(|(path, _), _| {
+        path != destination && source.is_none_or(|source_path| path != source_path)
+    });
+    expected.insert(
+        (destination.to_owned(), 0),
+        StageEntry {
+            mode: mode.to_owned(),
+            oid: oid.to_owned(),
+        },
+    );
+    git.ensure_full_index()?;
+    if index_entry_map(git)? != expected {
+        return Err(GitError::IndexChanged);
+    }
+    Ok(())
+}
+
+fn create_private_file(path: &Path, bytes: &[u8]) -> Result<File, GitError> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| io_error(GitIoOperation::WriteJournal, &error))?;
+    restrict_file_permissions_best_effort(&file);
+    if let Err(error) = file
+        .write_all(bytes)
+        .and_then(|()| file.flush())
+        .and_then(|()| file.sync_all())
+    {
+        drop(file);
+        let _ = fs::remove_file(path);
+        if let Some(parent) = path.parent() {
+            let _ = sync_directory(parent);
+        }
+        return Err(io_error(GitIoOperation::WriteJournal, &error));
+    }
+    Ok(file)
+}
+
+fn prepare_index_cas(
+    git: &Git,
+    transaction: &MergeJournalPayload,
+) -> Result<PreparedIndexCas, GitError> {
+    prepare_index_cas_with_hook(git, transaction, || Ok(()))
+}
+
+#[allow(clippy::too_many_lines)] // Keep candidate preparation and real-lock acquisition adjacent.
+fn prepare_index_cas_with_hook<F>(
+    git: &Git,
+    transaction: &MergeJournalPayload,
+    before_lock: F,
+) -> Result<PreparedIndexCas, GitError>
+where
+    F: FnOnce() -> Result<(), GitError>,
+{
+    validate_payload(transaction)?;
+    ensure_no_journal(&git.root)?;
+    git.ensure_full_index()?;
+    let old = read_index_snapshot(&index_path(&git.root))?;
+    let local = git.root.join(VAULT_LOCAL_DIRECTORY);
+    validate_local_directory(&local)?;
+
+    let lock_token = Uuid::new_v4().simple().to_string();
+    let candidate_file = format!("{INDEX_CANDIDATE_PREFIX}{lock_token}");
+    let candidate_path = index_candidate_path(&git.root, &candidate_file);
+    let marker_path = index_marker_staging_path(&git.root, &lock_token);
+    let candidate_file_handle = create_private_file(&candidate_path, &old.bytes)?;
+    drop(candidate_file_handle);
+    let mut private_files = PreLockPrivateFiles::new(vec![
+        marker_path.clone(),
+        appended_lock_path(&candidate_path),
+        candidate_path.clone(),
+    ]);
+    sync_directory(&local).map_err(|_| GitError::DurabilityNotConfirmed)?;
+
+    let candidate_git = git.with_index_file(candidate_path.clone())?;
+    let before = index_entry_map(&candidate_git)?;
+    apply_payload_to_index(&candidate_git, transaction)?;
+    verify_candidate_index(&candidate_git, transaction, &before)?;
+    let candidate = read_index_snapshot(&candidate_path)?;
+    if candidate.sha256 == old.sha256 {
+        return Err(GitError::IndexChanged);
+    }
+    before_lock()?;
+
+    let marker = index_lock_marker_bytes(
+        &lock_token,
+        old.size,
+        &old.sha256,
+        candidate.size,
+        &candidate.sha256,
+    );
+    let marker_file = create_private_file(&marker_path, &marker)?;
+    sync_directory(&local).map_err(|_| GitError::DurabilityNotConfirmed)?;
+    let lock_path = index_lock_path(&git.root);
+    let move_result = atomic_move_verified_file_no_replace(&marker_path, &marker_file, &lock_path);
+    drop(marker_file);
+    let namespace_durable = match move_result {
+        Ok(outcome) => require_file_move_durability(outcome).is_ok(),
+        Err(error) => {
+            let lock_has_marker = matches!(
+                read_regular_exact(&lock_path, marker.len()),
+                Ok(actual) if actual == marker
+            );
+            let staging_has_marker = matches!(
+                read_regular_exact(&marker_path, marker.len()),
+                Ok(actual) if actual == marker
+            );
+            if lock_has_marker && !staging_has_marker {
+                sync_directory(&local).is_ok() && sync_directory(&git.root.join(".git")).is_ok()
+            } else if staging_has_marker && !lock_has_marker {
+                return if error.kind() == io::ErrorKind::AlreadyExists {
+                    Err(GitError::IndexChanged)
+                } else {
+                    Err(io_error(GitIoOperation::SyncGitState, &error))
+                };
+            } else {
+                private_files.disarm();
+                return Err(GitError::RecoveryConflict);
+            }
+        }
+    };
+
+    let mut prepared = PreparedIndexCas {
+        root: git.root.clone(),
+        object_format: git.object_format,
+        lock_token,
+        lock_marker_sha256: hex_digest(digest(&marker)),
+        candidate_file,
+        expected_index_sha256: old.sha256.clone(),
+        expected_index_size: old.size,
+        candidate_index_sha256: candidate.sha256,
+        candidate_index_size: candidate.size,
+        armed: true,
+    };
+    private_files.disarm();
+    if !namespace_durable {
+        prepared.disarm();
+        return Err(GitError::DurabilityNotConfirmed);
+    }
+    if read_regular_exact(&lock_path, marker.len())? != marker {
+        return Err(GitError::IndexChanged);
+    }
+    let locked_old = read_index_snapshot(&index_path(&git.root))?;
+    if locked_old.sha256 != old.sha256 || locked_old.size != old.size {
+        return Err(GitError::IndexChanged);
+    }
+    git.ensure_full_index()?;
+    verify_candidate_index(&candidate_git, transaction, &before)?;
+    let locked_candidate = read_index_snapshot(&candidate_path)?;
+    if locked_candidate.sha256 != prepared.candidate_index_sha256
+        || locked_candidate.size != prepared.candidate_index_size
+    {
+        return Err(GitError::IndexChanged);
+    }
+    Ok(prepared)
+}
+
+fn write_cas_journal(
+    root: &Path,
+    prepared: &mut PreparedIndexCas,
+    transaction: MergeJournalPayload,
+) -> Result<PendingMergeJournal, GitError> {
+    let pending = PendingMergeJournal::Cas(prepared.journal(transaction));
+    match write_journal(root, &pending) {
+        Ok(()) => {
+            prepared.disarm();
+            Ok(pending)
+        }
+        Err(error) => {
+            let exact_journal_is_visible = matches!(
+                read_journal(root),
+                Ok(Some(ref actual)) if actual == &pending
+            );
+            if exact_journal_is_visible
+                || (!matches!(&error, GitError::JournalAlreadyExists)
+                    && fs::symlink_metadata(journal_path(root)).is_ok())
+            {
+                prepared.disarm();
+            }
+            Err(error)
+        }
+    }
+}
+
+fn mutation_matches_payload(mutation: IndexMutation<'_>, payload: &MergeJournalPayload) -> bool {
+    match (mutation, payload) {
+        (
+            IndexMutation::Upsert {
+                physical_path,
+                mode,
+                oid,
+            },
+            MergeJournalPayload::InPlace(journal),
+        ) => {
+            physical_path == journal.physical_path
+                && mode == journal.result_mode
+                && oid == journal.result_oid
+        }
+        (
+            IndexMutation::Upsert {
+                physical_path,
+                mode,
+                oid,
+            },
+            MergeJournalPayload::DetectedRename(journal),
+        ) => {
+            physical_path == journal.destination_physical_path
+                && mode == journal.result_mode
+                && oid == journal.result_oid
+        }
+        (
+            IndexMutation::Rename {
+                source_physical_path,
+                destination_physical_path,
+                mode,
+                oid,
+            },
+            MergeJournalPayload::Rename(journal),
+        ) => {
+            source_physical_path == journal.source_physical_path
+                && destination_physical_path == journal.destination_physical_path
+                && mode == journal.result_mode
+                && oid == journal.result_oid
+        }
+        (IndexMutation::Upsert { .. }, MergeJournalPayload::Rename(_))
+        | (IndexMutation::Rename { .. }, MergeJournalPayload::InPlace(_))
+        | (IndexMutation::Rename { .. }, MergeJournalPayload::DetectedRename(_)) => false,
+    }
+}
+
+fn optional_index_snapshot(path: &Path) -> Result<Option<IndexSnapshot>, GitError> {
+    match read_index_snapshot(path) {
+        Ok(snapshot) => Ok(Some(snapshot)),
+        Err(GitError::Io {
+            kind: io::ErrorKind::NotFound,
+            ..
+        }) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+enum AbandonedCasReservation {
+    None,
+    Exact {
+        marker: Vec<u8>,
+        candidate_path: PathBuf,
+        candidate_size: u64,
+        candidate_sha256: String,
+        journal_staging_path: Option<PathBuf>,
+    },
+    Conflict,
+}
+
+fn inspect_abandoned_cas_reservation(root: &Path) -> Result<AbandonedCasReservation, GitError> {
+    let lock_path = index_lock_path(root);
+    let metadata = match fs::symlink_metadata(&lock_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(AbandonedCasReservation::None);
+        }
+        Err(error) => return Err(io_error(GitIoOperation::InspectMetadata, &error)),
+    };
+    if is_link_or_reparse_point(&metadata)
+        || !metadata.file_type().is_file()
+        || metadata.len() == 0
+        || metadata.len() > 512
+    {
+        return Ok(AbandonedCasReservation::None);
+    }
+    let mut file =
+        File::open(&lock_path).map_err(|error| io_error(GitIoOperation::ReadMetadata, &error))?;
+    if !open_file_matches_path_and_is_single_link(&lock_path, &file)
+        .map_err(|error| io_error(GitIoOperation::InspectMetadata, &error))?
+    {
+        return Ok(AbandonedCasReservation::None);
+    }
+    let mut marker = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(512));
+    (&mut file)
+        .take(513)
+        .read_to_end(&mut marker)
+        .map_err(|error| io_error(GitIoOperation::ReadMetadata, &error))?;
+    if !marker.starts_with(INDEX_LOCK_MARKER_MAGIC) {
+        return Ok(AbandonedCasReservation::None);
+    }
+    let Ok(parsed) = parse_index_lock_marker(&marker) else {
+        return Ok(AbandonedCasReservation::Conflict);
+    };
+    let candidate_file = format!("{INDEX_CANDIDATE_PREFIX}{}", parsed.lock_token);
+    let candidate_path = index_candidate_path(root, &candidate_file);
+    if index_marker_staging_path(root, &parsed.lock_token).exists() {
+        return Ok(AbandonedCasReservation::Conflict);
+    }
+    let Ok(Some(candidate)) = optional_index_snapshot(&candidate_path) else {
+        return Ok(AbandonedCasReservation::Conflict);
+    };
+    let Ok(live) = read_index_snapshot(&index_path(root)) else {
+        return Ok(AbandonedCasReservation::Conflict);
+    };
+    if !snapshot_matches(
+        &live,
+        parsed.expected_index_size,
+        &parsed.expected_index_sha256,
+    ) || !snapshot_matches(
+        &candidate,
+        parsed.candidate_index_size,
+        &parsed.candidate_index_sha256,
+    ) {
+        return Ok(AbandonedCasReservation::Conflict);
+    }
+    let journal_staging_path = root
+        .join(VAULT_LOCAL_DIRECTORY)
+        .join(format!("{JOURNAL_STAGING_PREFIX}{}", parsed.lock_token));
+    let journal_staging_path = match fs::symlink_metadata(&journal_staging_path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Ok(metadata) if !is_link_or_reparse_point(&metadata) && metadata.file_type().is_file() => {
+            Some(journal_staging_path)
+        }
+        Ok(_) => None,
+        Err(error) => return Err(io_error(GitIoOperation::InspectMetadata, &error)),
+    };
+    Ok(AbandonedCasReservation::Exact {
+        marker,
+        candidate_path,
+        candidate_size: parsed.candidate_index_size,
+        candidate_sha256: parsed.candidate_index_sha256,
+        journal_staging_path,
+    })
+}
+
+fn recover_abandoned_cas_reservation(root: &Path) -> Result<bool, GitError> {
+    match inspect_abandoned_cas_reservation(root)? {
+        AbandonedCasReservation::None => Ok(false),
+        AbandonedCasReservation::Conflict => Err(GitError::RecoveryConflict),
+        AbandonedCasReservation::Exact {
+            marker,
+            candidate_path,
+            candidate_size,
+            candidate_sha256,
+            journal_staging_path,
+        } => {
+            if let Some(staging_path) = journal_staging_path {
+                let _ = remove_reserved_regular_file(&staging_path);
+            }
+            if !remove_regular_file_if_exact(&index_lock_path(root), &marker)? {
+                return Err(GitError::RecoveryConflict);
+            }
+            if !remove_regular_file_if_digest(&candidate_path, candidate_size, &candidate_sha256)? {
+                return Err(GitError::RecoveryConflict);
+            }
+            Ok(true)
+        }
+    }
+}
+
+fn snapshot_matches(snapshot: &IndexSnapshot, size: u64, sha256: &str) -> bool {
+    snapshot.size == size && snapshot.sha256 == sha256
+}
+
+fn require_file_move_durability(outcome: AtomicFileMoveOutcome) -> Result<(), GitError> {
+    if outcome.source_parent_sync == ParentSyncStatus::Synced
+        && outcome.destination_parent_sync == ParentSyncStatus::Synced
+    {
+        Ok(())
+    } else {
+        Err(GitError::DurabilityNotConfirmed)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CasIndexLockState {
+    Absent,
+    Marker,
+    Candidate,
+    Foreign,
+}
+
+fn classify_cas_index_lock(
+    root: &Path,
+    journal: &CasMergeJournal,
+) -> Result<CasIndexLockState, GitError> {
+    let path = index_lock_path(root);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(CasIndexLockState::Absent);
+        }
+        Err(error) => return Err(io_error(GitIoOperation::InspectMetadata, &error)),
+    };
+    if is_link_or_reparse_point(&metadata)
+        || !metadata.file_type().is_file()
+        || metadata.len() == 0
+        || metadata.len() > u64::try_from(MAX_GIT_OUTPUT_BYTES).unwrap_or(u64::MAX)
+    {
+        return Ok(CasIndexLockState::Foreign);
+    }
+    let snapshot = match read_index_snapshot(&path) {
+        Ok(snapshot) => snapshot,
+        Err(GitError::IndexChanged) => return Ok(CasIndexLockState::Foreign),
+        Err(error) => return Err(error),
+    };
+    let marker_size = u64::try_from(
+        index_lock_marker_bytes(
+            &journal.lock_token,
+            journal.expected_index_size,
+            &journal.expected_index_sha256,
+            journal.candidate_index_size,
+            &journal.candidate_index_sha256,
+        )
+        .len(),
+    )
+    .unwrap_or(u64::MAX);
+    if snapshot.size == marker_size && snapshot.sha256 == journal.lock_marker_sha256 {
+        Ok(CasIndexLockState::Marker)
+    } else if snapshot_matches(
+        &snapshot,
+        journal.candidate_index_size,
+        &journal.candidate_index_sha256,
+    ) {
+        Ok(CasIndexLockState::Candidate)
+    } else {
+        Ok(CasIndexLockState::Foreign)
+    }
+}
+
+fn reconcile_candidate_to_lock_error(
+    root: &Path,
+    journal: &CasMergeJournal,
+    error: &io::Error,
+) -> Result<(), GitError> {
+    let lock = optional_index_snapshot(&index_lock_path(root));
+    let candidate = optional_index_snapshot(&index_candidate_path(root, &journal.candidate_file));
+    match (lock, candidate) {
+        (Ok(Some(lock)), Ok(None))
+            if snapshot_matches(
+                &lock,
+                journal.candidate_index_size,
+                &journal.candidate_index_sha256,
+            ) =>
+        {
+            Err(GitError::DurabilityNotConfirmed)
+        }
+        (Ok(Some(lock)), Ok(Some(candidate)))
+            if lock.size
+                == u64::try_from(
+                    index_lock_marker_bytes(
+                        &journal.lock_token,
+                        journal.expected_index_size,
+                        &journal.expected_index_sha256,
+                        journal.candidate_index_size,
+                        &journal.candidate_index_sha256,
+                    )
+                    .len(),
+                )
+                .unwrap_or(u64::MAX)
+                && lock.sha256 == journal.lock_marker_sha256
+                && snapshot_matches(
+                    &candidate,
+                    journal.candidate_index_size,
+                    &journal.candidate_index_sha256,
+                ) =>
+        {
+            Err(io_error(GitIoOperation::SyncGitState, error))
+        }
+        _ => Err(GitError::RecoveryConflict),
+    }
+}
+
+fn reconcile_lock_to_index_error(
+    root: &Path,
+    journal: &CasMergeJournal,
+    error: &io::Error,
+) -> Result<(), GitError> {
+    let live = read_index_snapshot(&index_path(root));
+    let lock = optional_index_snapshot(&index_lock_path(root));
+    match (live, lock) {
+        (Ok(live), Ok(None))
+            if snapshot_matches(
+                &live,
+                journal.candidate_index_size,
+                &journal.candidate_index_sha256,
+            ) =>
+        {
+            Err(GitError::DurabilityNotConfirmed)
+        }
+        (Ok(live), Ok(Some(lock)))
+            if snapshot_matches(
+                &live,
+                journal.expected_index_size,
+                &journal.expected_index_sha256,
+            ) && snapshot_matches(
+                &lock,
+                journal.candidate_index_size,
+                &journal.candidate_index_sha256,
+            ) =>
+        {
+            Err(io_error(GitIoOperation::SyncGitState, error))
+        }
+        _ => Err(GitError::RecoveryConflict),
+    }
+}
+
+#[allow(clippy::too_many_lines)] // Keep the two physical index publication transitions adjacent.
+fn publish_cas_index(
+    git: &Git,
+    journal: &CasMergeJournal,
+    mutation: IndexMutation<'_>,
+) -> Result<(), GitError> {
+    validate_cas_journal(journal)?;
+    if journal.object_format != git.object_format
+        || !mutation_matches_payload(mutation, &journal.transaction)
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    git.ensure_full_index()?;
+    let live = read_index_snapshot(&index_path(&git.root))?;
+    if snapshot_matches(
+        &live,
+        journal.candidate_index_size,
+        &journal.candidate_index_sha256,
+    ) {
+        git.sync_index()?;
+        return Ok(());
+    }
+    if !snapshot_matches(
+        &live,
+        journal.expected_index_size,
+        &journal.expected_index_sha256,
+    ) {
+        return Err(GitError::RecoveryConflict);
+    }
+
+    let lock_path = index_lock_path(&git.root);
+    let candidate_path = index_candidate_path(&git.root, &journal.candidate_file);
+    let lock = optional_index_snapshot(&lock_path)?;
+    let candidate = optional_index_snapshot(&candidate_path)?;
+    let lock_has_marker = lock.as_ref().is_some_and(|snapshot| {
+        snapshot.size
+            == u64::try_from(
+                index_lock_marker_bytes(
+                    &journal.lock_token,
+                    journal.expected_index_size,
+                    &journal.expected_index_sha256,
+                    journal.candidate_index_size,
+                    &journal.candidate_index_sha256,
+                )
+                .len(),
+            )
+            .unwrap_or(u64::MAX)
+            && snapshot.sha256 == journal.lock_marker_sha256
+    });
+    let lock_has_candidate = lock.as_ref().is_some_and(|snapshot| {
+        snapshot_matches(
+            snapshot,
+            journal.candidate_index_size,
+            &journal.candidate_index_sha256,
+        )
+    });
+    let candidate_is_final = candidate.as_ref().is_some_and(|snapshot| {
+        snapshot_matches(
+            snapshot,
+            journal.candidate_index_size,
+            &journal.candidate_index_sha256,
+        )
+    });
+
+    let candidate_index_path = if lock_has_marker && candidate_is_final {
+        candidate_path.clone()
+    } else if lock_has_candidate && candidate.is_none() {
+        lock_path.clone()
+    } else {
+        return Err(GitError::RecoveryConflict);
+    };
+    let before = index_entry_map(git)?;
+    let candidate_git = git.with_index_file(candidate_index_path)?;
+    verify_candidate_index(&candidate_git, &journal.transaction, &before)?;
+
+    if lock_has_marker && candidate_is_final {
+        let source = File::open(&candidate_path)
+            .map_err(|error| io_error(GitIoOperation::SyncGitState, &error))?;
+        let destination = File::open(&lock_path)
+            .map_err(|error| io_error(GitIoOperation::SyncGitState, &error))?;
+        let outcome =
+            match atomic_replace_verified_file(&candidate_path, source, &lock_path, destination) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    return reconcile_candidate_to_lock_error(&git.root, journal, &error);
+                }
+            };
+        require_file_move_durability(outcome)?;
+    }
+
+    let lock = optional_index_snapshot(&lock_path)?;
+    if !lock.as_ref().is_some_and(|snapshot| {
+        snapshot_matches(
+            snapshot,
+            journal.candidate_index_size,
+            &journal.candidate_index_sha256,
+        )
+    }) || optional_index_snapshot(&candidate_path)?.is_some()
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    sync_regular_file(&lock_path, MAX_GIT_OUTPUT_BYTES)?;
+    let live = read_index_snapshot(&index_path(&git.root))?;
+    if !snapshot_matches(
+        &live,
+        journal.expected_index_size,
+        &journal.expected_index_sha256,
+    ) {
+        return Err(GitError::RecoveryConflict);
+    }
+
+    let source =
+        File::open(&lock_path).map_err(|error| io_error(GitIoOperation::SyncGitState, &error))?;
+    let destination = File::open(index_path(&git.root))
+        .map_err(|error| io_error(GitIoOperation::SyncGitState, &error))?;
+    let outcome =
+        match atomic_replace_verified_file(&lock_path, source, &index_path(&git.root), destination)
+        {
+            Ok(outcome) => outcome,
+            Err(error) => return reconcile_lock_to_index_error(&git.root, journal, &error),
+        };
+    require_file_move_durability(outcome)?;
+    let final_index = read_index_snapshot(&index_path(&git.root))?;
+    if !snapshot_matches(
+        &final_index,
+        journal.candidate_index_size,
+        &journal.candidate_index_sha256,
+    ) || optional_index_snapshot(&lock_path)?.is_some()
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    git.sync_index()
+}
+
 fn commit_result(
     vault: &Vault,
     git: &Git,
@@ -2545,8 +3850,23 @@ fn commit_result(
         result_oid: prepared.result_oid.clone(),
         result_sha256: hex_digest(result_digest),
     };
-    let pending = PendingMergeJournal::InPlace(journal.clone());
-    write_journal(vault.root(), &pending)?;
+    let transaction = MergeJournalPayload::InPlace(journal.clone());
+    let mut prepared_index = prepare_index_cas(git, &transaction)?;
+    if git.unmerged_entries()?.get(&conflict.physical_path) != Some(conflict)
+        || git.stage_zero(&conflict.physical_path)?.is_some()
+    {
+        return Err(GitError::IndexChanged);
+    }
+    verify_merge_identity_owners(
+        vault,
+        git,
+        &guard,
+        &prepared.file_id,
+        None,
+        &[&conflict.physical_path],
+    )?;
+    git.verify_attributes_for_path(&conflict.physical_path)?;
+    let pending = write_cas_journal(vault.root(), &mut prepared_index, transaction)?;
 
     let outcome = guard
         .write(&target, &prepared.encrypted.bytes, condition)
@@ -2682,8 +4002,22 @@ fn commit_detected_rename_result(
         result_oid: prepared.result_oid.clone(),
         result_sha256: hex_digest(result_digest),
     };
-    let pending = PendingMergeJournal::DetectedRename(journal.clone());
-    write_journal(vault.root(), &pending)?;
+    let transaction = MergeJournalPayload::DetectedRename(journal.clone());
+    let mut prepared_index = prepare_index_cas(git, &transaction)?;
+    if !detected_index_is_original(git, conflict, &source_physical_path)? {
+        return Err(GitError::IndexChanged);
+    }
+    verify_merge_identity_owners(
+        vault,
+        git,
+        &guard,
+        &prepared.file_id,
+        None,
+        &[&source_physical_path, &conflict.physical_path],
+    )?;
+    verify_active_rename_provenance(git, provenance)?;
+    git.verify_attributes_for_paths(&[&source_physical_path, &conflict.physical_path])?;
+    let pending = write_cas_journal(vault.root(), &mut prepared_index, transaction)?;
 
     let outcome = guard
         .write(
@@ -2850,8 +4184,22 @@ fn commit_split_rename_result(
         result_oid: prepared.result_oid.clone(),
         result_sha256: hex_digest(result_digest),
     };
-    let pending = PendingMergeJournal::Rename(journal.clone());
-    write_journal(vault.root(), &pending)?;
+    let transaction = MergeJournalPayload::Rename(journal.clone());
+    let mut prepared_index = prepare_index_cas(git, &transaction)?;
+    if !split_index_is_original(git, source, destination)? {
+        return Err(GitError::IndexChanged);
+    }
+    verify_merge_identity_owners(
+        vault,
+        git,
+        &guard,
+        &prepared.file_id,
+        Some(&destination.physical_path),
+        &[&source.physical_path, &destination.physical_path],
+    )?;
+    verify_active_rename_provenance(git, provenance)?;
+    git.verify_attributes_for_paths(&[&source.physical_path, &destination.physical_path])?;
+    let pending = write_cas_journal(vault.root(), &mut prepared_index, transaction)?;
 
     let destination_outcome = guard
         .write(
@@ -2924,10 +4272,116 @@ fn split_index_is_original(
     Ok(git.stage_zero(&destination.physical_path)?.as_ref() == Some(&destination.entry))
 }
 
+fn recover_payload_pending(
+    vault: &Vault,
+    git: &Git,
+    guard: &VaultMutationGuard,
+    payload: &MergeJournalPayload,
+) -> Result<(), GitError> {
+    match payload {
+        MergeJournalPayload::InPlace(journal) => {
+            recover_in_place_pending(vault, git, guard, journal)
+        }
+        MergeJournalPayload::Rename(journal) => {
+            recover_split_rename_pending(vault, git, guard, journal)
+        }
+        MergeJournalPayload::DetectedRename(journal) => {
+            recover_detected_rename_pending(vault, git, guard, journal)
+        }
+    }
+}
+
+fn payload_index_result_is_present(
+    git: &Git,
+    payload: &MergeJournalPayload,
+) -> Result<bool, GitError> {
+    match payload {
+        MergeJournalPayload::InPlace(journal) => {
+            if git.unmerged_entries()?.contains_key(&journal.physical_path) {
+                return Ok(false);
+            }
+            Ok(git
+                .stage_zero(&journal.physical_path)?
+                .is_some_and(|entry| {
+                    entry.mode == journal.result_mode && entry.oid == journal.result_oid
+                }))
+        }
+        MergeJournalPayload::Rename(journal) => split_index_is_final(git, journal),
+        MergeJournalPayload::DetectedRename(journal) => detected_index_is_final(git, journal),
+    }
+}
+
+fn recover_cas_pending(
+    vault: &Vault,
+    git: &Git,
+    guard: &VaultMutationGuard,
+    journal: &CasMergeJournal,
+) -> Result<(), GitError> {
+    validate_cas_journal(journal)?;
+    if journal.object_format != git.object_format {
+        return Err(GitError::InvalidJournal);
+    }
+    git.ensure_full_index()?;
+    let live = read_index_snapshot(&index_path(&git.root))?;
+    let candidate_path = index_candidate_path(&git.root, &journal.candidate_file);
+    let lock_path = index_lock_path(&git.root);
+    let candidate = optional_index_snapshot(&candidate_path)?;
+    let lock_state = classify_cas_index_lock(&git.root, journal)?;
+    let lock_has_marker = lock_state == CasIndexLockState::Marker;
+    let lock_has_candidate = lock_state == CasIndexLockState::Candidate;
+    let candidate_is_final = candidate.as_ref().is_some_and(|candidate| {
+        snapshot_matches(
+            candidate,
+            journal.candidate_index_size,
+            &journal.candidate_index_sha256,
+        )
+    });
+    let live_is_old = snapshot_matches(
+        &live,
+        journal.expected_index_size,
+        &journal.expected_index_sha256,
+    );
+    let live_is_final = snapshot_matches(
+        &live,
+        journal.candidate_index_size,
+        &journal.candidate_index_sha256,
+    );
+
+    if live_is_old {
+        let candidate_index_path = if lock_has_marker && candidate_is_final {
+            candidate_path.clone()
+        } else if lock_has_candidate && candidate.is_none() {
+            lock_path.clone()
+        } else {
+            return Err(GitError::RecoveryConflict);
+        };
+        let before = index_entry_map(git)?;
+        let candidate_git = git.with_index_file(candidate_index_path)?;
+        verify_candidate_index(&candidate_git, &journal.transaction, &before)?;
+        return recover_payload_pending(vault, git, guard, &journal.transaction);
+    }
+
+    if live_is_final {
+        if candidate.is_some() || lock_has_marker || lock_has_candidate {
+            return Err(GitError::RecoveryConflict);
+        }
+        return recover_payload_pending(vault, git, guard, &journal.transaction);
+    }
+
+    if candidate.is_none()
+        && !lock_has_marker
+        && !lock_has_candidate
+        && payload_index_result_is_present(git, &journal.transaction)?
+    {
+        return recover_payload_pending(vault, git, guard, &journal.transaction);
+    }
+    Err(GitError::RecoveryConflict)
+}
+
 fn recover_pending(vault: &Vault, git: &Git) -> Result<bool, GitError> {
     let guard = VaultMutationGuard::acquire(vault.root()).map_err(map_atomic_error)?;
     let Some(pending) = read_journal(vault.root())? else {
-        return Ok(false);
+        return recover_abandoned_cas_reservation(vault.root());
     };
     match &pending {
         PendingMergeJournal::InPlace(journal) => {
@@ -2938,6 +4392,9 @@ fn recover_pending(vault: &Vault, git: &Git) -> Result<bool, GitError> {
         }
         PendingMergeJournal::DetectedRename(journal) => {
             recover_detected_rename_pending(vault, git, &guard, journal)?;
+        }
+        PendingMergeJournal::Cas(journal) => {
+            recover_cas_pending(vault, git, &guard, journal)?;
         }
     }
     remove_journal(vault.root(), &pending)?;
@@ -3843,6 +5300,17 @@ fn journal_path(root: &Path) -> PathBuf {
     root.join(VAULT_LOCAL_DIRECTORY).join(JOURNAL_FILE)
 }
 
+fn journal_staging_path(root: &Path, journal: &PendingMergeJournal) -> PathBuf {
+    let suffix = match journal {
+        PendingMergeJournal::Cas(journal) => journal.lock_token.clone(),
+        PendingMergeJournal::InPlace(_)
+        | PendingMergeJournal::Rename(_)
+        | PendingMergeJournal::DetectedRename(_) => Uuid::new_v4().simple().to_string(),
+    };
+    root.join(VAULT_LOCAL_DIRECTORY)
+        .join(format!("{JOURNAL_STAGING_PREFIX}{suffix}"))
+}
+
 fn ensure_no_journal(root: &Path) -> Result<(), GitError> {
     match fs::symlink_metadata(journal_path(root)) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -3863,46 +5331,163 @@ fn write_journal(root: &Path, journal: &PendingMergeJournal) -> Result<(), GitEr
         PendingMergeJournal::InPlace(journal) => serde_json::to_vec(journal),
         PendingMergeJournal::Rename(journal) => serde_json::to_vec(journal),
         PendingMergeJournal::DetectedRename(journal) => serde_json::to_vec(journal),
+        PendingMergeJournal::Cas(journal) => serde_json::to_vec(journal),
     }
     .map_err(|_| GitError::InvalidJournal)?;
     if bytes.len() > MAX_JOURNAL_BYTES {
         return Err(GitError::InvalidJournal);
     }
     let path = journal_path(root);
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|error| {
-            if error.kind() == io::ErrorKind::AlreadyExists {
-                GitError::JournalAlreadyExists
-            } else {
-                io_error(GitIoOperation::WriteJournal, &error)
+    let staging_path = journal_staging_path(root, journal);
+    let staging_file = create_private_file(&staging_path, &bytes)?;
+    let move_result = atomic_move_verified_file_no_replace(&staging_path, &staging_file, &path);
+    drop(staging_file);
+    match move_result {
+        Ok(outcome) => {
+            require_file_move_durability(outcome)?;
+            if read_regular_exact(&path, bytes.len())? != bytes {
+                return Err(GitError::InvalidJournal);
             }
-        })?;
-    restrict_file_permissions_best_effort(&file);
-    file.write_all(&bytes)
-        .and_then(|()| file.flush())
-        .and_then(|()| file.sync_all())
-        .map_err(|error| io_error(GitIoOperation::WriteJournal, &error))?;
-    sync_directory(&local).map_err(|error| io_error(GitIoOperation::WriteJournal, &error))
+            Ok(())
+        }
+        Err(error) => {
+            if matches!(read_regular_exact(&path, bytes.len()), Ok(actual) if actual == bytes) {
+                return Err(GitError::DurabilityNotConfirmed);
+            }
+            let _ = remove_regular_file_if_exact(&staging_path, &bytes);
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                Err(GitError::JournalAlreadyExists)
+            } else {
+                Err(io_error(GitIoOperation::WriteJournal, &error))
+            }
+        }
+    }
+}
+
+struct DuplicateRejectingJson(serde_json::Value);
+
+impl<'de> Deserialize<'de> for DuplicateRejectingJson {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(DuplicateRejectingJsonVisitor)
+    }
+}
+
+struct DuplicateRejectingJsonVisitor;
+
+impl<'de> Visitor<'de> for DuplicateRejectingJsonVisitor {
+    type Value = DuplicateRejectingJson;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a duplicate-free JSON value")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(DuplicateRejectingJson(serde_json::Value::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(DuplicateRejectingJson(serde_json::Value::Number(
+            value.into(),
+        )))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(DuplicateRejectingJson(serde_json::Value::Number(
+            value.into(),
+        )))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(|number| DuplicateRejectingJson(serde_json::Value::Number(number)))
+            .ok_or_else(|| E::custom("non-finite JSON number"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.visit_string(value.to_owned())
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(DuplicateRejectingJson(serde_json::Value::String(value)))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(DuplicateRejectingJson(serde_json::Value::Null))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(DuplicateRejectingJson(serde_json::Value::Null))
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        DuplicateRejectingJson::deserialize(deserializer)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = sequence.next_element::<DuplicateRejectingJson>()? {
+            values.push(value.0);
+        }
+        Ok(DuplicateRejectingJson(serde_json::Value::Array(values)))
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut values = serde_json::Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if values.contains_key(&key) {
+                return Err(de::Error::custom("duplicate JSON object key"));
+            }
+            let value = map.next_value::<DuplicateRejectingJson>()?;
+            values.insert(key, value.0);
+        }
+        Ok(DuplicateRejectingJson(serde_json::Value::Object(values)))
+    }
+}
+
+fn parse_duplicate_free_json(bytes: &[u8]) -> Result<serde_json::Value, GitError> {
+    serde_json::from_slice::<DuplicateRejectingJson>(bytes)
+        .map(|value| value.0)
+        .map_err(|_| GitError::InvalidJournal)
 }
 
 fn read_journal(root: &Path) -> Result<Option<PendingMergeJournal>, GitError> {
     let path = journal_path(root);
-    let metadata = match fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(io_error(GitIoOperation::ReadJournal, &error)),
-    };
+    match fs::symlink_metadata(&path) {
+        Ok(_) => read_journal_file(&path).map(Some),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(io_error(GitIoOperation::ReadJournal, &error)),
+    }
+}
+
+fn read_journal_file(path: &Path) -> Result<PendingMergeJournal, GitError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| io_error(GitIoOperation::ReadJournal, &error))?;
     if is_link_or_reparse_point(&metadata)
         || !metadata.file_type().is_file()
         || metadata.len() > u64::try_from(MAX_JOURNAL_BYTES).unwrap_or(u64::MAX)
     {
         return Err(GitError::InvalidJournal);
     }
-    let file = File::open(&path).map_err(|error| io_error(GitIoOperation::ReadJournal, &error))?;
-    if !open_file_matches_path_and_is_single_link(&path, &file)
+    let file = File::open(path).map_err(|error| io_error(GitIoOperation::ReadJournal, &error))?;
+    if !open_file_matches_path_and_is_single_link(path, &file)
         .map_err(|error| io_error(GitIoOperation::ReadJournal, &error))?
     {
         return Err(GitError::InvalidJournal);
@@ -3923,36 +5508,58 @@ fn read_journal(root: &Path) -> Result<Option<PendingMergeJournal>, GitError> {
     if bytes.len() > MAX_JOURNAL_BYTES {
         return Err(GitError::InvalidJournal);
     }
-    let version = serde_json::from_slice::<JournalVersion>(&bytes)
-        .map_err(|_| GitError::InvalidJournal)?
-        .version;
+    let value = parse_duplicate_free_json(&bytes)?;
+    let version = value
+        .as_object()
+        .and_then(|object| object.get("version"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|version| u32::try_from(version).ok())
+        .ok_or(GitError::InvalidJournal)?;
     let journal = match version {
         1 => {
-            let journal = serde_json::from_slice::<MergeJournal>(&bytes)
+            let journal = serde_json::from_value::<MergeJournal>(value)
                 .map_err(|_| GitError::InvalidJournal)?;
             validate_journal(&journal)?;
             PendingMergeJournal::InPlace(journal)
         }
         2 => {
-            let journal = serde_json::from_slice::<RenameMergeJournal>(&bytes)
+            let journal = serde_json::from_value::<RenameMergeJournal>(value)
                 .map_err(|_| GitError::InvalidJournal)?;
             validate_rename_journal(&journal)?;
             PendingMergeJournal::Rename(journal)
         }
         3 => {
-            let journal = serde_json::from_slice::<DetectedRenameJournal>(&bytes)
+            let journal = serde_json::from_value::<DetectedRenameJournal>(value)
                 .map_err(|_| GitError::InvalidJournal)?;
             validate_detected_rename_journal(&journal)?;
             PendingMergeJournal::DetectedRename(journal)
         }
+        4 => {
+            let journal = serde_json::from_value::<CasMergeJournal>(value)
+                .map_err(|_| GitError::InvalidJournal)?;
+            validate_cas_journal(&journal)?;
+            PendingMergeJournal::Cas(journal)
+        }
         _ => return Err(GitError::InvalidJournal),
     };
-    Ok(Some(journal))
+    Ok(journal)
 }
 
 fn remove_journal(root: &Path, expected: &PendingMergeJournal) -> Result<(), GitError> {
     if read_journal(root)?.as_ref() != Some(expected) {
         return Err(GitError::RecoveryConflict);
+    }
+    if let PendingMergeJournal::Cas(journal) = expected {
+        if optional_index_snapshot(&index_candidate_path(root, &journal.candidate_file))?.is_some()
+        {
+            return Err(GitError::RecoveryConflict);
+        }
+        if matches!(
+            classify_cas_index_lock(root, journal)?,
+            CasIndexLockState::Marker | CasIndexLockState::Candidate
+        ) {
+            return Err(GitError::RecoveryConflict);
+        }
     }
     let path = journal_path(root);
     fs::remove_file(path).map_err(|error| io_error(GitIoOperation::RemoveJournal, &error))?;
@@ -4156,20 +5763,14 @@ mod tests {
     }
 
     fn create_conflicted_repository() -> (TestDirectory, Vault) {
+        create_conflicted_repository_with_format(GitObjectFormat::Sha1)
+    }
+
+    fn create_conflicted_repository_with_format(
+        object_format: GitObjectFormat,
+    ) -> (TestDirectory, Vault) {
         let directory = TestDirectory::new();
-        assert!(test_git(directory.path(), ["init", "-q"]));
-        assert!(test_git(
-            directory.path(),
-            ["symbolic-ref", "HEAD", "refs/heads/baseline"]
-        ));
-        assert!(test_git(
-            directory.path(),
-            ["config", "user.email", "inex-tests@example.invalid"]
-        ));
-        assert!(test_git(
-            directory.path(),
-            ["config", "user.name", "Inex Tests"]
-        ));
+        initialize_test_repository_with_format(directory.path(), object_format);
         let mut vault = Vault::create_with_params(
             directory.path(),
             PASSWORD,
@@ -4742,6 +6343,34 @@ mod tests {
         }
     }
 
+    fn install_rename_cas_journal(fixture: &RenameRecoveryFixture) -> CasMergeJournal {
+        let transaction = MergeJournalPayload::Rename(fixture.journal.clone());
+        let mut prepared = prepare_index_cas(&fixture.git, &transaction)
+            .expect("rename CAS candidate and index lock prepare");
+        let pending = write_cas_journal(fixture.vault.root(), &mut prepared, transaction)
+            .expect("rename CAS journal syncs");
+        let PendingMergeJournal::Cas(journal) = pending else {
+            panic!("expected CAS journal");
+        };
+        journal
+    }
+
+    fn assert_no_cas_private_files(root: &Path) {
+        assert!(!index_lock_path(root).exists());
+        let local = root.join(VAULT_LOCAL_DIRECTORY);
+        assert!(
+            fs::read_dir(local)
+                .expect("private directory enumerates")
+                .all(|entry| {
+                    let name = entry.expect("private entry reads").file_name();
+                    let name = name.to_string_lossy();
+                    !name.starts_with(INDEX_CANDIDATE_PREFIX)
+                        && !name.starts_with(INDEX_MARKER_PREFIX)
+                        && !name.starts_with(JOURNAL_STAGING_PREFIX)
+                })
+        );
+    }
+
     #[test]
     fn parses_unmerged_index_records_and_rejects_non_edry_paths() {
         let oid = "0123456789abcdef0123456789abcdef01234567";
@@ -4989,6 +6618,7 @@ mod tests {
                 .expect("journal inspects")
                 .is_none()
         );
+        assert_no_cas_private_files(vault.root());
     }
 
     #[cfg(unix)]
@@ -5088,6 +6718,80 @@ mod tests {
     }
 
     #[test]
+    fn in_place_merge_uses_index_cas_and_cleans_private_transaction_files() {
+        let (directory, vault) = create_conflicted_repository();
+        let git = Git::open(directory.path()).expect("Git repository opens");
+
+        let report = merge(&vault, 1_783_699_204_000).expect("in-place conflict encrypts");
+        assert_eq!(report.clean_results, 0);
+        assert_eq!(report.unresolved_results, 1);
+        assert!(git.unmerged_entries().expect("index verifies").is_empty());
+        assert!(
+            read_journal(vault.root())
+                .expect("journal inspects")
+                .is_none()
+        );
+        assert_no_cas_private_files(vault.root());
+    }
+
+    #[test]
+    fn in_place_v4_recovery_advances_from_durable_marker() {
+        let (directory, vault) = create_conflicted_repository();
+        let git = Git::open(directory.path()).expect("Git repository opens");
+        let conflict = git
+            .unmerged_entries()
+            .expect("conflicts enumerate")
+            .into_values()
+            .next()
+            .expect("one conflict exists");
+        let identities = tracked_identity_index(&vault, &git).expect("identities inspect");
+        let prepared = prepare_result(&vault, &git, &conflict, &identities, 1_783_699_204_000)
+            .expect("in-place result prepares");
+        let expected = expected_worktree_digest(&prepared).expect("worktree stage exists");
+        let result_digest = digest(&prepared.encrypted.bytes);
+        let inner = MergeJournal {
+            version: 1,
+            physical_path: conflict.physical_path.clone(),
+            result_mode: result_mode(&conflict).expect("mode exists").to_owned(),
+            stages: conflict.stages.clone(),
+            expected_worktree_sha256: hex_digest(expected),
+            result_oid: prepared.result_oid.clone(),
+            result_sha256: hex_digest(result_digest),
+        };
+        let transaction = MergeJournalPayload::InPlace(inner);
+        let mut index_cas = prepare_index_cas(&git, &transaction).expect("in-place CAS prepares");
+        write_cas_journal(vault.root(), &mut index_cas, transaction)
+            .expect("in-place v4 journal writes");
+
+        assert!(recover_pending(&vault, &git).expect("in-place v4 recovery succeeds"));
+        assert!(git.unmerged_entries().expect("index verifies").is_empty());
+        assert_eq!(
+            VaultMutationGuard::acquire(vault.root())
+                .expect("worktree guard acquires")
+                .inspect(&vault.root().join("entry.md.enc"))
+                .expect("result inspects"),
+            CurrentTarget::File(result_digest)
+        );
+        assert_no_cas_private_files(vault.root());
+    }
+
+    #[test]
+    fn sha256_in_place_merge_uses_full_width_cas_journal_binding() {
+        let (directory, vault) = create_conflicted_repository_with_format(GitObjectFormat::Sha256);
+        let git = Git::open(directory.path()).expect("SHA-256 repository opens");
+        assert_eq!(git.object_format, GitObjectFormat::Sha256);
+
+        let report = merge(&vault, 1_783_699_204_000).expect("SHA-256 conflict encrypts");
+        assert_eq!(report.unresolved_results, 1);
+        let stage_zero = git
+            .stage_zero("entry.md.enc")
+            .expect("stage zero inspects")
+            .expect("stage zero exists");
+        assert_eq!(stage_zero.oid.len(), 64);
+        assert_no_cas_private_files(vault.root());
+    }
+
+    #[test]
     fn detected_rename_modify_merges_at_authenticated_destination() {
         let (directory, vault, source, destination, file_id) =
             create_rename_modify_repository(true);
@@ -5129,6 +6833,7 @@ mod tests {
                 .expect("journal inspects")
                 .is_none()
         );
+        assert_no_cas_private_files(vault.root());
     }
 
     #[test]
@@ -5174,6 +6879,7 @@ mod tests {
                 .expect("journal inspects")
                 .is_none()
         );
+        assert_no_cas_private_files(vault.root());
     }
 
     #[test]
@@ -5559,6 +7265,7 @@ mod tests {
                 .expect("journal inspects")
                 .is_none()
         );
+        assert_no_cas_private_files(vault.root());
     }
 
     #[test]
@@ -5773,6 +7480,479 @@ mod tests {
             destination_before
         );
         fixture.assert_original_index();
+    }
+
+    #[test]
+    fn cas_v4_journal_round_trips_and_rejects_noncanonical_bindings() {
+        let fixture = create_rename_recovery_fixture();
+        let transaction = MergeJournalPayload::Rename(fixture.journal.clone());
+        let prepared = prepare_index_cas(&fixture.git, &transaction)
+            .expect("CAS candidate prepares for schema test");
+        let journal = prepared.journal(transaction);
+        validate_cas_journal(&journal).expect("canonical v4 validates");
+        let bytes = serde_json::to_vec(&journal).expect("v4 serializes");
+        let decoded: CasMergeJournal = serde_json::from_slice(&bytes).expect("v4 parses");
+        assert_eq!(decoded, journal);
+        let text = std::str::from_utf8(&bytes).expect("v4 JSON is UTF-8");
+        let duplicate = text.replacen("\"version\":4", "\"version\":4,\"version\":4", 1);
+        assert!(matches!(
+            parse_duplicate_free_json(duplicate.as_bytes()),
+            Err(GitError::InvalidJournal)
+        ));
+        let path = journal_path(fixture.vault.root());
+        fs::write(&path, duplicate.as_bytes()).expect("duplicate journal fixture writes");
+        assert!(matches!(
+            read_journal(fixture.vault.root()),
+            Err(GitError::InvalidJournal)
+        ));
+        fs::remove_file(&path).expect("duplicate fixture removes");
+        let mut unknown: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("v4 value parses");
+        unknown
+            .get_mut("transaction")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("transaction is an object")
+            .insert("unexpected".to_owned(), serde_json::Value::Bool(true));
+        assert!(serde_json::from_value::<CasMergeJournal>(unknown.clone()).is_err());
+        fs::write(
+            &path,
+            serde_json::to_vec(&unknown).expect("unknown-field fixture serializes"),
+        )
+        .expect("unknown-field fixture writes");
+        assert!(matches!(
+            read_journal(fixture.vault.root()),
+            Err(GitError::InvalidJournal)
+        ));
+        fs::remove_file(&path).expect("unknown-field fixture removes");
+        for replacement in ["true", "4.0", "\"4\""] {
+            let invalid_version =
+                text.replacen("\"version\":4", &format!("\"version\":{replacement}"), 1);
+            fs::write(&path, invalid_version).expect("invalid version fixture writes");
+            assert!(matches!(
+                read_journal(fixture.vault.root()),
+                Err(GitError::InvalidJournal)
+            ));
+            fs::remove_file(&path).expect("invalid version fixture removes");
+        }
+
+        let mut bad_candidate = journal.clone();
+        bad_candidate.candidate_file = "../index".to_owned();
+        assert!(matches!(
+            validate_cas_journal(&bad_candidate),
+            Err(GitError::InvalidJournal)
+        ));
+        let mut same_digest = journal.clone();
+        same_digest.candidate_index_sha256 = same_digest.expected_index_sha256.clone();
+        assert!(matches!(
+            validate_cas_journal(&same_digest),
+            Err(GitError::InvalidJournal)
+        ));
+        let mut wrong_format = journal.clone();
+        wrong_format.object_format = GitObjectFormat::Sha256;
+        assert!(matches!(
+            validate_cas_journal(&wrong_format),
+            Err(GitError::InvalidJournal)
+        ));
+        let mut wrong_provenance_format = journal.clone();
+        let MergeJournalPayload::Rename(rename) = &mut wrong_provenance_format.transaction else {
+            panic!("schema fixture must contain a rename transaction");
+        };
+        rename.provenance.object_format = GitObjectFormat::Sha256;
+        assert!(matches!(
+            validate_cas_journal(&wrong_provenance_format),
+            Err(GitError::InvalidJournal)
+        ));
+        let mut wrong_provenance_oid = journal;
+        let MergeJournalPayload::Rename(rename) = &mut wrong_provenance_oid.transaction else {
+            panic!("schema fixture must contain a rename transaction");
+        };
+        rename.provenance.base_commit = "a".repeat(64);
+        assert!(matches!(
+            validate_cas_journal(&wrong_provenance_oid),
+            Err(GitError::InvalidJournal)
+        ));
+    }
+
+    #[test]
+    fn cas_v4_file_move_durability_requires_both_parent_syncs() {
+        for outcome in [
+            AtomicFileMoveOutcome {
+                source_parent_sync: ParentSyncStatus::NotSynced,
+                destination_parent_sync: ParentSyncStatus::Synced,
+            },
+            AtomicFileMoveOutcome {
+                source_parent_sync: ParentSyncStatus::Synced,
+                destination_parent_sync: ParentSyncStatus::NotSynced,
+            },
+        ] {
+            assert!(matches!(
+                require_file_move_durability(outcome),
+                Err(GitError::DurabilityNotConfirmed)
+            ));
+        }
+    }
+
+    #[test]
+    fn foreign_index_lock_blocks_cas_without_mutating_repository() {
+        let fixture = create_rename_recovery_fixture();
+        let index_before = fs::read(index_path(fixture.vault.root())).expect("index snapshots");
+        let source_before = fs::read(&fixture.source_target).expect("source snapshots");
+        let destination_before =
+            fs::read(&fixture.destination_target).expect("destination snapshots");
+        let lock_path = index_lock_path(fixture.vault.root());
+        let foreign = b"FOREIGN_GIT_INDEX_LOCK_SENTINEL";
+        fs::write(&lock_path, foreign).expect("foreign lock installs");
+
+        let transaction = MergeJournalPayload::Rename(fixture.journal.clone());
+        assert!(matches!(
+            prepare_index_cas(&fixture.git, &transaction),
+            Err(GitError::IndexChanged)
+        ));
+        assert_eq!(
+            fs::read(&lock_path).expect("foreign lock re-reads"),
+            foreign
+        );
+        assert_eq!(
+            fs::read(index_path(fixture.vault.root())).expect("index re-reads"),
+            index_before
+        );
+        assert_eq!(
+            fs::read(&fixture.source_target).expect("source re-reads"),
+            source_before
+        );
+        assert_eq!(
+            fs::read(&fixture.destination_target).expect("destination re-reads"),
+            destination_before
+        );
+        assert!(
+            read_journal(fixture.vault.root())
+                .expect("journal inspects")
+                .is_none()
+        );
+        fs::remove_file(lock_path).expect("foreign lock fixture removes");
+        assert_no_cas_private_files(fixture.vault.root());
+    }
+
+    #[test]
+    fn abandoned_prejournal_cas_reservation_is_recognized_and_cleaned() {
+        let fixture = create_rename_recovery_fixture();
+        let transaction = MergeJournalPayload::Rename(fixture.journal.clone());
+        let mut prepared =
+            prepare_index_cas(&fixture.git, &transaction).expect("prejournal reservation prepares");
+        let pending = PendingMergeJournal::Cas(prepared.journal(transaction));
+        let journal_bytes = match &pending {
+            PendingMergeJournal::Cas(journal) => {
+                serde_json::to_vec(journal).expect("staged journal serializes")
+            }
+            PendingMergeJournal::InPlace(_)
+            | PendingMergeJournal::Rename(_)
+            | PendingMergeJournal::DetectedRename(_) => panic!("expected v4 journal"),
+        };
+        let staging_path = journal_staging_path(fixture.vault.root(), &pending);
+        drop(
+            create_private_file(&staging_path, &journal_bytes[..journal_bytes.len() / 2])
+                .expect("truncated staged journal fixture writes"),
+        );
+        prepared.disarm();
+        drop(prepared);
+        assert!(!journal_path(fixture.vault.root()).exists());
+        assert!(
+            has_pending_recovery(fixture.vault.root())
+                .expect("abandoned reservation reports pending")
+        );
+        fixture.assert_original_index();
+
+        assert!(
+            recover_pending(&fixture.vault, &fixture.git).expect("abandoned reservation cleans")
+        );
+        fixture.assert_original_index();
+        assert!(
+            !has_pending_recovery(fixture.vault.root())
+                .expect("clean reservation no longer pending")
+        );
+        assert_no_cas_private_files(fixture.vault.root());
+    }
+
+    #[test]
+    fn external_index_update_before_lock_wins_without_lost_update() {
+        let fixture = create_rename_recovery_fixture();
+        let source_before = fs::read(&fixture.source_target).expect("source snapshots");
+        let destination_before =
+            fs::read(&fixture.destination_target).expect("destination snapshots");
+        let transaction = MergeJournalPayload::Rename(fixture.journal.clone());
+        let root = fixture.vault.root().to_path_buf();
+        let result = prepare_index_cas_with_hook(&fixture.git, &transaction, || {
+            fs::write(
+                root.join("external.md.enc"),
+                b"external ciphertext-only update",
+            )
+            .map_err(|error| io_error(GitIoOperation::WriteJournal, &error))?;
+            assert!(test_git(&root, ["add", "external.md.enc"]));
+            Ok(())
+        });
+        assert!(matches!(result, Err(GitError::IndexChanged)));
+        assert!(
+            fixture
+                .git
+                .stage_zero("external.md.enc")
+                .expect("external stage inspects")
+                .is_some()
+        );
+        assert_eq!(
+            fs::read(&fixture.source_target).expect("source re-reads"),
+            source_before
+        );
+        assert_eq!(
+            fs::read(&fixture.destination_target).expect("destination re-reads"),
+            destination_before
+        );
+        assert!(!journal_path(fixture.vault.root()).exists());
+        assert_no_cas_private_files(fixture.vault.root());
+    }
+
+    #[test]
+    fn cas_v4_recovery_advances_from_durable_marker_and_blocks_external_git() {
+        let fixture = create_rename_recovery_fixture();
+        let index_before =
+            read_index_snapshot(&index_path(fixture.vault.root())).expect("old index snapshots");
+        let journal = install_rename_cas_journal(&fixture);
+        assert_eq!(
+            classify_cas_index_lock(fixture.vault.root(), &journal)
+                .expect("owned marker classifies"),
+            CasIndexLockState::Marker
+        );
+        let unrelated = fixture.vault.root().join("unrelated.bin");
+        fs::write(&unrelated, b"ciphertext-only-test-data").expect("unrelated fixture writes");
+        assert!(!test_git(fixture.vault.root(), ["add", "unrelated.bin"]));
+        let index_after_failed_git =
+            read_index_snapshot(&index_path(fixture.vault.root())).expect("locked index re-reads");
+        assert_eq!(index_after_failed_git.sha256, index_before.sha256);
+
+        assert!(recover_pending(&fixture.vault, &fixture.git).expect("v4 recovery succeeds"));
+        fixture.assert_final_state();
+        assert!(!journal_path(fixture.vault.root()).exists());
+        assert_no_cas_private_files(fixture.vault.root());
+    }
+
+    #[test]
+    fn cas_v4_recovery_publishes_candidate_already_installed_in_index_lock() {
+        let fixture = create_rename_recovery_fixture();
+        let journal = install_rename_cas_journal(&fixture);
+        fixture.write_result_to_destination();
+        fixture.delete_source();
+        let candidate = index_candidate_path(fixture.vault.root(), &journal.candidate_file);
+        let lock = index_lock_path(fixture.vault.root());
+        let source = File::open(&candidate).expect("candidate opens");
+        let destination = File::open(&lock).expect("marker opens");
+        let outcome = atomic_replace_verified_file(&candidate, source, &lock, destination)
+            .expect("candidate installs into index lock");
+        assert_eq!(outcome.source_parent_sync, ParentSyncStatus::Synced);
+        assert_eq!(outcome.destination_parent_sync, ParentSyncStatus::Synced);
+        assert_eq!(
+            classify_cas_index_lock(fixture.vault.root(), &journal)
+                .expect("candidate lock classifies"),
+            CasIndexLockState::Candidate
+        );
+
+        assert!(recover_pending(&fixture.vault, &fixture.git).expect("v4 recovery publishes"));
+        fixture.assert_final_state();
+        assert!(!journal_path(fixture.vault.root()).exists());
+        assert_no_cas_private_files(fixture.vault.root());
+    }
+
+    #[test]
+    fn cas_v4_reconciles_both_index_move_error_poststates() {
+        let fixture = create_rename_recovery_fixture();
+        let journal = install_rename_cas_journal(&fixture);
+        let injected = io::Error::other("injected namespace move error");
+        assert!(matches!(
+            reconcile_candidate_to_lock_error(fixture.vault.root(), &journal, &injected),
+            Err(GitError::Io {
+                operation: GitIoOperation::SyncGitState,
+                ..
+            })
+        ));
+
+        let candidate = index_candidate_path(fixture.vault.root(), &journal.candidate_file);
+        let lock = index_lock_path(fixture.vault.root());
+        let source = File::open(&candidate).expect("candidate opens");
+        let destination = File::open(&lock).expect("marker opens");
+        atomic_replace_verified_file(&candidate, source, &lock, destination)
+            .expect("first move fixture commits");
+        assert!(matches!(
+            reconcile_candidate_to_lock_error(fixture.vault.root(), &journal, &injected),
+            Err(GitError::DurabilityNotConfirmed)
+        ));
+        assert!(matches!(
+            reconcile_lock_to_index_error(fixture.vault.root(), &journal, &injected),
+            Err(GitError::Io {
+                operation: GitIoOperation::SyncGitState,
+                ..
+            })
+        ));
+
+        let index = index_path(fixture.vault.root());
+        let source = File::open(&lock).expect("candidate lock opens");
+        let destination = File::open(&index).expect("old index opens");
+        atomic_replace_verified_file(&lock, source, &index, destination)
+            .expect("second move fixture commits");
+        assert!(matches!(
+            reconcile_lock_to_index_error(fixture.vault.root(), &journal, &injected),
+            Err(GitError::DurabilityNotConfirmed)
+        ));
+    }
+
+    #[test]
+    fn cas_v4_recovery_rejects_tampered_candidate_without_worktree_mutation() {
+        let fixture = create_rename_recovery_fixture();
+        let source_before = fs::read(&fixture.source_target).expect("source snapshots");
+        let destination_before =
+            fs::read(&fixture.destination_target).expect("destination snapshots");
+        let journal = install_rename_cas_journal(&fixture);
+        let candidate = index_candidate_path(fixture.vault.root(), &journal.candidate_file);
+        fs::write(&candidate, b"tampered candidate").expect("candidate tampers");
+
+        assert!(matches!(
+            recover_pending(&fixture.vault, &fixture.git),
+            Err(GitError::RecoveryConflict | GitError::IndexChanged)
+        ));
+        assert_eq!(
+            fs::read(&fixture.source_target).expect("source re-reads"),
+            source_before
+        );
+        assert_eq!(
+            fs::read(&fixture.destination_target).expect("destination re-reads"),
+            destination_before
+        );
+        fixture.assert_original_index();
+        assert!(journal_path(fixture.vault.root()).is_file());
+        assert_eq!(
+            classify_cas_index_lock(fixture.vault.root(), &journal).expect("marker remains owned"),
+            CasIndexLockState::Marker
+        );
+    }
+
+    #[test]
+    fn cas_v4_recovery_preserves_foreign_replacement_lock() {
+        let fixture = create_rename_recovery_fixture();
+        let source_before = fs::read(&fixture.source_target).expect("source snapshots");
+        let destination_before =
+            fs::read(&fixture.destination_target).expect("destination snapshots");
+        let journal = install_rename_cas_journal(&fixture);
+        let lock = index_lock_path(fixture.vault.root());
+        let foreign = b"FOREIGN_REPLACEMENT_LOCK";
+        fs::write(&lock, foreign).expect("owned marker is replaced by foreign bytes");
+
+        assert!(matches!(
+            recover_pending(&fixture.vault, &fixture.git),
+            Err(GitError::RecoveryConflict)
+        ));
+        assert_eq!(fs::read(&lock).expect("foreign lock re-reads"), foreign);
+        assert_eq!(
+            fs::read(&fixture.source_target).expect("source re-reads"),
+            source_before
+        );
+        assert_eq!(
+            fs::read(&fixture.destination_target).expect("destination re-reads"),
+            destination_before
+        );
+        assert!(journal_path(fixture.vault.root()).is_file());
+        assert!(index_candidate_path(fixture.vault.root(), &journal.candidate_file).is_file());
+    }
+
+    #[test]
+    fn cas_v4_published_receipt_preserves_later_external_index_update_and_lock() {
+        let fixture = create_rename_recovery_fixture();
+        let journal = install_rename_cas_journal(&fixture);
+        fixture.write_result_to_destination();
+        fixture.delete_source();
+        fixture.update_index();
+        fixture.assert_final_state();
+        assert!(journal_path(fixture.vault.root()).is_file());
+        assert_no_cas_private_files(fixture.vault.root());
+
+        let unrelated = fixture.vault.root().join("later.bin");
+        fs::write(&unrelated, b"later ciphertext-only state").expect("later file writes");
+        assert!(test_git(fixture.vault.root(), ["add", "later.bin"]));
+        let later_index =
+            read_index_snapshot(&index_path(fixture.vault.root())).expect("later index snapshots");
+        assert_ne!(later_index.sha256, journal.candidate_index_sha256);
+        let foreign_lock = index_lock_path(fixture.vault.root());
+        fs::write(&foreign_lock, b"NEW_FOREIGN_LOCK").expect("new foreign lock installs");
+
+        assert!(
+            recover_pending(&fixture.vault, &fixture.git)
+                .expect("published receipt recovery succeeds")
+        );
+        assert_eq!(
+            read_index_snapshot(&index_path(fixture.vault.root()))
+                .expect("later index re-reads")
+                .sha256,
+            later_index.sha256
+        );
+        assert_eq!(
+            fs::read(&foreign_lock).expect("foreign lock remains"),
+            b"NEW_FOREIGN_LOCK"
+        );
+        assert!(!journal_path(fixture.vault.root()).exists());
+    }
+
+    #[test]
+    fn cas_v4_recovery_cleans_exact_published_state() {
+        let fixture = create_rename_recovery_fixture();
+        let _journal = install_rename_cas_journal(&fixture);
+        fixture.write_result_to_destination();
+        fixture.delete_source();
+        fixture.update_index();
+        fixture.assert_final_state();
+        assert!(journal_path(fixture.vault.root()).is_file());
+
+        assert!(
+            recover_pending(&fixture.vault, &fixture.git).expect("exact published state recovers")
+        );
+        fixture.assert_final_state();
+        assert!(!journal_path(fixture.vault.root()).exists());
+        assert_no_cas_private_files(fixture.vault.root());
+    }
+
+    #[test]
+    fn cas_v4_published_receipt_rejects_later_target_index_change() {
+        let fixture = create_rename_recovery_fixture();
+        let _journal = install_rename_cas_journal(&fixture);
+        fixture.write_result_to_destination();
+        fixture.delete_source();
+        fixture.update_index();
+        fixture.assert_final_state();
+        assert!(test_git(
+            fixture.vault.root(),
+            [
+                "update-index",
+                "--force-remove",
+                "--",
+                "renamed file.md.enc"
+            ]
+        ));
+
+        assert!(matches!(
+            recover_pending(&fixture.vault, &fixture.git),
+            Err(GitError::RecoveryConflict)
+        ));
+        assert!(journal_path(fixture.vault.root()).is_file());
+        assert!(
+            fixture
+                .git
+                .stage_zero("renamed file.md.enc")
+                .expect("changed target inspects")
+                .is_none()
+        );
+        assert_eq!(
+            VaultMutationGuard::acquire(fixture.vault.root())
+                .expect("worktree guard acquires")
+                .inspect(&fixture.destination_target)
+                .expect("destination inspects"),
+            CurrentTarget::File(fixture.result_digest)
+        );
+        assert_no_cas_private_files(fixture.vault.root());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Git merge and recovery v1
 
-Status: **implemented pre-alpha contract on 2026-07-11**.
+Status: **implemented pre-alpha contract updated on 2026-07-12**.
 
 Git always stores and transports complete EDRY envelopes. No Inex command
 creates a plaintext merge file, sends plaintext to Git, or asks Git to interpret
@@ -124,17 +124,19 @@ The workflow is:
 9. Send only the complete encrypted result to
    `git hash-object -w --stdin`, read the named blob back byte-for-byte with
    replacement objects disabled, synchronize its loose object and directories.
-10. Recheck the relevant original index stages and stage-zero owners, fixed
-    merge provenance, and expected worktree ciphertext SHA-256 under the Inex
-    mutation lock, then synchronize a recovery journal. In-place conflicts and
-    detected renames conditionally replace the destination; split renames
-    replace the destination, conditionally delete the source, and publish
-    source removal plus destination stage zero in one NUL-delimited
-    `git update-index -z --index-info` batch.
-11. Re-read both worktree state and index. Only then remove and synchronize the
-    journal. The Git index file and `.git` directory are explicitly synchronized
-    first. Any `ParentSyncStatus::NotSynced` or Git/object/index barrier failure
-    retains the journal and returns nonzero for authenticated recovery.
+10. Copy the exact old index bytes to a random private alternate
+    `GIT_INDEX_FILE`, let `git update-index -z --index-info` generate the final
+    candidate there, and verify the complete before/after stage maps. Synchronize
+    and bind both index lengths and SHA-256 digests; they must differ.
+11. Atomically install a complete random-token marker at the real
+    `.git/index.lock`. While that Git lock exists, recheck the old index,
+    stage-zero owners, attributes, fixed rename provenance, candidate semantics,
+    and expected worktree ciphertext. Atomically publish a complete create-only
+    v4 journal, then advance the worktree. Publication is two forward-only
+    namespace moves: candidate to `index.lock`, then `index.lock` over `index`.
+    Re-read worktree/index and synchronize the index, `.git`, and journal parent
+    before removing the journal. Any unconfirmed barrier retains a recognizable
+    forward-recovery state and returns nonzero.
 
 An unresolved result is nevertheless a complete authenticated EDRY file and a
 stage-zero Git object; the command exits nonzero and reports the unresolved
@@ -157,12 +159,17 @@ unsupported and fail closed.
 Split indexes are rejected before merge mutation: an effective
 `core.splitIndex=true` or any top-level `.git/sharedindex.*` artifact fails
 closed because the durability barrier intentionally covers one full
-`.git/index`. Run no other Git porcelain in parallel with `inex git merge` or
-recovery. Exact pre/post stage checks, authenticated owner scans, worktree
-SHA-256 conditions, and the journal detect observed races, but Git exposes no
-cross-process compare-and-swap primitive spanning the last verified index and
-`update-index`. An external process in that final window is an explicit non-GA
-boundary, not a claimed fail-closed case.
+`.git/index`; `rev-parse --shared-index-path` also has to be empty for the live
+and alternate indexes. New v4 transactions implement a physical expected-old
+CAS by holding the same real `index.lock` honored by ordinary Git index writers.
+An external index writer that publishes before Inex acquires the real lock is
+detected by the locked old-index digest/semantic recheck; a writer started
+while Inex holds the lock fails. The supported workflow still
+forbids deliberate parallel porcelain: ref-only operations are outside the
+index lock, legacy v1/v2/v3 recovery keeps its historical update path, and
+native Windows abrupt-kill/power-loss behavior is not yet binding evidence.
+Direct same-user unlink/rewrite of transaction files is outside the threat
+model and is not described as fail-closed concurrency.
 
 ## Subprocess boundary
 
@@ -187,9 +194,17 @@ is discarded and errors retain only a fixed operation category and
 ## Journal and recovery
 
 The stable filename `.vault-local/git-merge-journal-v1.json` contains one strict
-schema selected by its internal version: v1 for an in-place path, v2 for a
-split rename, and v3 for a detected rename. Depending on that schema it contains
-only:
+duplicate-free schema selected by its internal version. Versions 1, 2, and 3
+remain readable for legacy in-place, split-rename, and detected-rename recovery.
+Every new transaction writes v4, whose tagged inner payload is one of those
+three semantic shapes and whose outer binding additionally contains:
+
+- the exact SHA-1/SHA-256 repository object format;
+- a random lock token and fixed private candidate basename;
+- exact old/candidate index lengths and SHA-256 digests; and
+- the complete marker SHA-256 used to recognize an owned pre-journal lock.
+
+The inner payload contains only:
 
 - one portable ciphertext path, or exact source/destination paths and regular
   mode;
@@ -201,9 +216,15 @@ only:
 - the schema version.
 
 It never contains a password, key, session token, decrypted bytes, snippets, or
-conflict labels. The file is create-only, permission-restricted where supported,
-fully flushed and synchronized before the first worktree change. A partial or
-tampered journal fails closed.
+conflict labels. The complete JSON is first written, permission-restricted,
+flushed, and synchronized at a private staging name, then atomically moved
+no-replace to the stable create-only name before the first worktree change.
+Duplicate/unknown fields, partial JSON, and tampered bindings fail closed. An
+exact marker/candidate pair abandoned before stable journal publication is
+reported as pending and can be cleaned without changing index or worktree;
+unknown or foreign `index.lock` content is not intentionally removed after the
+ownership check. Direct same-user namespace replacement remains outside the
+threat model.
 
 On Linux, file `fsync` plus directory `fsync` covers the loose object, full index,
 worktree parent, and journal parent. On Windows, files are opened with write
@@ -219,20 +240,22 @@ inex git recover <vault> [--slot <uuid>]
 ```
 
 Locked `inex verify <vault>` reports whether a structurally valid pending Git
-merge journal exists, but deliberately does not authenticate its result object
-or complete the transaction without a password.
+merge journal or an Inex-marked pre-journal v4 reservation exists. Explicit
+recovery still distinguishes an exact cleanable pair from a conflicting marker
+state. Verification deliberately does not authenticate a result object or
+advance a transaction without a password.
 
 Recovery first validates every recorded ID against the repository object
-format, rechecks the fixed tree provenance, fetches the result blob, checks its
-ciphertext digest, and authenticates its path and file identity. It accepts only
-the schema's enumerated original, forward intermediate, or exact final
-index/worktree states. A detected rename requires the source to remain absent;
-a split rename may advance destination write, conditional source deletion, and
-the single index batch, never backward. Final-index recovery uses the fixed
-commit IDs and therefore does not require a still-present `MERGE_HEAD`. It
-revalidates tracked and untracked identity owners before worktree advancement,
-again before index publication, and in the final state, then removes the
-journal. Any other index, worktree,
-object, path, mode, owner, provenance, format, or digest state reports a
-recovery conflict and is
-left untouched for audit.
+format, rechecks fixed tree provenance, fetches the result blob, checks its
+ciphertext digest, and authenticates path/file identity. For v4 it accepts the
+three physical index states `old + marker + candidate`, `old + candidate lock`,
+and `final + consumed owned names`. Worktree changes move only forward. A
+detected rename keeps the source absent; a split rename writes destination
+before conditional source deletion. If ordinary Git legitimately changes
+unrelated index entries after publication, recovery may still clear v4 only
+when the exact result entry/source-removal, authenticated owners, provenance,
+and final worktree all remain valid; target-entry drift is a conflict. A
+foreign lock is preserved. Final-index recovery uses fixed commit IDs and does
+not require a still-present `MERGE_HEAD`. Any other index, worktree, object,
+path, mode, owner, provenance, format, or digest state is left untouched for
+audit.

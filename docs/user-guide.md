@@ -182,8 +182,9 @@ INEX=/absolute/path/to/inex
 This command does not prompt for a password and does **not** authenticate
 `vault.json` or decrypt/authenticate document bodies. It acquires the mutation
 lock and may recover a pending core ciphertext transaction, so it is not a pure
-read-only inspection. It reports a structurally present Git merge journal but
-does not authenticate or finish it.
+read-only inspection. It reports either a structurally present Git merge
+journal or an Inex-marked abandoned v4 index reservation, but does not
+authenticate a journal result or advance it without `inex git recover`.
 
 ### Password slots
 

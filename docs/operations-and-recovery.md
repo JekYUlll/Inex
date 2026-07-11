@@ -216,9 +216,13 @@ copies, rename/rename, multiple merge bases, executable/mode disagreement, and
 ambiguous identities fail closed. Versioned source-aware journals recover both
 paths without deleting an unexpected source. Split indexes, unsafe Git
 directories, attribute overrides, non-regular modes, and observed concurrent
-changes also fail closed. Do not run other Git porcelain concurrently: the
-final `update-index` boundary has no cross-process compare-and-swap. Native
-Windows power-loss evidence for these transitions remains pending.
+changes also fail closed. New transactions use a v4 alternate-index candidate,
+an Inex-owned real `.git/index.lock`, and exact old/candidate index digest
+bindings. Ordinary index writers that win before the lock are detected by the
+locked recheck; writers started while it is held fail instead of being
+overwritten. Continue to avoid deliberate parallel Git: legacy v1/v2/v3
+recovery and ref-only mutations are not serialized by v4, and native Windows
+abrupt-kill/power-loss evidence remains pending.
 
 ### Resolve a `vault.json` conflict
 
@@ -238,7 +242,8 @@ vault/Git snapshot.
 
 ### Recover an interrupted encrypted merge
 
-`inex verify <vault>` reports a structurally valid pending Git journal as:
+`inex verify <vault>` reports a structurally valid pending Git journal or an
+Inex-marked pre-journal v4 reservation as:
 
 ```text
 pending-git-merge-transaction: present-authenticated-recovery-required
@@ -250,11 +255,17 @@ Authenticate and reconcile it with:
 "$INEX" git recover /absolute/inex-vault
 ```
 
-Recovery accepts only the recorded original or exact result worktree/index
-states, re-authenticates the result EDRY object, completes a missing side, and
-then removes the journal. A recovery conflict leaves the current state for
-audit. Do not delete the journal, run `git reset --hard`, abort the Git operation,
-or retry merge writes until the state has been copied and understood.
+For v4, recovery recognizes only `old index + marker + candidate`, `old index +
+candidate lock`, or a published index whose owned names were consumed. It
+re-authenticates the EDRY result, owner set, fixed rename provenance, target
+stage, and worktree before moving forward. A later unrelated stage may remain;
+a changed/removed result stage is a conflict. Exact abandoned pre-journal
+marker/candidate state is cleaned without changing the index/worktree. Unknown
+or foreign locks are preserved. Legacy v1/v2/v3 journals remain readable but
+must be recovered with all other Git stopped. A recovery conflict leaves the
+current state for audit. Do not delete the journal, run `git reset --hard`,
+abort the Git operation, or retry merge writes until the state has been copied
+and understood.
 
 ## Password operation recovery
 

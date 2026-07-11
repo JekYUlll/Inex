@@ -155,6 +155,15 @@ pub struct AtomicRebindOutcome {
     pub destination_parent_sync: ParentSyncStatus,
 }
 
+/// Durability checkpoints reported after an atomic regular-file namespace move.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AtomicFileMoveOutcome {
+    /// Whether the source parent recorded removal of the old source name.
+    pub source_parent_sync: ParentSyncStatus,
+    /// Whether the destination parent recorded publication of the new name.
+    pub destination_parent_sync: ParentSyncStatus,
+}
+
 /// Result of checking a crash-recovery journal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RebindRecoveryOutcome {
@@ -1058,6 +1067,271 @@ pub fn recover_pending_rebind(
 /// identity, file type, reparse, or single-link validation failed.
 pub fn open_file_matches_path_and_is_single_link(path: &Path, file: &File) -> io::Result<bool> {
     platform::open_file_matches_path_and_is_single_link(path, file)
+}
+
+/// Atomically moves one verified regular file to a previously absent name.
+///
+/// `source_file` must remain open for the call and must identify the exact
+/// single-link regular file currently named by `source`. Both paths must be
+/// absolute, have canonical non-link parents on one supported local mount,
+/// and name direct children of those parents. The source file's content must
+/// already have been synchronized when content durability is required.
+///
+/// The destination is never replaced. Linux uses
+/// `renameat2(RENAME_NOREPLACE)` and Windows uses
+/// `MoveFileExW(MOVEFILE_WRITE_THROUGH)` without the replace flag. A
+/// successful cross-parent move checkpoints both parent directories and
+/// reports each result independently.
+///
+/// The namespace operation is path based after the final handle/path identity
+/// check. Callers must therefore exclude a non-cooperating process running as
+/// the same OS user from directly rebinding either path during this call.
+///
+/// # Errors
+///
+/// Returns an I/O error when either path is unsafe, non-local, crosses a mount,
+/// the source no longer matches `source_file`, the destination exists, or the
+/// platform move fails. A move error is returned without deleting, retrying,
+/// or otherwise reconciling either path; callers that need crash recovery must
+/// inspect their own durable transaction record.
+pub fn atomic_move_verified_file_no_replace(
+    source: &Path,
+    source_file: &File,
+    destination: &Path,
+) -> io::Result<AtomicFileMoveOutcome> {
+    let paths = VerifiedFileMovePaths::resolve(source, destination)?;
+    paths.verify_source(source_file)?;
+    match fs::symlink_metadata(&paths.destination) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "atomic file-move destination already exists",
+            ));
+        }
+        Err(error) => return Err(error),
+    }
+    paths.verify_parent_bindings()?;
+    paths.verify_source(source_file)?;
+    platform::namespace_move(&paths.source, &paths.destination, false)?;
+    Ok(paths.sync_parents())
+}
+
+/// Atomically replaces one verified regular destination with a verified file.
+///
+/// `source_file` and `destination_file` are consumed by the call and must
+/// identify the exact single-link regular files currently named by their
+/// respective paths. Both paths must be absolute, have canonical non-link
+/// parents on one supported local mount, and name direct children of those
+/// parents. The source file's content must already have been synchronized when
+/// content durability is required.
+///
+/// Linux uses one replacing `rename`, while Windows uses
+/// `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`. The old
+/// destination is never deleted first. A successful cross-parent replacement
+/// checkpoints both parent directories and reports each result independently.
+///
+/// Both handles are released after the final handle/path identity check and
+/// before the path-based namespace replacement so that Windows permits the
+/// move. Callers must therefore exclude a non-cooperating process running as
+/// the same OS user from directly rebinding either path during this call. This
+/// helper is not a kernel-level handle-bound compare-and-exchange primitive.
+///
+/// # Errors
+///
+/// Returns an I/O error when either path is unsafe, non-local, crosses a mount,
+/// either open file no longer matches its path, both paths identify one file,
+/// or the platform move fails. A move error is returned without cleanup,
+/// retry, or fallback; callers that need crash recovery must inspect their own
+/// durable transaction record.
+pub fn atomic_replace_verified_file(
+    source: &Path,
+    source_file: File,
+    destination: &Path,
+    destination_file: File,
+) -> io::Result<AtomicFileMoveOutcome> {
+    let paths = VerifiedFileMovePaths::resolve(source, destination)?;
+    paths.verify_source(&source_file)?;
+    paths.verify_destination(&destination_file)?;
+    if open_file_matches_path_and_is_single_link(&paths.destination, &source_file)? {
+        return Err(invalid_atomic_file_move(
+            "atomic file-move paths identify one file",
+        ));
+    }
+    paths.verify_parent_bindings()?;
+    paths.verify_source(&source_file)?;
+    paths.verify_destination(&destination_file)?;
+    drop(destination_file);
+    drop(source_file);
+    platform::namespace_move(&paths.source, &paths.destination, true)?;
+    Ok(paths.sync_parents())
+}
+
+#[derive(Debug)]
+struct VerifiedFileMovePaths {
+    source: PathBuf,
+    destination: PathBuf,
+    source_parent: PathBuf,
+    destination_parent: PathBuf,
+    source_parent_identity: FilesystemDirectoryIdentity,
+    destination_parent_identity: FilesystemDirectoryIdentity,
+}
+
+impl VerifiedFileMovePaths {
+    fn resolve(source: &Path, destination: &Path) -> io::Result<Self> {
+        if !source.is_absolute()
+            || !destination.is_absolute()
+            || source == destination
+            || !path_is_lexically_normal(source)
+            || !path_is_lexically_normal(destination)
+        {
+            return Err(invalid_atomic_file_move(
+                "atomic file-move paths must be distinct absolute paths",
+            ));
+        }
+        let source_name = source
+            .file_name()
+            .ok_or_else(|| invalid_atomic_file_move("atomic file-move source has no file name"))?;
+        let destination_name = destination.file_name().ok_or_else(|| {
+            invalid_atomic_file_move("atomic file-move destination has no file name")
+        })?;
+        let source_parent = source
+            .parent()
+            .ok_or_else(|| invalid_atomic_file_move("atomic file-move source has no parent"))?;
+        let destination_parent = destination.parent().ok_or_else(|| {
+            invalid_atomic_file_move("atomic file-move destination has no parent")
+        })?;
+        if !path_ancestors_are_non_link_directories(source_parent)?
+            || !path_ancestors_are_non_link_directories(destination_parent)?
+        {
+            return Err(invalid_atomic_file_move(
+                "atomic file-move parent chain is not canonical and link-free",
+            ));
+        }
+        let source_parent_input_identity = filesystem_directory_identity(source_parent)?;
+        let destination_parent_input_identity = filesystem_directory_identity(destination_parent)?;
+        let resolved_source_parent = fs::canonicalize(source_parent)?;
+        let resolved_destination_parent = fs::canonicalize(destination_parent)?;
+        let resolved_source = resolved_source_parent.join(source_name);
+        let resolved_destination = resolved_destination_parent.join(destination_name);
+
+        let source_parent_identity = filesystem_directory_identity(&resolved_source_parent)?;
+        let destination_parent_identity =
+            filesystem_directory_identity(&resolved_destination_parent)?;
+        if source_parent_input_identity != source_parent_identity
+            || destination_parent_input_identity != destination_parent_identity
+            || source_parent_identity.volume != destination_parent_identity.volume
+            || !paths_share_mount(&resolved_source_parent, &resolved_destination_parent)?
+        {
+            return Err(invalid_atomic_file_move(
+                "atomic file-move paths cross a mount",
+            ));
+        }
+        if !path_is_supported_local_filesystem(&resolved_source_parent)?
+            || !path_is_supported_local_filesystem(&resolved_destination_parent)?
+            || !path_is_supported_local_filesystem(&resolved_source)?
+            || !paths_share_mount(&resolved_source_parent, &resolved_source)?
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "atomic file-move paths are not on one supported local mount",
+            ));
+        }
+
+        Ok(Self {
+            source: resolved_source,
+            destination: resolved_destination,
+            source_parent: resolved_source_parent,
+            destination_parent: resolved_destination_parent,
+            source_parent_identity,
+            destination_parent_identity,
+        })
+    }
+
+    fn verify_source(&self, source_file: &File) -> io::Result<()> {
+        verify_open_single_link_regular_file(&self.source, source_file)?;
+        if !paths_share_mount(&self.source_parent, &self.source)? {
+            return Err(invalid_atomic_file_move(
+                "atomic file-move source crosses a mount",
+            ));
+        }
+        Ok(())
+    }
+
+    fn verify_destination(&self, destination_file: &File) -> io::Result<()> {
+        verify_open_single_link_regular_file(&self.destination, destination_file)?;
+        if !path_is_supported_local_filesystem(&self.destination)?
+            || !paths_share_mount(&self.destination_parent, &self.destination)?
+        {
+            return Err(invalid_atomic_file_move(
+                "atomic file-move destination crosses a mount",
+            ));
+        }
+        Ok(())
+    }
+
+    fn verify_parent_bindings(&self) -> io::Result<()> {
+        if filesystem_directory_identity(&self.source_parent)? != self.source_parent_identity
+            || filesystem_directory_identity(&self.destination_parent)?
+                != self.destination_parent_identity
+        {
+            return Err(invalid_atomic_file_move(
+                "atomic file-move parent identity changed",
+            ));
+        }
+        Ok(())
+    }
+
+    fn sync_parents(&self) -> AtomicFileMoveOutcome {
+        let destination_parent_sync = sync_namespace_parent_status(&self.destination_parent);
+        let source_parent_sync = if self.source_parent == self.destination_parent {
+            destination_parent_sync
+        } else {
+            sync_namespace_parent_status(&self.source_parent)
+        };
+        AtomicFileMoveOutcome {
+            source_parent_sync,
+            destination_parent_sync,
+        }
+    }
+}
+
+fn path_is_lexically_normal(path: &Path) -> bool {
+    path.components().all(|component| {
+        matches!(
+            component,
+            std::path::Component::Prefix(_)
+                | std::path::Component::RootDir
+                | std::path::Component::Normal(_)
+        )
+    })
+}
+
+fn path_ancestors_are_non_link_directories(path: &Path) -> io::Result<bool> {
+    for ancestor in path.ancestors() {
+        if ancestor.as_os_str().is_empty() {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(ancestor)?;
+        if is_link_or_reparse_point(&metadata) || !metadata.file_type().is_dir() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn verify_open_single_link_regular_file(path: &Path, file: &File) -> io::Result<()> {
+    if open_file_matches_path_and_is_single_link(path, file)? {
+        Ok(())
+    } else {
+        Err(invalid_atomic_file_move(
+            "atomic file-move path is not the verified single-link regular file",
+        ))
+    }
+}
+
+fn invalid_atomic_file_move(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
 /// Stable identity of one directory on its backing filesystem/volume.
@@ -3191,11 +3465,11 @@ mod tests {
         CIPHERTEXT_STAGING_SUFFIX, CurrentTarget, FaultInjector, FaultPoint, IMPORT_STAGING_PREFIX,
         MAX_ATOMIC_TARGET_BYTES, ParentSyncStatus, RebindJournal, VAULT_LOCAL_DIRECTORY,
         VAULT_MUTATION_LOCK_FILE, VaultMutationGuard, VaultMutationLock, WriteCondition,
-        atomic_delete_ciphertext, atomic_publish_directory_no_replace,
-        atomic_publish_directory_no_replace_with_fault, atomic_rebind_ciphertext,
-        atomic_write_ciphertext, atomic_write_ciphertext_with_faults, digest_bytes,
-        install_rebind_journal, pending_rebind_path, reconcile_failed_namespace_commit,
-        recover_pending_rebind,
+        atomic_delete_ciphertext, atomic_move_verified_file_no_replace,
+        atomic_publish_directory_no_replace, atomic_publish_directory_no_replace_with_fault,
+        atomic_rebind_ciphertext, atomic_replace_verified_file, atomic_write_ciphertext,
+        atomic_write_ciphertext_with_faults, digest_bytes, install_rebind_journal,
+        pending_rebind_path, reconcile_failed_namespace_commit, recover_pending_rebind,
     };
 
     #[cfg(windows)]
@@ -3436,6 +3710,239 @@ mod tests {
             &second_path,
             &first,
         )?);
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn verified_file_move_no_replace_publishes_absent_destination() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        let source = fixture.root().join("index.lock");
+        let destination = fixture.root().join("index");
+        fs::write(&source, b"candidate-index")?;
+        let source_file = fs::File::open(&source)?;
+
+        let outcome = atomic_move_verified_file_no_replace(&source, &source_file, &destination)?;
+
+        assert!(!source.exists());
+        assert_eq!(fs::read(&destination)?, b"candidate-index");
+        assert_eq!(outcome.source_parent_sync, ParentSyncStatus::Synced);
+        assert_eq!(outcome.destination_parent_sync, ParentSyncStatus::Synced);
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn verified_file_move_no_replace_preserves_existing_destination() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        let source = fixture.root().join("index.lock");
+        let destination = fixture.root().join("index");
+        fs::write(&source, b"candidate-index")?;
+        fs::write(&destination, b"current-index")?;
+        let source_file = fs::File::open(&source)?;
+
+        let error = atomic_move_verified_file_no_replace(&source, &source_file, &destination)
+            .expect_err("an existing destination must not be replaced");
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&source)?, b"candidate-index");
+        assert_eq!(fs::read(&destination)?, b"current-index");
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn verified_file_replace_commits_complete_source() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        let source = fixture.root().join("index.lock");
+        let destination = fixture.root().join("index");
+        fs::write(&source, b"candidate-index")?;
+        fs::write(&destination, b"current-index")?;
+        let source_file = fs::File::open(&source)?;
+        let destination_file = fs::File::open(&destination)?;
+
+        let outcome =
+            atomic_replace_verified_file(&source, source_file, &destination, destination_file)?;
+
+        assert!(!source.exists());
+        assert_eq!(fs::read(&destination)?, b"candidate-index");
+        assert_eq!(outcome.source_parent_sync, ParentSyncStatus::Synced);
+        assert_eq!(outcome.destination_parent_sync, ParentSyncStatus::Synced);
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn verified_file_move_check_failure_never_cleans_up_or_retries() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        let source = fixture.root().join("index.lock");
+        let destination = fixture.root().join("index");
+        let retired_destination = fixture.root().join("retired-index");
+        fs::write(&source, b"candidate-index")?;
+        fs::write(&destination, b"expected-current-index")?;
+        let source_file = fs::File::open(&source)?;
+        let stale_destination_file = fs::File::open(&destination)?;
+        fs::rename(&destination, &retired_destination)?;
+        fs::write(&destination, b"concurrent-index")?;
+
+        let error = atomic_replace_verified_file(
+            &source,
+            source_file,
+            &destination,
+            stale_destination_file,
+        )
+        .expect_err("a stale destination handle must fail closed");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(fs::read(&source)?, b"candidate-index");
+        assert_eq!(fs::read(&destination)?, b"concurrent-index");
+        assert_eq!(fs::read(&retired_destination)?, b"expected-current-index");
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn verified_file_move_checkpoints_both_cross_parent_directories() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        let source_parent = fixture.root().join("source-parent");
+        let destination_parent = fixture.root().join("destination-parent");
+        fs::create_dir(&source_parent)?;
+        fs::create_dir(&destination_parent)?;
+        let source = source_parent.join("index.lock");
+        let destination = destination_parent.join("index");
+        fs::write(&source, b"candidate-index")?;
+        let source_file = fs::File::open(&source)?;
+
+        let outcome = atomic_move_verified_file_no_replace(&source, &source_file, &destination)?;
+
+        assert!(!source.exists());
+        assert_eq!(fs::read(&destination)?, b"candidate-index");
+        assert_eq!(outcome.source_parent_sync, ParentSyncStatus::Synced);
+        assert_eq!(outcome.destination_parent_sync, ParentSyncStatus::Synced);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_file_moves_reject_symlinks_and_hardlinks() -> io::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let fixture = TestVault::new()?;
+
+        let real_source = fixture.root().join("real-source");
+        let symlink_source = fixture.root().join("symlink-source");
+        let symlink_destination = fixture.root().join("symlink-destination");
+        fs::write(&real_source, b"source")?;
+        symlink(&real_source, &symlink_source)?;
+        let symlink_source_file = fs::File::open(&symlink_source)?;
+        assert_eq!(
+            atomic_move_verified_file_no_replace(
+                &symlink_source,
+                &symlink_source_file,
+                &symlink_destination,
+            )
+            .expect_err("a symlink source must be rejected")
+            .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert!(symlink_source.is_symlink());
+        assert!(!symlink_destination.exists());
+
+        let hardlink_source = fixture.root().join("hardlink-source");
+        let hardlink_alias = fixture.root().join("hardlink-alias");
+        let hardlink_destination = fixture.root().join("hardlink-destination");
+        fs::write(&hardlink_source, b"source")?;
+        fs::hard_link(&hardlink_source, &hardlink_alias)?;
+        let hardlink_source_file = fs::File::open(&hardlink_source)?;
+        assert_eq!(
+            atomic_move_verified_file_no_replace(
+                &hardlink_source,
+                &hardlink_source_file,
+                &hardlink_destination,
+            )
+            .expect_err("a multiply-linked source must be rejected")
+            .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(fs::read(&hardlink_source)?, b"source");
+        assert_eq!(fs::read(&hardlink_alias)?, b"source");
+        assert!(!hardlink_destination.exists());
+
+        let replace_source = fixture.root().join("replace-source");
+        let real_destination = fixture.root().join("real-destination");
+        let symlinked_destination = fixture.root().join("symlinked-destination");
+        fs::write(&replace_source, b"candidate")?;
+        fs::write(&real_destination, b"current")?;
+        symlink(&real_destination, &symlinked_destination)?;
+        let replace_source_file = fs::File::open(&replace_source)?;
+        let symlinked_destination_file = fs::File::open(&symlinked_destination)?;
+        assert_eq!(
+            atomic_replace_verified_file(
+                &replace_source,
+                replace_source_file,
+                &symlinked_destination,
+                symlinked_destination_file,
+            )
+            .expect_err("a symlink destination must be rejected")
+            .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(fs::read(&replace_source)?, b"candidate");
+        assert_eq!(fs::read(&real_destination)?, b"current");
+        assert!(symlinked_destination.is_symlink());
+
+        let hardlink_replace_source = fixture.root().join("hardlink-replace-source");
+        let hardlink_replace_destination = fixture.root().join("hardlink-replace-destination");
+        let hardlink_replace_alias = fixture.root().join("hardlink-replace-alias");
+        fs::write(&hardlink_replace_source, b"candidate")?;
+        fs::write(&hardlink_replace_destination, b"current")?;
+        fs::hard_link(&hardlink_replace_destination, &hardlink_replace_alias)?;
+        let hardlink_replace_source_file = fs::File::open(&hardlink_replace_source)?;
+        let hardlink_replace_destination_file = fs::File::open(&hardlink_replace_destination)?;
+        assert_eq!(
+            atomic_replace_verified_file(
+                &hardlink_replace_source,
+                hardlink_replace_source_file,
+                &hardlink_replace_destination,
+                hardlink_replace_destination_file,
+            )
+            .expect_err("a multiply-linked destination must be rejected")
+            .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(fs::read(&hardlink_replace_source)?, b"candidate");
+        assert_eq!(fs::read(&hardlink_replace_destination)?, b"current");
+        assert_eq!(fs::read(&hardlink_replace_alias)?, b"current");
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_file_moves_reject_symlinked_parent_ancestors() -> io::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let fixture = TestVault::new()?;
+        let real_ancestor = fixture.root().join("real-ancestor");
+        let real_parent = real_ancestor.join("ordinary-parent");
+        let symlink_ancestor = fixture.root().join("symlink-ancestor");
+        fs::create_dir_all(&real_parent)?;
+        symlink(&real_ancestor, &symlink_ancestor)?;
+        let real_source = real_parent.join("source");
+        let aliased_source = symlink_ancestor.join("ordinary-parent").join("source");
+        let destination = fixture.root().join("destination");
+        fs::write(&real_source, b"source")?;
+        let aliased_source_file = fs::File::open(&aliased_source)?;
+
+        let error = atomic_move_verified_file_no_replace(
+            &aliased_source,
+            &aliased_source_file,
+            &destination,
+        )
+        .expect_err("a symlinked parent ancestor must be rejected");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(fs::read(&real_source)?, b"source");
+        assert!(!destination.exists());
         Ok(())
     }
 
