@@ -208,6 +208,151 @@ class RequestAndResponseTests(unittest.TestCase):
             corrupted._protected_params()
         self.assertIsInstance(corrupted._terminal_error, RpcProtocolError)
 
+    def test_crud_methods_emit_exact_v1_params_and_parse_durability(self):
+        client = InexRpcClient("/unused")
+        session = "S" * SESSION_TOKEN_TEXT_BYTES
+        client._session = session
+        old_etag = "sha256:" + "1" * 64
+        new_etag = "sha256:" + "2" * 64
+        calls = []
+
+        def metadata(path):
+            return {
+                "fileId": "00000000-0000-4000-8000-000000000000",
+                "logicalPath": path,
+                "createdAt": 1,
+                "modifiedAt": 2,
+                "flags": 0,
+            }
+
+        def call(method, params):
+            calls.append((method, params))
+            if method == "file.write":
+                return {
+                    "etag": old_etag,
+                    "metadata": metadata("new.md"),
+                    "durability": "synced",
+                }
+            if method == "file.mkdir":
+                return {"ok": True}
+            if method == "file.rename":
+                return {
+                    "etag": new_etag,
+                    "metadata": metadata("renamed.md"),
+                    "destinationDurability": "notSynced",
+                    "sourceDurability": "synced",
+                }
+            if method == "file.delete":
+                return {"ok": True, "durability": "synced"}
+            self.fail("unexpected method: %s" % method)
+
+        client._call_raw = call
+        self.assertEqual(
+            client.write_document("new.md", bytearray(), old_etag),
+            (old_etag, "synced"),
+        )
+        self.assertEqual(
+            client.create_document("new.md"), (old_etag, "synced")
+        )
+        client.create_directory("folder")
+        self.assertEqual(
+            client.rename_document("new.md", "renamed.md", old_etag),
+            (new_etag, "notSynced", "synced"),
+        )
+        self.assertEqual(
+            client.delete_document("renamed.md", new_etag), "synced"
+        )
+        self.assertEqual(
+            calls,
+            [
+                (
+                    "file.write",
+                    {
+                        "session": session,
+                        "logicalPath": "new.md",
+                        "contentBase64": "",
+                        "ifMatch": old_etag,
+                    },
+                ),
+                (
+                    "file.write",
+                    {
+                        "session": session,
+                        "logicalPath": "new.md",
+                        "contentBase64": "",
+                        "ifNoneMatch": "*",
+                    },
+                ),
+                ("file.mkdir", {"session": session, "logicalPath": "folder"}),
+                (
+                    "file.rename",
+                    {
+                        "session": session,
+                        "from": "new.md",
+                        "to": "renamed.md",
+                        "sourceEtag": old_etag,
+                        "destinationIfNoneMatch": "*",
+                    },
+                ),
+                (
+                    "file.delete",
+                    {
+                        "session": session,
+                        "logicalPath": "renamed.md",
+                        "ifMatch": new_etag,
+                        "recursive": False,
+                    },
+                ),
+            ],
+        )
+
+    def test_crud_response_shape_and_durability_fail_closed(self):
+        session = "S" * SESSION_TOKEN_TEXT_BYTES
+        etag = "sha256:" + "1" * 64
+        metadata = {
+            "fileId": "00000000-0000-4000-8000-000000000000",
+            "logicalPath": "new.md",
+            "createdAt": 1,
+            "modifiedAt": 2,
+            "flags": 0,
+        }
+
+        cases = [
+            (
+                "create",
+                lambda client: client.create_document("new.md"),
+                {"etag": etag, "metadata": metadata, "durability": "maybe"},
+            ),
+            (
+                "mkdir",
+                lambda client: client.create_directory("folder"),
+                {"ok": True, "extra": False},
+            ),
+            (
+                "rename",
+                lambda client: client.rename_document("old.md", "new.md", etag),
+                {
+                    "etag": etag,
+                    "metadata": metadata,
+                    "destinationDurability": "synced",
+                    "sourceDurability": "maybe",
+                },
+            ),
+            (
+                "delete",
+                lambda client: client.delete_document("new.md", etag),
+                {"ok": False, "durability": "synced"},
+            ),
+        ]
+        for name, invoke, response in cases:
+            with self.subTest(name=name):
+                client = InexRpcClient("/unused")
+                client._session = session
+                client._call_raw = lambda method, params, response=response: response
+                with self.assertRaises(RpcProtocolError):
+                    invoke(client)
+                self.assertIsInstance(client._terminal_error, RpcProtocolError)
+
     def test_request_is_compact_bounded_content_length(self):
         encoded = encode_request(7, "system.ping", {})
         header, body = bytes(encoded).split(b"\r\n\r\n", 1)

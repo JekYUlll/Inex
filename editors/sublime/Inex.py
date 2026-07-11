@@ -87,6 +87,7 @@ except ImportError:  # Direct package development outside Sublime's loader.
 PACKAGE_VERSION = "0.1.0"
 TESTED_SUBLIME_BUILD = "4200"
 STATUS_KEY = "inex.document"
+VIEW_PLAINTEXT_MARKER = "inex.managed_plaintext"
 PREFERENCES_CHANGE_TAG = "inex-strict-security-gate"
 LOCKED_TEXT = "[Inex locked — unlock the vault to reopen this document]\n"
 BLOCKED_TEXT = "[Inex blocked an unsafe plaintext save]\n"
@@ -99,7 +100,9 @@ _vault_path: Optional[str] = None
 _generation = 0
 _unlock_in_progress = False
 _plugin_active = False
+_orphan_scrub_blocked = False
 _scrubbing_views = set()  # type: ignore
+_fixed_scrub_acks: Dict[int, str] = {}
 _last_activity_ping = 0.0
 _activity_ping_inflight = False
 _idle_deadline: Optional[IdleDeadline] = None
@@ -135,6 +138,8 @@ def insecure_preferences() -> List[str]:
         )
     if _macro_is_tainted():
         issues.append("Sublime macro state captured managed input; restart Sublime Text")
+    if _orphan_scrub_blocked:
+        issues.append("An orphaned marked view could not be safely scrubbed")
     return issues
 
 
@@ -271,7 +276,11 @@ def _update_document_ui(document: ManagedDocument) -> None:
     view = _view_by_id(document.view_id)
     if view is None or not view.is_valid():
         return
-    if view.file_name() is not None or not view.is_scratch():
+    if (
+        view.file_name() is not None
+        or not view.is_scratch()
+        or view.settings().get(VIEW_PLAINTEXT_MARKER) is not True
+    ):
         _emergency_scrub_view(view, "Managed buffer acquired unsafe file state")
         return
     prefix = "● " if document.dirty else ""
@@ -291,14 +300,35 @@ def _update_document_ui(document: ManagedDocument) -> None:
 def _replace_view_with_fixed_text(view: sublime.View, text: str, status: str) -> None:
     if not view.is_valid():
         return
+    if text == LOCKED_TEXT:
+        scrub_command = "inex_scrub_locked_buffer"
+    elif text == BLOCKED_TEXT:
+        scrub_command = "inex_scrub_blocked_buffer"
+    else:
+        raise ModelError("Inex scrub text is not a fixed constant")
+    # The globally registered TextCommand refuses ordinary views. Internal
+    # emergency callers install the same fixed Boolean marker before invoking
+    # it, including an empty view that failed before its first insertion.
+    view.settings().set(VIEW_PLAINTEXT_MARKER, True)
     view.set_scratch(True)
     view.set_read_only(False)
     _scrubbing_views.add(view.id())
+    _fixed_scrub_acks.pop(view.id(), None)
+    scrubbed = False
     try:
-        _replace_buffer_from_bytes(view, bytearray(text.encode("utf-8")))
+        # This dedicated command accepts no text/token argument and deliberately
+        # works for named or non-scratch views reached by an emergency path.
+        view.run_command(scrub_command)
+        if _fixed_scrub_acks.pop(view.id(), None) != scrub_command:
+            raise ModelError("Inex fixed scrub command did not acknowledge replace")
         view.run_command("clear_undo_stack")
+        view.settings().erase(VIEW_PLAINTEXT_MARKER)
+        scrubbed = True
     finally:
+        _fixed_scrub_acks.pop(view.id(), None)
         _scrubbing_views.discard(view.id())
+        if not scrubbed and view.is_valid():
+            view.set_read_only(True)
     view.set_read_only(True)
     view.set_name("Inex — locked")
     view.set_status(STATUS_KEY, status)
@@ -333,14 +363,23 @@ def _cleanup_pending_owner(owner: Any) -> None:
 
 def _clear_pending_plaintext() -> None:
     for owner in _pending_plaintext.drain():
-        _cleanup_pending_owner(owner)
+        try:
+            _cleanup_pending_owner(owner)
+        except Exception:
+            # `_cleanup_pending_owner` wipes before scheduling handle close;
+            # continue draining so one failed Sublime callback cannot strand
+            # other pending plaintext owners in memory.
+            try:
+                owner.wipe()
+            except Exception:
+                pass
 
 
 def _lock_views_and_drop_models(reason: str) -> Tuple[Optional[InexRpcClient], List[str]]:
     global _client, _vault_id, _vault_path, _generation, _unlock_in_progress
     global _last_activity_ping, _activity_ping_inflight
     global _idle_deadline, _idle_timer_serial
-    global _macro_baseline
+    global _macro_baseline, _orphan_scrub_blocked
     with _runtime_lock:
         client = _client
         _client = None
@@ -352,27 +391,71 @@ def _lock_views_and_drop_models(reason: str) -> Tuple[Optional[InexRpcClient], L
         _activity_ping_inflight = False
         _idle_deadline = None
         _idle_timer_serial += 1
-    _handoffs.clear()
-    _clear_pending_plaintext()
+    scrub_failed = False
+    try:
+        _handoffs.clear()
+    except Exception:
+        scrub_failed = True
+    try:
+        _clear_pending_plaintext()
+    except Exception:
+        scrub_failed = True
     _macro_baseline = None
-    for window in _all_windows():
-        window.run_command("hide_overlay")
+    try:
+        windows = _all_windows()
+    except Exception:
+        windows = []
+        scrub_failed = True
+    for window in windows:
+        try:
+            window.run_command("hide_overlay")
+        except Exception:
+            scrub_failed = True
     handles = []
-    for document in _registry.values():
-        view = _view_by_id(document.view_id)
-        if view is not None:
-            handle = scrub_then_remove(
-                _registry,
-                document.view_id,
-                lambda view=view: _replace_view_with_fixed_text(
-                    view, LOCKED_TEXT, "Inex: locked"
-                ),
-            )
-        else:
-            handle = scrub_then_remove(_registry, document.view_id, lambda: None)
-        if handle:
-            handles.append(handle)
-    sublime.status_message(reason)
+    try:
+        documents = _registry.values()
+    except Exception:
+        documents = []
+        scrub_failed = True
+    for document in documents:
+        view = None
+        try:
+            view = _view_by_id(document.view_id)
+            if view is not None:
+                handle = scrub_then_remove(
+                    _registry,
+                    document.view_id,
+                    lambda view=view: _replace_view_with_fixed_text(
+                        view, LOCKED_TEXT, "Inex: locked"
+                    ),
+                )
+            else:
+                handle = scrub_then_remove(
+                    _registry, document.view_id, lambda: None
+                )
+            if handle:
+                handles.append(handle)
+        except Exception:
+            scrub_failed = True
+            try:
+                document.lock()
+            except Exception:
+                pass
+            if view is not None:
+                try:
+                    if view.is_valid():
+                        view.set_read_only(True)
+                except Exception:
+                    pass
+    if scrub_failed:
+        _orphan_scrub_blocked = True
+        message = "Inex locked the sidecar, but one or more marked views require restart"
+    else:
+        message = reason
+    try:
+        sublime.status_message(message)
+    except Exception:
+        pass
     return client, handles
 
 
@@ -399,7 +482,10 @@ def _shutdown_client(client: Optional[InexRpcClient], handles: List[str]) -> Non
 
 def _perform_lock(reason: str) -> None:
     client, handles = _lock_views_and_drop_models(reason)
-    sublime.set_timeout_async(lambda: _shutdown_client(client, handles), 0)
+    try:
+        sublime.set_timeout_async(lambda: _shutdown_client(client, handles), 0)
+    except Exception:
+        _shutdown_client(client, handles)
 
 
 def _session_lost(expected_client: Optional[InexRpcClient], _error: Exception) -> None:
@@ -424,8 +510,38 @@ def _security_gate_changed() -> None:
             _perform_lock("Inex strict security preferences changed; buffers were locked")
 
 
+def _scrub_orphaned_marked_views() -> bool:
+    safe = True
+    for window in _all_windows():
+        for view in window.views(include_transient=True):
+            try:
+                if (
+                    view.is_valid()
+                    and view.settings().get(VIEW_PLAINTEXT_MARKER) is True
+                ):
+                    _replace_view_with_fixed_text(
+                        view, LOCKED_TEXT, "Inex: orphaned plaintext locked"
+                    )
+            except Exception:
+                safe = False
+                try:
+                    view.set_read_only(True)
+                except Exception:
+                    pass
+    return safe
+
+
 def plugin_loaded() -> None:
-    global _plugin_active
+    global _plugin_active, _orphan_scrub_blocked
+    if not _scrub_orphaned_marked_views():
+        _plugin_active = False
+        _orphan_scrub_blocked = True
+        sublime.message_dialog(
+            "Inex editing remains disabled because an orphaned marked view "
+            "could not be scrubbed. Close the view and restart Sublime Text."
+        )
+        return
+    _orphan_scrub_blocked = False
     _plugin_active = True
     preferences = sublime.load_settings("Preferences.sublime-settings")
     preferences.clear_on_change(PREFERENCES_CHANGE_TAG)
@@ -901,6 +1017,9 @@ def _open_document(
             view.set_scratch(True)
             if view.file_name() is not None:
                 raise RpcLifecycleError("Sublime created an unsafe named buffer")
+            # The fixed Boolean marker intentionally survives plugin-host loss.
+            # It must exist before the first plaintext insertion command.
+            view.settings().set(VIEW_PLAINTEXT_MARKER, True)
             view.set_name(logical_path + " — Inex")
             document = ManagedDocument(
                 view.id(),
@@ -918,7 +1037,11 @@ def _open_document(
             # buffer, the first plaintext insertion changes the fingerprint;
             # its post-command hook then stops recording and scrubs the view.
             _start_macro_monitoring()
-            _replace_buffer_from_bytes(view, bytearray(content))
+            _scrubbing_views.add(view.id())
+            try:
+                _replace_buffer_from_bytes(view, bytearray(content))
+            finally:
+                _scrubbing_views.discard(view.id())
             if _registry.get(view.id()) is not document or _macro_is_tainted():
                 raise RpcLifecycleError(
                     "Inex stopped active macro recording before opening the document"
@@ -931,16 +1054,35 @@ def _open_document(
                 _select_heading(view, document, heading_slug_value)
         except Exception as error:
             wipe(content)
+            scrub_failed = False
             if document is not None and _registry.get(document.view_id) is document:
-                _registry.remove(document.view_id)
-                document.close()
-            if view is not None and view.is_valid():
-                _replace_view_with_fixed_text(
-                    view, LOCKED_TEXT, "Inex: document open failed"
+                try:
+                    scrub_then_remove(
+                        _registry,
+                        document.view_id,
+                        lambda: _replace_view_with_fixed_text(
+                            view, LOCKED_TEXT, "Inex: document open failed"
+                        ),
+                    )
+                except Exception:
+                    scrub_failed = True
+                    document.lock()
+                    if view is not None and view.is_valid():
+                        view.set_read_only(True)
+            elif view is not None and view.is_valid():
+                try:
+                    _replace_view_with_fixed_text(
+                        view, LOCKED_TEXT, "Inex: document open failed"
+                    )
+                except Exception:
+                    scrub_failed = True
+                    view.set_read_only(True)
+            if scrub_failed:
+                _perform_lock("Inex failed closed after a document-open scrub error")
+            else:
+                sublime.set_timeout_async(
+                    lambda: _close_handle_best_effort(client, handle), 0
                 )
-            sublime.set_timeout_async(
-                lambda: _close_handle_best_effort(client, handle), 0
-            )
             _show_error(error)
 
     def offer_recovery(
@@ -1068,7 +1210,11 @@ def _capture_view(document: ManagedDocument) -> Tuple[int, bytearray]:
     view = _view_by_id(document.view_id)
     if view is None or not view.is_valid():
         raise ModelError("Managed view is unavailable")
-    if view.file_name() is not None or not view.is_scratch():
+    if (
+        view.file_name() is not None
+        or not view.is_scratch()
+        or view.settings().get(VIEW_PLAINTEXT_MARKER) is not True
+    ):
         raise ModelError("Managed view entered unsafe file state")
     text = view.substr(sublime.Region(0, view.size()))
     content = bytearray(text.encode("utf-8"))
@@ -1083,21 +1229,26 @@ def _write_draft_snapshot(
     client: InexRpcClient,
     vault_id: str,
     document: ManagedDocument,
+    logical_path: str,
     version: int,
+    draft_epoch: int,
     snapshot: bytearray,
     base_etag: Optional[str],
 ) -> bool:
     envelope = bytearray()
     try:
         with document.draft_lock:
-            if document.closed or document.version != version:
+            if (
+                not document.draft_snapshot_is_current(version, draft_epoch)
+                or document.logical_path != logical_path
+            ):
                 return False
             envelope = client.encrypt_draft(
-                document.logical_path, snapshot, base_etag
+                logical_path, snapshot, base_etag
             )
             atomic_write_ciphertext(
                 _draft_directory(),
-                draft_filename(vault_id, document.logical_path),
+                draft_filename(vault_id, logical_path),
                 envelope,
             )
         return True
@@ -1121,6 +1272,8 @@ def _schedule_draft(document: ManagedDocument, debounce_generation: int) -> None
             return
         try:
             version, snapshot = document.snapshot()
+            draft_epoch = document.draft_epoch
+            logical_path = document.logical_path
             base_etag = document.draft_base_etag
             client, vault_id, generation = _runtime_snapshot()
             if client is None or vault_id is None:
@@ -1132,29 +1285,54 @@ def _schedule_draft(document: ManagedDocument, debounce_generation: int) -> None
         def worker() -> None:
             try:
                 wrote = _write_draft_snapshot(
-                    client, vault_id, document, version, snapshot, base_etag
+                    client,
+                    vault_id,
+                    document,
+                    logical_path,
+                    version,
+                    draft_epoch,
+                    snapshot,
+                    base_etag,
                 )
                 if wrote:
                     sublime.set_timeout(
-                        lambda: drafted(version, generation, base_etag), 0
+                        lambda: drafted(
+                            version,
+                            draft_epoch,
+                            logical_path,
+                            generation,
+                            base_etag,
+                        ),
+                        0,
                     )
             except Exception as error:
                 sublime.set_timeout(
                     lambda error=error: _draft_failed(document, error), 0
                 )
 
-        def drafted(version: int, expected_generation: int, base_etag: str) -> None:
+        def drafted(
+            version: int,
+            expected_draft_epoch: int,
+            expected_path: str,
+            expected_generation: int,
+            base_etag: str,
+        ) -> None:
             current_document = _registry.get(document.view_id)
             try:
                 _current_client(expected_generation)
             except Exception:
                 return
             if current_document is document:
-                if document.draft_base_etag != base_etag or not document.dirty:
+                if (
+                    document.draft_epoch != expected_draft_epoch
+                    or document.logical_path != expected_path
+                    or document.draft_base_etag != base_etag
+                    or not document.dirty
+                ):
                     try:
                         remove_encrypted_draft(
                             _draft_directory(),
-                            draft_filename(vault_id, document.logical_path),
+                            draft_filename(vault_id, expected_path),
                         )
                     except Exception as error:
                         _draft_failed(document, error)
@@ -1235,14 +1413,16 @@ def _save_one(
 
     def worker() -> None:
         try:
-            new_etag = client.write_document(document.logical_path, snapshot, write_etag)
-            sublime.set_timeout(lambda: saved(new_etag), 0)
+            new_etag, durability = client.write_document(
+                document.logical_path, snapshot, write_etag
+            )
+            sublime.set_timeout(lambda: saved(new_etag, durability), 0)
         except Exception as error:
             sublime.set_timeout(lambda error=error: failed(error), 0)
         finally:
             wipe(snapshot)
 
-    def saved(new_etag: str) -> None:
+    def saved(new_etag: str, durability: str) -> None:
         success = False
         if _registry.get(document.view_id) is document:
             try:
@@ -1263,6 +1443,7 @@ def _save_one(
                 else:
                     _schedule_draft(document, document.debounce_generation)
                 _update_document_ui(document)
+                _warn_if_not_synced("save", (durability,))
                 success = True
             except Exception:
                 pass
@@ -1311,9 +1492,18 @@ def _flush_final_draft(document: ManagedDocument) -> bool:
         if client is None or vault_id is None:
             raise RpcLifecycleError("Inex vault is locked")
         version, snapshot = _capture_view(document)
+        draft_epoch = document.draft_epoch
+        logical_path = document.logical_path
         base_etag = document.draft_base_etag
         wrote = _write_draft_snapshot(
-            client, vault_id, document, version, snapshot, base_etag
+            client,
+            vault_id,
+            document,
+            logical_path,
+            version,
+            draft_epoch,
+            snapshot,
+            base_etag,
         )
         if not wrote:
             raise DraftStorageError("Encrypted draft was superseded before close")
@@ -1486,9 +1676,418 @@ def _search(window: sublime.Window, query: str) -> None:
     sublime.set_timeout_async(worker, 0)
 
 
+def _command_session(
+    window: sublime.Window,
+) -> Optional[Tuple[InexRpcClient, str, int]]:
+    try:
+        if insecure_preferences():
+            raise RpcLifecycleError("Inex strict security gate is not satisfied")
+        client, vault_id, generation = _runtime_snapshot()
+        if client is None or vault_id is None or not client.has_session:
+            raise RpcLifecycleError("Inex vault is locked")
+        return client, vault_id, generation
+    except Exception as error:
+        _show_error(error)
+        return None
+
+
+def _warn_if_not_synced(operation: str, durabilities: Tuple[str, ...]) -> None:
+    messages = {
+        "create": (
+            "Inex created encrypted Markdown, but the daemon could not confirm "
+            "parent-directory durability."
+        ),
+        "rename": (
+            "Inex renamed ciphertext, but the daemon could not confirm all "
+            "source/destination directory durability."
+        ),
+        "delete": (
+            "Inex deleted ciphertext, but the daemon could not confirm "
+            "parent-directory durability."
+        ),
+        "save": (
+            "Inex saved ciphertext, but the daemon could not confirm "
+            "parent-directory durability."
+        ),
+    }
+    message = messages.get(operation)
+    if message is not None and "notSynced" in durabilities:
+        sublime.message_dialog(message)
+
+
+def _active_clean_context(
+    window: sublime.Window, operation: str
+) -> Optional[Tuple[sublime.View, ManagedDocument, InexRpcClient, str, int]]:
+    session = _command_session(window)
+    if session is None:
+        return None
+    client, vault_id, generation = session
+    view = window.active_view()
+    document = _registry.get(view.id()) if view is not None else None
+    if view is None or document is None:
+        sublime.message_dialog(
+            "Inex %s requires an active managed Markdown document." % operation
+        )
+        return None
+    if document.read_only or view.is_read_only():
+        sublime.message_dialog(
+            "Inex %s requires a clean writable managed document." % operation
+        )
+        return None
+    if (
+        view.file_name() is not None
+        or not view.is_scratch()
+        or view.settings().get(VIEW_PLAINTEXT_MARKER) is not True
+    ):
+        _emergency_scrub_view(view, "managed CRUD invariant failed")
+        return None
+    snapshot = bytearray()
+    try:
+        _version, snapshot = _capture_view(document)
+    except Exception as error:
+        _show_error(error)
+        return None
+    finally:
+        wipe(snapshot)
+    if document.dirty:
+        _schedule_draft(document, document.debounce_generation)
+        sublime.message_dialog(
+            "Save encrypted changes before using Inex %s." % operation
+        )
+        return None
+    return view, document, client, vault_id, generation
+
+
+def _crud_document_current(
+    document: ManagedDocument,
+    client: InexRpcClient,
+    vault_id: str,
+    generation: int,
+    logical_path: str,
+    etag: str,
+    draft_epoch: int,
+) -> bool:
+    current, current_vault, current_generation = _runtime_snapshot()
+    return (
+        current is client
+        and current_vault == vault_id
+        and current_generation == generation
+        and _registry.get(document.view_id) is document
+        and not document.closed
+        and not document.dirty
+        and document.logical_path == logical_path
+        and document.etag == etag
+        and document.draft_epoch == draft_epoch
+    )
+
+
+def _create_markdown(window: sublime.Window, logical_path: str) -> None:
+    session = _command_session(window)
+    if session is None:
+        return
+    client, _vault_id, generation = session
+    try:
+        path = validate_logical_path(logical_path)
+    except Exception as error:
+        _show_error(error)
+        return
+
+    def worker() -> None:
+        try:
+            _etag, durability = client.create_document(path)
+            sublime.set_timeout(lambda: created(durability), 0)
+        except Exception as error:
+            sublime.set_timeout(lambda error=error: failed(error), 0)
+
+    def created(durability: str) -> None:
+        current, _vault_now, current_generation = _runtime_snapshot()
+        if current is client and current_generation == generation:
+            _warn_if_not_synced("create", (durability,))
+            window.status_message("Inex: encrypted Markdown created")
+            _open_document(window, path, None)
+
+    def failed(error: Exception) -> None:
+        current, _vault_now, current_generation = _runtime_snapshot()
+        if current is client and current_generation == generation:
+            _show_error(error)
+
+    sublime.set_timeout_async(worker, 0)
+
+
+def _create_folder(window: sublime.Window, logical_path: str) -> None:
+    session = _command_session(window)
+    if session is None:
+        return
+    client, _vault_id, generation = session
+    try:
+        path = validate_logical_path(logical_path, allow_directory=True)
+        if not path:
+            raise ModelError("Logical directory path is invalid")
+    except Exception as error:
+        _show_error(error)
+        return
+
+    def worker() -> None:
+        try:
+            client.create_directory(path)
+            sublime.set_timeout(created, 0)
+        except Exception as error:
+            sublime.set_timeout(lambda error=error: failed(error), 0)
+
+    def created() -> None:
+        current, _vault_now, current_generation = _runtime_snapshot()
+        if current is client and current_generation == generation:
+            window.status_message("Inex: encrypted folder created")
+
+    def failed(error: Exception) -> None:
+        current, _vault_now, current_generation = _runtime_snapshot()
+        if current is client and current_generation == generation:
+            _show_error(error)
+
+    sublime.set_timeout_async(worker, 0)
+
+
+def _rename_active(
+    window: sublime.Window,
+    destination: str,
+    expected_document: Optional[ManagedDocument] = None,
+) -> None:
+    context = _active_clean_context(window, "rename")
+    if context is None:
+        return
+    view, document, client, vault_id, generation = context
+    if expected_document is not None and document is not expected_document:
+        sublime.message_dialog("Inex rename target changed; retry the command.")
+        return
+    source = document.logical_path
+    source_etag = document.etag
+    try:
+        destination = validate_logical_path(destination)
+        if destination == source:
+            raise ModelError("Rename destination must differ from the source")
+    except Exception as error:
+        _show_error(error)
+        return
+    view.set_read_only(True)
+    operation_draft_epoch = document.invalidate_drafts()
+
+    def worker() -> None:
+        try:
+            cleanup_error = None
+            with document.draft_lock:
+                if not _crud_document_current(
+                    document,
+                    client,
+                    vault_id,
+                    generation,
+                    source,
+                    source_etag,
+                    operation_draft_epoch,
+                ):
+                    raise RpcLifecycleError(
+                        "Inex rename context changed before ciphertext commit"
+                    )
+                (
+                    new_etag,
+                    destination_durability,
+                    source_durability,
+                ) = client.rename_document(source, destination, source_etag)
+                try:
+                    remove_encrypted_draft(
+                        _draft_directory(), draft_filename(vault_id, source)
+                    )
+                except Exception as error:
+                    cleanup_error = error
+            sublime.set_timeout(
+                lambda: renamed(
+                    new_etag,
+                    destination_durability,
+                    source_durability,
+                    cleanup_error,
+                ),
+                0,
+            )
+        except Exception as error:
+            sublime.set_timeout(lambda error=error: failed(error), 0)
+
+    def renamed(
+        new_etag: str,
+        destination_durability: str,
+        source_durability: str,
+        cleanup_error: Optional[Exception],
+    ) -> None:
+        current, current_vault, current_generation = _runtime_snapshot()
+        if (
+            current is not client
+            or current_vault != vault_id
+            or current_generation != generation
+            or _registry.get(document.view_id) is not document
+            or document.logical_path != source
+            or document.etag != source_etag
+            or document.dirty
+        ):
+            return
+        try:
+            document.rename_clean(destination, new_etag)
+            if cleanup_error is not None:
+                sublime.message_dialog(
+                    "Inex renamed ciphertext, but could not remove an old "
+                    "encrypted draft.\n\n" + _safe_error(cleanup_error)
+                )
+            if view.is_valid() and not document.read_only:
+                view.set_read_only(False)
+            _update_document_ui(document)
+            _warn_if_not_synced(
+                "rename", (destination_durability, source_durability)
+            )
+            window.status_message("Inex: encrypted document renamed")
+        except Exception as error:
+            _show_error(error)
+
+    def failed(error: Exception) -> None:
+        current, _vault_now, current_generation = _runtime_snapshot()
+        if (
+            current is client
+            and current_generation == generation
+            and _registry.get(document.view_id) is document
+            and view.is_valid()
+            and not document.read_only
+        ):
+            view.set_read_only(False)
+            _show_error(error)
+
+    sublime.set_timeout_async(worker, 0)
+
+
+def _delete_active(window: sublime.Window) -> None:
+    context = _active_clean_context(window, "delete")
+    if context is None:
+        return
+    view, document, client, vault_id, generation = context
+    logical_path = document.logical_path
+    etag = document.etag
+    operation_draft_epoch: Optional[int] = None
+    choices = [
+        ["Delete encrypted document", "Deletion uses the current ciphertext etag"],
+        ["Cancel", "Keep the encrypted document"],
+    ]
+
+    def selected(index: int) -> None:
+        nonlocal operation_draft_epoch
+        current, current_vault, current_generation = _runtime_snapshot()
+        if (
+            index != 0
+            or current is not client
+            or current_vault != vault_id
+            or current_generation != generation
+            or _registry.get(document.view_id) is not document
+            or document.logical_path != logical_path
+            or document.etag != etag
+            or document.dirty
+            or document.read_only
+            or not view.is_valid()
+        ):
+            return
+        view.set_read_only(True)
+        operation_draft_epoch = document.invalidate_drafts()
+        sublime.set_timeout_async(worker, 0)
+
+    def worker() -> None:
+        try:
+            cleanup_error = None
+            with document.draft_lock:
+                if not _crud_document_current(
+                    document,
+                    client,
+                    vault_id,
+                    generation,
+                    logical_path,
+                    etag,
+                    operation_draft_epoch
+                    if operation_draft_epoch is not None
+                    else -1,
+                ):
+                    raise RpcLifecycleError(
+                        "Inex delete context changed before ciphertext commit"
+                    )
+                durability = client.delete_document(logical_path, etag)
+                try:
+                    remove_encrypted_draft(
+                        _draft_directory(), draft_filename(vault_id, logical_path)
+                    )
+                except Exception as error:
+                    cleanup_error = error
+            sublime.set_timeout(
+                lambda: deleted(durability, cleanup_error), 0
+            )
+        except Exception as error:
+            sublime.set_timeout(lambda error=error: failed(error), 0)
+
+    def deleted(
+        durability: str, cleanup_error: Optional[Exception]
+    ) -> None:
+        current, current_vault, current_generation = _runtime_snapshot()
+        if (
+            current is not client
+            or current_vault != vault_id
+            or current_generation != generation
+            or _registry.get(document.view_id) is not document
+            or document.logical_path != logical_path
+            or document.etag != etag
+            or document.dirty
+        ):
+            return
+        try:
+            handle = scrub_then_remove(
+                _registry,
+                document.view_id,
+                lambda: _replace_view_with_fixed_text(
+                    view, LOCKED_TEXT, "Inex: deleted"
+                ),
+            )
+            if cleanup_error is not None:
+                sublime.message_dialog(
+                    "Inex deleted ciphertext, but could not remove an old "
+                    "encrypted draft.\n\n" + _safe_error(cleanup_error)
+                )
+            if handle:
+                sublime.set_timeout_async(
+                    lambda: _close_handle_best_effort(client, handle), 0
+                )
+            owner = view.window() if view.is_valid() else None
+            if owner is not None:
+                owner.focus_view(view)
+                _registry.grant_bypass(owner.id(), "close_file")
+                owner.run_command("close_file")
+            _warn_if_not_synced("delete", (durability,))
+            window.status_message("Inex: encrypted document deleted")
+        except Exception as error:
+            _show_error(error)
+
+    def failed(error: Exception) -> None:
+        current, _vault_now, current_generation = _runtime_snapshot()
+        if (
+            current is client
+            and current_generation == generation
+            and _registry.get(document.view_id) is document
+            and view.is_valid()
+            and not document.read_only
+        ):
+            view.set_read_only(False)
+            _show_error(error)
+
+    window.show_quick_panel(
+        choices, selected, placeholder="Confirm encrypted document deletion"
+    )
+
+
 class InexReplaceEntireBufferCommand(sublime_plugin.TextCommand):
     def run(self, edit: sublime.Edit, token: str) -> None:
-        if not self.view.is_scratch() or self.view.file_name() is not None:
+        if (
+            not self.view.is_scratch()
+            or self.view.file_name() is not None
+            or self.view.settings().get(VIEW_PLAINTEXT_MARKER) is not True
+        ):
             raise RuntimeError("Inex refused to insert into a non-scratch buffer")
         value = _handoffs.take(token)
         try:
@@ -1496,6 +2095,26 @@ class InexReplaceEntireBufferCommand(sublime_plugin.TextCommand):
             self.view.replace(edit, sublime.Region(0, self.view.size()), text)
         finally:
             wipe(value)
+
+
+class InexScrubLockedBufferCommand(sublime_plugin.TextCommand):
+    def run(self, edit: sublime.Edit) -> None:
+        if self.view.settings().get(VIEW_PLAINTEXT_MARKER) is not True:
+            raise RuntimeError("Inex refused to scrub an unmarked buffer")
+        self.view.replace(
+            edit, sublime.Region(0, self.view.size()), LOCKED_TEXT
+        )
+        _fixed_scrub_acks[self.view.id()] = "inex_scrub_locked_buffer"
+
+
+class InexScrubBlockedBufferCommand(sublime_plugin.TextCommand):
+    def run(self, edit: sublime.Edit) -> None:
+        if self.view.settings().get(VIEW_PLAINTEXT_MARKER) is not True:
+            raise RuntimeError("Inex refused to scrub an unmarked buffer")
+        self.view.replace(
+            edit, sublime.Region(0, self.view.size()), BLOCKED_TEXT
+        )
+        _fixed_scrub_acks[self.view.id()] = "inex_scrub_blocked_buffer"
 
 
 class InexShowSecurityStatusCommand(sublime_plugin.ApplicationCommand):
@@ -1549,6 +2168,71 @@ class InexSearchCommand(sublime_plugin.WindowCommand):
         # dedicated non-history search API; the exact release residue matrix
         # remains binding for this experimental feature.
         self.window.show_input_panel("Inex search", "", done, None, None)
+
+
+class InexNewEncryptedMarkdownCommand(sublime_plugin.WindowCommand):
+    def run(self) -> None:
+        session = _command_session(self.window)
+        if session is None:
+            return
+        client, _vault_id, generation = session
+
+        def done(logical_path: str) -> None:
+            current, _vault_now, current_generation = _runtime_snapshot()
+            if current is client and current_generation == generation:
+                _create_markdown(self.window, logical_path)
+
+        self.window.show_input_panel(
+            "New encrypted Markdown path", "", done, None, None
+        )
+
+
+class InexNewFolderCommand(sublime_plugin.WindowCommand):
+    def run(self) -> None:
+        session = _command_session(self.window)
+        if session is None:
+            return
+        client, _vault_id, generation = session
+
+        def done(logical_path: str) -> None:
+            current, _vault_now, current_generation = _runtime_snapshot()
+            if current is client and current_generation == generation:
+                _create_folder(self.window, logical_path)
+
+        self.window.show_input_panel(
+            "New encrypted folder path", "", done, None, None
+        )
+
+
+class InexRenameActiveCommand(sublime_plugin.WindowCommand):
+    def run(self) -> None:
+        context = _active_clean_context(self.window, "rename")
+        if context is None:
+            return
+        _view, document, client, _vault_id, generation = context
+
+        def done(destination: str) -> None:
+            current, _vault_now, current_generation = _runtime_snapshot()
+            if (
+                current is client
+                and current_generation == generation
+                and _registry.get(document.view_id) is document
+                and not document.dirty
+            ):
+                _rename_active(self.window, destination, document)
+
+        self.window.show_input_panel(
+            "Rename encrypted Markdown path",
+            document.logical_path,
+            done,
+            None,
+            None,
+        )
+
+
+class InexDeleteActiveCommand(sublime_plugin.WindowCommand):
+    def run(self) -> None:
+        _delete_active(self.window)
 
 
 class InexShowHeadingsCommand(sublime_plugin.WindowCommand):
@@ -1850,7 +2534,12 @@ class InexStrictEventListener(sublime_plugin.EventListener):
         document = _registry.get(view.id())
         if document is None:
             return
-        if insecure_preferences() or view.file_name() is not None or not view.is_scratch():
+        if (
+            insecure_preferences()
+            or view.file_name() is not None
+            or not view.is_scratch()
+            or view.settings().get(VIEW_PLAINTEXT_MARKER) is not True
+        ):
             _emergency_scrub_view(view, "strict gate or scratch invariant failed")
             return
         try:
@@ -1869,7 +2558,12 @@ class InexStrictEventListener(sublime_plugin.EventListener):
         document = _registry.get(view.id())
         if document is None:
             return
-        if insecure_preferences() or view.file_name() is not None or not view.is_scratch():
+        if (
+            insecure_preferences()
+            or view.file_name() is not None
+            or not view.is_scratch()
+            or view.settings().get(VIEW_PLAINTEXT_MARKER) is not True
+        ):
             _emergency_scrub_view(view, "strict gate or scratch invariant failed")
             return
         _note_user_activity()

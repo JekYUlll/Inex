@@ -1,0 +1,67 @@
+# Sublime Text Build 4200 isolated QA
+
+`run_build4200.py` launches the exact local Build 4200 with a brand-new,
+isolated XDG data directory. It starts its own private D-Bus session, Xvfb
+server, and metacity instance, and preinstalls the current Inex package, exact
+global preferences, and a test-only Python 3.8 helper. It does not use the real
+Sublime profile. Build 4200 Safe Mode was not used because it intentionally
+clears third-party packages and does not reliably hot-load a package created
+after startup.
+
+The initial bounded smoke flow imports one random Markdown document with the
+real CLI, unlocks it through a controlled regular-file `zenity` helper, opens
+the real `.md.enc`, edits without putting plaintext in command arguments,
+saves through Inex, closes the scratch view, terminates Sublime, and scans the
+entire isolated root for UTF-8, UTF-16, hex, and base64 forms of both random
+canaries. `HOME`, all XDG roots, and `TMPDIR`/`TMP`/`TEMP` point into that root.
+The report contains only fixed event names, booleans, lengths, and SHA-256
+hashes; it never contains managed text.
+
+The controlled password helper validates this integration path only. Password
+prompt argv/environment/stderr residue is covered by the pure Python password
+tests, not claimed by this fixture.
+
+Build current binaries, then run:
+
+```sh
+cargo build -p inex-cli -p inex-daemon
+timeout --signal=TERM --kill-after=5s 90s \
+  python3 editors/sublime/test/build4200/run_build4200.py
+```
+
+After the minimal flow passes, probe abrupt Python plugin-host loss with:
+
+```sh
+timeout --signal=TERM --kill-after=5s 90s \
+  python3 editors/sublime/test/build4200/run_build4200.py \
+  --plugin-host-crash --keep
+```
+
+That mode follows the same ordinary open/edit/encrypted-save path, then keeps
+the managed view open and kills only the isolated profile's
+`plugin_host-3.8`. (The default run separately covers close and the final root
+scan.) The restarted test helper reports the active view's byte length,
+SHA-256 digest, and one fixed boolean marker. It never reports the view text.
+An unchanged marked view is a fail-closed blocker and makes the runner exit
+nonzero while retaining the isolated root.
+
+Build 4200 does not restart a killed plugin host in the same editor process;
+Sublime's documented recovery is to restart Sublime Text. The runner therefore
+uses the private Xvfb clipboard for a black-box probe while the old host is
+dead. It first tries native Select All/Copy, then a mouse selection through the
+X11 PRIMARY channel, compares only byte length and SHA-256 with the pre-kill
+values, and records whether a channel could be read. It never writes view text
+to the report.
+
+When Build 4200 requires an application restart, the scenario exits zero with
+`PASS_WITH_DOCUMENTED_BOUNDARY`, `sublime_restart_required: true`, and the
+measured host-dead copy result. This means the harness successfully reproduced
+the declared experimental boundary; it does **not** mean crash-time plaintext
+scrubbing passed. The runner then terminates the isolated editor and requires a
+zero-hit root scan. If a build ever restarts the host automatically, the
+existing marker-based orphan scrub remains a mandatory assertion instead.
+
+Use `--keep` to retain an isolated failure root for diagnosis. The runner
+tracks every process it starts and terminates Sublime, metacity, Xvfb, and
+D-Bus in its `finally` cleanup path, including on SIGTERM. Failure roots are
+retained; `--keep` also retains successful roots for inspection.

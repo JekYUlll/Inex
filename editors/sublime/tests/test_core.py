@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import threading
 import unittest
 
 from inex_core import (
@@ -147,6 +148,52 @@ class ModelTests(unittest.TestCase):
         self.assertFalse(document.requires_overwrite_confirmation)
         self.assertEqual(document.draft_base_etag, NEW_ETAG)
 
+    def test_only_clean_document_can_update_rename_identity(self):
+        document = ManagedDocument(
+            12, "before.md", "h", ETAG, bytearray(b"clean")
+        )
+        source = document.rename_clean("folder/after.md", NEW_ETAG)
+        self.assertEqual(source, "before.md")
+        self.assertEqual(document.logical_path, "folder/after.md")
+        self.assertEqual(document.etag, NEW_ETAG)
+        self.assertEqual(document.draft_base_etag, NEW_ETAG)
+
+        document.replace(bytearray(b"dirty"))
+        with self.assertRaisesRegex(ModelError, "clean open"):
+            document.rename_clean("other.md", ETAG)
+
+    def test_draft_epoch_cancels_waiters_and_crud_lock_waits_for_inflight_draft(self):
+        document = ManagedDocument(
+            13, "before.md", "h", ETAG, bytearray(b"clean")
+        )
+        old_epoch = document.draft_epoch
+        draft_holds_lock = threading.Event()
+        release_draft = threading.Event()
+        crud_acquired = threading.Event()
+
+        def inflight_draft():
+            with document.draft_lock:
+                draft_holds_lock.set()
+                release_draft.wait(2.0)
+
+        def crud_worker():
+            with document.draft_lock:
+                crud_acquired.set()
+
+        draft_thread = threading.Thread(target=inflight_draft)
+        draft_thread.start()
+        self.assertTrue(draft_holds_lock.wait(1.0))
+        new_epoch = document.invalidate_drafts()
+        crud_thread = threading.Thread(target=crud_worker)
+        crud_thread.start()
+        self.assertFalse(crud_acquired.wait(0.05))
+        self.assertFalse(document.draft_snapshot_is_current(0, old_epoch))
+        self.assertTrue(document.draft_snapshot_is_current(0, new_epoch))
+        release_draft.set()
+        draft_thread.join(1.0)
+        crud_thread.join(1.0)
+        self.assertTrue(crud_acquired.is_set())
+
     def test_idle_deadline_warns_expires_and_renews(self):
         deadline = IdleDeadline(10000, 100.0)
         self.assertEqual(deadline.state(100.0), "active")
@@ -216,6 +263,15 @@ class DraftStorageTests(unittest.TestCase):
             os.symlink(target, link)
             with self.assertRaises(DraftStorageError):
                 atomic_write_ciphertext(link, filename, bytearray(b"EDRYcipher"))
+            target_draft = os.path.join(target, filename)
+            with open(target_draft, "wb") as stream:
+                stream.write(b"EDRYcipher")
+            with self.assertRaises(DraftStorageError):
+                read_encrypted_draft(link, filename)
+            with self.assertRaises(DraftStorageError):
+                remove_encrypted_draft(link, filename)
+            with open(target_draft, "rb") as stream:
+                self.assertEqual(stream.read(), b"EDRYcipher")
 
 
 class CommandInterceptionTests(unittest.TestCase):

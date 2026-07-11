@@ -522,7 +522,9 @@ class InexRpcClient:
             wipe(content)
             self._terminate_protocol(error)
 
-    def write_document(self, logical_path: str, content: bytearray, etag: str) -> str:
+    def write_document(
+        self, logical_path: str, content: bytearray, etag: str
+    ) -> Tuple[str, str]:
         etag = _expect_etag(etag)
         encoded = encode_base64url(content, MAX_DOCUMENT_BYTES)
         try:
@@ -541,9 +543,101 @@ class InexRpcClient:
             )
             new_etag = _expect_etag(result.get("etag"))
             _validate_metadata(result.get("metadata"), logical_path, (0, 1))
-            if result.get("durability") not in ("synced", "notSynced"):
-                raise RpcProtocolError("RPC write durability is invalid")
-            return new_etag
+            durability = _expect_durability(result.get("durability"), "write")
+            return new_etag, durability
+        except RpcProtocolError as error:
+            self._terminate_protocol(error)
+
+    def create_document(self, logical_path: str) -> Tuple[str, str]:
+        try:
+            result = _expect_exact_object(
+                self._call_raw(
+                    "file.write",
+                    dict(
+                        self._protected_params(),
+                        logicalPath=logical_path,
+                        contentBase64="",
+                        ifNoneMatch="*",
+                    ),
+                ),
+                {"etag", "metadata", "durability"},
+                "create result",
+            )
+            etag = _expect_etag(result.get("etag"))
+            _validate_metadata(result.get("metadata"), logical_path, (0, 1))
+            durability = _expect_durability(result.get("durability"), "create")
+            return etag, durability
+        except RpcProtocolError as error:
+            self._terminate_protocol(error)
+
+    def create_directory(self, logical_path: str) -> None:
+        try:
+            self._expect_ok(
+                self._call_raw(
+                    "file.mkdir",
+                    dict(self._protected_params(), logicalPath=logical_path),
+                )
+            )
+        except RpcProtocolError as error:
+            self._terminate_protocol(error)
+
+    def rename_document(
+        self, source: str, destination: str, source_etag: str
+    ) -> Tuple[str, str, str]:
+        source_etag = _expect_etag(source_etag)
+        try:
+            result = _expect_exact_object(
+                self._call_raw(
+                    "file.rename",
+                    dict(
+                        self._protected_params(),
+                        **{
+                            "from": source,
+                            "to": destination,
+                            "sourceEtag": source_etag,
+                            "destinationIfNoneMatch": "*",
+                        }
+                    ),
+                ),
+                {
+                    "etag",
+                    "metadata",
+                    "destinationDurability",
+                    "sourceDurability",
+                },
+                "rename result",
+            )
+            etag = _expect_etag(result.get("etag"))
+            _validate_metadata(result.get("metadata"), destination, (0, 1))
+            destination_durability = _expect_durability(
+                result.get("destinationDurability"), "rename destination"
+            )
+            source_durability = _expect_durability(
+                result.get("sourceDurability"), "rename source"
+            )
+            return etag, destination_durability, source_durability
+        except RpcProtocolError as error:
+            self._terminate_protocol(error)
+
+    def delete_document(self, logical_path: str, etag: str) -> str:
+        etag = _expect_etag(etag)
+        try:
+            result = _expect_exact_object(
+                self._call_raw(
+                    "file.delete",
+                    dict(
+                        self._protected_params(),
+                        logicalPath=logical_path,
+                        ifMatch=etag,
+                        recursive=False,
+                    ),
+                ),
+                {"ok", "durability"},
+                "delete result",
+            )
+            if result.get("ok") is not True:
+                raise RpcProtocolError("RPC delete result is invalid")
+            return _expect_durability(result.get("durability"), "delete")
         except RpcProtocolError as error:
             self._terminate_protocol(error)
 
@@ -992,6 +1086,12 @@ def _expect_document_handle(value: Any) -> str:
 def _expect_etag(value: Any) -> str:
     if not isinstance(value, str) or not _ETAG_RE.fullmatch(value):
         raise RpcProtocolError("RPC etag is invalid")
+    return value
+
+
+def _expect_durability(value: Any, operation: str) -> str:
+    if value not in ("synced", "notSynced"):
+        raise RpcProtocolError("RPC %s durability is invalid" % operation)
     return value
 
 

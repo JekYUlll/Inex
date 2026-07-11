@@ -423,6 +423,7 @@ class ManagedDocument:
         self.read_only = False
         self.closed = False
         self.debounce_generation = 0
+        self.draft_epoch = 0
         self.draft_lock = threading.Lock()
 
     @property
@@ -462,6 +463,34 @@ class ManagedDocument:
         if version <= self.version:
             self.draft_version = max(self.draft_version, version)
 
+    def invalidate_drafts(self) -> int:
+        if self.closed:
+            raise ModelError("Document is closed")
+        self.debounce_generation += 1
+        self.draft_epoch += 1
+        return self.draft_epoch
+
+    def draft_snapshot_is_current(self, version: int, draft_epoch: int) -> bool:
+        return (
+            not self.closed
+            and self.version == version
+            and self.draft_epoch == draft_epoch
+        )
+
+    def rename_clean(self, logical_path: str, etag: str) -> str:
+        if self.closed or self.dirty:
+            raise ModelError("Only a clean open document can be renamed")
+        destination = validate_logical_path(logical_path)
+        if not isinstance(etag, str) or not _ETAG_RE.fullmatch(etag):
+            raise ModelError("Document etag is invalid")
+        source = self.logical_path
+        self.logical_path = destination
+        self.etag = etag
+        self.draft_base_etag = etag
+        self.draft_epoch += 1
+        self.requires_overwrite_confirmation = False
+        return source
+
     def lock(self) -> None:
         self.read_only = True
 
@@ -470,6 +499,7 @@ class ManagedDocument:
             return
         self.closed = True
         self.read_only = True
+        self.draft_epoch += 1
         wipe(self.content)
         self.content = bytearray()
         # Handles/session tokens are immutable Python strings and cannot be
@@ -544,6 +574,12 @@ def draft_filename(vault_id: str, logical_path: str) -> str:
     return hashlib.sha256(material).hexdigest() + ".edry"
 
 
+def _metadata_is_link(metadata: os.stat_result) -> bool:
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    file_attributes = getattr(metadata, "st_file_attributes", 0)
+    return stat.S_ISLNK(metadata.st_mode) or bool(file_attributes & reparse_flag)
+
+
 def atomic_write_ciphertext(directory: str, filename: str, envelope: bytearray) -> str:
     """Atomically persist one bounded EDRY envelope and never plaintext."""
 
@@ -560,7 +596,7 @@ def atomic_write_ciphertext(directory: str, filename: str, envelope: bytearray) 
         metadata = os.lstat(directory)
     except OSError:
         raise DraftStorageError("Encrypted draft directory is unavailable")
-    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+    if _metadata_is_link(metadata) or not stat.S_ISDIR(metadata.st_mode):
         raise DraftStorageError("Encrypted draft directory is unsafe")
     destination = os.path.join(directory, filename)
     temporary = os.path.join(
@@ -593,7 +629,9 @@ def atomic_write_ciphertext(directory: str, filename: str, envelope: bytearray) 
             # itself was synced and replace remains atomic on supported hosts.
             pass
         result_metadata = os.lstat(destination)
-        if stat.S_ISLNK(result_metadata.st_mode) or not stat.S_ISREG(result_metadata.st_mode):
+        if _metadata_is_link(result_metadata) or not stat.S_ISREG(
+            result_metadata.st_mode
+        ):
             raise DraftStorageError("Encrypted draft destination is unsafe")
         return destination
     except DraftStorageError:
@@ -624,7 +662,9 @@ def read_encrypted_draft(directory: str, filename: str) -> Optional[bytearray]:
         return None
     except OSError:
         raise DraftStorageError("Encrypted draft directory is unavailable")
-    if stat.S_ISLNK(directory_metadata.st_mode) or not stat.S_ISDIR(directory_metadata.st_mode):
+    if _metadata_is_link(directory_metadata) or not stat.S_ISDIR(
+        directory_metadata.st_mode
+    ):
         raise DraftStorageError("Encrypted draft directory is unsafe")
     try:
         metadata = os.lstat(path)
@@ -633,7 +673,7 @@ def read_encrypted_draft(directory: str, filename: str) -> Optional[bytearray]:
     except OSError:
         raise DraftStorageError("Encrypted draft is unavailable")
     if (
-        stat.S_ISLNK(metadata.st_mode)
+        _metadata_is_link(metadata)
         or not stat.S_ISREG(metadata.st_mode)
         or metadata.st_size < 4
         or metadata.st_size > MAX_DRAFT_BYTES
@@ -684,6 +724,65 @@ def remove_encrypted_draft(directory: str, filename: str) -> bool:
 
     if not os.path.isabs(directory) or not _DRAFT_NAME_RE.fullmatch(filename):
         raise DraftStorageError("Encrypted draft destination is invalid")
+    try:
+        directory_metadata = os.lstat(directory)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        raise DraftStorageError("Encrypted draft directory is unavailable")
+    if (
+        _metadata_is_link(directory_metadata)
+        or not stat.S_ISDIR(directory_metadata.st_mode)
+    ):
+        raise DraftStorageError("Encrypted draft directory is unsafe")
+
+    anchored = (
+        os.stat in os.supports_dir_fd
+        and os.stat in os.supports_follow_symlinks
+        and os.unlink in os.supports_dir_fd
+    )
+    if anchored:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = None
+        try:
+            descriptor = os.open(directory, flags)
+            opened_directory = os.fstat(descriptor)
+            if (
+                not stat.S_ISDIR(opened_directory.st_mode)
+                or opened_directory.st_dev != directory_metadata.st_dev
+                or opened_directory.st_ino != directory_metadata.st_ino
+            ):
+                raise DraftStorageError("Encrypted draft directory changed while opening")
+            try:
+                metadata = os.stat(filename, dir_fd=descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                return False
+            if _metadata_is_link(metadata) or not stat.S_ISREG(metadata.st_mode):
+                raise DraftStorageError("Encrypted draft destination is unsafe")
+            os.unlink(filename, dir_fd=descriptor)
+            try:
+                os.fsync(descriptor)
+            except OSError:
+                pass
+            return True
+        except DraftStorageError:
+            raise
+        except OSError:
+            raise DraftStorageError("Encrypted draft delete failed")
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+    # Windows does not expose Python dir_fd operations. Recheck the exact
+    # directory identity immediately before unlinking so ordinary symlink or
+    # junction replacement fails closed within the available API boundary.
     path = os.path.join(directory, filename)
     try:
         metadata = os.lstat(path)
@@ -691,9 +790,17 @@ def remove_encrypted_draft(directory: str, filename: str) -> bool:
         return False
     except OSError:
         raise DraftStorageError("Encrypted draft is unavailable")
-    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+    if _metadata_is_link(metadata) or not stat.S_ISREG(metadata.st_mode):
         raise DraftStorageError("Encrypted draft destination is unsafe")
     try:
+        current_directory = os.lstat(directory)
+        if (
+            _metadata_is_link(current_directory)
+            or not stat.S_ISDIR(current_directory.st_mode)
+            or current_directory.st_dev != directory_metadata.st_dev
+            or current_directory.st_ino != directory_metadata.st_ino
+        ):
+            raise DraftStorageError("Encrypted draft directory changed before delete")
         os.unlink(path)
         try:
             descriptor = os.open(directory, os.O_RDONLY)
@@ -704,5 +811,7 @@ def remove_encrypted_draft(directory: str, filename: str) -> bool:
         except OSError:
             pass
         return True
+    except DraftStorageError:
+        raise
     except OSError:
         raise DraftStorageError("Encrypted draft delete failed")

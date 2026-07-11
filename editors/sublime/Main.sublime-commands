@@ -12,6 +12,22 @@
     "command": "inex_search"
   },
   {
+    "caption": "Inex: New Encrypted Markdown",
+    "command": "inex_new_encrypted_markdown"
+  },
+  {
+    "caption": "Inex: New Folder",
+    "command": "inex_new_folder"
+  },
+  {
+    "caption": "Inex: Rename Active",
+    "command": "inex_rename_active"
+  },
+  {
+    "caption": "Inex: Delete Active",
+    "command": "inex_delete_active"
+  },
+  {
     "caption": "Inex: Show Markdown Headings",
     "command": "inex_show_headings"
   },
