@@ -108,6 +108,15 @@
 - **Started:** 2026-07-11 (Asia/Shanghai)
 - Actions taken:
   - 已完成 strict Content-Length JSON-RPC framing checkpoint（15/15），下一步接入协议验证、session store、handler/server 与 CLI。
+  - 按用户补充要求启用 Git checkpoint 工作流；在暂停并行写入、确认无 partial edit、执行 staged whitespace/secret audit 后，将 Phase 1/2 稳定基线提交为 `075f8fd`（`feat: establish encrypted vault core and project baseline`），并创建 annotated tag `checkpoint-phase-2` 作为明确回滚点。
+  - 接入 session/sensitive 模块后的首轮 daemon 门禁在 rustfmt 检查处停止；已先记录失败，尚未把未执行的 tests/clippy/rustdoc 误记为通过。
+  - 格式修复后首次真实编译暴露 sensitive helper 测试的引用类型不匹配；该编译门禁已记录并按最小范围修正。
+  - daemon 25/25 tests 通过后，clippy 在 sensitive base64 decoder 的所有权意图处停止；保留“转移并清零输入”契约并显式消费 owner 后重新执行全门禁。
+  - 完成 256-bit session capability、15 分钟 monotonic idle、128 个随机 document handle 上限、lock/expiry/shutdown 清理，以及敏感 JSON 字段的 zeroizing ownership 转移；集成 daemon 25/25 tests、clippy、rustdoc 通过。
+  - 完成 20 个冻结 RPC method 的严格 request parser、复杂度预算、可关联 request id 的拒绝响应与固定错误模型；集成 daemon 35/35 tests、clippy、rustdoc 通过。
+  - CLI 完成 init/locked verify/password add-remove-change/search/serve：口令和查询均不进入 argv/env value，查询通过隐藏 TTY 或显式有界 stdin；独立 18/18 tests 后又通过 workspace 162/162 tests、clippy 与 rustdoc。
+  - 并行安全审计发现两个集成前 hardening 项：阻塞 stdio 不能让 idle session 无限驻留，server 必须定时唤醒并触发 expiry；`inex serve` 缺少 sibling daemon 时必须 fail closed，禁止隐式 PATH 回退。
+  - 修复 `inex serve` PATH 劫持面：仅接受同目录 daemon 或显式非空 `INEXD_PATH`；最终基础增量 workspace gate 为 CLI 20/20 + core 119/119 + daemon 35/35，fmt、clippy `-D warnings`、rustdoc `-D warnings` 与 diff whitespace 全通过。
 
 ### Phase 4: VS Code 主客户端
 

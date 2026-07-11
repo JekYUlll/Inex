@@ -1,0 +1,523 @@
+//! Administrative command-line interface for Inex encrypted vaults.
+//!
+//! Passwords are accepted only from a hidden terminal prompt or, when the
+//! caller explicitly sets `INEX_PASSWORD_STDIN=1`, one bounded stdin line per
+//! prompt. They are never accepted as command-line arguments or environment
+//! variable values.
+
+#![forbid(unsafe_code)]
+#![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
+
+mod args;
+mod password;
+mod query;
+mod verify;
+
+use std::fmt;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command as ProcessCommand, ExitCode};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use inex_core::search::{CaseSensitivity, DEFAULT_SEARCH_SNIPPET_BYTES, SearchQuery};
+use inex_core::sodium::DEFAULT_ARGON2ID_PARAMS;
+use inex_core::vault::{PasswordSlotCommit, Vault, VaultError};
+use inex_core::vault_config::KdfPolicy;
+use uuid::Uuid;
+
+use crate::args::{Cli, Command, PasswordCommand};
+use crate::password::{PasswordInput, read_confirmed_password, read_password};
+use crate::query::{QueryInput, read_query};
+
+/// Run the CLI using process arguments and standard streams.
+///
+/// This is the library entry point used by the `inex` binary. It returns a
+/// process exit code instead of terminating directly, keeping cleanup and
+/// zeroizing destructors deterministic.
+#[must_use]
+pub fn main_entry() -> ExitCode {
+    match run_from_environment() {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("inex: {error}");
+            error.exit_code()
+        }
+    }
+}
+
+fn run_from_environment() -> Result<ExitCode, AppError> {
+    let cli = Cli::parse(std::env::args_os().skip(1))?;
+    if matches!(cli.command, Command::Help) {
+        print!("{}", args::USAGE);
+        io::stdout()
+            .flush()
+            .map_err(|error| AppError::io(IoOperation::WriteOutput, &error))?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    if matches!(cli.command, Command::Version) {
+        println!("inex {}", env!("CARGO_PKG_VERSION"));
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    execute(cli.command)
+}
+
+fn execute(command: Command) -> Result<ExitCode, AppError> {
+    match command {
+        Command::Init { vault } => command_init(&vault, PasswordInput::from_environment()?),
+        Command::Verify { vault } => command_verify(&vault),
+        Command::Password(command) => command_password(command, PasswordInput::from_environment()?),
+        Command::Search {
+            vault,
+            slot,
+            case_sensitive,
+            limit,
+        } => {
+            let password_input = PasswordInput::from_environment()?;
+            let query_input = QueryInput::from_environment()?;
+            command_search(
+                &vault,
+                slot,
+                case_sensitive,
+                limit,
+                password_input,
+                query_input,
+            )
+        }
+        Command::Serve => command_serve(),
+        Command::Help | Command::Version => unreachable!("handled before password input setup"),
+    }
+}
+
+fn command_init(vault_path: &Path, input: PasswordInput) -> Result<ExitCode, AppError> {
+    let password = read_confirmed_password(input, "New vault password: ")?;
+    let created = Vault::create(vault_path, password.as_slice(), unix_time_ms()?)?;
+    println!("vault created");
+    println!("vault-id: {}", created.config().vault_id);
+    println!("password-slot: {}", created.unlocked_slot_id());
+    print_warnings(created.warnings());
+    Ok(ExitCode::SUCCESS)
+}
+
+fn command_verify(vault_path: &Path) -> Result<ExitCode, AppError> {
+    let report = verify::verify_locked(vault_path)?;
+    println!("verification-mode: locked-structural");
+    println!("vault-metadata: structurally-valid-untrusted");
+    println!("directories: {}", report.directories);
+    println!("documents: {}", report.documents);
+    println!("weak-kdf-slots: {}", report.weak_kdf_slots);
+    println!("authenticated-content: not-performed");
+    println!("result: locked structure valid; unlock is required for authenticity");
+    Ok(ExitCode::SUCCESS)
+}
+
+fn command_password(command: PasswordCommand, input: PasswordInput) -> Result<ExitCode, AppError> {
+    match command {
+        PasswordCommand::Add { vault, slot } => {
+            let current = read_password(input, "Current vault password: ")?;
+            let mut vault = Vault::unlock(&vault, current.as_slice(), slot, KdfPolicy::default())?;
+            let new = read_confirmed_password(input, "New password: ")?;
+            let committed = vault.add_password_slot(
+                new.as_slice(),
+                unix_time_ms()?,
+                DEFAULT_ARGON2ID_PARAMS,
+                KdfPolicy::default(),
+            )?;
+            print_password_slot_commit("password slot added", committed);
+            Ok(ExitCode::SUCCESS)
+        }
+        PasswordCommand::Remove {
+            vault,
+            slot_to_remove,
+            retained_slot,
+        } => {
+            let retained = read_password(input, "Retained-slot password: ")?;
+            let mut vault = Vault::unlock(
+                &vault,
+                retained.as_slice(),
+                Some(retained_slot),
+                KdfPolicy::default(),
+            )?;
+            vault.remove_password_slot(
+                slot_to_remove,
+                retained.as_slice(),
+                retained_slot,
+                KdfPolicy::default(),
+            )?;
+            println!("password slot removed");
+            println!("removed-slot: {slot_to_remove}");
+            Ok(ExitCode::SUCCESS)
+        }
+        PasswordCommand::Change { vault, old_slot } => {
+            let current = read_password(input, "Current vault password: ")?;
+            let mut vault =
+                Vault::unlock(&vault, current.as_slice(), old_slot, KdfPolicy::default())?;
+            let selected_old_slot = vault.unlocked_slot_id();
+            let new = read_confirmed_password(input, "New password: ")?;
+            let committed = vault.change_password(
+                new.as_slice(),
+                unix_time_ms()?,
+                DEFAULT_ARGON2ID_PARAMS,
+                KdfPolicy::default(),
+            )?;
+            if let Err(_retirement_error) = vault.remove_password_slot(
+                selected_old_slot,
+                new.as_slice(),
+                committed.new_slot_id,
+                KdfPolicy::default(),
+            ) {
+                return Err(AppError::PasswordRetirementDeferred {
+                    new_slot: committed.new_slot_id,
+                });
+            }
+            print_password_slot_commit("password changed", committed);
+            println!("retired-slot: {selected_old_slot}");
+            Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn command_search(
+    vault_path: &Path,
+    slot: Option<Uuid>,
+    case_sensitive: bool,
+    limit: usize,
+    password_input: PasswordInput,
+    query_input: QueryInput,
+) -> Result<ExitCode, AppError> {
+    let password = read_password(password_input, "Vault password: ")?;
+    let mut vault = Vault::unlock(vault_path, password.as_slice(), slot, KdfPolicy::default())?;
+    let query = read_query(query_input)?;
+    vault.rebuild_search_index()?;
+    let sensitivity = if case_sensitive {
+        CaseSensitivity::Sensitive
+    } else {
+        CaseSensitivity::UnicodeInsensitive
+    };
+    let query = SearchQuery::new(query, sensitivity, limit, DEFAULT_SEARCH_SNIPPET_BYTES)?;
+    let hits = vault.search(&query)?;
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    for hit in hits.iter() {
+        writeln!(
+            output,
+            "{}:{}:{}\t{}",
+            hit.logical_path(),
+            hit.line() + 1,
+            hit.utf16_column() + 1,
+            escaped_terminal_text(hit.snippet())
+        )
+        .map_err(|error| AppError::io(IoOperation::WriteOutput, &error))?;
+    }
+    writeln!(output, "matches: {}", hits.len())
+        .map_err(|error| AppError::io(IoOperation::WriteOutput, &error))?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn command_serve() -> Result<ExitCode, AppError> {
+    let executable = daemon_executable()?;
+    let mut command = ProcessCommand::new(executable);
+    command.stdin(std::process::Stdio::inherit());
+    command.stdout(std::process::Stdio::inherit());
+    command.stderr(std::process::Stdio::inherit());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+
+        let error = command.exec();
+        Err(AppError::io(IoOperation::LaunchDaemon, &error))
+    }
+
+    #[cfg(not(unix))]
+    {
+        let status = command
+            .status()
+            .map_err(|error| AppError::io(IoOperation::LaunchDaemon, &error))?;
+        Ok(match status.code() {
+            Some(code) => u8::try_from(code).map_or(ExitCode::FAILURE, ExitCode::from),
+            None => ExitCode::FAILURE,
+        })
+    }
+}
+
+fn daemon_executable() -> Result<PathBuf, AppError> {
+    if let Some(configured) = configured_daemon_executable(std::env::var_os("INEXD_PATH"))? {
+        return Ok(configured);
+    }
+    let current =
+        std::env::current_exe().map_err(|error| AppError::io(IoOperation::LocateDaemon, &error))?;
+    sibling_daemon_executable(&current)
+}
+
+fn configured_daemon_executable(
+    configured: Option<std::ffi::OsString>,
+) -> Result<Option<PathBuf>, AppError> {
+    let Some(configured) = configured else {
+        return Ok(None);
+    };
+    if configured.is_empty() {
+        return Err(AppError::InvalidDaemonPath);
+    }
+    Ok(Some(PathBuf::from(configured)))
+}
+
+fn sibling_daemon_executable(current: &Path) -> Result<PathBuf, AppError> {
+    let sibling = current.with_file_name(if cfg!(windows) { "inexd.exe" } else { "inexd" });
+    if sibling.is_file() {
+        Ok(sibling)
+    } else {
+        Err(AppError::DaemonNotFound)
+    }
+}
+
+fn print_password_slot_commit(message: &str, committed: PasswordSlotCommit) {
+    println!("{message}");
+    println!("new-slot: {}", committed.new_slot_id);
+}
+
+fn print_warnings(warnings: &[inex_core::vault_config::ConfigWarning]) {
+    if !warnings.is_empty() {
+        println!("warnings: {}", warnings.len());
+    }
+}
+
+fn escaped_terminal_text(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '\t' => escaped.push_str("\\t"),
+            character if character.is_control() => {
+                use std::fmt::Write as _;
+                let _ = write!(escaped, "\\u{{{:04X}}}", u32::from(character));
+            }
+            character => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+fn unix_time_ms() -> Result<i64, AppError> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| AppError::Clock)?;
+    i64::try_from(duration.as_millis()).map_err(|_| AppError::Clock)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IoOperation {
+    LocateDaemon,
+    LaunchDaemon,
+    WriteOutput,
+}
+
+impl fmt::Display for IoOperation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::LocateDaemon => "locating inexd",
+            Self::LaunchDaemon => "launching inexd",
+            Self::WriteOutput => "writing command output",
+        })
+    }
+}
+
+#[derive(Debug)]
+enum AppError {
+    Arguments(args::ArgumentError),
+    Password(password::PasswordError),
+    Query(query::QueryError),
+    Verification(verify::VerifyError),
+    Vault(VaultError),
+    Search(inex_core::search::SearchError),
+    PasswordRetirementDeferred {
+        new_slot: Uuid,
+    },
+    InvalidDaemonPath,
+    DaemonNotFound,
+    Clock,
+    Io {
+        operation: IoOperation,
+        kind: io::ErrorKind,
+    },
+}
+
+impl AppError {
+    fn io(operation: IoOperation, error: &io::Error) -> Self {
+        Self::Io {
+            operation,
+            kind: error.kind(),
+        }
+    }
+
+    fn exit_code(&self) -> ExitCode {
+        match self {
+            Self::Arguments(_) => ExitCode::from(2),
+            Self::Password(_)
+            | Self::Query(_)
+            | Self::Verification(_)
+            | Self::Vault(_)
+            | Self::Search(_)
+            | Self::PasswordRetirementDeferred { .. }
+            | Self::InvalidDaemonPath
+            | Self::DaemonNotFound
+            | Self::Clock
+            | Self::Io { .. } => ExitCode::FAILURE,
+        }
+    }
+}
+
+impl fmt::Display for AppError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Arguments(error) => write!(formatter, "{error}\n\n{}", args::USAGE),
+            Self::Password(error) => error.fmt(formatter),
+            Self::Query(error) => error.fmt(formatter),
+            Self::Verification(error) => error.fmt(formatter),
+            Self::Vault(error) => error.fmt(formatter),
+            Self::Search(error) => error.fmt(formatter),
+            Self::PasswordRetirementDeferred { new_slot } => write!(
+                formatter,
+                "new password slot {new_slot} is committed, but old-slot retirement could not be confirmed"
+            ),
+            Self::InvalidDaemonPath => formatter.write_str("INEXD_PATH is empty"),
+            Self::DaemonNotFound => formatter.write_str("sibling inexd executable does not exist"),
+            Self::Clock => formatter.write_str("system clock cannot produce a Unix timestamp"),
+            Self::Io { operation, kind } => {
+                write!(formatter, "I/O failed while {operation}: {kind:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AppError {}
+
+impl From<args::ArgumentError> for AppError {
+    fn from(error: args::ArgumentError) -> Self {
+        Self::Arguments(error)
+    }
+}
+
+impl From<password::PasswordError> for AppError {
+    fn from(error: password::PasswordError) -> Self {
+        Self::Password(error)
+    }
+}
+
+impl From<query::QueryError> for AppError {
+    fn from(error: query::QueryError) -> Self {
+        Self::Query(error)
+    }
+}
+
+impl From<verify::VerifyError> for AppError {
+    fn from(error: verify::VerifyError) -> Self {
+        Self::Verification(error)
+    }
+}
+
+impl From<VaultError> for AppError {
+    fn from(error: VaultError) -> Self {
+        Self::Vault(error)
+    }
+}
+
+impl From<inex_core::search::SearchError> for AppError {
+    fn from(error: inex_core::search::SearchError) -> Self {
+        Self::Search(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos());
+            let path = std::env::temp_dir().join(format!(
+                "inex-cli-daemon-selection-{}-{nanos}-{counter}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path)
+                .unwrap_or_else(|error| panic!("test directory creation failed: {error}"));
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn terminal_escaping_blocks_control_sequences() {
+        assert_eq!(
+            escaped_terminal_text("ok\x1b[31m\t\\"),
+            "ok\\u{001B}[31m\\t\\\\"
+        );
+    }
+
+    #[test]
+    fn search_plaintext_in_argv_is_rejected_without_echoing_it() {
+        let error = Cli::parse(["search", "/vault", "search-canary-secret"])
+            .expect_err("query plaintext in argv must be rejected");
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+        assert!(!display.contains("search-canary-secret"));
+        assert!(!debug.contains("search-canary-secret"));
+    }
+
+    #[test]
+    fn explicit_daemon_path_remains_authoritative() {
+        let configured = PathBuf::from("configured-daemon-that-need-not-exist");
+        let selected = configured_daemon_executable(Some(configured.clone().into_os_string()))
+            .unwrap_or_else(|error| panic!("selection failed: {error}"));
+        assert_eq!(selected, Some(configured));
+        assert!(matches!(
+            configured_daemon_executable(Some(OsString::new())),
+            Err(AppError::InvalidDaemonPath)
+        ));
+    }
+
+    #[test]
+    fn sibling_daemon_selection_fails_closed() {
+        let directory = TestDirectory::new();
+        let current = directory
+            .path()
+            .join(if cfg!(windows) { "inex.exe" } else { "inex" });
+        assert!(matches!(
+            sibling_daemon_executable(&current),
+            Err(AppError::DaemonNotFound)
+        ));
+
+        let sibling = directory
+            .path()
+            .join(if cfg!(windows) { "inexd.exe" } else { "inexd" });
+        fs::write(&sibling, b"test executable placeholder")
+            .unwrap_or_else(|error| panic!("sibling creation failed: {error}"));
+        assert_eq!(
+            sibling_daemon_executable(&current)
+                .unwrap_or_else(|error| panic!("sibling selection failed: {error}")),
+            sibling
+        );
+    }
+}

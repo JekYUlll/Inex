@@ -14,6 +14,9 @@ path = "src/main.rs"
 [dependencies]
 inex-core = { path = "../inex-core" }
 inex-daemon = { path = "../inex-daemon" }
+rpassword = "=7.5.4"
+uuid.workspace = true
+zeroize.workspace = true
 
 [lints]
 workspace = true

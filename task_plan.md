@@ -133,9 +133,13 @@ Phase 3 — `inexd`、CLI 与本地协议
 | Core 118/118 and rustdoc passed, but final clippy rejected Linux-only `filesystem_device`'s uniform `Option` return and a manual test `match` | 1 | Keep the cfg-uniform mount API with a narrowly documented lint allowance and use `let...else`, then rerun the complete gate |
 | Native clippy passed, while Windows cross-clippy rejected the cfg-uniform no-op `MountBoundary::contains` receiver | 1 | Add a targeted allowance documenting the shared cross-platform method shape, then rerun Windows clippy/link/tests |
 | Draft alias regression patch missed the current encrypted-draft test tail | 1 | No partial test edit applied; inspect the exact test boundary and insert the independent regression before the next test |
+| Phase 3 integration gate stopped at rustfmt drift in the new sensitive-JSON test | 1 | Record the failed gate, apply canonical workspace formatting, then restart daemon tests/clippy/rustdoc from the beginning |
+| Restarted daemon gate compiled the integrated module but the optional zeroizing-string assertion compared `Option<&String>` with `Option<&str>` | 1 | Use an explicit `as_ref().map(...as_str())` comparison and restart the complete daemon gate |
+| Integrated daemon tests passed 25/25, then pedantic clippy rejected owned encoded input as `needless_pass_by_value` | 1 | Keep ownership so caller copies are wiped on every return, explicitly consume the zeroizing owner after canonical validation, and restart the complete gate |
 
 ## Notes
 
 - `.agent/init_plan.md` 是产品与架构的上位约束；若实现细节与其冲突，先记录并选择不削弱安全边界的方案。
 - 每完成一个阶段立即更新本文件及 `progress.md`；发现和决策持续写入 `findings.md`。
 - 所有破坏性迁移默认禁用；任何 in-place 操作必须显式确认并先完成可验证备份。
+- Git 作为开发容错边界：已通过门禁的阶段/垂直增量单独提交；未完成或未验证的并行改动不混入稳定提交，不改写已共享历史。

@@ -1,0 +1,436 @@
+//! Small, strict command-line parser with redacted diagnostics.
+
+use std::collections::VecDeque;
+use std::ffi::OsString;
+use std::fmt;
+use std::path::PathBuf;
+
+use inex_core::search::DEFAULT_SEARCH_RESULTS;
+use uuid::Uuid;
+
+pub(crate) const USAGE: &str = "\
+Usage:
+  inex init <vault>
+  inex verify <vault>
+  inex password add <vault> [--slot <current-slot-uuid>]
+  inex password remove <vault> <slot-to-remove> --slot <retained-slot-uuid>
+  inex password change <vault> [--slot <old-slot-uuid>]
+  inex search <vault> [--slot <uuid>] [--case-sensitive] [--limit <count>]
+  inex serve
+  inex --help
+  inex --version
+
+Passwords are never accepted in argv or environment variables. By default
+Inex prompts on the controlling TTY with echo disabled. For explicit pipe use,
+set INEX_PASSWORD_STDIN=1 and provide one line per prompt. The line order is
+current, then new and confirmation where applicable.
+
+Search queries follow the same rule: they are read from a hidden TTY prompt,
+or one bounded stdin line with INEX_QUERY_STDIN=1. If both stdin opt-ins are
+set for `search`, provide the password line first and the query line second.
+
+`verify` performs locked structural validation only. It does not authenticate
+vault metadata or document ciphertext.
+";
+
+pub(crate) struct Cli {
+    pub(crate) command: Command,
+}
+
+impl fmt::Debug for Cli {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Cli")
+            .field("command", &self.command.redacted_name())
+            .finish()
+    }
+}
+
+pub(crate) enum Command {
+    Init {
+        vault: PathBuf,
+    },
+    Verify {
+        vault: PathBuf,
+    },
+    Password(PasswordCommand),
+    Search {
+        vault: PathBuf,
+        slot: Option<Uuid>,
+        case_sensitive: bool,
+        limit: usize,
+    },
+    Serve,
+    Help,
+    Version,
+}
+
+impl Command {
+    const fn redacted_name(&self) -> &'static str {
+        match self {
+            Self::Init { .. } => "init",
+            Self::Verify { .. } => "verify",
+            Self::Password(PasswordCommand::Add { .. }) => "password add",
+            Self::Password(PasswordCommand::Remove { .. }) => "password remove",
+            Self::Password(PasswordCommand::Change { .. }) => "password change",
+            Self::Search { .. } => "search <query-from-secure-input>",
+            Self::Serve => "serve",
+            Self::Help => "help",
+            Self::Version => "version",
+        }
+    }
+}
+
+pub(crate) enum PasswordCommand {
+    Add {
+        vault: PathBuf,
+        slot: Option<Uuid>,
+    },
+    Remove {
+        vault: PathBuf,
+        slot_to_remove: Uuid,
+        retained_slot: Uuid,
+    },
+    Change {
+        vault: PathBuf,
+        old_slot: Option<Uuid>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ArgumentError {
+    MissingCommand,
+    UnknownCommand,
+    MissingVault,
+    MissingPasswordSubcommand,
+    UnknownPasswordSubcommand,
+    MissingSlotToRemove,
+    RetainedSlotRequired,
+    MissingOptionValue,
+    InvalidSlot,
+    InvalidLimit,
+    UnexpectedArgument,
+    NonUnicodeCommand,
+    ForbiddenPasswordArgument,
+}
+
+impl fmt::Display for ArgumentError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::MissingCommand => "a command is required",
+            Self::UnknownCommand => "unknown command",
+            Self::MissingVault => "vault path is required",
+            Self::MissingPasswordSubcommand => "password subcommand is required",
+            Self::UnknownPasswordSubcommand => "unknown password subcommand",
+            Self::MissingSlotToRemove => "slot-to-remove UUID is required",
+            Self::RetainedSlotRequired => "password remove requires --slot <retained-slot-uuid>",
+            Self::MissingOptionValue => "command-line option requires a value",
+            Self::InvalidSlot => "slot must be a canonical UUID",
+            Self::InvalidLimit => "search limit must be a positive decimal integer",
+            Self::UnexpectedArgument => "unexpected command-line argument",
+            Self::NonUnicodeCommand => "command and option names must be valid Unicode",
+            Self::ForbiddenPasswordArgument => {
+                "passwords cannot be supplied through command-line arguments"
+            }
+        })
+    }
+}
+
+impl std::error::Error for ArgumentError {}
+
+impl Cli {
+    pub(crate) fn parse<I, S>(arguments: I) -> Result<Self, ArgumentError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<OsString>,
+    {
+        let mut arguments = Arguments::new(arguments);
+        let command = arguments.pop_text()?.ok_or(ArgumentError::MissingCommand)?;
+        let command = match command.as_str() {
+            "init" => Command::Init {
+                vault: arguments.pop_path()?.ok_or(ArgumentError::MissingVault)?,
+            },
+            "verify" => Command::Verify {
+                vault: arguments.pop_path()?.ok_or(ArgumentError::MissingVault)?,
+            },
+            "password" => Command::Password(parse_password(&mut arguments)?),
+            "search" => parse_search(&mut arguments)?,
+            "serve" => Command::Serve,
+            "help" | "--help" | "-h" => Command::Help,
+            "--version" | "-V" => Command::Version,
+            "--password" | "--passphrase" => {
+                return Err(ArgumentError::ForbiddenPasswordArgument);
+            }
+            _ => return Err(ArgumentError::UnknownCommand),
+        };
+        reject_remaining(arguments)?;
+        Ok(Self { command })
+    }
+}
+
+fn parse_password(arguments: &mut Arguments) -> Result<PasswordCommand, ArgumentError> {
+    let subcommand = arguments
+        .pop_text()?
+        .ok_or(ArgumentError::MissingPasswordSubcommand)?;
+    match subcommand.as_str() {
+        "add" => {
+            let vault = arguments.pop_path()?.ok_or(ArgumentError::MissingVault)?;
+            let options = parse_options(arguments, false)?;
+            Ok(PasswordCommand::Add {
+                vault,
+                slot: options.slot,
+            })
+        }
+        "remove" => {
+            let vault = arguments.pop_path()?.ok_or(ArgumentError::MissingVault)?;
+            let slot_to_remove_text = arguments
+                .pop_text()?
+                .ok_or(ArgumentError::MissingSlotToRemove)?;
+            let slot_to_remove = parse_uuid(&slot_to_remove_text)?;
+            let options = parse_options(arguments, false)?;
+            let retained_slot = options.slot.ok_or(ArgumentError::RetainedSlotRequired)?;
+            Ok(PasswordCommand::Remove {
+                vault,
+                slot_to_remove,
+                retained_slot,
+            })
+        }
+        "change" => {
+            let vault = arguments.pop_path()?.ok_or(ArgumentError::MissingVault)?;
+            let options = parse_options(arguments, false)?;
+            Ok(PasswordCommand::Change {
+                vault,
+                old_slot: options.slot,
+            })
+        }
+        "--password" | "--passphrase" => Err(ArgumentError::ForbiddenPasswordArgument),
+        _ => Err(ArgumentError::UnknownPasswordSubcommand),
+    }
+}
+
+fn parse_search(arguments: &mut Arguments) -> Result<Command, ArgumentError> {
+    let vault = arguments.pop_path()?.ok_or(ArgumentError::MissingVault)?;
+    let options = parse_options(arguments, true)?;
+    Ok(Command::Search {
+        vault,
+        slot: options.slot,
+        case_sensitive: options.case_sensitive,
+        limit: options.limit.unwrap_or(DEFAULT_SEARCH_RESULTS),
+    })
+}
+
+#[derive(Default)]
+struct Options {
+    slot: Option<Uuid>,
+    case_sensitive: bool,
+    limit: Option<usize>,
+}
+
+fn parse_options(
+    arguments: &mut Arguments,
+    search_options: bool,
+) -> Result<Options, ArgumentError> {
+    let mut options = Options::default();
+    while let Some(option) = arguments.pop_text()? {
+        match option.as_str() {
+            "--slot" if options.slot.is_none() => {
+                let slot_text = arguments
+                    .pop_text()?
+                    .ok_or(ArgumentError::MissingOptionValue)?;
+                options.slot = Some(parse_uuid(&slot_text)?);
+            }
+            "--case-sensitive" if search_options && !options.case_sensitive => {
+                options.case_sensitive = true;
+            }
+            "--limit" if search_options && options.limit.is_none() => {
+                let limit = arguments
+                    .pop_text()?
+                    .ok_or(ArgumentError::MissingOptionValue)?;
+                let limit = limit
+                    .parse::<usize>()
+                    .map_err(|_| ArgumentError::InvalidLimit)?;
+                if limit == 0 {
+                    return Err(ArgumentError::InvalidLimit);
+                }
+                options.limit = Some(limit);
+            }
+            "--password" | "--passphrase" => {
+                return Err(ArgumentError::ForbiddenPasswordArgument);
+            }
+            _ => return Err(ArgumentError::UnexpectedArgument),
+        }
+    }
+    Ok(options)
+}
+
+fn parse_uuid(value: &str) -> Result<Uuid, ArgumentError> {
+    let parsed = Uuid::parse_str(value).map_err(|_| ArgumentError::InvalidSlot)?;
+    if parsed.to_string() != value {
+        return Err(ArgumentError::InvalidSlot);
+    }
+    Ok(parsed)
+}
+
+fn reject_remaining(mut arguments: Arguments) -> Result<(), ArgumentError> {
+    if let Some(value) = arguments.pop_text()? {
+        if matches!(value.as_str(), "--password" | "--passphrase") {
+            Err(ArgumentError::ForbiddenPasswordArgument)
+        } else {
+            Err(ArgumentError::UnexpectedArgument)
+        }
+    } else {
+        Ok(())
+    }
+}
+
+struct Arguments {
+    values: VecDeque<OsString>,
+}
+
+impl Arguments {
+    fn new<I, S>(arguments: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<OsString>,
+    {
+        Self {
+            values: arguments.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    fn pop_os(&mut self) -> Option<OsString> {
+        self.values.pop_front()
+    }
+
+    fn pop_text(&mut self) -> Result<Option<String>, ArgumentError> {
+        self.pop_os()
+            .map(|value| {
+                value
+                    .into_string()
+                    .map_err(|_| ArgumentError::NonUnicodeCommand)
+            })
+            .transpose()
+    }
+
+    fn pop_path(&mut self) -> Result<Option<PathBuf>, ArgumentError> {
+        let value = self.pop_os();
+        if value
+            .as_ref()
+            .is_some_and(|value| matches!(value.to_str(), Some("--password" | "--passphrase")))
+        {
+            return Err(ArgumentError::ForbiddenPasswordArgument);
+        }
+        Ok(value.map(PathBuf::from))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SLOT_A: &str = "00112233-4455-4677-8899-aabbccddeeff";
+    const SLOT_B: &str = "10213243-5465-4768-9aab-bccddeeff001";
+
+    #[test]
+    fn parses_baseline_commands() {
+        assert!(matches!(
+            Cli::parse(["init", "/vault"]),
+            Ok(Cli {
+                command: Command::Init { .. }
+            })
+        ));
+        assert!(matches!(
+            Cli::parse(["verify", "/vault"]),
+            Ok(Cli {
+                command: Command::Verify { .. }
+            })
+        ));
+        assert!(matches!(
+            Cli::parse(["serve"]),
+            Ok(Cli {
+                command: Command::Serve
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_password_commands_and_requires_retained_slot() {
+        assert!(matches!(
+            Cli::parse(["password", "add", "/vault", "--slot", SLOT_A]),
+            Ok(Cli {
+                command: Command::Password(PasswordCommand::Add { slot: Some(_), .. })
+            })
+        ));
+        assert!(matches!(
+            Cli::parse(["password", "remove", "/vault", SLOT_A]),
+            Err(ArgumentError::RetainedSlotRequired)
+        ));
+        assert!(matches!(
+            Cli::parse(["password", "remove", "/vault", SLOT_A, "--slot", SLOT_B,]),
+            Ok(Cli {
+                command: Command::Password(PasswordCommand::Remove { .. })
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_search_options_without_query_argv() {
+        let cli = Cli::parse([
+            "search",
+            "/vault",
+            "--case-sensitive",
+            "--limit",
+            "3",
+            "--slot",
+            SLOT_A,
+        ])
+        .unwrap_or_else(|error| panic!("parse failed: {error}"));
+        assert!(matches!(
+            cli.command,
+            Command::Search {
+                case_sensitive: true,
+                limit: 3,
+                slot: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_password_and_extra_arguments() {
+        assert!(matches!(
+            Cli::parse(["init", "/vault", "--password", "secret"]),
+            Err(ArgumentError::ForbiddenPasswordArgument)
+        ));
+        assert!(matches!(
+            Cli::parse(["serve", "secret"]),
+            Err(ArgumentError::UnexpectedArgument)
+        ));
+        assert!(matches!(
+            Cli::parse(["search", "/vault", "query-must-not-be-in-argv"]),
+            Err(ArgumentError::UnexpectedArgument)
+        ));
+        assert!(matches!(
+            Cli::parse(["--password", "secret"]),
+            Err(ArgumentError::ForbiddenPasswordArgument)
+        ));
+    }
+
+    #[test]
+    fn rejects_noncanonical_uuid_and_zero_limit() {
+        assert!(matches!(
+            Cli::parse([
+                "password",
+                "add",
+                "/vault",
+                "--slot",
+                &SLOT_A.to_uppercase()
+            ]),
+            Err(ArgumentError::InvalidSlot)
+        ));
+        assert!(matches!(
+            Cli::parse(["search", "/vault", "--limit", "0"]),
+            Err(ArgumentError::InvalidLimit)
+        ));
+    }
+}

@@ -92,6 +92,9 @@
 | Recovery 对 journal path 重新执行 no-link/no-mount/identity 验证 | 合法 journal 创建后祖先仍可能被换成 symlink/junction/mount；不重新验证会让 recovery 在 vault 外 inspect/remove |
 | Search 查询用完整 ciphertext fingerprint 而非 metadata fast path | 正确性和不返回 stale plaintext 优先于查询前的额外密文 I/O；metadata-preserving external mutation 必须可检测 |
 | Windows GNU shim 仅服务交叉验证，发布矩阵以原生 MSVC 为主 | shim 已通过 link/Wine ABI 测试，但 Wine 不能替代 NTFS/ReFS power-loss 和 native handle semantics evidence |
+| 开发过程以 Git verified checkpoint 管理 | Phase 1/2 的完整可构建基线提交为 `075f8fd`；后续按协议/session/handler/CLI/editor 等可独立回滚的验收增量提交，禁止把未过门禁状态混入 checkpoint |
+| stdio server 必须以 bounded reader channel + 定时主循环驱动 idle expiry | 单线程阻塞读取下一帧会让无请求会话的 master key/search index 超过 15 分钟驻留；session 的惰性 expiry 只有配合 watchdog 才满足协议 |
+| `inex serve` 只信任同目录 `inexd` 或显式 `INEXD_PATH` | sibling 缺失时隐式 PATH 搜索可能把后续解锁口令交给同名恶意程序，生产启动路径必须失败关闭 |
 
 ## Issues Encountered
 
