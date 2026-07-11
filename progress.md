@@ -143,12 +143,22 @@
 
 ### Phase 4: VS Code 主客户端
 
-- **Status:** in_progress
+- **Status:** complete
 - **Started:** 2026-07-11 (Asia/Shanghai)
+- Actions taken:
+  - 实现 strict Content-Length RPC client 与 explicit/bundled-only sidecar resolution；不存在 PATH fallback，child exit、stdio/protocol fault、session expiry 均进入一次性 fail-closed lock。
+  - 实现真实 `*.md.enc` `CustomEditorProvider`、Tree View、搜索、heading/link/wiki-link/backlink 导航，以及 generation-bound document handles；plaintext 不注册为 `TextDocument`。
+  - 实现 EDRY encrypted backup/recovery、stale draft 二次确认、save-time webview snapshot、etag conflict、dirty save/discard/cancel 和 lock 时 script-free locked page 替换。
+  - 对 framing、sidecar、路径、bounded file、Markdown 与 residue scanner 建立 20 个 Node 测试；`pnpm check`、20/20 tests、100.6 KiB production bundle 与 integration bundle 全部通过。
+  - 在本机 VS Code 与最低支持的 1.125.0 上分别运行真实 Extension Host backup/recovery + isolated-root canary 扫描，均 exit 0；runner 同时检查并清理残留进程/目录。
+  - 最终只读安全审阅给出 GO；打包 VSIX + bundled platform `inexd` 安装 smoke，以及 Windows/Linux 持久 profile 的跨进程 Hot Exit/Local History/crash restore 继续作为 Phase 7 发布证据，不扩大 Phase 4 的自动化结论。
+  - 将 hardened VS Code client、安全文档与测试 harness 独立提交为 `f51d4e9`（`feat: add hardened VS Code encrypted editor`），未混入 Sublime 工作树。
+- **Completed:** 2026-07-11 (Asia/Shanghai)
 
 ### Phase 5: Sublime 轻量客户端
 
-- **Status:** pending
+- **Status:** in_progress
+- **Started:** 2026-07-11 (Asia/Shanghai)
 
 ### Phase 6: Git 合并、迁移与恢复工具
 
@@ -184,11 +194,13 @@
 | search freshness adversary | same-size ciphertext tamper + restore accessed/modified timestamps | query invalidates plaintext index before returning stale hit | `SearchIndexNotReady` regression passes | PASS |
 | rebind recovery escape adversary | valid journal then replace source ancestor with symlink | recovery conflicts and leaves redirected ciphertext untouched | regression passes | PASS |
 | VS Code Phase 4 foundation | `pnpm check && pnpm test && pnpm build` | strict TypeScript, framing/sidecar unit tests, and production bundle all pass | passed; 6/6 Node tests; 43.5 KiB bundle | PASS |
-| VS Code hardened client/navigation | `pnpm check && pnpm test && pnpm build` | strict TypeScript, bounded protocol/path/file/Markdown/EPIPE tests, and production bundle pass | passed; 14/14 Node tests; 83.3 KiB bundle | PASS |
+| VS Code hardened client/navigation | `pnpm check && pnpm test && pnpm build && pnpm test:extension:build` | strict TypeScript, bounded protocol/path/file/Markdown/EPIPE/residue tests, production and integration bundles pass | passed; 20/20 Node tests; 100.6 KiB production bundle | PASS |
 | authenticated keepalive daemon | daemon 57 tests + process E2E + pedantic clippy + rustdoc | optional-session ping renews idle deadline without weakening session errors | all passed; committed as `cb8e17c` | PASS |
 | Phase 3 staged import | `cargo test --workspace --all-targets` | dry-run/copy import, verified staging, source preservation, no-replace publication and failure classification pass | 221/221 passed | PASS |
 | Phase 3 import static gates | fmt + pedantic clippy + rustdoc `-D warnings` + diff check | no formatting, lint, documentation or whitespace failures | all passed | PASS |
 | Phase 3 import Windows smoke | Windows GNU no-run/clippy + Wine tests | cross-platform API/link behavior compiles and Wine suite passes | no-run/clippy passed; Wine 215/215 | PASS (non-native) |
+| VS Code current Extension Host | isolated user/extensions/temp/vault roots on local VS Code | encrypted backup/recovery succeeds and dynamic canary leaves no detected residue | exit 0; residue audit passed | PASS |
+| VS Code minimum Extension Host | same harness on VS Code 1.125.0 | minimum supported engine follows the same encrypted recovery contract | exit 0; residue audit passed | PASS |
 
 ## Error Log
 
@@ -224,8 +236,8 @@
 
 | Question | Answer |
 |----------|--------|
-| Where am I? | Phase 4 — VS Code 主客户端 |
-| Where am I going? | VS Code → Sublime → Git merge/recovery → release verification |
+| Where am I? | Phase 5 — Sublime 轻量客户端 |
+| Where am I going? | Sublime → Git merge/recovery → release verification |
 | What's the goal? | 交付 init plan 定义的跨平台密文仓库与编辑器虚拟明文系统 |
 | What have I learned? | 见 `findings.md`：冻结格式、依赖、编辑器备份风险与失败安全边界 |
-| What have I done? | 完成 Phase 1/2 与 Phase 3 sidecar/CLI/import，并以独立 Git checkpoint 固化；正在验收 VS Code 主客户端 |
+| What have I done? | 完成 Phase 1/2/3 与 Phase 4 VS Code 主客户端，并以独立 Git checkpoint 固化；正在收敛 Sublime experimental 客户端 |

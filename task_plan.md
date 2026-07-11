@@ -6,7 +6,7 @@
 
 ## Current Phase
 
-Phase 4 — VS Code 主客户端
+Phase 5 — Sublime 轻量客户端
 
 ## Scope and Acceptance Baseline
 
@@ -47,12 +47,12 @@ Phase 4 — VS Code 主客户端
 
 ### Phase 4: VS Code 主客户端
 
-- [ ] 实现 sidecar 生命周期、密码输入、vault unlock/lock 与状态展示
-- [ ] 实现 Tree View、真实 `*.md.enc` CustomEditorProvider 与加密 draft backup；不暴露 plaintext TextDocument
-- [ ] 在受控编辑器内实现 Markdown link/heading/backlink、内存搜索结果面板与定位
-- [ ] 黑盒审计 VS Code backup/Local History，并检测相关明文残留风险、提供工作区级安全引导
-- [ ] 添加 lint、类型检查、单元测试与 Extension Host 集成测试基础
-- **Status:** in_progress
+- [x] 实现 sidecar 生命周期、密码输入、vault unlock/lock 与状态展示
+- [x] 实现 Tree View、真实 `*.md.enc` CustomEditorProvider 与加密 draft backup；不暴露 plaintext TextDocument
+- [x] 在受控编辑器内实现 Markdown link/heading/backlink、内存搜索结果面板与定位
+- [x] 使用真实 Extension Host 黑盒验证 encrypted backup/recovery 并扫描 isolated profile；持久 profile/Local History/crash 矩阵留作 Phase 7 发布门禁
+- [x] 添加 lint、类型检查、单元测试与 Extension Host 集成测试基础
+- **Status:** complete
 
 ### Phase 5: Sublime 轻量客户端
 
@@ -61,7 +61,7 @@ Phase 4 — VS Code 主客户端
 - [ ] 拦截可拦截的 save/close 命令，并在全局 hot_exit/recent-files gate 不满足时拒绝可写模式
 - [ ] 实现搜索、跳转与 plugin-host/应用退出失败安全降级
 - [ ] 添加 Python 单元测试与 Safe Mode/独立 data-dir canary 残留矩阵
-- **Status:** pending
+- **Status:** in_progress
 
 ### Phase 6: Git 合并、迁移与恢复工具
 
