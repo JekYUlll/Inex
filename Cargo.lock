@@ -283,6 +283,7 @@ dependencies = [
  "base64",
  "inex-core",
  "serde_json",
+ "uuid",
  "zeroize",
 ]
 

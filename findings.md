@@ -92,9 +92,12 @@
 | Recovery 对 journal path 重新执行 no-link/no-mount/identity 验证 | 合法 journal 创建后祖先仍可能被换成 symlink/junction/mount；不重新验证会让 recovery 在 vault 外 inspect/remove |
 | Search 查询用完整 ciphertext fingerprint 而非 metadata fast path | 正确性和不返回 stale plaintext 优先于查询前的额外密文 I/O；metadata-preserving external mutation 必须可检测 |
 | Windows GNU shim 仅服务交叉验证，发布矩阵以原生 MSVC 为主 | shim 已通过 link/Wine ABI 测试，但 Wine 不能替代 NTFS/ReFS power-loss 和 native handle semantics evidence |
-| 开发过程以 Git verified checkpoint 管理 | Phase 1/2 的完整可构建基线提交为 `075f8fd`；后续按协议/session/handler/CLI/editor 等可独立回滚的验收增量提交，禁止把未过门禁状态混入 checkpoint |
+| 开发过程以 Git verified checkpoint 管理 | Phase 1/2 基线为 `075f8fd`，Phase 3 协议/session/CLI foundation 为 `99044dc`；后续继续按 handler/server/editor 等可独立回滚的验收增量提交，禁止把未过门禁状态混入 checkpoint |
 | stdio server 必须以 bounded reader channel + 定时主循环驱动 idle expiry | 单线程阻塞读取下一帧会让无请求会话的 master key/search index 超过 15 分钟驻留；session 的惰性 expiry 只有配合 watchdog 才满足协议 |
 | `inex serve` 只信任同目录 `inexd` 或显式 `INEXD_PATH` | sibling 缺失时隐式 PATH 搜索可能把后续解锁口令交给同名恶意程序，生产启动路径必须失败关闭 |
+| CLI hidden-TTY 的读取期硬上限需要修补/替换 `rpassword` | 7.5.4 的公开 TTY 路径在 Enter 前持续增长私有 `SafeString`，自定义 bounded Reader 又失去 Unix echo-off/Windows Console mode；当前显式 stdin 是硬上限路径，TTY 限制如实文档化且不得假称已解决 |
+| handler 本身也必须是 fail-closed 终态机 | 即使 stdio transport 正常会在 shutdown/mismatch 响应后退出，公开 dispatcher 仍不得在终态继续 hello/create/unlock；active vault 也只能显式 lock 后再 unlock，不能由无旧 capability 的请求静默替换 |
+| RPC 结果在构造期必须预留 framing 上界 | core tree 的合法资源上限可能大于单帧 24 MiB；listTree 在分配结果项时按保守 JSON 上界计数并提前返回 `LIMIT_EXCEEDED`，不能等 writer 无法发送后才失败 |
 
 ## Issues Encountered
 

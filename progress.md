@@ -117,6 +117,19 @@
   - CLI 完成 init/locked verify/password add-remove-change/search/serve：口令和查询均不进入 argv/env value，查询通过隐藏 TTY 或显式有界 stdin；独立 18/18 tests 后又通过 workspace 162/162 tests、clippy 与 rustdoc。
   - 并行安全审计发现两个集成前 hardening 项：阻塞 stdio 不能让 idle session 无限驻留，server 必须定时唤醒并触发 expiry；`inex serve` 缺少 sibling daemon 时必须 fail closed，禁止隐式 PATH 回退。
   - 修复 `inex serve` PATH 劫持面：仅接受同目录 daemon 或显式非空 `INEXD_PATH`；最终基础增量 workspace gate 为 CLI 20/20 + core 119/119 + daemon 35/35，fmt、clippy `-D warnings`、rustdoc `-D warnings` 与 diff whitespace 全通过。
+  - 将上述可独立回滚的 Phase 3 基础增量提交为 `99044dc`（`feat: add secure RPC and CLI foundations`）；handler/watchdog/E2E 未混入该稳定 checkpoint。
+  - 首次把 20-method handler 接入真实 crate 后，编译在一个 zeroizing string 匹配类型、未使用 import 和漏映射的 plaintext-size variant 处停止；已按 planning-with-files 先记录再做最小修复。
+  - handler 编译修复后的重跑先被 rustfmt 门禁拦截；按门禁顺序记录并格式化后从 tests 重新开始。
+  - handler/params 接入后 daemon 48/48 tests 通过；随后的 pedantic clippy 在机械 match/ownership 风格和一个完整生命周期测试长度处停止，已记录后按不改变行为的最小范围修正。
+  - 处理 CLI 审计项：解锁凭据尽早 drop、snippet 流式转义、密码元数据 durability/弱 KDF 逐槽告警、search limit 前置拒绝、verify mutation/recovery 披露；22/22 tests、完整 clippy/rustdoc 通过并提交为 `7128a8b`（`fix: harden CLI secret and durability handling`）。
+  - 核对 `rpassword 7.5.4` 源码确认其 hidden-TTY 公共 API 无调用方输入硬上限；显式 stdin 仍为读取期硬上限，TTY 只能 Enter 后检查，已在 CLI help/module docs 明示并保留为后续依赖修补项。
+  - handler 对抗审计确认 session 错误同码、shutdown 终态、active-vault unlock、listTree 输出预算和 TreeError 分类五个语义缺口；在 server checkpoint 前全部按冻结协议收敛并补回归测试。
+  - 五项 handler 审计回归加入后的首轮门禁仅在两处 rustfmt 差异停止；已记录并从格式化后重启完整 daemon 门禁。
+  - audit-hardened daemon 57/57 tests 通过后，clippy 要求合并 terminal/pre-hello 的同结果分支；保持错误语义不变并重跑全门禁。
+  - shipped `inexd` 进程级 framed RPC E2E 首次通过；随后 clippy 仅对完整生命周期场景的 108 行长度停止，采用窄 test-only 说明后重跑。
+  - 完成 production `inexd`：zero-capacity reader backpressure、1 秒 idle watchdog、aligned-body error continuation、desync termination、response/request scrub、clean EOF/shutdown wipe；Linux daemon 57/57 + process E2E 1/1 通过。
+  - 通过最终 workspace gate：CLI 22/22、core 119/119、daemon 57/57、process E2E 1/1，fmt、pedantic clippy `-D warnings`、rustdoc `-D warnings` 与 whitespace check 全部通过。
+  - 通过 Windows GNU workspace clippy 与全 target no-run link；Wine 实跑 CLI 21/21、daemon 57/57、`inexd` process E2E 1/1。原生 NTFS/ReFS 与 MSVC 仍保留为 Phase 7 发布门禁。
 
 ### Phase 4: VS Code 主客户端
 

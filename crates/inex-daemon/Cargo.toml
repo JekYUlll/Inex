@@ -19,6 +19,7 @@ path = "src/bin/inexd.rs"
 base64.workspace = true
 inex-core = { path = "../inex-core" }
 serde_json.workspace = true
+uuid.workspace = true
 zeroize.workspace = true
 
 [lints]

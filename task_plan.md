@@ -39,10 +39,10 @@ Phase 3 — `inexd`、CLI 与本地协议
 
 ### Phase 3: `inexd`、CLI 与本地协议
 
-- [ ] 实现 stdio JSON-RPC 2.0 server、结构化错误与无秘密日志策略
-- [ ] 实现 session token、空闲锁定、缓存淘汰、并发/etag 冲突与 shutdown 清理
+- [x] 实现 stdio JSON-RPC 2.0 server、结构化错误与无秘密日志策略
+- [x] 实现 session token、空闲锁定、缓存淘汰、并发/etag 冲突与 shutdown 清理
 - [ ] 实现 `inex` CLI 的 init/import/verify/password/search/serve 命令
-- [ ] 添加协议契约测试与端到端进程测试
+- [x] 添加协议契约测试与端到端进程测试
 - **Status:** in_progress
 
 ### Phase 4: VS Code 主客户端
@@ -136,6 +136,12 @@ Phase 3 — `inexd`、CLI 与本地协议
 | Phase 3 integration gate stopped at rustfmt drift in the new sensitive-JSON test | 1 | Record the failed gate, apply canonical workspace formatting, then restart daemon tests/clippy/rustdoc from the beginning |
 | Restarted daemon gate compiled the integrated module but the optional zeroizing-string assertion compared `Option<&String>` with `Option<&str>` | 1 | Use an explicit `as_ref().map(...as_str())` comparison and restart the complete daemon gate |
 | Integrated daemon tests passed 25/25, then pedantic clippy rejected owned encoded input as `needless_pass_by_value` | 1 | Keep ownership so caller copies are wiped on every return, explicitly consume the zeroizing owner after canonical validation, and restart the complete gate |
+| First handler integration compile found one `Zeroizing<String>` deref mismatch, an unused timeout import, and an uncovered `PlaintextTooLarge` error variant | 1 | Record the failed compile, compare through `as_ref().as_str()`, remove the unused import, map the size variant to `LIMIT_EXCEEDED`, then restart daemon tests |
+| Handler restart stopped at canonical rustfmt differences after the compile fix | 1 | Apply workspace rustfmt, then restart compilation/tests rather than treating them as executed |
+| Handler 48/48 tests passed, then pedantic clippy found mechanical ownership/match-style issues and one long lifecycle test | 1 | Merge identical error arms, borrow non-consumed wrappers/errors, collapse the nested condition, make the test helper consume its value explicitly, and narrowly document the intentional end-to-end test length |
+| Handler audit regression additions introduced two rustfmt-only differences | 1 | Record the gate stop, run canonical workspace formatting, and restart daemon tests/clippy/rustdoc |
+| Audit-hardened daemon passed 57/57 tests, then clippy found identical fail-closed branches for terminal and pre-hello states | 1 | Combine the two predicates into one unavailable-state guard and rerun the complete daemon gate |
+| Process E2E passed, then clippy rejected its single 108-line lifecycle scenario | 1 | Keep the framed unlock/write/read/search/lock/shutdown flow as one auditable scenario and add a narrow documented test-only allowance |
 
 ## Notes
 

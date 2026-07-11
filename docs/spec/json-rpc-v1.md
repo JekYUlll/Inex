@@ -20,6 +20,11 @@ an explicit protocol compatibility decision.
   terminate before unlock.
 - One stdio child serves at most one vault at a time. Session capabilities are
   additionally bound to that transport; they are not valid in another child.
+- `vaultPath` is an absolute UTF-8/JSON path. Relative paths are rejected so a
+  client's working directory cannot silently select another vault.
+- The dispatcher is terminal after `system.shutdown` or a protocol-major
+  mismatch. A live vault must be explicitly locked before another
+  `vault.unlock`; an unauthenticated request cannot rotate an active session.
 
 ## Capability sessions
 
@@ -27,6 +32,10 @@ an explicit protocol compatibility decision.
 token is required in every protected method, scoped to one daemon process and
 vault, expires after an idle timeout, and is never persisted. An invalid token
 uses the same error as an expired token.
+
+The stdio server checks expiry at least once per second even while stdin is
+blocked. Missing, empty, wrongly typed, oversized, expired, locked, and unknown
+session values all return `SESSION_INVALID`; their shape is not an oracle.
 
 ## Core methods
 
@@ -56,6 +65,37 @@ uses the same error as an expired token.
 Vault administration, bulk import, verification, and Git merge-driver commands
 are CLI-first in v1 so editor clients do not gain unnecessary destructive
 capabilities.
+
+## Exact parameter schemas
+
+Every `params` value is an object with all and only the fields listed below.
+Unknown fields are rejected. UUIDs are lowercase hyphenated strings, etags are
+`sha256:` followed by 64 lowercase hex digits, and binary fields are canonical
+unpadded base64url.
+
+| Method | Exact v1 fields |
+|--------|-----------------|
+| `system.hello` | `client` string, `clientVersion` string, integer `protocolMajor` |
+| `system.ping`, `system.shutdown` | no fields |
+| `vault.create` | absolute `vaultPath`, `password`, optional `kdf` object containing exactly `opsLimit` and `memLimitBytes` |
+| `vault.unlock` | absolute `vaultPath`, `password`, optional canonical `slotId` |
+| `vault.lock`, `vault.status` | `session` |
+| `vault.listTree` | `session`, optional canonical directory `prefix`; empty prefix means root |
+| `file.stat`, `file.read`, `document.open` | `session`, canonical Markdown `logicalPath` |
+| `file.write` | `session`, `logicalPath`, `contentBase64`, and exactly one of canonical `ifMatch` or `ifNoneMatch: "*"` |
+| `file.mkdir` | `session`, canonical directory `logicalPath`; empty root is not creatable |
+| `file.rename` | `session`, canonical `from`/`to`, `sourceEtag`, and `destinationIfNoneMatch: "*"` |
+| `file.delete` | `session`, `logicalPath`, `ifMatch`, Boolean `recursive`; v1 accepts only `false` because multi-entry recursive deletion has no crash-atomic transaction yet |
+| `document.close` | `session`, opaque `handle` |
+| `draft.encrypt` | `session`, exactly one of `handle`/`logicalPath`, `contentBase64`, optional `baseEtag` |
+| `draft.decrypt` | `session`, `logicalPath`, `draftBase64` |
+| `search.query` | `session`, `query`, optional `limit`, `caseSensitive`, and `snippetByteLimit` |
+| `cache.evict` | `session`, optional file `logicalPath` |
+
+`vault.listTree` applies a conservative serialized-response budget while
+building results. A legal but exceptionally large tree returns
+`LIMIT_EXCEEDED` rather than constructing a response that the 24 MiB framing
+layer cannot transmit. Pagination is reserved for a later protocol revision.
 
 ## Representative exchange
 

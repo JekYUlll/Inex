@@ -1,8 +1,22 @@
 //! Inex local sidecar process.
 
-fn main() {
-    // The stdio transport is wired in Phase 3. Keeping the binary present now
-    // makes packaging and editor-client discovery paths testable from Phase 1.
-    eprintln!("inexd: JSON-RPC transport is not implemented yet");
-    std::process::exit(2);
+use std::process::ExitCode;
+
+use inex_daemon::server::{ServerExit, run_stdio};
+
+fn main() -> ExitCode {
+    match run_stdio() {
+        Ok(ServerExit::CleanEof | ServerExit::ShutdownRequested) => ExitCode::SUCCESS,
+        Ok(ServerExit::Desynchronized(error)) => {
+            eprintln!(
+                "inexd: protocol stream desynchronized ({})",
+                error.stable_name()
+            );
+            ExitCode::from(2)
+        }
+        Err(error) => {
+            eprintln!("inexd: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
