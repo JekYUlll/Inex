@@ -174,17 +174,31 @@ impl<C: MonotonicClock> RpcService<C> {
             "server": "inexd",
             "serverVersion": env!("CARGO_PKG_VERSION"),
             "protocolMajor": PROTOCOL_MAJOR,
-            "capabilities": ["vault", "files", "documents", "encryptedDrafts", "search"],
+            "capabilities": ["vault", "files", "documents", "encryptedDrafts", "search", "authenticatedPing"],
         }))
     }
 
     fn system_ping(&mut self, params: Params) -> RpcResult {
-        ParamObject::new(params).finish()?;
+        let mut params = ParamObject::new(params);
+        let session = params
+            .optional_sensitive_string("session", 1, MAX_CAPABILITY_TEXT_BYTES)
+            .map_err(|_| ErrorObject::new(ErrorCode::SessionInvalid))?;
+        params.finish()?;
+        let idle_timeout_ms = session
+            .as_ref()
+            .map(|session| {
+                self.sessions
+                    .idle_remaining(session.as_str())
+                    .map(duration_ms)
+                    .map_err(map_session_error)
+            })
+            .transpose()?;
         let uptime_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
         Ok(json!({
             "ok": true,
             "uptimeMs": uptime_ms,
             "sessionActive": self.sessions.is_active(),
+            "idleTimeoutMs": idle_timeout_ms,
         }))
     }
 
@@ -1124,6 +1138,17 @@ mod tests {
         );
         assert!(!session.is_empty());
         scrub_object(&mut unlocked);
+
+        let mut keepalive = response(
+            &mut service,
+            21,
+            "system.ping",
+            json!({"session": session.as_str()}),
+        );
+        assert_eq!(keepalive["result"]["ok"], true);
+        assert_eq!(keepalive["result"]["sessionActive"], true);
+        assert!(keepalive["result"]["idleTimeoutMs"].as_u64().is_some());
+        scrub_object(&mut keepalive);
 
         let mut replacement = response(
             &mut service,

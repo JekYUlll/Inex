@@ -42,7 +42,7 @@ session values all return `SESSION_INVALID`; their shape is not an oracle.
 | Method | Important params | Result summary |
 |--------|------------------|----------------|
 | `system.hello` | `client`, `clientVersion`, `protocolMajor` | server/version/capabilities |
-| `system.ping` | none | monotonic health information, no secrets |
+| `system.ping` | optional `session` | monotonic health information; an authenticated ping renews idle allowance |
 | `system.shutdown` | none | acknowledgement, then wipe and exit |
 | `vault.create` | `vaultPath`, `password`, optional KDF policy | vault id and warnings |
 | `vault.unlock` | `vaultPath`, `password`, optional `slotId` | session, vault id, expiry, warnings |
@@ -76,7 +76,8 @@ unpadded base64url.
 | Method | Exact v1 fields |
 |--------|-----------------|
 | `system.hello` | `client` string, `clientVersion` string, integer `protocolMajor` |
-| `system.ping`, `system.shutdown` | no fields |
+| `system.ping` | optional `session`; response `idleTimeoutMs` is null without it and the renewed allowance with it |
+| `system.shutdown` | no fields |
 | `vault.create` | absolute `vaultPath`, `password`, optional `kdf` object containing exactly `opsLimit` and `memLimitBytes` |
 | `vault.unlock` | absolute `vaultPath`, `password`, optional canonical `slotId` |
 | `vault.lock`, `vault.status` | `session` |
@@ -101,7 +102,7 @@ layer cannot transmit. Pagination is reserved for a later protocol revision.
 
 ```json
 {"jsonrpc":"2.0","id":1,"method":"system.hello","params":{"client":"vscode","clientVersion":"0.1.0","protocolMajor":1}}
-{"jsonrpc":"2.0","id":1,"result":{"server":"inexd","serverVersion":"0.1.0","protocolMajor":1,"capabilities":["vault","files","documents","encryptedDrafts","search"]}}
+{"jsonrpc":"2.0","id":1,"result":{"server":"inexd","serverVersion":"0.1.0","protocolMajor":1,"capabilities":["vault","files","documents","encryptedDrafts","search","authenticatedPing"]}}
 {"jsonrpc":"2.0","id":2,"method":"file.read","params":{"session":"...","logicalPath":"2026/07/2026-07-10.md"}}
 {"jsonrpc":"2.0","id":2,"result":{"contentBase64":"IyBUaXRsZQo","etag":"sha256:...","metadata":{"createdAt":1783699200000,"modifiedAt":1783699200000,"flags":0}}}
 ```
