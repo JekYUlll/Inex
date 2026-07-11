@@ -66,7 +66,7 @@ traversal, case-fold collisions, plaintext `.md` inside the vault, and wrong-cas
 `.md.enc` suffixes.
 
 Do not work around the check by disabling Git NTFS protection or moving files
-with ordinary filesystem tools. Copy a clean backup to a supported local path
+with ordinary filesystem tools. Copy a clean backup to an accepted local path
 and diagnose the rejected entry by its safe relative-name error.
 
 Linux copy import also requires usable `openat2` so absolute ancestors and
@@ -88,7 +88,7 @@ conflict.
 The exact requested ciphertext may already be the live target even though the
 platform did not confirm the parent namespace durability barrier. Do not repeat
 the write blindly. Save a ciphertext snapshot, run structural verification,
-unlock/read the target, and move the vault to a supported filesystem if this is
+unlock/read the target, and move the vault to an accepted local filesystem if this is
 recurrent. Such a platform is not release-qualified until its crash matrix
 passes.
 

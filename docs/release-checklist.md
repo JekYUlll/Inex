@@ -89,7 +89,10 @@ RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps
 test -z "$(git status --porcelain=v1 --untracked-files=all)"
 empty_tree=$(git hash-object -t tree /dev/null)
 git diff --check "$empty_tree" HEAD -- .
-actionlint .github/workflows/*.yml
+GOBIN="$PWD/target/tools" \
+  go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+test "$(target/tools/actionlint -version | sed -n '1p')" = "v1.7.12"
+target/tools/actionlint .github/workflows/*.yml
 ```
 
 - [ ] The commit is clean, tagged intentionally, and contains no test secret,
@@ -151,7 +154,10 @@ actionlint .github/workflows/*.yml
 
 ## VS Code gate
 
-Run the source gates first:
+Run the source gates first. The named Extension Host scripts below are the
+Linux/Xvfb harnesses and assume the local host at `/usr/share/code/code` plus
+the downloaded 1.125 build; they are not native Windows commands. The Windows
+release matrix must drive an equivalent explicit native host/profile path.
 
 ```sh
 cd editors/vscode

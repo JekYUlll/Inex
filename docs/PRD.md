@@ -44,7 +44,7 @@ on Windows and Linux and uses Git for history/synchronization.
 |----|-------------|---------|---------|
 | P1-01 | Unlock/lock and clear session state. | Required | Required |
 | P1-02 | Browse logical folders and files. | Tree View | Quick Panel |
-| P1-03 | Open/edit/save Markdown without a plaintext mirror or editor backup. | Custom editor + encrypted draft backup | Scratch buffer + encrypted draft (experimental until residue gate passes) |
+| P1-03 | Open/edit/save Markdown without a plaintext mirror or plaintext editor backup. | Custom editor + encrypted draft backup | Scratch buffer + encrypted draft (experimental until residue gate passes) |
 | P1-04 | Create logical Markdown files/folders and rename/delete Markdown files. Multi-file directory rename/delete is deferred. | Required | Command based |
 | P1-05 | Search plaintext using a memory-only index. | Secure extension panel | Results Quick Panel |
 | P1-06 | Follow relative Markdown/wiki links and headings. | Custom-editor navigation/buttons | Commands |

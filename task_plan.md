@@ -6,7 +6,7 @@
 
 ## Current Phase
 
-Phase 5 — Sublime 轻量客户端
+Phase 7 — 跨平台验证、打包与发布准备
 
 ## Scope and Acceptance Baseline
 
@@ -50,34 +50,37 @@ Phase 5 — Sublime 轻量客户端
 - [x] 实现 sidecar 生命周期、密码输入、vault unlock/lock 与状态展示
 - [x] 实现 Tree View、真实 `*.md.enc` CustomEditorProvider 与加密 draft backup；不暴露 plaintext TextDocument
 - [x] 在受控编辑器内实现 Markdown link/heading/backlink、内存搜索结果面板与定位
+- [x] 实现 create/mkdir/etag-conditional rename/delete，并在 custom-editor 关闭或 RPC 失败时认证对账与恢复
 - [x] 使用真实 Extension Host 黑盒验证 encrypted backup/recovery 并扫描 isolated profile；持久 profile/Local History/crash 矩阵留作 Phase 7 发布门禁
 - [x] 添加 lint、类型检查、单元测试与 Extension Host 集成测试基础
 - **Status:** complete
 
 ### Phase 5: Sublime 轻量客户端
 
-- [ ] 实现 sidecar 客户端、vault 解锁与 Quick Panel 树浏览
-- [ ] 实现 scratch Markdown buffer、自管 dirty/版本、加密 draft debounce 与安全写回
-- [ ] 拦截可拦截的 save/close 命令，并在全局 hot_exit/recent-files gate 不满足时拒绝可写模式
-- [ ] 实现搜索、跳转与 plugin-host/应用退出失败安全降级
-- [ ] 添加 Python 单元测试与 Safe Mode/独立 data-dir canary 残留矩阵
-- **Status:** in_progress
+- [x] 实现 sidecar 客户端、vault 解锁与 Quick Panel 树浏览
+- [x] 实现 scratch Markdown buffer、自管 dirty/版本、加密 draft debounce 与安全写回
+- [x] 拦截可拦截的 save/close 命令，并在全局 hot_exit/recent-files gate 不满足时拒绝可写模式
+- [x] 实现搜索、跳转与 plugin-host/应用退出失败安全降级
+- [x] 添加 61 项 Python 测试与独立 data-dir Build 4200 canary/CRUD/宿主崩溃边界矩阵；记录 Safe Mode 不加载第三方包的限制
+- **Status:** complete（experimental；宿主崩溃后需重启 Sublime 的平台边界不宣称已消除）
 
 ### Phase 6: Git 合并、迁移与恢复工具
 
-- [ ] 实现 `.gitattributes`、locked-safe `inex merge-driver` 与已解锁插件/CLI 三方合并
-- [ ] 实现加密冲突状态与编辑器内解决流程
+- [x] 实现 `.gitattributes`、locked-safe `inex merge-driver` 与已解锁 CLI 三方合并
+- [x] 实现加密冲突状态、普通编辑器保存清旗与 journal 恢复流程
 - [x] 实现 plaintext copy-import/dry-run、校验报告，并明确拒绝破坏性 in-place 转换
-- [ ] 实现 vault verify/备份恢复说明，确保失败不破坏源数据
-- **Status:** pending
+- [x] 实现 vault verify/pending recovery 报告与恢复说明，确保失败不破坏源数据
+- **Status:** complete
 
 ### Phase 7: 跨平台验证、打包与发布准备
 
 - [ ] 跑通格式、性质、RPC、编辑器、Git、Unicode/长路径/换行的验证矩阵
-- [ ] 配置 Linux/Windows x64/arm64 CI、Rust 二进制、VSIX 与 Sublime 包产物
-- [ ] 完成 threat model、用户指南、安全配置、迁移/升级与故障恢复文档
+- [ ] 闭合 binding Git rename/modify 场景；若不实现，必须同步修订 PRD、acceptance matrix 与 release scope，不得静默豁免
+- [x] 配置 Linux/Windows x64/arm64 CI、Rust 二进制、VSIX 与 Sublime 包产物；远端 hosted jobs 尚待执行
+- [x] 完成 threat model、用户指南、安全配置、迁移/升级与故障恢复文档
 - [ ] 审计磁盘明文残留、日志秘密、依赖许可与发布清单
-- **Status:** pending
+- [ ] 在最终 clean commit 上用 system GCC 完成两次逐字节一致的 Linux x64 package/audit/native-dependency/VSIX-install smoke
+- **Status:** in_progress
 
 ## Key Questions
 
@@ -101,6 +104,9 @@ Phase 5 — Sublime 轻量客户端
 | 外部名称统一为 Inex、`inex` CLI、`inexd` daemon、`inex.markdownEditor` 与 `merge=inex`；仅磁盘 magic 保留 `EDRY` | 消除研究报告里的 diaryd/diary/ediary 占位命名，避免协议、打包与 Git driver 混用 |
 | VS Code 写入走 CustomEditorProvider 与扩展控制的加密 backup | 普通 modified working copy 会被 VS Code backup tracker 持久化，`files.hotExit=off` 不能阻止该调度 |
 | Sublime 严格模式使用 scratch buffer、自管 dirty 与持续加密 draft | pre-save/pre-close 不能 veto，API 也不能在自定义保存后清原生 dirty；非 scratch 方案不可安全接管 |
+| Sublime Build 4200 客户端保持 experimental | 宿主 SIGKILL 后官方恢复方式是重启整个 Sublime；实测缓冲区仍可复制，插件无法在死亡窗口运行，故只承诺应用退出后的零磁盘残留，不宣称崩溃瞬时擦除 |
+| v1 只承诺目录创建与 Markdown 文件 rename/delete | 目录 rename 会重绑整个子树的 authenticated logical path，需要独立的多文件 crash transaction；在该事务存在前显式 deferred，不用非原子循环伪装支持 |
+| 发布包采用严格 allowlist、可移植 ZIP key、内部 manifest 与原生依赖审计 | 产物必须拒绝特殊文件、Windows 路径/权限碰撞、伪 VSIX/PE、脏 provenance 和动态 libsodium；独立发布工具代码审计方可进入 clean-source 构建 |
 
 ## Errors Encountered
 
@@ -150,6 +156,31 @@ Phase 5 — Sublime 轻量客户端
 | VS Code post-race-fix gate used a workspace-relative `editors/vscode/src` path from inside that same directory | 1 | Record later gates as not executed, use local `src`, and rerun the complete check/test/build sequence |
 | VS Code typecheck found no `CancellationToken.None` API for pre-lock webview synchronization | 1 | Use a scoped `CancellationTokenSource`, dispose it after synchronization, and restart the complete client gate |
 | VS Code backup-recovery test seam omitted required `untitledDocumentData` from `CustomDocumentOpenContext` | 1 | Pass explicit `undefined`, then restart check/test/build; the parallel build result is not a complete gate |
+| Main-thread Sublime unittest discovery omitted the package directory from `PYTHONPATH` | 1 | Record the invocation error, rerun with `PYTHONPATH=editors/sublime`, and do not classify the import failures as product regressions |
+| Main-thread Sublime gate incorrectly passed comment-bearing `.sublime-settings` to strict `json.tool` | 1 | Validate only strict `Main.sublime-commands` as JSON; treat documented Sublime JSON comments as supported settings syntax |
+| Final Sublime review found Build 4200 `open_context_url`/macro persistence gaps and an idle-response timestamp drift | 1 | Block the exact browser/macro commands on every hookable path, add regressions, and base initial/renewed deadlines on the worker-thread authenticated response timestamp |
+| Sublime macro re-review found fingerprint-equivalent non-list empties and an unsafe `Packages/Default` macro trust prefix | 1 | Require an actual empty list from `get_macro()` and block every `run_macro_file` while managed plaintext exists; no resource namespace is trusted |
+| Sublime staged whitespace gate found three new files with an extra blank line at EOF | 1 | Stop before commit, remove only the redundant final blank lines, then rerun tests and the staged gate |
+| First Build 4200 E2E probe launched `sublime_text --wait` in the foreground and could not reach its UI-driving steps | 1 | Terminate only the isolated `/tmp` profile processes, relaunch in background, and bound both window discovery and process exit |
+| Build 4200 Safe Mode created its profile but intentionally did not hot-load packages injected after startup | 1 | Stop waiting on the watcher; explicitly reload fixed test plugins through the isolated UI, or fall back to a pre-populated ordinary isolated data-dir and document the exact mode |
+| Phase 6 audit found late cross-result file-id collision detection and a fixed-size Windows `check-attr` batch | 1 | Preflight the complete conflict result identity set before any write and batch Git argv by encoded byte budget rather than path count |
+| The isolated Build 4200 profile loaded Inex but not its QA helper because the helper package lacked `.python-version` | 1 | Pin the test-only helper to Python 3.8 like the product package, then rerun the bounded flow without changing product code |
+| Phase 6 durability review found split-index repositories require synchronizing `sharedindex.*`, not only `.git/index` | 1 | Fail closed on split index before merge/recover in v1 and cover the real Git extension with a regression test |
+| Real Build 4200 unlock stalled because Python `BufferedReader.read(65536)` waited for a full stdout buffer/EOF before decoding a short RPC frame | 1 | Use a bounded read-once primitive (`read1`/`os.read`) for sidecar pipes and add a real short-frame child-process regression before resuming E2E |
+| Phase 6 residual review found configured fsmonitor and partial-clone lazy fetch could execute external helpers during Git plumbing | 1 | Force `core.fsmonitor=false` on every Git subprocess, set `GIT_NO_LAZY_FETCH=1`, and prove a configured helper is never invoked |
+| Build 4200 E2E reached unlock/tree UI but sent Enter while Quick Panel still had `selected_index=-1` | 1 | Select the first bounded item with Down before Enter, then rerun from a fresh isolated profile |
+| Build 4200 isolated launch exposed both an initial untitled window and the bootstrap window, so generic X11 focus targeted the wrong one | 1 | Bind UI input to the unique bootstrap-title window instead of assuming one Sublime top-level window |
+| Real Sublime `document.open` rejected daemon's 22-character document handle because the client reused the 43-character session validator | 1 | Split session/document capability validation by frozen byte length and add a real handler-response regression |
+| Build 4200 helper invoked Save/Close through `view.run_command`, but those built-ins dispatch as WindowCommands and silently did nothing | 1 | Drive the exact `window.run_command("save"/"close_file")` path exercised by real menus/keybindings |
+| Programmatic generic WindowCommand Save still did not dispatch through Build 4200's interactive command path | 1 | Separate concerns: call Inex's registered save/close commands for the crypto lifecycle smoke, and test native Ctrl+S interception later through X11 input |
+| Build 4200 closes a tab while the old Python `View` wrapper can remain `is_valid() == true` | 1 | Define closure by absence of the view id from every live window plus an empty managed registry, not wrapper validity |
+| Build 4200 harness could scan/remove its root while reparented plugin-host or crash-handler processes were still exiting | 1 | Track the full isolated process set, terminate and wait for it before residue scan, final PASS, or root deletion |
+| Build 4200 crash probe treated empty `xclip` as an exception and then tried to restart a host that the platform requires an application restart to recover | 2 | Probe clipboard/PRIMARY explicitly, classify the reproducible result as `PASS_WITH_DOCUMENTED_BOUNDARY`, recheck for a late replacement host, terminate the whole isolated editor, and require zero root hits |
+| First real Sublime CRUD run selected Cancel because the delete Quick Panel already highlighted its first row | 1 | Keep the undeleted ciphertext as failure evidence, select the destructive first row deterministically with Home, and rerun create/mkdir/rename/etag-delete to `crud_complete=true` |
+| Sublime draft removal checked only the final file and could follow a symlinked draft directory | 1 | Reject symlink/reparse directories, anchor POSIX stat/unlink to a verified dirfd, recheck fallback directory identity, and prove the redirected target remains untouched |
+| Initial release audit found permissive VSIX/ZIP/version/PE checks; follow-up found Win32 names, privileged modes, tag/native gate and provenance bypasses | 2 | Add strict negative tests and workflow bindings until 19/19, actionlint, pedantic/all-features, native audit and independent re-review all return GO |
+| Main release-test invocations first omitted `PYTHONPATH=scripts`, then reused zsh's special `path` variable and invalidated PATH | 2 | Treat both chains as invalid evidence, remove generated caches, use fail-fast plus a non-special loop variable, and rerun the complete 19-test/actionlint/Clippy/diff gate |
+| Documentation audit found overbroad encryption claims, an incorrect VS Code resource scheme, non-runnable PATH/Python/package examples, and ambiguous support wording | 1 | Align every claim and command with current code, use explicit absolute binaries/Python 3.13.14/build prerequisites, then require an independent zero-blocker/zero-major rereview |
 
 ## Notes
 

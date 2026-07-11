@@ -7,7 +7,7 @@ are intentionally unsupported.
 ## Safety contract
 
 - The destination must be absent and its parent must already exist on a
-  supported local filesystem. A user-selected destination name may not use the
+  accepted local filesystem. A user-selected destination name may not use the
   reserved `.inex-import-staging-` prefix.
 - The source is opened only for bounded reads. Inex never writes, renames, or
   removes a source entry.

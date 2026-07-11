@@ -49,6 +49,12 @@
 - 首次锁定依赖后 `libsodium-sys-stable 1.24.0` 的构建链解析到 `zip 8.6.0`（要求 Rust 1.88），因此 workspace MSRV 从初拟 1.85 调整为真实可验证的 1.88；开发工具链继续固定 1.97.0。
 - Sublime `on_pre_save`/`on_pre_close` 是不可取消通知，且没有公开 `set_dirty`/`mark_clean`；研究报告中的“非 scratch + 接管保存 + 保留原生 dirty”不可实现。严格模式必须在插入明文前 `set_scratch(True)`，自管 dirty/提示，并用短 debounce + pre-close best effort 只写加密 draft。
 - Sublime 应把 `hot_exit: "disabled"`、`hot_exit_projects: false`、`update_system_recent_files: false` 作为可写 hard gate。应用退出无法可靠拦截，因此客户端在独立 Safe Mode/data dir 的崩溃残留测试通过前只能标 experimental/secondary。
+- Build 4200 实机 hook probe 证明 `open_context_url`/`old_open_context_url`、`toggle_record_macro` 与 `save_macro` 都进入 `EventListener.on_text_command`；因此可在 managed view 上确定性改写为固定阻断命令，但分类 helper 与 listener 实际分支必须同时有测试，不能只靠静态命令名列表。
+- Build 4200 的 Python 3.8 plugin host 被异常终止后，Sublime 主进程仍可保留原 managed view，且宿主不会在短窗口内自动重启；仅靠进程内 registry 无法识别孤儿明文。产品必须在首次明文插入前给 view 写入不含秘密的固定布尔 marker，并让新宿主在启用功能前先固定文本 scrub 所有 marker view。宿主死亡到重载之间没有插件代码能隐藏该 editor buffer，黑盒 probe 证明它仍可被主动复制；这属于既有 editor-memory/clipboard 边界而非磁盘残留保证，必须如实保留 experimental 状态，不能宣称瞬时 fail-safe。
+- Sublime 官方 API environment 文档把 plugin-host crash 后的恢复描述为重启 Sublime；Build 4200 实测 mtime、内建 plugin command 与 dead console 都不会在同一主进程恢复宿主。因此 QA 的正确成功条件是 `PASS_WITH_DOCUMENTED_BOUNDARY` + 整个应用退出后的零磁盘命中，而不是伪造同进程 scrub PASS。
+- Build 4200 的真实 InputPanel/QuickPanel 可稳定驱动注册的 New Folder/New Markdown/Rename/Delete WindowCommand；删除确认面板首项可能已被选中，确定性选择应使用 Home 而不是假定 `selected_index=-1` 后按 Down。最终 authenticated tree checks 与四个 CRUD event 证明产品路径，不再用静态/私有 helper 冒充 E2E。
+- 发布归档的可移植性需要同时冻结路径、类型、权限与规模：拒绝 Win32 禁止字符、普通/上标设备名、case/Unicode/prefix collision、symlink/FIFO、setuid/setgid/sticky、member storm/oversize；不能先掩掉权限位再审计。VSIX/PE/TOML/tag/origin 也必须解析其真实控制结构，而不是字符串或文件名启发式。
+- 本机 xlings Rust 链接环境把 Linux ELF interpreter/RUNPATH 写成 `/home/horeb/.xlings/subos/default/...`；同机 package smoke 不能证明这种本机构建可移植。Linux 发布证据必须来自干净的原生 runner，并应拒绝携带构建机 home 路径的 ELF 产物。
 - Rust 标准库 `File::lock/try_lock/unlock` 到 1.89 才稳定，当前 workspace MSRV 1.88 不能直接依赖；atomic 层需要窄平台锁后端或显式提高 MSRV。
 - Rust 1.97 `std::fs::rename` 提供同文件系统 replacement 语义，但不暴露 Windows durability flags，也不能承诺所有文件系统上的 crash atomicity。v1 坚持 same-directory encrypted staging + `sync_all` + rename、绝不 delete-first，并保持 local-filesystem-only 边界。
 - Windows `ReplaceFileW` 在部分失败码下可能让原目标缺失，不满足“失败保留旧目标”，因此不能作为无备份的默认替换路径。
@@ -92,7 +98,9 @@
 | Recovery 对 journal path 重新执行 no-link/no-mount/identity 验证 | 合法 journal 创建后祖先仍可能被换成 symlink/junction/mount；不重新验证会让 recovery 在 vault 外 inspect/remove |
 | Search 查询用完整 ciphertext fingerprint 而非 metadata fast path | 正确性和不返回 stale plaintext 优先于查询前的额外密文 I/O；metadata-preserving external mutation 必须可检测 |
 | Windows GNU shim 仅服务交叉验证，发布矩阵以原生 MSVC 为主 | shim 已通过 link/Wine ABI 测试，但 Wine 不能替代 NTFS/ReFS power-loss 和 native handle semantics evidence |
-| 开发过程以 Git verified checkpoint 管理 | Phase 1/2 基线为 `075f8fd`，Phase 3 foundation 为 `99044dc`，CLI hardening 为 `7128a8b`，watchdog-backed daemon 为 `815f216`，authenticated keepalive 为 `cb8e17c`，failure-safe import 为 `2f287e3`，hardened VS Code client 为 `f51d4e9`；后续继续按 Sublime/Git 等可独立回滚的验收增量提交 |
+| 开发过程以 Git verified checkpoint 管理 | Phase 1/2 基线为 `075f8fd`，Phase 3 foundation 为 `99044dc`，CLI hardening 为 `7128a8b`，watchdog-backed daemon 为 `815f216`，authenticated keepalive 为 `cb8e17c`，failure-safe import 为 `2f287e3`，VS Code base/CRUD 为 `f51d4e9`/`b3bad32`，Sublime client/read/capability/final 为 `ee09d60`/`bc10b85`/`2211e55`/`b124170`，encrypted Git merge 为 `02260d8`，audited release pipeline/docs 为 `d042360` |
+| v1 目录 CRUD 明确限定为 mkdir + Markdown 文件 rename/delete | 目录 rename 必须为子树内每个 EDRY 重新绑定 authenticated path，普通循环无法提供 crash atomicity；在设计多文件 journal 前必须 deferred 并如实写入 PRD |
+| 发布文档中的命令本身也是验收面 | clean checkout 必须显式准备锁定的 vsce/extension dependencies、构建 `dist/extension.js`、调用 Python 3.13.14、审计原生依赖并给 smoke 传 exact VS Code CLI；不能用前文隐含状态或 PATH 假设 |
 | v1 导入只支持 absent-destination copy import，明确拒绝 in-place | 先删除/改写源目录无法给出跨平台可证明的失败安全语义；copy-only 让源明文保持只读，并允许完整 encrypted staging 复验后一次性 no-replace 发布 |
 | import 发布使用私有 ciphertext-only marker 区分 OS 模糊结果 | rename 返回错误不能证明目录未移动；P/S/L/marker identity 可重建 exact moved、exact unmoved 或 indeterminate，marker 清理失败必须返回独立非零结果并告知不得重跑同一目的地 |
 | VS Code 明文清理必须区分确定性与 best effort | Rust sidecar key/cache 可明确清零；Node Buffer 由扩展覆写，但 JS string、V8/Chromium/VS Code 内部副本无法确定性 zeroize，因此锁定会销毁 webview/drop references，最终磁盘残留结论必须来自 isolated-profile canary 审计 |

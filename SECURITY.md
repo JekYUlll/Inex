@@ -35,7 +35,7 @@ The current evidence and blockers are maintained in
 [`docs/release-checklist.md`](docs/release-checklist.md). Do not use Inex as the
 only copy of important data.
 
-## Supported security goal
+## Intended security goal
 
 An Inex vault protects Markdown bodies at rest from ordinary local access by a
 person who does not know the vault password. Before unlock, filesystem tools,

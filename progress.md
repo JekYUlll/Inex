@@ -153,20 +153,48 @@
   - 在本机 VS Code 与最低支持的 1.125.0 上分别运行真实 Extension Host backup/recovery + isolated-root canary 扫描，均 exit 0；runner 同时检查并清理残留进程/目录。
   - 最终只读安全审阅给出 GO；打包 VSIX + bundled platform `inexd` 安装 smoke，以及 Windows/Linux 持久 profile 的跨进程 Hot Exit/Local History/crash restore 继续作为 Phase 7 发布证据，不扩大 Phase 4 的自动化结论。
   - 将 hardened VS Code client、安全文档与测试 harness 独立提交为 `f51d4e9`（`feat: add hardened VS Code encrypted editor`），未混入 Sublime 工作树。
+  - 补齐 P1-04 文件管理：新建空 Markdown、mkdir、etag 条件 rename/delete；脏文档、tab-close 拒绝、handle-close/RPC 失败均失败关闭并通过认证树对账恢复。
+  - 主线程复验 `pnpm check`、23/23 unit、production/integration bundle，以及当前 VS Code 与最低 1.125.0 的真实 Extension Host CRUD + encrypted backup/recovery + residue audit；独立提交为 `b3bad32`（`feat: add authenticated editor file management`）。
 - **Completed:** 2026-07-11 (Asia/Shanghai)
 
 ### Phase 5: Sublime 轻量客户端
 
-- **Status:** in_progress
+- **Status:** complete (experimental platform boundary retained)
 - **Started:** 2026-07-11 (Asia/Shanghai)
+- Actions taken:
+  - 完成 strict framed RPC、bundled/explicit sidecar、vault unlock/tree/search/navigation、scratch managed buffer、自管 dirty/etag、encrypted draft、save/close/lock 与安全设置 hard gate。
+  - 增加 New Folder/New Markdown/active clean rename/etag-delete，使用 generation/path/etag/draft epoch 与 per-document lock 阻断 UI 切换、编辑和 draft/CRUD 竞态。
+  - 在首次明文插入前设置固定 marker；所有 lock/open/delete 先固定 scrub 再释放 owner，逐 view 异常隔离且 sidecar shutdown 有同步兜底；draft 删除拒绝 symlink/reparse 并在 POSIX 用 verified dirfd 锚定。
+  - 61/61 pure-Python tests（含 Python 3.8 AST）通过；真实 Build 4200 normal 通过注册 WindowCommand 与 InputPanel/QuickPanel 完成 open/edit/save/close + mkdir/create/rename/delete，`crud_complete=true`、`root_scan_hits=0`。
+  - 真实 Build 4200 plugin-host SIGKILL 得到 `PASS_WITH_DOCUMENTED_BOUNDARY`：host-dead plaintext 可复制、宿主不在同进程重启、必须重启 Sublime，应用退出后 `root_scan_hits=0`；因此继续标 experimental，不宣称 crash-time erasure。
+  - 独立只读审计复跑 pure、normal CRUD 与 SIGKILL 场景；Sublime 增量提交为 `b124170`（`feat: complete experimental Sublime client`）。
+- **Completed:** 2026-07-11 (Asia/Shanghai)
 
 ### Phase 6: Git 合并、迁移与恢复工具
 
-- **Status:** pending
+- **Status:** complete
+- **Started:** 2026-07-11 (Asia/Shanghai)
+- Actions taken:
+  - 新增 `inex-git` crate 与 `inex merge-driver`、`inex git install-driver/merge/recover`；locked driver 安装为 canonical absolute `inex` + 零 placeholders，不读取 Git 临时路径且固定返回冲突。
+  - 实现 local-only `.gitattributes`/`.gitignore` 安装、有效属性复核、Git ≥2.36、清空环境、禁用 fsmonitor/lazy fetch、bounded plumbing 与动态 Windows argv 预算。
+  - 实现 stage AEAD 认证、内存 diff3、clean/unresolved EDRY 标志、全局 file-id 预检、密文 worktree/index transaction journal 与认证恢复；split-index、非 `100644`、跨路径 rename/modify 和并行 Git porcelain 均失败关闭。
+  - 独立审计闭合 file-id late-write、Windows batch、split-index durability、fsmonitor/lazy-fetch 四项 blocker，最终判定 Checkpoint GO；GA 的原生 Windows 与 rename/modify 证据留给 Phase 7。
+  - 主线程复验 workspace 239/239 tests、fmt、pedantic clippy、rustdoc、Windows GNU workspace check 与 diff-check 全部通过。
+  - 将 Rust/CLI/spec 增量独立提交为 `02260d8`（`feat: add encrypted Git merge and recovery`），未混入 planning 或 Sublime E2E harness。
+- **Completed:** 2026-07-11 (Asia/Shanghai)
 
 ### Phase 7: 跨平台验证、打包与发布准备
 
-- **Status:** pending
+- **Status:** in_progress
+- **Started:** 2026-07-11 (Asia/Shanghai)
+- Actions taken:
+  - 新增四平台 CI/package workflow、确定性 Rust/VSIX/unpacked-Sublime ZIP、SHA256SUMS、package provenance、77-component/147-text license inventory、严格 artifact/native dependency audit 与 executable/VSIX smoke。
+  - 闭合两轮独立发布审计：严格 VSIX XML/content-types/package identity、TOML/tag version、PE32+、ELF interpreter/RPATH、Win32 portable paths、特殊成员/权限、member/size ceiling、canonical origin 与 tag-bound native gates；最终代码审计 GO。
+  - 发布工具 19/19、actionlint、pedantic/all-features Clippy、239/239 Rust workspace tests 与 rustdoc 均通过；system-GCC Linux x64 repackage/audit/VSIX CLI smoke 已有本地 checkpoint 证据。
+  - 完成安装、用户、操作/恢复、排错、editor security、dependency/license 与 release checklist 文档；仍保留 native Windows/ARM、持久 editor profile、签名/私密报告、独立法律审查和最终 clean-source 双构建门禁。
+  - 使用 system GCC 重建可移植 ELF；precommit 两轮 Rust ZIP/VSIX/Sublime ZIP/SHA256SUMS 逐字节一致，严格 artifact/native-dependency audit、三个 executable smoke 与 VS Code 1.125.0 CLI 安装均通过（manifest 如实标记 dirty，不能替代最终 clean-source 证据）。
+  - 独立文档审计修复过度安全声明、`.vault-local`/CustomEditor 事实、绝对 CLI 路径、Python/pnpm/build 前提与可执行发布命令；复审为零 blocker、零 major。
+  - 将发布流水线、24 个代码/配置/文档文件独立提交为 `d042360`（`feat: add audited cross-platform release pipeline`）；planning 与后续 completion 证据未混入该功能提交。
 
 ## Test Results
 
@@ -201,6 +229,16 @@
 | Phase 3 import Windows smoke | Windows GNU no-run/clippy + Wine tests | cross-platform API/link behavior compiles and Wine suite passes | no-run/clippy passed; Wine 215/215 | PASS (non-native) |
 | VS Code current Extension Host | isolated user/extensions/temp/vault roots on local VS Code | encrypted backup/recovery succeeds and dynamic canary leaves no detected residue | exit 0; residue audit passed | PASS |
 | VS Code minimum Extension Host | same harness on VS Code 1.125.0 | minimum supported engine follows the same encrypted recovery contract | exit 0; residue audit passed | PASS |
+| post-Phase-6 full Rust regression | `cargo test --workspace --all-targets --locked` | CLI/core/daemon/process/Git suites remain green while editor/release work proceeds | 239/239 passed (43 CLI, 128 core, 58 daemon/process, 10 Git) | PASS |
+| VS Code authenticated CRUD unit gate | `pnpm check && pnpm test && pnpm build && pnpm test:extension:build` | strict RPC/path/model mutations and bundles pass | 23/23 tests; 127.1 KiB production bundle; 13.7 KiB integration bundle | PASS |
+| VS Code authenticated CRUD Extension Host | current VS Code and 1.125.0 isolated runners | real daemon create/mkdir/rename/delete, close/RPC failure recovery, encrypted backup, and residue scan pass | both runners exit 0 | PASS |
+| Sublime final pure gate | `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=editors/sublime python3 -W error::ResourceWarning -m unittest discover ...` | Python 3.8-compatible client/model/RPC/draft/CRUD/scrub invariants pass without cache residue | 61/61; no ResourceWarning or `__pycache__` | PASS |
+| Sublime Build 4200 real CRUD | isolated XDG/Xvfb/DBus profile with registered commands and real panels | unlock/open/edit/save/close, mkdir/create/rename/etag-delete and authenticated tree checks leave no plaintext disk residue | `crud_complete=true`, four CRUD events, `root_scan_hits=0`, EDRY | PASS |
+| Sublime Build 4200 host SIGKILL | kill only isolated `plugin_host-3.8` with marked managed plaintext open | reproduce and report platform boundary, then terminate app and scan roots | plaintext copyable; host not restarted; `PASS_WITH_DOCUMENTED_BOUNDARY`; `root_scan_hits=0` | PASS (boundary, not crash erasure) |
+| hardened release-tool gate | 19 negative/determinism/provenance tests + actionlint + pedantic/all-features Clippy | reject forged VSIX/ZIP/PE/tag/origin inputs and keep workflows syntactically valid | 19/19; actionlint 0; Clippy pass | PASS |
+| release-tool independent re-review | replay both audit rounds against current scripts/workflow | every reported bypass is rejected; no code blocker/major remains | final code-audit verdict GO | PASS |
+| precommit deterministic Linux package | system-GCC release build + two package directories + strict audits/smoke | all four outputs are byte-identical and install/run while dirty provenance remains explicit | two `cmp` chains pass; artifact/native audits and VS Code 1.125.0 CLI smoke pass | PASS (precommit only) |
+| documentation consistency audit | README/security/PRD/architecture/install/operations/release commands vs implementation | no overclaim or non-runnable binding command remains | independent rereview reports 0 blocker, 0 major; noted minors repaired | PASS |
 
 ## Error Log
 
@@ -231,13 +269,39 @@
 | 2026-07-11 | Combined VS Code session-epoch patch missed current controller context | 1 | No partial edit; inspect the exact file and split the open-vs-lock race fix into smaller patches |
 | 2026-07-11 | VS Code post-race-fix gate used a duplicated relative path from the package directory | 1 | Treat all chained gates as not executed, correct `rg` to `src`, and restart check/test/build |
 | 2026-07-11 | VS Code typecheck rejected nonexistent `CancellationToken.None` | 1 | Use a scoped `CancellationTokenSource` for pre-lock snapshots and restart check/test/build |
+| 2026-07-11 | Main-thread Sublime unittest discovery could not import package modules because `PYTHONPATH` was omitted | 1 | Record the harness invocation error and rerun with `PYTHONPATH=editors/sublime`; no product code was changed |
+| 2026-07-11 | Strict `json.tool` rejected comments in `Inex.sublime-settings` after all 42 tests passed | 1 | Do not misclassify Sublime's comment-bearing settings syntax; validate the strict commands file separately |
+| 2026-07-11 | Sublime final audit found unblocked `open_context_url`, macro recording/save persistence, and UI-delay idle-deadline drift | 1 | Keep Phase 5 NO-GO; repair exact Build 4200 command surfaces and carry authenticated response monotonic timestamps into main-thread deadline updates |
+| 2026-07-11 | Sublime macro re-review showed JSON fingerprints cannot prove exact `[]`, and `res://Packages/Default` is overrideable | 1 | Check the returned Python type/value directly and fail closed on all macro files while a managed buffer exists |
+| 2026-07-11 | Sublime staged diff check rejected three redundant EOF blank lines | 1 | No commit was created; apply a three-file formatting-only fix and restart the final test/staged gate |
+| 2026-07-11 | Initial Build 4200 E2E harness blocked on a foreground `--wait` launch | 1 | Treat as a harness failure, stop only its isolated process tree, and redesign the runner around background launch plus explicit timeouts |
+| 2026-07-11 | Build 4200 Safe Mode did not auto-load Inex/InexQA packages copied after startup | 1 | Use an explicit fixed plugin reload through the isolated UI; if Safe Mode forbids it, run the same matrix in a pre-populated ordinary isolated XDG profile and report that evidence boundary |
+| 2026-07-11 | Phase 6 review found file-id uniqueness could fail after an earlier result write and Windows `check-attr` batches could exceed argv limits | 1 | Keep the Git increment uncommitted; perform whole-plan identity preflight and use encoded-byte-budgeted batches with boundary tests |
+| 2026-07-11 | Normal isolated Build 4200 loaded Inex but the test helper never reported because it defaulted to Python 3.3 | 1 | Add a test-only `.python-version` selecting 3.8 and rerun; product package loading was already evidenced by its Python 3.8 bytecode |
+| 2026-07-11 | Phase 6 durability audit found `sharedindex.*` was outside the journal/index fsync model | 1 | Reject Git split-index repositories before any merge/recovery write and add a real-repository regression |
+| 2026-07-11 | Build 4200 reached real unlock but Python RPC stdout blocked on `BufferedReader.read(65536)` for a short hello frame | 1 | Pause the editor matrix, switch to a bounded read-once pipe primitive, add a real subprocess regression, and rerun from hello |
+| 2026-07-11 | Git residual audit exposed fsmonitor helper execution and promisor lazy-fetch subprocess risk | 1 | Override fsmonitor off in every invocation, disable lazy fetch, and add an external-helper non-execution regression |
+| 2026-07-11 | Build 4200 E2E completed real unlock but the harness pressed Enter before selecting a Quick Panel row | 1 | Treat as UI-driver error; send Down then Enter for the single `qa.md` item and restart the isolated run |
+| 2026-07-11 | Build 4200 created an initial untitled window beside the bootstrap window and generic class search focused the wrong top-level | 1 | Select the bootstrap-title X11 window explicitly before driving its Quick Panel |
+| 2026-07-11 | Build 4200 hello/unlock/tree passed but `document.open` rejected the daemon's 22-character handle as if it were a 43-character session | 1 | Introduce exact session/document capability validators and rerun against a real daemon response |
+| 2026-07-11 | Build 4200 opened and edited correctly, but the QA helper sent Save/Close as TextCommands rather than their real WindowCommand dispatch | 1 | Fix only the helper to call the owning window and rerun the same bounded flow |
+| 2026-07-11 | Generic programmatic WindowCommand Save also remained a no-op without a product error | 1 | Use explicit `inex_save`/`inex_close_active` for the minimal encrypted lifecycle; reserve native command interception for an X11-driven subtest |
+| 2026-07-11 | Build 4200 removed the saved tab but retained a Python wrapper reporting `is_valid()` | 1 | Make the harness assert live-window membership and registry removal instead of stale wrapper validity |
+| 2026-07-11 | Build 4200 post-flow cleanup raced reparented plugin-host/crash-handler exit | 1 | Quiesce the complete isolated process tree before scanning, printing PASS, and deleting the root |
+| 2026-07-11 | Crash runner treated empty `xclip` as fatal, then attempted an unsupported same-process plugin-host restart | 2 | Use explicit clipboard/PRIMARY states, late-host checks and `PASS_WITH_DOCUMENTED_BOUNDARY`; always terminate the isolated app and require zero root hits |
+| 2026-07-11 | First real CRUD E2E pressed Down on a preselected delete row and chose Cancel | 1 | Preserve the file, select the first row with Home, and rerun the complete real-panel flow to `crud_complete=true` |
+| 2026-07-11 | Independent Sublime audit found lock-loop API exceptions could bypass sidecar shutdown and draft removal could follow a symlinked directory | 1 | Isolate every view operation with shutdown fallback; use reparse checks/dirfd-anchored removal and regress redirected-target preservation |
+| 2026-07-11 | First release unit invocation omitted `PYTHONPATH=scripts`; the retry reused zsh's special `path` array and erased PATH | 2 | Discard both incomplete chains, clear generated cache, enable fail-fast, use a safe variable name and rerun 19/19 plus all static gates |
+| 2026-07-11 | Two independent release audits exposed permissive VSIX/ZIP/version/PE checks and later Win32-name/mode/tag/native/provenance bypasses | 2 | Add strict negative tests and exact workflow bindings; final 19/19/actionlint/pedantic/native-smoke re-review is GO |
+| 2026-07-11 | Default xlings release binary used a build-home ELF interpreter/RUNPATH | 1 | Reject it as non-portable, rebuild with `/usr/bin/gcc`, and require strict ELF/native-dependency audit before packaging |
+| 2026-07-11 | Documentation audit found overbroad encryption/support claims and release/CLI examples that were not self-contained | 1 | Correct the threat/resource model and exact commands, then obtain a zero-blocker/zero-major independent rereview |
 
 ## 5-Question Reboot Check
 
 | Question | Answer |
 |----------|--------|
-| Where am I? | Phase 5 — Sublime 轻量客户端 |
-| Where am I going? | Sublime → Git merge/recovery → release verification |
+| Where am I? | Phase 7 — 跨平台验证、打包与发布准备 |
+| Where am I going? | Git rename/modify contract → final clean-source deterministic build/audit/smoke → completion audit |
 | What's the goal? | 交付 init plan 定义的跨平台密文仓库与编辑器虚拟明文系统 |
 | What have I learned? | 见 `findings.md`：冻结格式、依赖、编辑器备份风险与失败安全边界 |
-| What have I done? | 完成 Phase 1/2/3 与 Phase 4 VS Code 主客户端，并以独立 Git checkpoint 固化；正在收敛 Sublime experimental 客户端 |
+| What have I done? | Phase 1–6 与发布流水线已以 Git checkpoints 固化；代码/文档审计 GO，正在闭合最后的本地产品与 clean-source 证据 |

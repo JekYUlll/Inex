@@ -9,7 +9,7 @@ The canonical source repository is <https://github.com/JekYUlll/Inex>. The VS
 Code extension publisher remains `horeb`; that identifier is not a vault Git
 remote. Configure each vault with a separate private remote chosen by its owner.
 
-## Supported-shape prerequisites
+## Accepted storage-shape prerequisites
 
 The implementation currently targets:
 
