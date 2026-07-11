@@ -401,6 +401,86 @@ impl Vault {
         self.read_kind(logical_path, ExpectedEnvelopeKind::Committed)
     }
 
+    /// Authenticate one committed EDRY envelope supplied from an external
+    /// ciphertext-only source such as a Git object.
+    ///
+    /// This is the only supported bridge from Git plumbing into the unlocked
+    /// vault key domain. The bytes are bounded before parsing and must bind to
+    /// this vault, epoch, and exact logical path. No filesystem object is
+    /// created and the returned plaintext allocation zeroizes on drop.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError`] when the envelope exceeds the v1 bound or fails
+    /// framing, context, authentication, kind, or UTF-8 validation.
+    pub fn authenticate_committed_envelope(
+        &self,
+        logical_path: &LogicalPath,
+        envelope: &[u8],
+    ) -> Result<DecryptedDocument, VaultError> {
+        if envelope.len() > MAX_EDRY_ENVELOPE_BYTES {
+            return Err(VaultError::EnvelopeTooLarge);
+        }
+        Ok(crypto::decrypt_document(
+            &self.master_key,
+            self.config.vault_id,
+            self.config.key_epoch,
+            logical_path,
+            ExpectedEnvelopeKind::Committed,
+            envelope,
+        )?)
+    }
+
+    /// Encrypt an in-memory three-way merge result as a committed EDRY file.
+    ///
+    /// `identity_header` must have come from an authenticated committed stage
+    /// for the same vault and logical path. Its stable file id and creation
+    /// time are retained. The unresolved flag is set or cleared according to
+    /// `unresolved`; the draft flag can never enter committed storage.
+    ///
+    /// This method only prepares ciphertext. Callers must still use the vault
+    /// mutation lock and an optimistic condition when writing it to disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError`] for a mismatched identity header, invalid merge
+    /// bytes/timestamp, or any cryptographic failure.
+    pub fn encrypt_merge_result(
+        &self,
+        logical_path: &LogicalPath,
+        identity_header: &EdryHeader,
+        plaintext: &[u8],
+        modified_at_ms: i64,
+        unresolved: bool,
+    ) -> Result<EncryptedDocument, VaultError> {
+        if identity_header.vault_id != self.config.vault_id
+            || identity_header.key_epoch != self.config.key_epoch
+            || identity_header.logical_path != logical_path.as_str()
+            || identity_header.is_draft()
+        {
+            return Err(CryptoError::DocumentContextMismatch.into());
+        }
+
+        let retained_bits = identity_header.content_flags.bits()
+            & !ContentFlags::UNRESOLVED_MERGE.bits()
+            & !ContentFlags::DRAFT.bits();
+        let mut flags = ContentFlags::from_bits(retained_bits).map_err(CryptoError::from)?;
+        if unresolved {
+            flags |= ContentFlags::UNRESOLVED_MERGE;
+        }
+        Ok(crypto::encrypt_document(
+            &self.master_key,
+            self.config.vault_id,
+            self.config.key_epoch,
+            logical_path,
+            Some(FileIdentity::from_header(identity_header)),
+            plaintext,
+            modified_at_ms,
+            flags,
+            EnvelopeKind::Committed,
+        )?)
+    }
+
     fn read_kind(
         &self,
         logical_path: &LogicalPath,
@@ -457,7 +537,10 @@ impl Vault {
     ///
     /// A fresh nonce is generated and stable file id/creation time are
     /// retained. `expected_etag` is rechecked by the atomic layer immediately
-    /// before replacement.
+    /// before replacement. When the current authenticated header is marked as
+    /// an unresolved merge, a save clears that flag only after all canonical
+    /// diff3 marker lines have been removed; ordinary files never gain the
+    /// flag merely because their Markdown resembles a marker.
     ///
     /// # Errors
     ///
@@ -478,7 +561,15 @@ impl Vault {
             });
         }
         let identity = FileIdentity::from_header(&current.header);
-        let content_flags = current.header.content_flags;
+        let mut content_flags = current.header.content_flags;
+        if content_flags.contains(ContentFlags::UNRESOLVED_MERGE)
+            && !contains_diff3_markers(plaintext)
+        {
+            content_flags = ContentFlags::from_bits(
+                content_flags.bits() & !ContentFlags::UNRESOLVED_MERGE.bits(),
+            )
+            .map_err(CryptoError::from)?;
+        }
         drop(current);
 
         let encrypted = crypto::encrypt_document(
@@ -1073,6 +1164,16 @@ fn document_metadata(
         etag: encrypted.etag,
         parent_sync: outcome.parent_sync,
     }
+}
+
+fn contains_diff3_markers(plaintext: &[u8]) -> bool {
+    plaintext.split(|byte| *byte == b'\n').any(|line| {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        line.starts_with(b"<<<<<<< ")
+            || line.starts_with(b"||||||| ")
+            || line == b"======="
+            || line.starts_with(b">>>>>>> ")
+    })
 }
 
 fn rename_outcome(encrypted: EncryptedDocument, outcome: AtomicRebindOutcome) -> RenameOutcome {
@@ -2138,5 +2239,14 @@ mod tests {
         assert!(matches!(decode_etag(&encoded), Ok(decoded) if decoded == bytes));
         assert!(decode_etag("sha256:AB").is_err());
         assert!(decode_etag("abc").is_err());
+    }
+
+    #[test]
+    fn diff3_marker_detection_is_line_scoped_and_crlf_aware() {
+        assert!(contains_diff3_markers(b"<<<<<<< ours\nbody\n"));
+        assert!(contains_diff3_markers(b"body\r\n=======\r\n"));
+        assert!(contains_diff3_markers(b">>>>>>> theirs"));
+        assert!(!contains_diff3_markers(b"quoted <<<<<<< ours\n"));
+        assert!(!contains_diff3_markers(b"resolved body\n"));
     }
 }

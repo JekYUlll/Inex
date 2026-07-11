@@ -52,6 +52,12 @@ pub const IMPORT_STAGING_PREFIX: &str = ".inex-import-staging-";
 /// Private marker temporarily held open across staged-vault publication.
 pub const IMPORT_PUBLISH_MARKER: &str = "import-publish-marker-v1";
 
+/// Repository-visible Git attributes installed by explicit user request.
+pub const GIT_ATTRIBUTES_FILE: &str = ".gitattributes";
+
+/// Repository-visible ignore rules installed by explicit user request.
+pub const GIT_IGNORE_FILE: &str = ".gitignore";
+
 const PENDING_REBIND_STAGING_PREFIX: &str = ".inex-rebind-stage-";
 #[cfg(windows)]
 const RETIRED_CIPHERTEXT_PREFIX: &str = ".inex-retired-ciphertext-";
@@ -1683,7 +1689,10 @@ fn target_parent(target: &Path) -> Option<&Path> {
 
 fn ensure_write_target_in_root(vault_root: &Path, target: &Path) -> Result<(), AtomicWriteError> {
     let relative = validated_relative_target(vault_root, target)?;
-    if relative == Path::new("vault.json") {
+    if relative == Path::new("vault.json")
+        || relative == Path::new(GIT_ATTRIBUTES_FILE)
+        || relative == Path::new(GIT_IGNORE_FILE)
+    {
         if case_alias_exists(target)
             .map_err(|source| AtomicWriteError::io(AtomicWriteStage::ReadCurrent, source))?
         {
@@ -1990,7 +1999,18 @@ fn retire_ciphertext_entry(_vault_root: &Path, target: &Path) -> io::Result<()> 
     fs::remove_file(target)
 }
 
-pub(crate) fn sync_directory(parent: &Path) -> io::Result<()> {
+/// Synchronize a directory after committing non-secret repository metadata.
+///
+/// Linux uses a directory `fsync`; Windows reports the result of the audited
+/// write-through namespace path. Callers must already have validated the
+/// directory and must never use this helper as a substitute for an atomic
+/// move.
+///
+/// # Errors
+///
+/// Returns the platform I/O error when the directory durability checkpoint
+/// cannot be completed.
+pub fn sync_directory(parent: &Path) -> io::Result<()> {
     platform::sync_directory(parent)
 }
 

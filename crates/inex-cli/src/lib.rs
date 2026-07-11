@@ -27,7 +27,7 @@ use inex_core::vault::{PasswordSlotCommit, Vault, VaultError};
 use inex_core::vault_config::{ConfigWarning, KdfPolicy};
 use uuid::Uuid;
 
-use crate::args::{Cli, Command, PasswordCommand};
+use crate::args::{Cli, Command, GitCommand, PasswordCommand};
 use crate::password::{PasswordInput, read_confirmed_password, read_password};
 use crate::query::{QueryInput, read_query};
 
@@ -91,8 +91,91 @@ fn execute(command: Command) -> Result<ExitCode, AppError> {
                 query_input,
             )
         }
+        Command::MergeDriver { inputs } => Ok(command_merge_driver(inputs)),
+        Command::Git(command) => command_git(command),
         Command::Serve => command_serve(),
         Command::Help | Command::Version => unreachable!("handled before password input setup"),
+    }
+}
+
+fn command_merge_driver(inputs: Option<[PathBuf; 4]>) -> ExitCode {
+    // These argv values are intentionally never inspected, canonicalized, or
+    // opened. Dropping their owned representations preserves `%A` bytes and
+    // metadata while guaranteeing this locked Git hook cannot reach a key,
+    // password prompt, sidecar, or plaintext path.
+    drop(inputs);
+    eprintln!(
+        "inex: locked merge driver preserved all inputs; run `inex git merge <vault>` after explicit unlock"
+    );
+    ExitCode::FAILURE
+}
+
+fn command_git(command: GitCommand) -> Result<ExitCode, AppError> {
+    match command {
+        GitCommand::InstallDriver { vault } => {
+            let report = inex_git::install_driver(&vault)?;
+            println!(
+                "gitattributes: {}",
+                if report.attributes_changed {
+                    "updated"
+                } else {
+                    "already-configured"
+                }
+            );
+            println!(
+                "gitignore: {}",
+                if report.ignore_changed {
+                    "updated"
+                } else {
+                    "already-configured"
+                }
+            );
+            println!("git-config-scope: repository-local");
+            println!("merge-driver: locked-safe");
+            println!("local-config-verified: yes");
+            #[cfg(windows)]
+            println!("core.longPaths: repository-local-true");
+            Ok(ExitCode::SUCCESS)
+        }
+        GitCommand::Merge { vault, slot } => {
+            let password_input = PasswordInput::from_environment()?;
+            let password = read_password(password_input, "Vault password: ")?;
+            let unlocked = Vault::unlock(&vault, password.as_slice(), slot, KdfPolicy::default());
+            drop(password);
+            let vault = unlocked?;
+            print_warnings(vault.warnings());
+            let report = inex_git::merge(&vault, unix_time_ms()?)?;
+            println!(
+                "recovered-encrypted-transactions: {}",
+                report.recovered_transactions
+            );
+            println!("clean-encrypted-results: {}", report.clean_results);
+            println!(
+                "unresolved-encrypted-results: {}",
+                report.unresolved_results
+            );
+            println!("plaintext-files-written: 0");
+            Ok(if report.unresolved_results == 0 {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            })
+        }
+        GitCommand::Recover { vault, slot } => {
+            let password_input = PasswordInput::from_environment()?;
+            let password = read_password(password_input, "Vault password: ")?;
+            let unlocked = Vault::unlock(&vault, password.as_slice(), slot, KdfPolicy::default());
+            drop(password);
+            let vault = unlocked?;
+            print_warnings(vault.warnings());
+            let report = inex_git::recover(&vault)?;
+            println!(
+                "recovered-encrypted-transactions: {}",
+                report.recovered_transactions
+            );
+            println!("plaintext-files-written: 0");
+            Ok(ExitCode::SUCCESS)
+        }
     }
 }
 
@@ -192,6 +275,7 @@ fn command_init(vault_path: &Path, input: PasswordInput) -> Result<ExitCode, App
 
 fn command_verify(vault_path: &Path) -> Result<ExitCode, AppError> {
     let report = verify::verify_locked(vault_path)?;
+    let pending_git_merge = inex_git::has_pending_recovery(vault_path)?;
     println!("verification-mode: locked-structural");
     println!("mutation-lock: acquired");
     println!(
@@ -207,6 +291,14 @@ fn command_verify(vault_path: &Path) -> Result<ExitCode, AppError> {
     println!("documents: {}", report.documents);
     println!("weak-kdf-slots: {}", report.weak_kdf_slots);
     println!("authenticated-content: not-performed");
+    println!(
+        "pending-git-merge-transaction: {}",
+        if pending_git_merge {
+            "present-authenticated-recovery-required"
+        } else {
+            "none"
+        }
+    );
     println!("result: locked structure valid; unlock is required for authenticity");
     Ok(ExitCode::SUCCESS)
 }
@@ -503,6 +595,7 @@ enum AppError {
     Verification(verify::VerifyError),
     Vault(VaultError),
     Search(inex_core::search::SearchError),
+    Git(inex_git::GitError),
     PasswordRetirementDeferred {
         new_slot: Uuid,
     },
@@ -532,6 +625,7 @@ impl AppError {
             | Self::Verification(_)
             | Self::Vault(_)
             | Self::Search(_)
+            | Self::Git(_)
             | Self::PasswordRetirementDeferred { .. }
             | Self::InvalidDaemonPath
             | Self::DaemonNotFound
@@ -551,6 +645,7 @@ impl fmt::Display for AppError {
             Self::Verification(error) => error.fmt(formatter),
             Self::Vault(error) => error.fmt(formatter),
             Self::Search(error) => error.fmt(formatter),
+            Self::Git(error) => error.fmt(formatter),
             Self::PasswordRetirementDeferred { new_slot } => write!(
                 formatter,
                 "new password slot {new_slot} is committed, but old-slot retirement could not be confirmed"
@@ -606,6 +701,12 @@ impl From<VaultError> for AppError {
 impl From<inex_core::search::SearchError> for AppError {
     fn from(error: inex_core::search::SearchError) -> Self {
         Self::Search(error)
+    }
+}
+
+impl From<inex_git::GitError> for AppError {
+    fn from(error: inex_git::GitError) -> Self {
+        Self::Git(error)
     }
 }
 

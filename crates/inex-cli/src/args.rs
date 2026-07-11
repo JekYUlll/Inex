@@ -17,6 +17,10 @@ Usage:
   inex password remove <vault> <slot-to-remove> --slot <retained-slot-uuid>
   inex password change <vault> [--slot <old-slot-uuid>]
   inex search <vault> [--slot <uuid>] [--case-sensitive] [--limit <count>]
+  inex merge-driver <ancestor> <current> <incoming> <logical-path>
+  inex git install-driver <vault>
+  inex git merge <vault> [--slot <uuid>]
+  inex git recover <vault> [--slot <uuid>]
   inex serve
   inex --help
   inex --version
@@ -53,6 +57,18 @@ storage, 16 MiB per Markdown file, and 256 MiB total Markdown plaintext.
 `verify` performs locked structural validation only. It does not authenticate
 vault metadata or document ciphertext. It acquires the vault mutation lock and
 may recover a pending ciphertext transaction; it is not a pure read-only scan.
+
+`merge-driver` is deliberately locked-safe: it never reads any of its four
+paths, never requests a password or starts a sidecar, leaves the current file
+byte-for-byte and metadata-for-metadata unchanged, and exits with Git conflict.
+The repository installer uses the equivalent zero-argument form with a fixed
+absolute Inex executable path, eliminating merge-time PATH and placeholder
+shell expansion; the four-path form remains accepted for compatibility tests.
+Run `inex git install-driver <vault>` explicitly in each clone. The installer
+writes only repository-local Git config plus the tracked `.gitattributes` and
+`.gitignore` rules. `inex git merge` and `inex git recover` prompt for a vault
+password and keep all three-way plaintext in memory; their Git subprocesses
+receive ciphertext and path metadata only.
 ";
 
 pub(crate) struct Cli {
@@ -87,6 +103,10 @@ pub(crate) enum Command {
         case_sensitive: bool,
         limit: usize,
     },
+    MergeDriver {
+        inputs: Option<[PathBuf; 4]>,
+    },
+    Git(GitCommand),
     Serve,
     Help,
     Version,
@@ -102,11 +122,21 @@ impl Command {
             Self::Password(PasswordCommand::Remove { .. }) => "password remove",
             Self::Password(PasswordCommand::Change { .. }) => "password change",
             Self::Search { .. } => "search <query-from-secure-input>",
+            Self::MergeDriver { .. } => "merge-driver <locked-safe>",
+            Self::Git(GitCommand::InstallDriver { .. }) => "git install-driver",
+            Self::Git(GitCommand::Merge { .. }) => "git merge",
+            Self::Git(GitCommand::Recover { .. }) => "git recover",
             Self::Serve => "serve",
             Self::Help => "help",
             Self::Version => "version",
         }
     }
+}
+
+pub(crate) enum GitCommand {
+    InstallDriver { vault: PathBuf },
+    Merge { vault: PathBuf, slot: Option<Uuid> },
+    Recover { vault: PathBuf, slot: Option<Uuid> },
 }
 
 pub(crate) enum PasswordCommand {
@@ -133,6 +163,9 @@ pub(crate) enum ArgumentError {
     MissingVault,
     MissingPasswordSubcommand,
     UnknownPasswordSubcommand,
+    MissingGitSubcommand,
+    UnknownGitSubcommand,
+    MissingMergeDriverPath,
     MissingSlotToRemove,
     RetainedSlotRequired,
     MissingOptionValue,
@@ -154,6 +187,9 @@ impl fmt::Display for ArgumentError {
             Self::MissingVault => "vault path is required",
             Self::MissingPasswordSubcommand => "password subcommand is required",
             Self::UnknownPasswordSubcommand => "unknown password subcommand",
+            Self::MissingGitSubcommand => "git subcommand is required",
+            Self::UnknownGitSubcommand => "unknown git subcommand",
+            Self::MissingMergeDriverPath => "merge-driver requires exactly four path arguments",
             Self::MissingSlotToRemove => "slot-to-remove UUID is required",
             Self::RetainedSlotRequired => "password remove requires --slot <retained-slot-uuid>",
             Self::MissingOptionValue => "command-line option requires a value",
@@ -192,6 +228,8 @@ impl Cli {
             "import" => parse_import(&mut arguments)?,
             "password" => Command::Password(parse_password(&mut arguments)?),
             "search" => parse_search(&mut arguments)?,
+            "merge-driver" => parse_merge_driver(&mut arguments)?,
+            "git" => Command::Git(parse_git(&mut arguments)?),
             "serve" => Command::Serve,
             "help" | "--help" | "-h" => Command::Help,
             "--version" | "-V" => Command::Version,
@@ -202,6 +240,53 @@ impl Cli {
         };
         reject_remaining(arguments)?;
         Ok(Self { command })
+    }
+}
+
+fn parse_merge_driver(arguments: &mut Arguments) -> Result<Command, ArgumentError> {
+    let Some(ancestor) = arguments.pop_path()? else {
+        return Ok(Command::MergeDriver { inputs: None });
+    };
+    let current = arguments
+        .pop_path()?
+        .ok_or(ArgumentError::MissingMergeDriverPath)?;
+    let incoming = arguments
+        .pop_path()?
+        .ok_or(ArgumentError::MissingMergeDriverPath)?;
+    let logical_path = arguments
+        .pop_path()?
+        .ok_or(ArgumentError::MissingMergeDriverPath)?;
+    Ok(Command::MergeDriver {
+        inputs: Some([ancestor, current, incoming, logical_path]),
+    })
+}
+
+fn parse_git(arguments: &mut Arguments) -> Result<GitCommand, ArgumentError> {
+    let subcommand = arguments
+        .pop_text()?
+        .ok_or(ArgumentError::MissingGitSubcommand)?;
+    match subcommand.as_str() {
+        "install-driver" => Ok(GitCommand::InstallDriver {
+            vault: arguments.pop_path()?.ok_or(ArgumentError::MissingVault)?,
+        }),
+        "merge" => {
+            let vault = arguments.pop_path()?.ok_or(ArgumentError::MissingVault)?;
+            let options = parse_options(arguments, true, false, false)?;
+            Ok(GitCommand::Merge {
+                vault,
+                slot: options.slot,
+            })
+        }
+        "recover" => {
+            let vault = arguments.pop_path()?.ok_or(ArgumentError::MissingVault)?;
+            let options = parse_options(arguments, true, false, false)?;
+            Ok(GitCommand::Recover {
+                vault,
+                slot: options.slot,
+            })
+        }
+        "--password" | "--passphrase" => Err(ArgumentError::ForbiddenPasswordArgument),
+        _ => Err(ArgumentError::UnknownGitSubcommand),
     }
 }
 
@@ -417,6 +502,30 @@ mod tests {
                 command: Command::Serve
             })
         ));
+        assert!(matches!(
+            Cli::parse(["git", "install-driver", "/vault"]),
+            Ok(Cli {
+                command: Command::Git(GitCommand::InstallDriver { .. })
+            })
+        ));
+        assert!(matches!(
+            Cli::parse(["git", "merge", "/vault", "--slot", SLOT_A]),
+            Ok(Cli {
+                command: Command::Git(GitCommand::Merge { slot: Some(_), .. })
+            })
+        ));
+        assert!(matches!(
+            Cli::parse(["merge-driver", "base", "ours", "theirs", "entry.md.enc"]),
+            Ok(Cli {
+                command: Command::MergeDriver { .. }
+            })
+        ));
+        assert!(matches!(
+            Cli::parse(["merge-driver"]),
+            Ok(Cli {
+                command: Command::MergeDriver { inputs: None }
+            })
+        ));
     }
 
     #[test]
@@ -471,6 +580,10 @@ mod tests {
         assert!(matches!(
             Cli::parse(["serve", "secret"]),
             Err(ArgumentError::UnexpectedArgument)
+        ));
+        assert!(matches!(
+            Cli::parse(["merge-driver", "base", "ours", "theirs"]),
+            Err(ArgumentError::MissingMergeDriverPath)
         ));
         assert!(matches!(
             Cli::parse(["search", "/vault", "query-must-not-be-in-argv"]),

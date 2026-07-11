@@ -30,6 +30,11 @@ are intentionally unsupported.
   during the final namespace operation. This allowlist is checked after
   population, after independent unlock, before publication, and again at the
   publication critical point with the marker present.
+- Import deliberately does not create `.git`, `.gitattributes`, or `.gitignore`
+  inside the publication staging tree. After successful publication, initialize
+  or clone the Git repository and run `inex git install-driver <vault>`. This
+  ordering preserves the exact import allowlist and prevents repository-local
+  executable configuration from entering the pre-publication trust boundary.
 - After authenticated re-open, SHA-256 seals are captured for `vault.json`,
   every planned ciphertext file, and the mutation-lock file. The complete seal
   is re-read before publication and inside the marker-present critical audit,

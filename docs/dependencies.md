@@ -19,6 +19,7 @@
 | `minicbor = 2.2.2` | exact, manual encoder/decoder | RFC 8949 deterministic EDRY/vault AAD encoding. No HashMap/derive controls wire order. |
 | `zeroize = 1.9.0` | exact | Best-effort wipe for temporary Rust-owned buffers. It is not mlock. |
 | `sha2` | compatible 0.10 | Ciphertext-only etags and fixture manifests. Not password/file encryption. |
+| `diffy = 0.5.0` | exact, default features only | In-memory line-based diff3 for authenticated Markdown stages. MIT OR Apache-2.0; crate MSRV 1.85, below the project Rust 1.97 baseline. |
 
 The core wraps `sodium_init`, randombytes, explicit Argon2id13 pwhash,
 XChaCha20-Poly1305-IETF, explicit BLAKE2b generic hash, secure allocation,
@@ -52,6 +53,9 @@ operations limit 3. Readers validate a resource ceiling before calling sodium.
 
 ## Git for Windows preflight
 
+- Git 2.36 or newer is required and checked before repository plumbing. This is
+  the first supported baseline where command-line `core.fsmonitor=false` has
+  the boolean disable semantics used to suppress repository-configured hooks.
 - A vault permits logical paths beyond legacy `MAX_PATH`. Phase 6's explicit
   `inex git install-driver` setup therefore verifies Git for Windows and writes
   repository-local `core.longPaths=true`; it does not change global Git config.
@@ -69,3 +73,4 @@ operations limit 3. Readers validate a resource ceiling before calling sodium.
 - https://doc.libsodium.org/secret-key_cryptography/aead/chacha20-poly1305/xchacha20-poly1305_construction
 - https://doc.libsodium.org/memory_management
 - https://www.rfc-editor.org/rfc/rfc8949.html#section-4.2.1
+- https://github.com/bmwill/diffy/tree/0.5.0

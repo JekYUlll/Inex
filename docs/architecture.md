@@ -27,6 +27,7 @@ crates/
   inex-core/       cryptography, EDRY, vault, paths, index, merge
   inex-daemon/     session manager, RPC types/handler, inexd binary
   inex-cli/        inex administrative/import/merge-driver CLI
+  inex-git/        bounded Git plumbing, encrypted merge transactions/recovery
 editors/
   vscode/          TypeScript VS Code extension
   sublime/         Python Sublime Text package
@@ -40,6 +41,7 @@ fixtures/          cross-language and cross-platform compatibility fixtures
 vault/
   vault.json
   .gitattributes
+  .gitignore
   2026/07/2026-07-10.md.enc
   topics/example.md.enc
   .vault-local/          ignored; non-secret logs/config only
@@ -146,15 +148,37 @@ snippet. v1 writes no index to `.vault-local`.
 
 ## Git and merge
 
-Git sees each `*.md.enc` as non-text and invokes
-`inex merge-driver %O %A %B %P`. Without a safe unlock channel the driver
-leaves `%A` byte-for-byte unchanged, returns nonzero, and preserves Git index
-stages 1/2/3. An unlocked Inex editor can read those encrypted stages, merge in
-memory, encrypt the result or authenticated conflict state, and stage it. A
-successful interactive `inex git merge` flow may do the same from a terminal.
-Fully automatic built-in Git integration is deferred until an authenticated
-local broker exists; keys, passwords, and session tokens are never passed in
-argv or environment variables.
+Git sees each `*.md.enc` as non-text and invokes a canonical absolute Inex
+executable as `'<absolute-inex>' merge-driver`, with no path placeholders.
+The compatibility CLI form remains `inex merge-driver %O %A %B %P`. Without a safe unlock channel the driver
+does not open or stat any of the four paths, leaves `%A` byte-for-byte and
+metadata-for-metadata unchanged, returns nonzero, and preserves Git index
+stages 1/2/3. Installation is explicit per clone with
+`inex git install-driver <vault>`; it appends tracked `-text -diff merge=inex`
+and `/.vault-local/` rules by atomic metadata replacement and writes only
+`git config --local` values.
+
+`inex git merge <vault>` is the separate unlocked path. It reads stages through
+bounded `ls-files -u -z` and `cat-file blob` plumbing, authenticates every EDRY
+stage, and globally rejects a file identity assigned to multiple conflict paths
+before any merge write. It performs diff3 only in zeroizing process memory,
+writes only the new EDRY envelope to `hash-object -w --stdin`, and changes the
+worktree/index under a ciphertext-only
+`.vault-local/git-merge-journal-v1.json`. A clean result
+clears the merge flag. A conflict result contains encrypted diff3 markers and
+sets authenticated `ContentFlags::UNRESOLVED_MERGE`; a later ordinary editor
+save clears the flag only after all canonical marker lines have been removed.
+`inex git recover <vault>` authenticates the journal's Git object and safely
+finishes an interrupted worktree/index transition.
+
+Git is resolved to one absolute regular executable before use. Plumbing uses a
+fixed argument grammar, bounded stdin/stdout, a cleared environment with only
+fixed safe Git variables, `-c core.fsmonitor=false`, and lazy fetching disabled.
+Split indexes fail closed before mutation because the v1 recovery barrier covers
+one full `.git/index`. Diagnostics use scrubbed stderr and validated portable
+paths/modes/OIDs; no password, key, session token, or plaintext reaches Git.
+Fully automatic locked Git integration remains deferred until an authenticated
+local broker exists.
 
 ## Failure principles
 

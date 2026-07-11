@@ -1,23 +1,19 @@
 [package]
-name = "inex-cli"
-description = "Administrative, import, verification, and Git tooling for Inex"
+name = "inex-git"
+description = "Ciphertext-only Git installation, merge, and recovery tooling for Inex"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
-[[bin]]
-name = "inex"
-path = "src/main.rs"
-
 [dependencies]
+diffy.workspace = true
 inex-core = { path = "../inex-core" }
-inex-daemon = { path = "../inex-daemon" }
-inex-git = { path = "../inex-git" }
-rpassword = "=7.5.4"
+serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
-uuid.workspace = true
+thiserror.workspace = true
 zeroize.workspace = true
 
 [lints]

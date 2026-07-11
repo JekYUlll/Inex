@@ -3,6 +3,7 @@ members = [
     "crates/inex-cli",
     "crates/inex-core",
     "crates/inex-daemon",
+    "crates/inex-git",
 ]
 resolver = "3"
 
@@ -15,6 +16,7 @@ repository = "https://github.com/horeb/Inex"
 
 [workspace.dependencies]
 base64 = "0.22.1"
+diffy = "=0.5.0"
 libsodium-sys-stable = { version = "=1.24.0", default-features = false }
 minicbor = { version = "=2.2.2", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"] }

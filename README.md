@@ -29,6 +29,8 @@ The non-negotiable storage invariant is:
 - `inexd`: local JSON-RPC sidecar shared by editor clients.
 - `inex`: CLI for vault creation, verification, password changes, import, and
   Git merge-driver integration.
+- `inex-git`: bounded system-Git plumbing, locked-safe driver installation,
+  in-memory diff3, encrypted conflict state, and crash recovery.
 - `editors/vscode`: primary VS Code client with a ciphertext-backed custom
   editor, tree, controlled navigation, encrypted backups, and secure search UI.
 - `editors/sublime`: lightweight Sublime Text client with Quick Panel browsing
@@ -43,6 +45,7 @@ The non-negotiable storage invariant is:
 - [Vault metadata v1](docs/spec/vault-v1.md)
 - [JSON-RPC v1 protocol](docs/spec/json-rpc-v1.md)
 - [Copy import v1 safety and recovery contract](docs/spec/import-v1.md)
+- [Git merge and recovery v1 contract](docs/spec/git-merge-v1.md)
 - [Acceptance matrix](docs/acceptance-matrix.md)
 
 The implementation plan and live development record are kept in
