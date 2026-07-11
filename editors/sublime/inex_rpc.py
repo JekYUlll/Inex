@@ -24,6 +24,8 @@ MAX_STDERR_BYTES = 64 * 1024
 MAX_PIPE_READ_BYTES = 64 * 1024
 MAX_DOCUMENT_BYTES = 16 * 1024 * 1024
 MAX_DRAFT_BYTES = MAX_DOCUMENT_BYTES + 12 + 4096 + 16
+SESSION_TOKEN_TEXT_BYTES = 43
+DOCUMENT_HANDLE_TEXT_BYTES = 22
 REQUEST_TIMEOUT_SECONDS = 120.0
 PROTOCOL_MAJOR = 1
 SESSION_RENEWING_METHODS = frozenset(
@@ -444,29 +446,31 @@ class InexRpcClient:
     def unlock(self, vault_path: str, password: str) -> Dict[str, Any]:
         if not isinstance(vault_path, str) or not os.path.isabs(vault_path):
             raise RpcProtocolError("Vault path must be absolute")
-        result = _expect_object(
-            self._call_raw("vault.unlock", {"vaultPath": vault_path, "password": password}),
-            "unlock result",
-        )
-        session = result.get("session")
-        idle = result.get("idleTimeoutMs")
-        vault_id = result.get("vaultId")
-        warnings = result.get("warnings")
-        if (
-            set(result) != {"session", "vaultId", "idleTimeoutMs", "warnings"}
-            or not isinstance(session, str)
-            or len(session.encode("utf-8")) != 43
-            or not _CAPABILITY_RE.fullmatch(session)
-            or isinstance(idle, bool)
-            or not isinstance(idle, int)
-            or idle < 1000
-            or idle > 60 * 60 * 1000
-            or not isinstance(vault_id, str)
-            or not _UUID_RE.fullmatch(vault_id)
-            or not isinstance(warnings, list)
-        ):
-            self._fail_terminal(RpcProtocolError("RPC unlock result is invalid"))
-            raise RpcProtocolError("RPC unlock result is invalid")
+        try:
+            result = _expect_exact_object(
+                self._call_raw(
+                    "vault.unlock",
+                    {"vaultPath": vault_path, "password": password},
+                ),
+                {"session", "vaultId", "idleTimeoutMs", "warnings"},
+                "unlock result",
+            )
+            session = _expect_session_token(result.get("session"))
+            idle = result.get("idleTimeoutMs")
+            vault_id = result.get("vaultId")
+            warnings = result.get("warnings")
+            if (
+                isinstance(idle, bool)
+                or not isinstance(idle, int)
+                or idle < 1000
+                or idle > 60 * 60 * 1000
+                or not isinstance(vault_id, str)
+                or not _UUID_RE.fullmatch(vault_id)
+                or not isinstance(warnings, list)
+            ):
+                raise RpcProtocolError("RPC unlock result is invalid")
+        except RpcProtocolError as error:
+            self._terminate_protocol(error)
         with self._state_lock:
             self._session = session
         return {"vaultId": vault_id, "idleTimeoutMs": idle, "warnings": warnings}
@@ -509,7 +513,7 @@ class InexRpcClient:
                 {"handle", "contentBase64", "etag", "metadata"},
                 "document result",
             )
-            handle = _expect_capability(result.get("handle"), "document handle")
+            handle = _expect_document_handle(result.get("handle"))
             content = decode_base64url(result.get("contentBase64"), MAX_DOCUMENT_BYTES)
             etag = _expect_etag(result.get("etag"))
             _validate_metadata(result.get("metadata"), logical_path, (0, 1))
@@ -651,7 +655,7 @@ class InexRpcClient:
             self._terminate_protocol(error)
 
     def close_document(self, handle: str) -> None:
-        handle = _expect_capability(handle, "document handle")
+        handle = _expect_document_handle(handle)
         try:
             self._expect_ok(
                 self._call_raw(
@@ -731,7 +735,11 @@ class InexRpcClient:
         with self._state_lock:
             if self._session is None:
                 raise RpcLifecycleError("Inex vault is locked")
-            return self._session
+            session = self._session
+        try:
+            return _expect_session_token(session)
+        except RpcProtocolError as error:
+            self._terminate_protocol(error)
 
     def _call_raw(self, method: str, params: Dict[str, Any]) -> Any:
         process = self._process
@@ -957,10 +965,27 @@ def _expect_bounded_string(value: Any, name: str, maximum: int) -> str:
     return value
 
 
-def _expect_capability(value: Any, name: str) -> str:
-    result = _expect_bounded_string(value, name, 43)
-    if len(result.encode("utf-8")) != 43 or not _CAPABILITY_RE.fullmatch(result):
-        raise RpcProtocolError("RPC %s is invalid" % name)
+def _expect_session_token(value: Any) -> str:
+    result = _expect_bounded_string(
+        value, "session token", SESSION_TOKEN_TEXT_BYTES
+    )
+    if (
+        len(result.encode("utf-8")) != SESSION_TOKEN_TEXT_BYTES
+        or not _CAPABILITY_RE.fullmatch(result)
+    ):
+        raise RpcProtocolError("RPC session token is invalid")
+    return result
+
+
+def _expect_document_handle(value: Any) -> str:
+    result = _expect_bounded_string(
+        value, "document handle", DOCUMENT_HANDLE_TEXT_BYTES
+    )
+    if (
+        len(result.encode("utf-8")) != DOCUMENT_HANDLE_TEXT_BYTES
+        or not _CAPABILITY_RE.fullmatch(result)
+    ):
+        raise RpcProtocolError("RPC document handle is invalid")
     return result
 
 

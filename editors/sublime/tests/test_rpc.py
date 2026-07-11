@@ -9,15 +9,19 @@ import time
 import unittest
 
 from inex_rpc import (
+    DOCUMENT_HANDLE_TEXT_BYTES,
     ERROR_CONTRACT,
     MAX_FRAME_BYTES,
     MAX_PIPE_READ_BYTES,
+    SESSION_TOKEN_TEXT_BYTES,
     FrameDecoder,
     InexRpcClient,
     MAX_PENDING_CALLS,
     RpcLifecycleError,
     RpcProtocolError,
     RpcRemoteError,
+    _expect_document_handle,
+    _expect_session_token,
     _read_pipe_once,
     decode_base64url,
     encode_request,
@@ -138,6 +142,72 @@ class PipeReadTests(unittest.TestCase):
 
 
 class RequestAndResponseTests(unittest.TestCase):
+    def test_session_and_document_capabilities_have_distinct_exact_lengths(self):
+        session = "S" * SESSION_TOKEN_TEXT_BYTES
+        handle = "H" * DOCUMENT_HANDLE_TEXT_BYTES
+        self.assertEqual(_expect_session_token(session), session)
+        self.assertEqual(_expect_document_handle(handle), handle)
+
+        for value in ("S" * 42, "S" * 44, "S" * 42 + "+"):
+            with self.subTest(kind="session", value=value):
+                with self.assertRaises(RpcProtocolError):
+                    _expect_session_token(value)
+        for value in ("H" * 21, "H" * 23, "H" * 21 + "+"):
+            with self.subTest(kind="document", value=value):
+                with self.assertRaises(RpcProtocolError):
+                    _expect_document_handle(value)
+
+    def test_unlock_and_document_open_close_use_their_exact_capabilities(self):
+        client = InexRpcClient("/unused")
+        session = "S" * SESSION_TOKEN_TEXT_BYTES
+        handle = "H" * DOCUMENT_HANDLE_TEXT_BYTES
+        etag = "sha256:" + "1" * 64
+        metadata = {
+            "fileId": "00000000-0000-4000-8000-000000000000",
+            "logicalPath": "today.md",
+            "createdAt": 1,
+            "modifiedAt": 2,
+            "flags": 0,
+        }
+        calls = []
+
+        def call(method, params):
+            calls.append((method, params))
+            if method == "vault.unlock":
+                return {
+                    "session": session,
+                    "vaultId": "00000000-0000-4000-8000-000000000000",
+                    "idleTimeoutMs": 60000,
+                    "warnings": [],
+                }
+            if method == "document.open":
+                return {
+                    "handle": handle,
+                    "contentBase64": "",
+                    "etag": etag,
+                    "metadata": metadata,
+                }
+            if method == "document.close":
+                return {"ok": True}
+            self.fail("unexpected RPC method: %s" % method)
+
+        client._call_raw = call
+        vault_path = os.path.abspath("vault")
+        client.unlock(vault_path, "password")
+        opened_handle, content, opened_etag = client.open_document("today.md")
+        self.assertEqual(opened_handle, handle)
+        self.assertEqual(content, bytearray())
+        self.assertEqual(opened_etag, etag)
+        client.close_document(opened_handle)
+        self.assertEqual(calls[1][1]["session"], session)
+        self.assertEqual(calls[2][1], {"session": session, "handle": handle})
+
+        corrupted = InexRpcClient("/unused")
+        corrupted._session = "S" * 42
+        with self.assertRaises(RpcProtocolError):
+            corrupted._protected_params()
+        self.assertIsInstance(corrupted._terminal_error, RpcProtocolError)
+
     def test_request_is_compact_bounded_content_length(self):
         encoded = encode_request(7, "system.ping", {})
         header, body = bytes(encoded).split(b"\r\n\r\n", 1)
