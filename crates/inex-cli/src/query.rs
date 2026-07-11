@@ -1,4 +1,8 @@
-//! Bounded search-query acquisition from a hidden TTY or explicit stdin line.
+//! Search-query acquisition from a hidden TTY or allocation-bounded stdin.
+//!
+//! `rpassword` 7.5.4 does not expose a caller-bounded hidden-TTY reader. The
+//! TTY path therefore validates the byte limit immediately after Enter; the
+//! explicit-stdin path enforces the limit while reading.
 
 use std::fmt;
 use std::io::{self, BufRead, Read};
@@ -56,9 +60,12 @@ impl std::error::Error for QueryError {}
 pub(crate) fn read_query(input: QueryInput) -> Result<Zeroizing<String>, QueryError> {
     let query = match input {
         QueryInput::Tty => {
-            let query = rpassword::prompt_password("Search query (hidden): ")
-                .map_err(|error| QueryError::ReadFailed(error.kind()))?;
-            Zeroizing::new(query)
+            // No public rpassword API combines terminal echo suppression with
+            // a caller-controlled read bound. Validate immediately below.
+            Zeroizing::new(
+                rpassword::prompt_password("Search query (hidden): ")
+                    .map_err(|error| QueryError::ReadFailed(error.kind()))?,
+            )
         }
         QueryInput::ExplicitStdin => {
             let stdin = io::stdin();

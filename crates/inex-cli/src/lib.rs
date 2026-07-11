@@ -19,10 +19,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, ExitCode};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use inex_core::atomic::ParentSyncStatus;
 use inex_core::search::{CaseSensitivity, DEFAULT_SEARCH_SNIPPET_BYTES, SearchQuery};
 use inex_core::sodium::DEFAULT_ARGON2ID_PARAMS;
 use inex_core::vault::{PasswordSlotCommit, Vault, VaultError};
-use inex_core::vault_config::KdfPolicy;
+use inex_core::vault_config::{ConfigWarning, KdfPolicy};
 use uuid::Uuid;
 
 use crate::args::{Cli, Command, PasswordCommand};
@@ -91,7 +92,10 @@ fn execute(command: Command) -> Result<ExitCode, AppError> {
 
 fn command_init(vault_path: &Path, input: PasswordInput) -> Result<ExitCode, AppError> {
     let password = read_confirmed_password(input, "New vault password: ")?;
-    let created = Vault::create(vault_path, password.as_slice(), unix_time_ms()?)?;
+    let created_at_ms = unix_time_ms()?;
+    let created = Vault::create(vault_path, password.as_slice(), created_at_ms);
+    drop(password);
+    let created = created?;
     println!("vault created");
     println!("vault-id: {}", created.config().vault_id);
     println!("password-slot: {}", created.unlocked_slot_id());
@@ -102,6 +106,15 @@ fn command_init(vault_path: &Path, input: PasswordInput) -> Result<ExitCode, App
 fn command_verify(vault_path: &Path) -> Result<ExitCode, AppError> {
     let report = verify::verify_locked(vault_path)?;
     println!("verification-mode: locked-structural");
+    println!("mutation-lock: acquired");
+    println!(
+        "pending-ciphertext-transaction: {}",
+        if report.recovered_pending_transaction {
+            "recovered"
+        } else {
+            "none"
+        }
+    );
     println!("vault-metadata: structurally-valid-untrusted");
     println!("directories: {}", report.directories);
     println!("documents: {}", report.documents);
@@ -115,15 +128,21 @@ fn command_password(command: PasswordCommand, input: PasswordInput) -> Result<Ex
     match command {
         PasswordCommand::Add { vault, slot } => {
             let current = read_password(input, "Current vault password: ")?;
-            let mut vault = Vault::unlock(&vault, current.as_slice(), slot, KdfPolicy::default())?;
+            let unlocked = Vault::unlock(&vault, current.as_slice(), slot, KdfPolicy::default());
+            drop(current);
+            let mut vault = unlocked?;
+            print_warnings(vault.warnings());
             let new = read_confirmed_password(input, "New password: ")?;
+            let created_at_ms = unix_time_ms()?;
             let committed = vault.add_password_slot(
                 new.as_slice(),
-                unix_time_ms()?,
+                created_at_ms,
                 DEFAULT_ARGON2ID_PARAMS,
                 KdfPolicy::default(),
-            )?;
-            print_password_slot_commit("password slot added", committed);
+            );
+            drop(new);
+            let committed = committed?;
+            print_password_slot_commit("password slot added", committed, "new-slot-parent-sync");
             Ok(ExitCode::SUCCESS)
         }
         PasswordCommand::Remove {
@@ -138,40 +157,63 @@ fn command_password(command: PasswordCommand, input: PasswordInput) -> Result<Ex
                 Some(retained_slot),
                 KdfPolicy::default(),
             )?;
-            vault.remove_password_slot(
+            print_warnings(vault.warnings());
+            let parent_sync = vault.remove_password_slot(
                 slot_to_remove,
                 retained.as_slice(),
                 retained_slot,
                 KdfPolicy::default(),
-            )?;
+            );
+            drop(retained);
+            let parent_sync = parent_sync?;
             println!("password slot removed");
             println!("removed-slot: {slot_to_remove}");
+            print_parent_sync("slot-removal-parent-sync", parent_sync);
             Ok(ExitCode::SUCCESS)
         }
         PasswordCommand::Change { vault, old_slot } => {
             let current = read_password(input, "Current vault password: ")?;
-            let mut vault =
-                Vault::unlock(&vault, current.as_slice(), old_slot, KdfPolicy::default())?;
+            let unlocked =
+                Vault::unlock(&vault, current.as_slice(), old_slot, KdfPolicy::default());
+            drop(current);
+            let mut vault = unlocked?;
+            print_warnings(vault.warnings());
             let selected_old_slot = vault.unlocked_slot_id();
             let new = read_confirmed_password(input, "New password: ")?;
+            let created_at_ms = unix_time_ms()?;
             let committed = vault.change_password(
                 new.as_slice(),
-                unix_time_ms()?,
+                created_at_ms,
                 DEFAULT_ARGON2ID_PARAMS,
                 KdfPolicy::default(),
-            )?;
-            if let Err(_retirement_error) = vault.remove_password_slot(
+            );
+            let committed = match committed {
+                Ok(committed) => committed,
+                Err(error) => {
+                    drop(new);
+                    return Err(error.into());
+                }
+            };
+            let retirement = vault.remove_password_slot(
                 selected_old_slot,
                 new.as_slice(),
                 committed.new_slot_id,
                 KdfPolicy::default(),
-            ) {
+            );
+            drop(new);
+            let Ok(retirement_parent_sync) = retirement else {
+                print_password_slot_commit(
+                    "new password slot committed; old slot retained",
+                    committed,
+                    "new-slot-parent-sync",
+                );
                 return Err(AppError::PasswordRetirementDeferred {
                     new_slot: committed.new_slot_id,
                 });
-            }
-            print_password_slot_commit("password changed", committed);
+            };
+            print_password_slot_commit("password changed", committed, "new-slot-parent-sync");
             println!("retired-slot: {selected_old_slot}");
+            print_parent_sync("old-slot-removal-parent-sync", retirement_parent_sync);
             Ok(ExitCode::SUCCESS)
         }
     }
@@ -187,7 +229,10 @@ fn command_search(
     query_input: QueryInput,
 ) -> Result<ExitCode, AppError> {
     let password = read_password(password_input, "Vault password: ")?;
-    let mut vault = Vault::unlock(vault_path, password.as_slice(), slot, KdfPolicy::default())?;
+    let unlocked = Vault::unlock(vault_path, password.as_slice(), slot, KdfPolicy::default());
+    drop(password);
+    let mut vault = unlocked?;
+    print_warnings(vault.warnings());
     let query = read_query(query_input)?;
     vault.rebuild_search_index()?;
     let sensitivity = if case_sensitive {
@@ -200,15 +245,17 @@ fn command_search(
     let stdout = io::stdout();
     let mut output = stdout.lock();
     for hit in hits.iter() {
-        writeln!(
+        write!(
             output,
-            "{}:{}:{}\t{}",
+            "{}:{}:{}\t",
             hit.logical_path(),
             hit.line() + 1,
             hit.utf16_column() + 1,
-            escaped_terminal_text(hit.snippet())
         )
         .map_err(|error| AppError::io(IoOperation::WriteOutput, &error))?;
+        write_escaped_terminal_text(&mut output, hit.snippet())
+            .map_err(|error| AppError::io(IoOperation::WriteOutput, &error))?;
+        writeln!(output).map_err(|error| AppError::io(IoOperation::WriteOutput, &error))?;
     }
     writeln!(output, "matches: {}", hits.len())
         .map_err(|error| AppError::io(IoOperation::WriteOutput, &error))?;
@@ -272,31 +319,68 @@ fn sibling_daemon_executable(current: &Path) -> Result<PathBuf, AppError> {
     }
 }
 
-fn print_password_slot_commit(message: &str, committed: PasswordSlotCommit) {
+fn print_password_slot_commit(
+    message: &str,
+    committed: PasswordSlotCommit,
+    parent_sync_label: &str,
+) {
     println!("{message}");
     println!("new-slot: {}", committed.new_slot_id);
+    print_parent_sync(parent_sync_label, committed.parent_sync);
 }
 
-fn print_warnings(warnings: &[inex_core::vault_config::ConfigWarning]) {
-    if !warnings.is_empty() {
-        println!("warnings: {}", warnings.len());
+fn print_parent_sync(label: &str, status: ParentSyncStatus) {
+    println!("{label}: {}", parent_sync_name(status));
+    if let Some(warning) = parent_sync_warning(status) {
+        eprintln!("warning: {label} is {warning}");
     }
 }
 
-fn escaped_terminal_text(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
+const fn parent_sync_name(status: ParentSyncStatus) -> &'static str {
+    match status {
+        ParentSyncStatus::Synced => "ParentSyncStatus::Synced",
+        ParentSyncStatus::NotSynced => "ParentSyncStatus::NotSynced",
+    }
+}
+
+const fn parent_sync_warning(status: ParentSyncStatus) -> Option<&'static str> {
+    match status {
+        ParentSyncStatus::Synced => None,
+        ParentSyncStatus::NotSynced => Some(
+            "ParentSyncStatus::NotSynced; the metadata commit succeeded, but parent-directory crash durability was not confirmed",
+        ),
+    }
+}
+
+fn print_warnings(warnings: &[ConfigWarning]) {
+    for warning in warnings {
+        eprintln!("warning: {}", config_warning_message(warning));
+    }
+}
+
+fn config_warning_message(warning: &ConfigWarning) -> String {
+    match warning {
+        ConfigWarning::WeakKdf { slot_id } => format!(
+            "password slot {slot_id} uses weak legacy Argon2id parameters below the current creation minimum; unlock was permitted for migration, but this slot should be replaced"
+        ),
+    }
+}
+
+fn write_escaped_terminal_text(output: &mut impl Write, value: &str) -> io::Result<()> {
     for character in value.chars() {
         match character {
-            '\\' => escaped.push_str("\\\\"),
-            '\t' => escaped.push_str("\\t"),
+            '\\' => output.write_all(b"\\\\")?,
+            '\t' => output.write_all(b"\\t")?,
             character if character.is_control() => {
-                use std::fmt::Write as _;
-                let _ = write!(escaped, "\\u{{{:04X}}}", u32::from(character));
+                write!(output, "\\u{{{:04X}}}", u32::from(character))?;
             }
-            character => escaped.push(character),
+            character => {
+                let mut encoded = [0_u8; 4];
+                output.write_all(character.encode_utf8(&mut encoded).as_bytes())?;
+            }
         }
     }
-    escaped
+    Ok(())
 }
 
 fn unix_time_ms() -> Result<i64, AppError> {
@@ -470,10 +554,36 @@ mod tests {
 
     #[test]
     fn terminal_escaping_blocks_control_sequences() {
+        let mut output = Vec::new();
+        write_escaped_terminal_text(&mut output, "ok\x1b[31m\t\\")
+            .unwrap_or_else(|error| panic!("escape write failed: {error}"));
+        assert_eq!(output, b"ok\\u{001B}[31m\\t\\\\");
+    }
+
+    #[test]
+    fn durability_status_and_warning_are_explicit() {
         assert_eq!(
-            escaped_terminal_text("ok\x1b[31m\t\\"),
-            "ok\\u{001B}[31m\\t\\\\"
+            parent_sync_name(ParentSyncStatus::Synced),
+            "ParentSyncStatus::Synced"
         );
+        assert!(parent_sync_warning(ParentSyncStatus::Synced).is_none());
+        assert_eq!(
+            parent_sync_name(ParentSyncStatus::NotSynced),
+            "ParentSyncStatus::NotSynced"
+        );
+        let warning = parent_sync_warning(ParentSyncStatus::NotSynced)
+            .unwrap_or_else(|| panic!("NotSynced must have a warning"));
+        assert!(warning.contains("crash durability was not confirmed"));
+    }
+
+    #[test]
+    fn weak_kdf_warning_identifies_slot_and_migration_action() {
+        let slot_id = Uuid::parse_str("00112233-4455-4677-8899-aabbccddeeff")
+            .unwrap_or_else(|error| panic!("test UUID failed: {error}"));
+        let message = config_warning_message(&ConfigWarning::WeakKdf { slot_id });
+        assert!(message.contains(&slot_id.to_string()));
+        assert!(message.contains("weak legacy Argon2id"));
+        assert!(message.contains("should be replaced"));
     }
 
     #[test]

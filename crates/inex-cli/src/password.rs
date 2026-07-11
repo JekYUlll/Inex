@@ -1,4 +1,8 @@
-//! Bounded password acquisition from a hidden TTY or explicit stdin lines.
+//! Password acquisition from a hidden TTY or allocation-bounded stdin lines.
+//!
+//! `rpassword` 7.5.4 does not expose a caller-bounded hidden-TTY reader. The
+//! TTY path therefore validates the byte limit immediately after Enter; the
+//! explicit-stdin path enforces the limit while reading.
 
 use std::fmt;
 use std::io::{self, BufRead, Read};
@@ -59,9 +63,13 @@ pub(crate) fn read_password(
 ) -> Result<Zeroizing<Vec<u8>>, PasswordError> {
     let password = match input {
         PasswordInput::Tty => {
-            let password = rpassword::prompt_password(prompt)
-                .map_err(|error| PasswordError::ReadFailed(error.kind()))?;
-            Zeroizing::new(password.into_bytes())
+            // No public rpassword API combines terminal echo suppression with
+            // a caller-controlled read bound. Validate immediately below.
+            Zeroizing::new(
+                rpassword::prompt_password(prompt)
+                    .map_err(|error| PasswordError::ReadFailed(error.kind()))?
+                    .into_bytes(),
+            )
         }
         PasswordInput::ExplicitStdin => {
             let stdin = io::stdin();

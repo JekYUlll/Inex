@@ -5,7 +5,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::path::PathBuf;
 
-use inex_core::search::DEFAULT_SEARCH_RESULTS;
+use inex_core::search::{DEFAULT_SEARCH_RESULTS, MAX_SEARCH_RESULTS};
 use uuid::Uuid;
 
 pub(crate) const USAGE: &str = "\
@@ -29,8 +29,13 @@ Search queries follow the same rule: they are read from a hidden TTY prompt,
 or one bounded stdin line with INEX_QUERY_STDIN=1. If both stdin opt-ins are
 set for `search`, provide the password line first and the query line second.
 
+The rpassword 7.5.4 hidden-TTY backend has no caller-supplied input bound, so
+TTY byte limits are checked immediately after Enter. The explicit stdin modes
+apply their byte bounds while reading and are the hard allocation-bounded path.
+
 `verify` performs locked structural validation only. It does not authenticate
-vault metadata or document ciphertext.
+vault metadata or document ciphertext. It acquires the vault mutation lock and
+may recover a pending ciphertext transaction; it is not a pure read-only scan.
 ";
 
 pub(crate) struct Cli {
@@ -109,6 +114,7 @@ pub(crate) enum ArgumentError {
     MissingOptionValue,
     InvalidSlot,
     InvalidLimit,
+    SearchLimitTooLarge,
     UnexpectedArgument,
     NonUnicodeCommand,
     ForbiddenPasswordArgument,
@@ -127,6 +133,7 @@ impl fmt::Display for ArgumentError {
             Self::MissingOptionValue => "command-line option requires a value",
             Self::InvalidSlot => "slot must be a canonical UUID",
             Self::InvalidLimit => "search limit must be a positive decimal integer",
+            Self::SearchLimitTooLarge => "search limit exceeds the supported maximum",
             Self::UnexpectedArgument => "unexpected command-line argument",
             Self::NonUnicodeCommand => "command and option names must be valid Unicode",
             Self::ForbiddenPasswordArgument => {
@@ -251,6 +258,9 @@ fn parse_options(
                     .map_err(|_| ArgumentError::InvalidLimit)?;
                 if limit == 0 {
                     return Err(ArgumentError::InvalidLimit);
+                }
+                if limit > MAX_SEARCH_RESULTS {
+                    return Err(ArgumentError::SearchLimitTooLarge);
                 }
                 options.limit = Some(limit);
             }
@@ -431,6 +441,12 @@ mod tests {
         assert!(matches!(
             Cli::parse(["search", "/vault", "--limit", "0"]),
             Err(ArgumentError::InvalidLimit)
+        ));
+
+        let excessive_limit = (MAX_SEARCH_RESULTS + 1).to_string();
+        assert!(matches!(
+            Cli::parse(["search", "/vault", "--limit", excessive_limit.as_str()]),
+            Err(ArgumentError::SearchLimitTooLarge)
         ));
     }
 }

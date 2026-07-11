@@ -17,6 +17,7 @@ pub(crate) struct VerificationReport {
     pub(crate) documents: usize,
     pub(crate) directories: usize,
     pub(crate) weak_kdf_slots: usize,
+    pub(crate) recovered_pending_transaction: bool,
 }
 
 #[derive(Debug)]
@@ -94,7 +95,8 @@ impl std::error::Error for VerifyError {}
 
 pub(crate) fn verify_locked(root: &Path) -> Result<VerificationReport, VerifyError> {
     let root = resolve_root(root)?;
-    let _guard = VaultMutationGuard::acquire(&root).map_err(|_| VerifyError::MutationLock)?;
+    let guard = VaultMutationGuard::acquire(&root).map_err(|_| VerifyError::MutationLock)?;
+    let recovered_pending_transaction = guard.recovery_changed_repository();
     let metadata_path = root.join(VAULT_CONFIG_FILE);
     require_exact_metadata_name(&root)?;
     let metadata_bytes = read_regular_bounded(&metadata_path, MAX_VAULT_JSON_BYTES)?;
@@ -132,10 +134,12 @@ pub(crate) fn verify_locked(root: &Path) -> Result<VerificationReport, VerifyErr
         }
     }
 
+    drop(guard);
     Ok(VerificationReport {
         documents,
         directories,
         weak_kdf_slots: warnings.len(),
+        recovered_pending_transaction,
     })
 }
 
@@ -353,6 +357,7 @@ mod tests {
         assert_eq!(report.documents, 1);
         assert_eq!(report.directories, 1);
         assert_eq!(report.weak_kdf_slots, 1);
+        assert!(!report.recovered_pending_transaction);
     }
 
     #[test]
