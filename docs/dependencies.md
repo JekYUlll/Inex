@@ -53,7 +53,7 @@ operations limit 3. Readers validate a resource ceiling before calling sodium.
   artifacts/source paths supplied and verified by the pinned sys crate.
 - Linux/Windows x64 are the first blocking matrix; Linux/Windows arm64 join
   before GA. Format fixtures must be byte-identical on every target.
-- The release-tool suite passes 19/19, `actionlint` and pedantic/all-features
+- The release-tool suite passes 49/49, `actionlint` and pedantic/all-features
   Clippy pass, and independent code review is GO. A local system-GCC Linux x64
   clean-source double build is byte-identical and passes strict
   ELF/archive/native-dependency audit plus executable/VSIX sidecar smoke with

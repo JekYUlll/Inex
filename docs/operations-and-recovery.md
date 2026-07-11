@@ -46,6 +46,34 @@ A Git-only backup omits uncommitted changes and intentionally omits
 omit that private runtime directory. Do not infer authenticity from a successful
 archive checksum alone; an authenticated unlock/read is the content check.
 
+For release engineering, a source checkout provides
+`scripts/drill_release_lifecycle.py`. It rehearses the normal path with a final
+Linux artifact, a synthetic disposable source, Git bundle and clean
+regular-file tree-copy restores, and authenticated byte comparison. It refuses
+a dirty harness worktree and native Windows until Windows process-tree and ADS
+coverage exist. The drill captures and audits the bounded four-file artifact
+set before creating secrets, requires an exact imported ciphertext layout,
+accepts only one Git `main` ref/commit with no unreachable objects, and scans
+content plus relative path components outside the intentionally retained
+`plaintext-source`. A failure after the disposable evidence root is created
+retains it and prints its path for explicit inspection and cleanup; an early
+dirty-source, Windows, or input-path rejection creates no root. A successful
+run removes its evidence root.
+
+Treat that result as binding only from a dedicated standalone, exclusive and
+quiescent release checkout. From interpreter startup through artifact/report
+capture, no editor, sync client, watcher, sibling worktree, build process or
+other same-principal writer may modify the worktree, Git administration state,
+generated inputs, target/artifact directory, `PATH` or toolchain. The harness
+samples and rehashes these boundaries but does not acquire an OS-wide lock; its
+JSON therefore records this trust assumption and excludes adversarial
+same-user release-host writers. The manifest source commit is not a build
+attestation for binaries or generated editor bundles.
+
+A clean passing Linux x64 result is a platform checkpoint only: it does not
+simulate publication ambiguity, power loss, a real failure journal, NTFS ADS,
+or rollback between two released program versions.
+
 ### Failure-state preservation
 
 If a command reports an indeterminate namespace result, unconfirmed durability,

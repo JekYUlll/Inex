@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 from pathlib import Path, PurePosixPath
 import re
@@ -124,42 +125,58 @@ def validate_member_name(name: str) -> str:
     return normalized
 
 
-def read_zip_entries(path: Path) -> dict[str, tuple[bytes, int]]:
+def _read_zip_entries(
+    archive: zipfile.ZipFile, label: str
+) -> dict[str, tuple[bytes, int]]:
     entries: dict[str, tuple[bytes, int]] = {}
     seen: dict[str, tuple[str, bool]] = {}
     total = 0
+    if not archive.infolist() or len(archive.infolist()) > MAX_ARCHIVE_MEMBERS:
+        raise ReleaseError("artifact has an invalid member count")
+    for information in archive.infolist():
+        raw_name, is_directory = zip_member_name(information)
+        name = validate_member_name(raw_name)
+        register_archive_member(seen, name, is_directory=is_directory)
+        mode = information.external_attr >> 16
+        if information.flag_bits & 0x1:
+            raise ReleaseError(f"artifact contains an encrypted member: {name}")
+        if is_directory:
+            continue
+        if name in entries:
+            raise ReleaseError(f"artifact contains a duplicate member: {name}")
+        if information.file_size > MAX_ARCHIVE_MEMBER_BYTES:
+            raise ReleaseError(f"artifact member exceeds the size ceiling: {name}")
+        total += information.file_size
+        if total > MAX_ARCHIVE_TOTAL_BYTES:
+            raise ReleaseError(f"artifact exceeds the total size ceiling: {label}")
+        data = archive.read(information)
+        if len(data) != information.file_size:
+            raise ReleaseError(f"artifact member size changed while reading: {name}")
+        for marker in FORBIDDEN_PAYLOAD_MARKERS:
+            if marker in data:
+                raise ReleaseError(f"artifact contains a test canary marker: {name}")
+        entries[name] = (data, mode & 0o777)
+    if not entries:
+        raise ReleaseError(f"artifact is empty: {label}")
+    return entries
+
+
+def read_zip_entries(path: Path) -> dict[str, tuple[bytes, int]]:
     try:
         with zipfile.ZipFile(path, "r") as archive:
-            if not archive.infolist() or len(archive.infolist()) > MAX_ARCHIVE_MEMBERS:
-                raise ReleaseError("artifact has an invalid member count")
-            for information in archive.infolist():
-                raw_name, is_directory = zip_member_name(information)
-                name = validate_member_name(raw_name)
-                register_archive_member(seen, name, is_directory=is_directory)
-                mode = information.external_attr >> 16
-                if information.flag_bits & 0x1:
-                    raise ReleaseError(f"artifact contains an encrypted member: {name}")
-                if is_directory:
-                    continue
-                if name in entries:
-                    raise ReleaseError(f"artifact contains a duplicate member: {name}")
-                if information.file_size > MAX_ARCHIVE_MEMBER_BYTES:
-                    raise ReleaseError(f"artifact member exceeds the size ceiling: {name}")
-                total += information.file_size
-                if total > MAX_ARCHIVE_TOTAL_BYTES:
-                    raise ReleaseError(f"artifact exceeds the total size ceiling: {path.name}")
-                data = archive.read(information)
-                if len(data) != information.file_size:
-                    raise ReleaseError(f"artifact member size changed while reading: {name}")
-                for marker in FORBIDDEN_PAYLOAD_MARKERS:
-                    if marker in data:
-                        raise ReleaseError(f"artifact contains a test canary marker: {name}")
-                entries[name] = (data, mode & 0o777)
+            return _read_zip_entries(archive, path.name)
     except (OSError, zipfile.BadZipFile) as error:
         raise ReleaseError(f"artifact is not a valid ZIP container: {path}") from error
-    if not entries:
-        raise ReleaseError(f"artifact is empty: {path}")
-    return entries
+
+
+def read_zip_entries_from_bytes(data: bytes, label: str) -> dict[str, tuple[bytes, int]]:
+    if len(data) > MAX_ARCHIVE_TOTAL_BYTES:
+        raise ReleaseError(f"artifact container exceeds the size ceiling: {label}")
+    try:
+        with zipfile.ZipFile(io.BytesIO(data), "r") as archive:
+            return _read_zip_entries(archive, label)
+    except (OSError, zipfile.BadZipFile) as error:
+        raise ReleaseError(f"artifact is not a valid ZIP container: {label}") from error
 
 
 def require_entry(entries: dict[str, tuple[bytes, int]], name: str) -> tuple[bytes, int]:
@@ -515,6 +532,15 @@ def validate_documentation(
                 require_entry(entries, target)
 
 
+def _strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ReleaseError(f"package manifest repeats a JSON key: {key}")
+        result[key] = value
+    return result
+
+
 def validate_package_manifest(
     data: bytes,
     expected_kind: str,
@@ -527,10 +553,26 @@ def validate_package_manifest(
     expected_version: str,
 ) -> None:
     try:
-        manifest = json.loads(data)
+        text = data.decode("utf-8", "strict")
+        manifest = json.loads(text, object_pairs_hook=_strict_json_object)
     except (UnicodeError, json.JSONDecodeError) as error:
-        raise ReleaseError("package manifest is invalid JSON") from error
-    if not isinstance(manifest, dict) or manifest.get("schemaVersion") != 1:
+        raise ReleaseError("package manifest is not strict UTF-8 JSON") from error
+    if (
+        not isinstance(manifest, dict)
+        or set(manifest)
+        != {
+            "schemaVersion",
+            "package",
+            "platform",
+            "version",
+            "installFormat",
+            "source",
+            "files",
+        }
+        or not isinstance(manifest.get("schemaVersion"), int)
+        or isinstance(manifest.get("schemaVersion"), bool)
+        or manifest.get("schemaVersion") != 1
+    ):
         raise ReleaseError("package manifest has an invalid schema")
     kind = manifest.get("package")
     expected = {
@@ -544,11 +586,19 @@ def validate_package_manifest(
         raise ReleaseError("package manifest platform does not match the artifact identity")
     if manifest.get("version") != expected_version:
         raise ReleaseError("package manifest version does not match the artifact identity")
+    expected_install_format = {
+        "rust": "portable ZIP with bin/inex and bin/inexd",
+        "vscode": f"VSIX target {PLATFORMS[expected_platform]['vscode_target']}",
+        "sublime": "extract the Inex directory into the Sublime Text Packages directory",
+    }[expected_kind]
+    if manifest.get("installFormat") != expected_install_format:
+        raise ReleaseError("package manifest install format does not match the artifact")
     source = manifest.get("source")
     if (
         not isinstance(source, dict)
+        or set(source) != {"commit", "dirtySourceTree", "repository"}
         or not isinstance(source.get("commit"), str)
-        or not re.fullmatch(r"[0-9a-f]{40}", source["commit"])
+        or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", source["commit"])
         or source.get("repository") != "https://github.com/JekYUlll/Inex"
     ):
         raise ReleaseError("package manifest has an invalid source revision")
@@ -562,7 +612,7 @@ def validate_package_manifest(
         raise ReleaseError("package manifest has no file inventory")
     declared: set[str] = set()
     for record in files:
-        if not isinstance(record, dict):
+        if not isinstance(record, dict) or set(record) != {"path", "sha256", "size"}:
             raise ReleaseError("package manifest contains an invalid file record")
         relative = record.get("path")
         digest = record.get("sha256")

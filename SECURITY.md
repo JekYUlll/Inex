@@ -24,7 +24,7 @@ In particular:
   plugin host still leaves the visible buffer actively copyable and requires a
   full Sublime restart; the client therefore remains experimental until the
   complete package canary matrix passes; and
-- release-tool tests pass 19/19, `actionlint` and pedantic/all-features Clippy
+- release-tool tests pass 49/49, `actionlint` and pedantic/all-features Clippy
   pass, and independent release-tool code review is GO. A system-GCC Linux x64
   clean-source double build is byte-identical and passes strict
   archive/native-dependency audit plus VS Code 1.125.0 CLI
@@ -62,6 +62,17 @@ Inex does not protect plaintext from:
 
 Full-disk encryption, a trusted editor profile, OS updates, and protected
 swap/hibernation remain recommended.
+
+Release evidence has an additional host trust boundary. A binding run requires
+a dedicated standalone, exclusive, quiescent checkout. From interpreter startup
+until artifacts and the JSON report are captured, no editor, sync client,
+watcher, sibling worktree, build process, or other process with the same OS
+principal may modify the worktree, `.git`, index, refs, config, generated inputs,
+target/artifact directories, `PATH`, or toolchain. Start/end identity, Git-tree,
+and byte checks detect observed drift; they are not an OS lock and cannot defeat
+an authorized writer that changes and restores state between samples. Manifest
+source identity is provenance metadata, not an independent attestation that
+generated binaries or editor bundles were built from that commit.
 
 ## Storage invariants
 

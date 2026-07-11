@@ -27,14 +27,15 @@ Status terms in this document mean:
 
 | Area | Status | Evidence and exact boundary |
 |------|--------|-----------------------------|
-| Linux Rust workspace | verified checkpoint | 261/261 workspace tests after rename/modify hardening, plus rustfmt, all-features pedantic Clippy with warnings denied, rustdoc warnings denied, and whitespace checks |
+| Linux Rust workspace | verified checkpoint | 262/262 workspace tests after rename/modify hardening, plus rustfmt, all-features pedantic Clippy with warnings denied, rustdoc warnings denied, and whitespace checks |
 | EDRY/vault compatibility | checkpoint | Frozen v1 fixture rebuild/unlock/decrypt and broad format/path/tamper tests pass on Linux; Windows GNU compiles and earlier Wine suites pass, but this is not native Windows evidence |
-| Import | verified checkpoint | Copy-only absent-destination staging, re-open/seal/allowlist/publication, source-preservation, and failure-class tests pass; independent code review gave checkpoint GO |
+| Import | verified checkpoint | Copy-only absent-destination staging, re-open/seal/allowlist/publication, source-preservation, and failure-class tests pass. The final clean Linux x64 artifact also imports a five-document synthetic tree including exact 16 MiB content, preserves every source hash, and produces no plaintext Markdown in the vault; publication ambiguity and native-platform fault cases remain pending |
 | Git | verified checkpoint | Locked-safe driver, local installer, real-repository plumbing, encrypted diff3, unresolved flag, versioned plaintext-free journals, fixed tree provenance, full-width SHA-1/SHA-256 validation, detected/split rename/modify, owner drift rejection, and v1/v2/v3 recovery regressions pass on Linux; native Windows power-loss and a true cross-process index CAS remain pending |
 | VS Code unit/bundle | verified checkpoint | Strict TypeScript, 23/23 Node tests, production bundle, and integration bundle pass |
 | VS Code Extension Host | partial | The current local build and 1.125.0 directly drive the production create/folder-create/file-rename/file-delete actions plus encrypted backup/recovery against the daemon/custom editor. Close refusal, rename collision, Unix delete-I/O failure recovery, command registration, and isolated-root residue pass. InputBox/QuickPick mouse interaction is not automated, and test-mode workbench storage is in-memory, so persistent cross-process restore/Local History is unproven |
 | Sublime current source | partial | Pure-Python tests pass 61/61. An exact Build 4200 normal E2E drives unlock/open/edit/save/close and real-panel New Folder/New Markdown/rename/etag-delete through registered commands. Authenticated tree checks pass after each mutation; `folder_created`, `markdown_created`, `renamed`, and `deleted` are present, `crud_complete=true`, `vault_envelope=EDRY`, and `root_scan_hits=0`. The plugin-host SIGKILL probe remains `PASS_WITH_DOCUMENTED_BOUNDARY`: the visible buffer is copyable, the host does not restart in-process, a full Sublime restart is required, `vault_envelope=EDRY`, and roots scanned after application exit remain clean. Its `crud_complete=false` is intentional because the crash branch kills after open/edit/save; this is not crash-time plaintext erasure. The full packaged matrix is pending |
-| Linux x64 packaging | verified clean-source checkpoint, release-tool review GO | Release-tooling unit tests pass 19/19; local `actionlint` and pedantic/all-features Clippy pass. Two system-GCC builds from the final clean source are byte-identical across Rust ZIP, VSIX, unpacked Sublime ZIP, and SHA256SUMS; both pass strict artifact/native-dependency audit and VS Code 1.125.0 CLI install/bundled-sidecar smoke. Manifest provenance records the canonical repository, exact commit, and `dirtySourceTree=false` |
+| Linux x64 packaging | verified clean-source checkpoint, release-tool review GO | Release-tooling unit tests pass 49/49; local `actionlint` and pedantic/all-features Clippy pass. Two system-GCC builds from the final clean source are byte-identical across Rust ZIP, VSIX, unpacked Sublime ZIP, and SHA256SUMS; both pass strict artifact/native-dependency audit and VS Code 1.125.0 CLI install/bundled-sidecar smoke. Manifest provenance records the canonical repository, exact commit, and `dirtySourceTree=false`; it is not independent build attestation for generated inputs |
+| Linux x64 artifact lifecycle | hardened development checkpoint; clean rerun pending | The harness now fails closed on a dirty source tree and binds all three artifact SHA-256 values, artifact source, five harness files, fixture hashes, native runtime, Git and filesystem. Development runs cover copy import, exact physical ciphertext allowlist, password rewrap/current-old-password rejection, historical-metadata scope, exact authenticated RPC tree/full-body reads, a single-ref/single-commit Git bundle with unreachable-object rejection, clean regular-file tree copy/restore with driver relocation, and sensitive content/path residue scanning; only plaintext-source file contents are intentionally excluded while its directory set and non-canary path components remain bound. Commit and rerun with `dirtySourceTree=false` before treating this as binding evidence. This is neither native multi-platform evidence nor fault-state/cross-version upgrade evidence |
 | License collection | verified engineering checkpoint | The native-target inventory contains 77 resolved Cargo components and 147 collected license/NOTICE texts: 146 Cargo files plus bundled libsodium 1.0.22 ISC. Independent legal review and license-choice/signature policy remain pending |
 | CI configuration | source-only, non-binding | Linux x64, Windows x64, Linux arm64, and Windows arm64 labels are configured; actions are immutable-SHA pinned and local `actionlint` passes. Push/manual tag refs bind the exact version; the required job runs binding source-quality gates; package targets rerun x64 native tests or ARM no-run compilation, enforce canonical provenance, and install/smoke each platform VSIX. The workflows have not been pushed or run remotely, so every matrix result remains unproven |
 | Native Windows | pending | No native MSVC/NTFS/ReFS/FAT/exFAT release host result is available; GNU cross-check and Wine are non-binding |
@@ -59,8 +60,11 @@ These are not documentation polish items; each changes the release decision:
 5. Build and smoke all four intended platform artifacts on their native target:
    Linux x64/arm64 and Windows x64/arm64. Verify executable architecture and
    dynamic/static native-library expectations, not only archive names.
-6. Run disposable-vault backup/import/restore/upgrade drills from the final
-   artifacts, including publication/recovery fault cases.
+6. After the hardened harness passes from its committed clean source, repeat
+   that Linux x64 normal-path lifecycle on every native final artifact, then add
+   publication/recovery fault-state preservation and a true two-version
+   upgrade/rollback drill. A frozen-v1 read is compatibility evidence, not a
+   substitute for two released program versions.
 7. Complete independent legal review of the collected 77-component inventory,
    147 license/NOTICE texts, license-expression choices, and distribution
    obligations; collection is implemented but is not legal approval.
@@ -114,6 +118,41 @@ target/tools/actionlint .github/workflows/*.yml
 
 ## CLI, import, and backup gate
 
+Maintainers can run the pending Linux-only normal-path gate from a source
+checkout. The tool first audits clean artifact provenance, creates only an
+isolated disposable tree, never accepts a password in argv/environment, and
+prints a body-free JSON summary:
+
+```sh
+ARTIFACT_DIR=/absolute/path/to/final/linux-x64
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=scripts \
+  python3.13 scripts/drill_release_lifecycle.py \
+  "$ARTIFACT_DIR"
+```
+
+Run this only from the exact clean commit under review, in a dedicated
+standalone, exclusive and quiescent release checkout. From interpreter startup
+through artifact/report capture, no editor, sync client, watcher, sibling
+worktree, build process or other same-principal writer may modify the worktree,
+Git state, generated inputs, target/artifact directories, `PATH` or toolchain.
+The tracked root `.gitattributes` applies `* -text` before materialization, and
+the release checkout additionally requires `core.autocrlf=false`; actual
+tracked bytes are hashed against the HEAD blobs, so any line-ending conversion
+fails closed.
+POSIX executable bits are bound on POSIX, while Windows uses its native
+non-filemode checkout semantics and still binds the committed tree mode.
+The command rejects special index flags,
+replacement refs, redirected worktrees, non-canonical tracked bytes/modes, and
+Git command output beyond its fixed safety bounds; it rehashes the complete HEAD
+tree at both provenance boundaries. Those checks detect in-run drift but do not
+turn a same-user-writable live checkout into an atomic snapshot. The command
+fails before artifact use when the harness worktree is dirty, and it fails
+closed on native Windows until Job Object descendant cleanup and NTFS ADS
+residue coverage are implemented. A failure after the disposable evidence root has been created
+prints and retains that private directory; early dirty-source, Windows, or path
+validation rejection creates no evidence root. Inspect and remove a retained
+directory explicitly after triage.
+
 - [ ] Wrong password/slot, metadata tamper, weak KDF warning/resource ceiling,
       password add/change/remove, and "change committed, retirement deferred"
       recovery pass on each native platform.
@@ -127,8 +166,17 @@ target/tools/actionlint .github/workflows/*.yml
       destination, disk faults, publication ambiguity, and marker cleanup
       failure.
 - [ ] Source hashes remain unchanged in every import result.
-- [ ] A successful final-artifact import is committed, backed up, restored to a
-      new path, unlocked, and byte-compared before the source is retired.
+- [ ] After committing the hardened harness, rerun the final clean Linux x64
+      artifact lifecycle with `dirtySourceTree=false`: import to one Git commit,
+      require only `refs/heads/main` and no unreachable objects, create and
+      verify both a Git bundle and clean regular-file tree copy, restore to
+      new paths, relocate/reinstall the local driver, authenticate the exact
+      tree and byte-compare all five expected bodies, and leave the disposable
+      source hashes intact. The exact physical ciphertext allowlist and the
+      sensitive content/path scan outside `plaintext-source` must also pass.
+- [ ] Repeat that final-artifact lifecycle on every advertised native target and
+      preserve injected import/recovery failure states, including their exact
+      `.vault-local` and staging siblings.
 - [ ] Documentation and help continue to reject in-place conversion and import
       into an existing vault; no release material implies otherwise.
 - [ ] Backup/restore covers `vault.json`, all EDRY files, Git objects/refs, local
@@ -260,7 +308,7 @@ PYTHONPATH=scripts python3.13 scripts/smoke_release_artifacts.py \
   "target/release-artifacts/$PLATFORM" --vscode-cli "$VSCODE_CLI"
 ```
 
-On the current Linux x64 host, release-tool tests pass 19/19. Two clean-source
+On the current Linux x64 host, release-tool tests pass 49/49. Two clean-source
 system-GCC packages are byte-identical and both pass artifact/native-dependency
 audits plus VS Code 1.125.0 CLI install/bundled-sidecar smoke. Validation covers VSIX control metadata,
 bounded regular ZIP members and Windows-portable path/mode collisions, exact

@@ -7,12 +7,16 @@ import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
+import signal
+import shutil
 import stat
 import struct
 import subprocess
 import tarfile
+import threading
+import time
 import tomllib
-from typing import Any, Iterable, Mapping
+from typing import Any, Collection, Iterable, Mapping
 import unicodedata
 import zipfile
 
@@ -22,6 +26,17 @@ FIXED_ZIP_TIME = (1980, 1, 1, 0, 0, 0)
 MAX_ARCHIVE_MEMBER_BYTES = 128 * 1024 * 1024
 MAX_ARCHIVE_TOTAL_BYTES = 256 * 1024 * 1024
 MAX_ARCHIVE_MEMBERS = 4096
+MAX_SOURCE_TRACKED_FILES = 16 * 1024
+MAX_SOURCE_FILE_BYTES = 512 * 1024 * 1024
+MAX_SOURCE_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
+MAX_SOURCE_GIT_LISTING_BYTES = 64 * 1024 * 1024
+MAX_SOURCE_GIT_SMALL_OUTPUT_BYTES = 64 * 1024
+MAX_SOURCE_GIT_STDERR_BYTES = 1024 * 1024
+MAX_SOURCE_GIT_METADATA_BYTES = 1024 * 1024
+MAX_SOURCE_UNTRACKED_IGNORE_FILES = 1024
+MAX_SOURCE_GIT_ARGUMENT_BYTES = 32 * 1024
+SOURCE_GIT_TIMEOUT_SECONDS = 60
+WINDOWS_REPARSE_POINT = 0x0400
 
 PLATFORMS: dict[str, dict[str, str]] = {
     "linux-x64": {
@@ -557,29 +572,774 @@ def files_as_entries(
     return entries
 
 
-def source_revision(repository_root: Path) -> dict[str, Any]:
-    def git(*arguments: str) -> str:
-        result = subprocess.run(
-            ["git", *arguments],
-            cwd=repository_root,
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
+def _git_blob_oid(path: Path, algorithm: str, tree_mode: str) -> tuple[str, int]:
+    try:
+        before = path.lstat()
+    except OSError as error:
+        raise ReleaseError("clean source is missing a tracked file") from error
+    if (
+        path.is_symlink()
+        or getattr(before, "st_file_attributes", 0) & WINDOWS_REPARSE_POINT
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or before.st_size > MAX_SOURCE_FILE_BYTES
+    ):
+        raise ReleaseError("clean source contains an unsafe or oversized tracked file")
+    if before.st_mode & 0o7000 or (
+        os.name != "nt"
+        and bool(before.st_mode & stat.S_IXUSR) != (tree_mode == "100755")
+    ):
+        raise ReleaseError("clean source tracked-file mode does not match the HEAD tree")
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    binary = getattr(os, "O_BINARY", 0)
+    descriptor = os.open(path, os.O_RDONLY | no_follow | binary)
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or opened.st_size > MAX_SOURCE_FILE_BYTES
+            or opened.st_mode != before.st_mode
+            or not os.path.samestat(before, opened)
+        ):
+            raise ReleaseError("clean source tracked-file identity changed")
+        digest = hashlib.new(algorithm)
+        digest.update(f"blob {opened.st_size}\0".encode("ascii"))
+        total = 0
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_SOURCE_FILE_BYTES:
+                    raise ReleaseError("clean source tracked file exceeds its size ceiling")
+                digest.update(chunk)
+    finally:
+        os.close(descriptor)
+    try:
+        after = path.lstat()
+    except OSError as error:
+        raise ReleaseError("clean source tracked file disappeared") from error
+    if (
+        not os.path.samestat(opened, after)
+        or total != opened.st_size
+        or opened.st_mode != after.st_mode
+        or opened.st_size != after.st_size
+        or opened.st_mtime_ns != after.st_mtime_ns
+        or opened.st_ctime_ns != after.st_ctime_ns
+    ):
+        raise ReleaseError("clean source tracked file changed during hashing")
+    return digest.hexdigest(), total
+
+
+def _parse_normal_index_paths(raw: str) -> set[str]:
+    paths: set[str] = set()
+    records = [record for record in raw.split("\0") if record]
+    if len(records) > MAX_SOURCE_TRACKED_FILES:
+        raise ReleaseError("source index exceeds the tracked-file ceiling")
+    for record in records:
+        if len(record) < 3 or record[1] != " " or record[0] != "H":
+            raise ReleaseError("source index contains special or non-normal flags")
+        path = record[2:]
+        if path in paths:
+            raise ReleaseError("source index repeats a tracked path")
+        paths.add(path)
+    return paths
+
+
+def _verify_clean_head_tree(
+    repository_root: Path,
+    commit: str,
+    object_format: str,
+    index_paths: set[str],
+    tree_output: str,
+) -> None:
+    if object_format not in {"sha1", "sha256"}:
+        raise ReleaseError("source repository uses an unsupported object format")
+    expected_oid_length = {"sha1": 40, "sha256": 64}[object_format]
+    tree_paths: set[str] = set()
+    portable_files: set[str] = set()
+    portable_directories: set[str] = set()
+    total_bytes = 0
+    records = [record for record in tree_output.split("\0") if record]
+    if not records or len(records) > MAX_SOURCE_TRACKED_FILES:
+        raise ReleaseError("source HEAD tree has an invalid tracked-file count")
+    for record in records:
+        try:
+            metadata, path_text = record.split("\t", 1)
+            mode, kind, expected_oid = metadata.split(" ", 2)
+        except ValueError as error:
+            raise ReleaseError("source HEAD tree listing is malformed") from error
+        path = PurePosixPath(path_text)
+        try:
+            portable_path = portable_archive_key(path_text)
+        except ReleaseError as error:
+            raise ReleaseError("source HEAD tree contains an unsafe tracked path") from error
+        portable_parts = portable_path.split("/")
+        portable_parents = {
+            "/".join(portable_parts[:index])
+            for index in range(1, len(portable_parts))
+        }
+        if (
+            mode not in {"100644", "100755"}
+            or kind != "blob"
+            or len(expected_oid) != expected_oid_length
+            or any(character not in "0123456789abcdef" for character in expected_oid)
+            or path.is_absolute()
+            or not path.parts
+            or any(part in {"", ".", ".."} for part in path.parts)
+            or path_text in tree_paths
+            or portable_path in portable_files
+            or portable_path in portable_directories
+            or any(parent in portable_files for parent in portable_parents)
+        ):
+            raise ReleaseError("source HEAD tree contains an unsafe tracked entry")
+        tree_paths.add(path_text)
+        portable_files.add(portable_path)
+        portable_directories.update(portable_parents)
+        observed_oid, size = _git_blob_oid(
+            repository_root.joinpath(*path.parts), object_format, mode
         )
-        return result.stdout.strip()
+        total_bytes += size
+        if total_bytes > MAX_SOURCE_TOTAL_BYTES:
+            raise ReleaseError("source HEAD tree exceeds the tracked-byte ceiling")
+        if observed_oid != expected_oid:
+            raise ReleaseError(
+                f"clean source bytes do not match commit {commit[:12]}"
+            )
+    if tree_paths != index_paths:
+        raise ReleaseError("source index paths do not match the HEAD tree")
+
+
+class _BoundedGitStreamReader:
+    def __init__(
+        self,
+        stream: Any,
+        limit: int,
+        failure_event: threading.Event,
+    ) -> None:
+        self._stream = stream
+        self._limit = limit
+        self._failure_event = failure_event
+        self._data = bytearray()
+        self.overflow = False
+        self.error: OSError | None = None
+        self.thread = threading.Thread(target=self._read, daemon=True)
+
+    def _read(self) -> None:
+        try:
+            while True:
+                chunk = self._stream.read(64 * 1024)
+                if not chunk:
+                    break
+                remaining = self._limit - len(self._data)
+                if remaining > 0:
+                    self._data.extend(chunk[:remaining])
+                if len(chunk) > remaining:
+                    self.overflow = True
+                    self._failure_event.set()
+        except OSError as error:
+            self.error = error
+            self._failure_event.set()
+        finally:
+            try:
+                self._stream.close()
+            except OSError as error:
+                if self.error is None:
+                    self.error = error
+                    self._failure_event.set()
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def finish(self) -> bytes:
+        self.thread.join(timeout=10)
+        if self.thread.is_alive():
+            raise ReleaseError("source provenance Git output did not reach EOF")
+        if self.error is not None:
+            raise ReleaseError("source provenance Git output could not be read") from self.error
+        if self.overflow:
+            raise ReleaseError("source provenance Git output exceeds its byte ceiling")
+        return bytes(self._data)
+
+
+def _terminate_git_process(process: subprocess.Popen[bytes]) -> None:
+    if os.name != "nt":
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    elif process.poll() is None:
+        process.kill()
+
+
+def _run_bounded_git(
+    git_executable: Path,
+    repository_root: Path,
+    environment: Mapping[str, str],
+    arguments: tuple[str, ...],
+    *,
+    stdout_limit: int,
+    allowed_statuses: Collection[int] = (0,),
+) -> str:
+    file_mode = "false" if os.name == "nt" else "true"
+    process = subprocess.Popen(
+        [
+            str(git_executable),
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+            "-c",
+            "core.ignoreCase=false",
+            "-c",
+            "core.precomposeUnicode=false",
+            "-c",
+            f"core.fileMode={file_mode}",
+            "-c",
+            f"core.excludesFile={os.devnull}",
+            "-c",
+            f"core.attributesFile={os.devnull}",
+            "-c",
+            "core.quotePath=false",
+            "-c",
+            "gc.auto=0",
+            "-c",
+            "maintenance.auto=false",
+            *arguments,
+        ],
+        cwd=repository_root,
+        env=dict(environment),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=os.name != "nt",
+    )
+    if process.stdout is None or process.stderr is None:
+        _terminate_git_process(process)
+        raise ReleaseError("source provenance Git streams are unavailable")
+    failure_event = threading.Event()
+    stdout_reader = _BoundedGitStreamReader(
+        process.stdout, stdout_limit, failure_event
+    )
+    stderr_reader = _BoundedGitStreamReader(
+        process.stderr, MAX_SOURCE_GIT_STDERR_BYTES, failure_event
+    )
+    stdout_reader.start()
+    stderr_reader.start()
+    deadline = time.monotonic() + SOURCE_GIT_TIMEOUT_SECONDS
+    failed = False
+    while process.poll() is None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or failure_event.wait(timeout=min(0.05, remaining)):
+            failed = True
+            _terminate_git_process(process)
+            break
+    try:
+        status = process.wait(timeout=10)
+    except subprocess.TimeoutExpired as error:
+        _terminate_git_process(process)
+        raise ReleaseError("source provenance Git process could not be terminated") from error
+    outputs: list[bytes] = []
+    first_reader_error: BaseException | None = None
+    for reader in (stdout_reader, stderr_reader):
+        try:
+            outputs.append(reader.finish())
+        except BaseException as error:
+            outputs.append(b"")
+            if first_reader_error is None:
+                first_reader_error = error
+    if first_reader_error is not None:
+        _terminate_git_process(process)
+        raise first_reader_error
+    stdout, stderr = outputs
+    if failed:
+        raise ReleaseError("source provenance Git command exceeded its safety bounds")
+    if status not in allowed_statuses or stderr:
+        raise ReleaseError("source provenance Git command failed")
+    try:
+        return stdout.decode("utf-8", "strict")
+    except UnicodeError as error:
+        raise ReleaseError("source provenance Git output is not UTF-8") from error
+
+
+def _provenance_path_identity(path: Path, *, directory: bool) -> tuple[int, ...]:
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise ReleaseError("source provenance path is unavailable") from error
+    if (
+        path.is_symlink()
+        or getattr(metadata, "st_file_attributes", 0) & WINDOWS_REPARSE_POINT
+        or (directory and not stat.S_ISDIR(metadata.st_mode))
+        or (not directory and not stat.S_ISREG(metadata.st_mode))
+        or (not directory and metadata.st_nlink != 1)
+    ):
+        raise ReleaseError("source provenance path has an unsafe identity")
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _single_git_line(output: str, label: str) -> str:
+    if not output.endswith("\n") or output.count("\n") != 1 or "\0" in output:
+        raise ReleaseError(f"source provenance {label} output is malformed")
+    value = output[:-1]
+    if not value:
+        raise ReleaseError(f"source provenance {label} output is empty")
+    return value
+
+
+def _direct_provenance_path(
+    output: str,
+    expected: Path,
+    *,
+    directory: bool,
+    label: str,
+) -> tuple[Path, tuple[int, ...]]:
+    candidate = Path(_single_git_line(output, label))
+    if not candidate.is_absolute():
+        raise ReleaseError(f"source provenance {label} path is not absolute")
+    lexical = Path(os.path.abspath(candidate))
+    try:
+        resolved = lexical.resolve(strict=True)
+    except OSError as error:
+        raise ReleaseError(f"source provenance {label} path is unavailable") from error
+    if lexical != expected or resolved != lexical:
+        raise ReleaseError(f"source provenance {label} path is indirect or unexpected")
+    return lexical, _provenance_path_identity(lexical, directory=directory)
+
+
+def _validated_local_git_config(raw: str) -> tuple[str, str]:
+    if not raw or not raw.endswith("\0"):
+        raise ReleaseError("source repository local Git configuration is malformed")
+    records = raw[:-1].split("\0")
+    origins: list[str] = []
+    allowed_exact_keys = {
+        "core.bare",
+        "core.autocrlf",
+        "core.checkstat",
+        "core.filemode",
+        "core.ignorecase",
+        "core.logallrefupdates",
+        "core.fscache",
+        "core.longpaths",
+        "core.precomposeunicode",
+        "core.protecthfs",
+        "core.protectntfs",
+        "core.repositoryformatversion",
+        "core.symlinks",
+        "core.trustctime",
+        "extensions.objectformat",
+        "gc.auto",
+        "remote.origin.fetch",
+        "remote.origin.url",
+        "user.email",
+        "user.name",
+    }
+    for record in records:
+        key, separator, value = record.partition("\n")
+        if not separator or not key:
+            raise ReleaseError("source repository local Git configuration is malformed")
+        normalized = key.casefold()
+        branch_key = normalized.startswith("branch.") and normalized.rsplit(
+            ".", 1
+        )[-1] in {"merge", "remote"}
+        if normalized not in allowed_exact_keys and not branch_key:
+            raise ReleaseError("source repository has unsafe local Git configuration")
+        if normalized == "gc.auto" and value != "0":
+            raise ReleaseError("source repository has unsafe local Git configuration")
+        if normalized == "core.autocrlf" and value.casefold() != "false":
+            raise ReleaseError("source repository has unsafe local Git configuration")
+        if normalized == "remote.origin.url":
+            origins.append(value)
+    if len(origins) != 1 or not origins[0]:
+        raise ReleaseError("source repository must have exactly one local origin URL")
+    return origins[0], raw
+
+
+def _validated_info_exclude(path: Path) -> tuple[tuple[int, ...], str]:
+    identity = _provenance_path_identity(path, directory=False)
+    if identity[4] > MAX_SOURCE_GIT_METADATA_BYTES:
+        raise ReleaseError("source repository private exclude file is oversized")
+    try:
+        data = path.read_bytes()
+    except OSError as error:
+        raise ReleaseError("source repository private exclude file is unreadable") from error
+    if (
+        len(data) != identity[4]
+        or _provenance_path_identity(path, directory=False) != identity
+    ):
+        raise ReleaseError("source repository private exclude file changed during reading")
+    try:
+        text = data.decode("utf-8", "strict")
+    except UnicodeError as error:
+        raise ReleaseError("source repository private exclude file is not UTF-8") from error
+    if any(
+        line.strip() and not line.startswith("#")
+        for line in text.splitlines()
+    ):
+        raise ReleaseError("source repository private exclude patterns are not allowed")
+    return identity, sha256_bytes(data)
+
+
+def source_revision(repository_root: Path) -> dict[str, Any]:
+    try:
+        repository_root = repository_root.resolve(strict=True)
+    except OSError as error:
+        raise ReleaseError("source repository root is unavailable") from error
+    root_identity = _provenance_path_identity(repository_root, directory=True)
+    git_environment = {
+        name: value for name, value in os.environ.items() if not name.startswith("GIT_")
+    }
+    git_environment.update(
+        {
+            "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_NO_LAZY_FETCH": "1",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+    )
+    git_lookup = shutil.which("git", path=git_environment.get("PATH"))
+    if git_lookup is None:
+        raise ReleaseError("source provenance Git executable is unavailable")
+    try:
+        git_executable = Path(git_lookup).resolve(strict=True)
+    except OSError as error:
+        raise ReleaseError("source provenance Git executable is unavailable") from error
+    git_executable_identity = _provenance_path_identity(
+        git_executable, directory=False
+    )
+
+    def git(
+        *arguments: str,
+        stdout_limit: int = MAX_SOURCE_GIT_SMALL_OUTPUT_BYTES,
+        allowed_statuses: Collection[int] = (0,),
+    ) -> str:
+        return _run_bounded_git(
+            git_executable,
+            repository_root,
+            git_environment,
+            arguments,
+            stdout_limit=stdout_limit,
+            allowed_statuses=allowed_statuses,
+        )
+
+    expected_git_directory = repository_root / ".git"
+    expected_index_path = expected_git_directory / "index"
+
+    def repository_layout() -> tuple[object, ...]:
+        top_level, top_level_identity = _direct_provenance_path(
+            git("rev-parse", "--show-toplevel"),
+            repository_root,
+            directory=True,
+            label="worktree root",
+        )
+        git_directory, git_directory_identity = _direct_provenance_path(
+            git("rev-parse", "--absolute-git-dir"),
+            expected_git_directory,
+            directory=True,
+            label="Git directory",
+        )
+        common_directory, common_directory_identity = _direct_provenance_path(
+            git("rev-parse", "--path-format=absolute", "--git-common-dir"),
+            expected_git_directory,
+            directory=True,
+            label="Git common directory",
+        )
+        index_path, index_identity = _direct_provenance_path(
+            git("rev-parse", "--path-format=absolute", "--git-path", "index"),
+            expected_index_path,
+            directory=False,
+            label="Git index",
+        )
+        objects_path, objects_identity = _direct_provenance_path(
+            git("rev-parse", "--path-format=absolute", "--git-path", "objects"),
+            expected_git_directory / "objects",
+            directory=True,
+            label="Git object directory",
+        )
+        object_info_path, object_info_identity = _direct_provenance_path(
+            f"{expected_git_directory / 'objects' / 'info'}\n",
+            expected_git_directory / "objects" / "info",
+            directory=True,
+            label="Git object info directory",
+        )
+        config_path, config_identity = _direct_provenance_path(
+            f"{expected_git_directory / 'config'}\n",
+            expected_git_directory / "config",
+            directory=False,
+            label="Git config",
+        )
+        head_path, head_identity = _direct_provenance_path(
+            f"{expected_git_directory / 'HEAD'}\n",
+            expected_git_directory / "HEAD",
+            directory=False,
+            label="Git HEAD",
+        )
+        info_exclude_path, info_exclude_path_identity = _direct_provenance_path(
+            f"{expected_git_directory / 'info' / 'exclude'}\n",
+            expected_git_directory / "info" / "exclude",
+            directory=False,
+            label="Git private exclude file",
+        )
+        info_exclude_identity, info_exclude_digest = _validated_info_exclude(
+            info_exclude_path
+        )
+        if info_exclude_identity != info_exclude_path_identity:
+            raise ReleaseError("source repository private exclude identity changed")
+        for unsupported in (
+            expected_git_directory / "worktrees",
+            expected_git_directory / "config.worktree",
+        ):
+            if unsupported.exists() or unsupported.is_symlink():
+                raise ReleaseError(
+                    "source provenance requires a standalone checkout without worktree state"
+                )
+        private_attributes = expected_git_directory / "info" / "attributes"
+        if private_attributes.exists() or private_attributes.is_symlink():
+            raise ReleaseError(
+                "source provenance does not allow private Git attributes"
+            )
+        for alternate in (
+            expected_git_directory / "objects" / "info" / "alternates",
+            expected_git_directory / "objects" / "info" / "http-alternates",
+        ):
+            if alternate.exists() or alternate.is_symlink():
+                raise ReleaseError(
+                    "source provenance requires a standalone object database without alternates"
+                )
+        if any(expected_git_directory.glob("sharedindex.*")):
+            raise ReleaseError("source provenance does not allow a split Git index")
+        return (
+            top_level,
+            top_level_identity,
+            git_directory,
+            git_directory_identity,
+            common_directory,
+            common_directory_identity,
+            index_path,
+            index_identity,
+            objects_path,
+            objects_identity,
+            object_info_path,
+            object_info_identity,
+            config_path,
+            config_identity,
+            head_path,
+            head_identity,
+            info_exclude_path,
+            info_exclude_identity,
+            info_exclude_digest,
+        )
+
+    def local_configuration() -> tuple[str, str]:
+        raw = git(
+            "config",
+            "--local",
+            "--no-includes",
+            "--null",
+            "--list",
+            stdout_limit=MAX_SOURCE_GIT_LISTING_BYTES,
+        )
+        remote, snapshot = _validated_local_git_config(raw)
+        effective_remote = _single_git_line(
+            git("remote", "get-url", "--all", "origin"),
+            "effective origin",
+        )
+        if effective_remote != remote:
+            raise ReleaseError("Git effective origin does not match its local origin URL")
+        return remote, snapshot
+
+    def untracked_ignore_snapshot() -> tuple[str, ...]:
+        raw = git(
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "-z",
+            "--",
+            ":(icase,glob)**/.gitignore",
+            stdout_limit=MAX_SOURCE_GIT_LISTING_BYTES,
+        )
+        if raw and not raw.endswith("\0"):
+            raise ReleaseError("source repository ignore-file listing is malformed")
+        paths = tuple(raw[:-1].split("\0")) if raw else ()
+        if any(not record for record in paths):
+            raise ReleaseError("source repository ignore-file listing is malformed")
+        if len(paths) > MAX_SOURCE_UNTRACKED_IGNORE_FILES:
+            raise ReleaseError("source repository has too many untracked ignore files")
+        if len(set(paths)) != len(paths):
+            raise ReleaseError("source repository repeats an untracked ignore path")
+        parents: set[str] = set()
+        for path_text in paths:
+            portable_archive_key(path_text)
+            path = PurePosixPath(path_text)
+            if path.name.casefold() != ".gitignore":
+                raise ReleaseError("source repository returned an invalid ignore path")
+            parent = path.parent.as_posix()
+            if parent == ".":
+                raise ReleaseError(
+                    "source repository has an untracked ignore file outside an ignored directory"
+                )
+            parents.add(parent)
+
+        matched_parents: set[str] = set()
+        chunk: list[str] = []
+        chunk_bytes = 0
+
+        def check_chunk() -> None:
+            nonlocal chunk, chunk_bytes
+            if not chunk:
+                return
+            output = git(
+                "check-ignore",
+                "--no-index",
+                "--",
+                *chunk,
+                stdout_limit=MAX_SOURCE_GIT_SMALL_OUTPUT_BYTES,
+                allowed_statuses=(0, 1),
+            )
+            records = output.splitlines()
+            if output != "".join(f"{record}\n" for record in records):
+                raise ReleaseError("source repository ignore output is malformed")
+            matched_parents.update(records)
+            chunk = []
+            chunk_bytes = 0
+
+        for parent in sorted(parents):
+            encoded_size = len(parent.encode("utf-8")) + 1
+            if encoded_size > MAX_SOURCE_GIT_ARGUMENT_BYTES:
+                raise ReleaseError("source repository ignore path is oversized")
+            if chunk and chunk_bytes + encoded_size > MAX_SOURCE_GIT_ARGUMENT_BYTES:
+                check_chunk()
+            chunk.append(parent)
+            chunk_bytes += encoded_size
+        check_chunk()
+        if matched_parents != parents:
+            raise ReleaseError(
+                "source repository has an untracked ignore file outside an ignored directory"
+            )
+        return tuple(sorted(paths))
 
     try:
-        commit = git("rev-parse", "HEAD")
-        dirty = bool(git("status", "--porcelain=v1", "--untracked-files=all"))
-        remote = git("remote", "get-url", "origin")
-    except (OSError, subprocess.CalledProcessError, UnicodeError) as error:
+        layout = repository_layout()
+        if layout[1] != root_identity:
+            raise ReleaseError("source repository root identity changed")
+        commit = _single_git_line(
+            git("rev-parse", "--verify", "HEAD^{commit}"), "commit"
+        )
+        remote, local_config = local_configuration()
+        untracked_ignore_files = untracked_ignore_snapshot()
+        object_format = _single_git_line(
+            git("rev-parse", "--show-object-format"), "object format"
+        )
+        if object_format not in {"sha1", "sha256"}:
+            raise ReleaseError("source repository uses an unsupported object format")
+        replace_refs = git(
+            "for-each-ref", "--format=%(refname)", "refs/replace/"
+        )
+        if replace_refs:
+            raise ReleaseError("source repository contains replacement object refs")
+        index_flags = git(
+            "ls-files", "-v", "-z", stdout_limit=MAX_SOURCE_GIT_LISTING_BYTES
+        )
+        index_paths = _parse_normal_index_paths(index_flags)
+        status = git(
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignore-submodules=all",
+            stdout_limit=MAX_SOURCE_GIT_LISTING_BYTES,
+        )
+        dirty = bool(status)
+        if not dirty:
+            tree_output = git(
+                "ls-tree",
+                "-r",
+                "-z",
+                "--full-tree",
+                commit,
+                stdout_limit=MAX_SOURCE_GIT_LISTING_BYTES,
+            )
+            _verify_clean_head_tree(
+                repository_root,
+                commit,
+                object_format,
+                index_paths,
+                tree_output,
+            )
+        final_commit = _single_git_line(
+            git("rev-parse", "--verify", "HEAD^{commit}"), "final commit"
+        )
+        final_remote, final_local_config = local_configuration()
+        final_untracked_ignore_files = untracked_ignore_snapshot()
+        final_replace_refs = git(
+            "for-each-ref", "--format=%(refname)", "refs/replace/"
+        )
+        final_index_flags = git(
+            "ls-files", "-v", "-z", stdout_limit=MAX_SOURCE_GIT_LISTING_BYTES
+        )
+        final_status = git(
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignore-submodules=all",
+            stdout_limit=MAX_SOURCE_GIT_LISTING_BYTES,
+        )
+        if not dirty:
+            final_index_paths = _parse_normal_index_paths(final_index_flags)
+            final_tree_output = git(
+                "ls-tree",
+                "-r",
+                "-z",
+                "--full-tree",
+                final_commit,
+                stdout_limit=MAX_SOURCE_GIT_LISTING_BYTES,
+            )
+            if final_tree_output != tree_output:
+                raise ReleaseError("source HEAD tree changed during provenance verification")
+            _verify_clean_head_tree(
+                repository_root,
+                final_commit,
+                object_format,
+                final_index_paths,
+                final_tree_output,
+            )
+        final_layout = repository_layout()
+    except (OSError, UnicodeError, ValueError) as error:
         raise ReleaseError("could not identify the source revision") from error
-    if len(commit) != 40 or any(character not in "0123456789abcdef" for character in commit):
+    expected_commit_length = {"sha1": 40, "sha256": 64}[object_format]
+    if len(commit) != expected_commit_length or any(
+        character not in "0123456789abcdef" for character in commit
+    ):
         raise ReleaseError("Git returned an invalid source revision")
     if remote not in _CANONICAL_REMOTES:
         raise ReleaseError("Git origin is not the canonical Inex repository")
+    if (
+        final_commit != commit
+        or final_remote != remote
+        or final_local_config != local_config
+        or final_untracked_ignore_files != untracked_ignore_files
+        or final_layout != layout
+        or _provenance_path_identity(repository_root, directory=True) != root_identity
+        or _provenance_path_identity(git_executable, directory=False)
+        != git_executable_identity
+        or final_replace_refs != replace_refs
+        or final_index_flags != index_flags
+        or final_status != status
+    ):
+        raise ReleaseError("source revision changed during provenance verification")
     return {
         "commit": commit,
         "dirtySourceTree": dirty,

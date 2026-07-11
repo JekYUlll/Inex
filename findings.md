@@ -118,6 +118,46 @@
 | handler 本身也必须是 fail-closed 终态机 | 即使 stdio transport 正常会在 shutdown/mismatch 响应后退出，公开 dispatcher 仍不得在终态继续 hello/create/unlock；active vault 也只能显式 lock 后再 unlock，不能由无旧 capability 的请求静默替换 |
 | RPC 结果在构造期必须预留 framing 上界 | core tree 的合法资源上限可能大于单帧 24 MiB；listTree 在分配结果项时按保守 JSON 上界计数并提前返回 `LIMIT_EXCEEDED`，不能等 writer 无法发送后才失败 |
 
+## 2026-07-12 Phase 7 continuation findings
+
+- 当前已证明的是干净源码上的 Linux x64 可复现发布检查点，不等价于 `.agent/init_plan.md` 要求的 Windows/Linux GA；关闭 Phase 7 必须逐项区分“本机可形成的新证据”和“只能由原生平台、托管服务或外部审查形成的证据”。
+- Git 管理边界保持为：稳定 `master` 上每个纵向增量单独提交，验证失败时保留工作树证据，未经授权不推送远端；这既提升开发容错，也避免把尚未绑定的 hosted CI 结果误写成已执行。
+- Phase 7 的三个未勾选项都是聚合门禁；`docs/release-checklist.md` 显示本机仍可加强的绑定证据集中在最终产物 import/backup/restore、源码/日志/动态 canary 与依赖许可清单，原生 Windows/ARM、持久编辑器配置、签名和法务必须保持独立未完成状态。
+- `docs/release-checklist.md` 把最终产物的成功 import→Git commit→backup→新路径 restore→unlock→字节比对列为明确 blocker；现有 CLI 已提供 copy-only import、verify、password 与 Git driver 命令，足以在 Linux x64 产物上做一次无破坏的绑定演练，但目前没有单一可重复的 lifecycle drill 工具把这些步骤、源哈希不变和磁盘 canary 扫描连成证据。
+- 最终 Rust ZIP 同时携带 `inex` 与 `inexd`，现有 framed JSON-RPC `vault.unlock`/`file.read` 可以从打包后的 daemon 认证解密并逐字节对照源文件；公开 v1 fixture 也包含完整口令、逻辑路径和期望 plaintext，可用于证明最终产物只读打开旧格式且不改写 fixture。
+- `inex git install-driver` 只写仓库本地 config 与可跟踪 attributes/ignore；因此 lifecycle drill 可以用 Git bundle/clone 明确证明本地绝对 driver 不随备份传播、恢复后必须显式重装，同时验证 refs/objects 与密文树一并可恢复。
+- 发布审计器已严格验证三种 archive 的一致 version/platform/source provenance，可作为 lifecycle drill 的入口门；16 MiB 最大 Markdown 经无 padding base64url 后约 22.37 MiB，仍低于 daemon 的 24 MiB frame ceiling，因此最终 daemon 可对边界文件做完整认证字节比对。
+- 独立恢复审计指出 Git bundle 只证明已提交 Git refs/objects 与密文树，不能替代包含未提交状态、空目录和故障期 `.vault-local` 的完整文件系统快照；演练应同时形成 Git bundle restore 与 clean full-snapshot restore，并把真实 fault-state preservation 留作单独故障注入门禁。
+- 当前只有单一 `0.1.0` artifact；最终 daemon 对冻结 v1 fixture 的不改写读取是格式向后兼容 checkpoint，但不应被表述为两个发行版本之间的真实 upgrade/rollback。
+- 密码变更演练必须同时证明两件看似相反但都重要的性质：当前 `vault.json` 拒绝旧密码且所有 EDRY 哈希不变；历史完整 metadata 备份与旧密码仍能解开同一 master key。这能防止文档把 slot rewrap 误报为历史凭据撤销。
+- Git 没有可直接调用的 index expected-old CAS porcelain；GA 级事务必须让 Git 通过 alternate index 生成候选，由 Inex 以 O_EXCL 持有真实 `.git/index.lock`，在锁内重验 old digest/owner/provenance、前滚 worktree，再原子发布候选。它需要 journal v4 和原生 Windows replace/power-loss 证据，不能作为当前发布演练的顺手小修。
+- “冻结 fixture 不改写”绑定的是原始格式资产 `vault.json` 与 EDRY envelope 字节；认证读取可按正常锁协议创建 Git-ignored `.vault-local/mutation.lock`。审计应允许这类明确的本地运行时文件，同时拒绝原始哈希变化和任何其他新增路径。
+- 真实最终产物演练证明了 Linux x64 正常路径：copy-only import、最大文件、密码 slot rewrap、认证全字节读取、Git bundle clone、完整 regular-file snapshot restore 与 v1 只读兼容均成立；它仍不是 import publication ambiguity、故障期 `.vault-local`、真实跨版本 rollback 或原生 Windows/ARM 证据。
+- 残留审计不能只扫 vault：最终 harness 将整个隔离临时根（唯一排除仍应保留的 plaintext source）纳入 raw/encoded/UTF-16 动态秘密检查，并额外按文件名拒绝空 plaintext `.md`，避免“空文件无 canary”成为假阴性。
+- 独立复审发现 audit 后按路径重开 Rust ZIP 会留下 audit→execute swap；绑定证据必须执行同一份内存 snapshot，并把 artifact SHA-256、artifact source commit、harness source hash/commit/dirty 状态写入固定 JSON 报告。仅有 artifact count/platform 不足以长期追溯 PASS。
+- Release harness 的子进程还必须固定 `TMPDIR` 与隔离 cwd、精确断言旧密码得到 `AUTH_FAILED`，并把 frozen-v1 称为 compatibility 而非真实 upgrade；真正 upgrade 仍要求两个已校验发行版本。
+- 三路复审补充的强判据：fixture 必须固定身份且绝不能把未验证 `logicalPath` 拼入磁盘路径；`git bundle verify` 必须显式在目标 vault 上下文执行；driver config 必须按 Rust shell-quote 规则整体相等；filesystem restore 重装 driver 后必须再验 clean status；`verify` 输出、完整 `vault.listTree` 集合和报告 schema 都要精确断言。
+- Clean regular-file tree copy 只证明内容/目录集合恢复，不证明 ACL/xattr/ownership/目录 fsync/掉电耐久；报告字段和文档必须避免用笼统 `filesystemSnapshotVerified` 暗示真实 OS snapshot 或 crash-safe backup。
+- 绑定后的报告必须同时显示 artifact source 与 harness source：旧 final artifact 可以合法来自 `76ac04a` clean commit，而新增 release harness 在提交前必须显式是 dirty；只有脚本/测试/文档提交后重跑得到 clean harness source，才可把该 PASS 固化为发布 checkpoint。
+- 最新安全复审否决了当前 harness 的最终绑定资格：冻结 v1 fixture 在摘要校验后重新按外部路径打开四个文件，仍有 check→use 换包窗口；修复必须先把固定名称、限长、no-follow 的同一批字节捕获到私有边界，再对这些字节验哈希、解析和写出。
+- Linux 正常路径还必须补齐四类可证伪条件：每个 framed RPC response 都不得回显动态秘密且必须符合精确 schema；Git 备份只能包含 harness 创建的唯一 main commit/ref 并比较源/恢复 refs/HEAD；Git 初始化前物理 vault 必须符合精确密文 allowlist；父进程退出后仍须有界清理持管道后代并有界收尾 stdout/stderr。
+- 动态残留结论必须覆盖文件与目录相对路径组件，以及标准/URL Base64 padded、unpadded 和三种流对齐；报告字段必须明确排除被设计保留的 plaintext source，不能把排除后的零命中写成全根零命中。
+- Native Windows 仍是独立未覆盖门禁：NTFS ADS、Job Object 子进程树清理和 Rust `canonicalize` 的 `\\?\` 路径语义都不能从 Linux 演练推断；Git driver installer/verifier 还必须拒绝 canonical executable path 中会被 Git 展开的 `%` placeholder。
+- Git driver 的 `%` placeholder 问题必须在产品 installer 而不只在 Python verifier 中关闭：Git 在 shell parsing 前替换 `%O/%A/%B/%L/%P/%S/%X/%Y`，单引号不构成保护。当前实现选择拒绝 canonical executable path 中任意 `%`，并把校验放在 `.gitignore`、`.gitattributes` 和 local config 的任何写入之前。
+- 真正可绑定的 lifecycle PASS 必须 fail-closed：工作树 dirty 时在 artifact 使用前退出；native Windows 在 Job Object/ADS 门禁前退出；Linux 报告只把 `plaintext-source` 列为明确排除根，并以 exact physical allowlist、单 ref/commit/unreachable-object 拒绝和 RPC method schema 共同支撑零泄漏/恢复结论。
+- Superseding resolution：前述“目前没有单一 lifecycle 工具”和“dirty harness 需提交后升级”的现时态发现记录的是本轮早期状态。工具现已实现并在 dirty/native-Windows 条件下 fail-closed；当前剩余动作是提交 hardened harness 后从 clean HEAD 重跑真实 Linux artifact，再据 `dirtySourceTree=false` 把 provisional checkpoint 升级为 binding evidence。
+- `git status` 的“clean”不是 commit-byte provenance：`assume-unchanged`/`skip-worktree` 可隐藏实际工作树差异。发布公共 `source_revision()` 必须拒绝非普通 index flags，并在 clean 情况下逐个按仓库 object format 计算真实 regular-file Git blob OID，与固定 HEAD tree 完整匹配；开始/结束双采样只是补充，不能替代字节绑定。
+- Git clean provenance 还必须把命令解释环境纳入边界：清除继承的 `GIT_*`、禁用 replacement objects/fsmonitor/untracked cache、显式拒绝 `refs/replace/*`，并绑定 canonical worktree、gitdir、index identity、portable tree path、文件 mode 和 Git 输出/时间上界；否则同一个表面 HEAD 可被替换对象、`core.worktree` 或 helper 重定向到其他内容。
+- 首尾两次完整 Git blob 重算能检测校验过程中的普通改写，但不能把一个同用户可写的 live checkout 变成原子 snapshot：攻击者仍可在最后一次读取后改写。发布/证据工具因此只允许在受信任的独占、静止 checkout 中运行；若未来要求抵抗并发写者，必须从私有捕获的固定字节构建并验证产物，而不是无限追加 `status`/rehash 轮次。
+- Git 配置的“raw canonical origin”仍不足以证明有效来源：local include、worktree config、`url.*.insteadOf` 与重复/空 URL 都能改变或扩展有效 remote。绑定实现现只接受直接 standalone `.git`，精确解析并首尾比较 local NUL config snapshot，拒绝 include/worktree/url rewrite/push URL，且要求 raw/effective origin 都恰好一个并一致。
+- Git 的大小写和 mode 语义必须由 verifier 固定，而不是相信 repo config：`core.ignoreCase=true` 可在 Linux 隐藏 `tracked`/`TRACKED` 别名，任意 `0o111` 也不是 Git executable bit。所有 provenance Git 调用现强制 `core.ignoreCase=false`、`core.precomposeUnicode=false`；POSIX 使用 `core.fileMode=true`，Windows 使用原生非 filemode 语义。blob 校验在 POSIX 按 owner execute 位绑定 `100755`，并用 peeled `HEAD^{commit}` 报告真实 commit OID。
+- Manifest 的 commit/clean 标记只证明受信任 release-host 上被采样的源码 provenance；它不证明 `target` binary、VS Code `dist`、vsce 或其他 ignored/generated input 由该 commit 构建。可复现双构建、artifact hash、原生依赖审计与可信工具链是相互独立的证据面。
+- Clean source 的 portable tree 必须同时拒绝 exact key 与 file/directory prefix 碰撞；Linux 可表示 `foo` 文件和 `FOO/bar`，Windows/大小写不敏感文件系统不能。HEAD tree 验证现维护 portable file/directory 双集合，两种插入顺序都 fail-closed。
+- Git 的 ignore/helper 面同样参与 clean 判定：未跟踪 root/nested `.gitignore` 能用 `*` 隐藏自身，`filter.*.clean` 能在 `status` 时执行外部命令。实现现将 local config 限为窄 allowlist、关闭 global excludes/自动维护/submodule traversal，拒绝 active private excludes，并只容许位于已整体忽略父目录内的 generated `.gitignore`；真实 marker 回归证明 filter helper 未执行。
+- “Standalone checkout” 包括直接 object database 与单体 index：linked/sibling worktree、index symlink、split `sharedindex.*`、objects/info alternates 和 worktree config 均被拒绝。Windows 不模拟 POSIX physical execute 位；Git status 在 Windows 固定 `core.fileMode=false`，但仍绑定 commit tree mode与真实 blob bytes，并要求 `core.autocrlf=false`。
+- 跨平台 release checkout 的 EOL 策略必须在 materialization 前生效；checkout 后才写 `core.autocrlf=false` 只能让异常 fail-closed，不能防止转换。根 `.gitattributes` 现以 `* -text` 禁止全树 Git EOL 转换，package workflow 仍显式 pin false，actual blob hash 作为最后门禁。
+- “Exact manifest schema” 同时要求 exact keys、语义值与 parser 一致性：直接 `json.loads(bytes)` 会接受 UTF-16/32、重复键 last-wins，以及把 `true`/`1.0` 与整数 1 等同比较。artifact audit 现先 strict UTF-8 decode、递归拒绝重复键、要求非 bool 整数 schemaVersion=1，并精确验证三类 `installFormat`。
+
 ## Issues Encountered
 
 | Issue | Resolution |

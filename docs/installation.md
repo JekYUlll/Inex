@@ -98,11 +98,14 @@ these commands describe the intended MSVC build shape, not a supported binary.
 The implemented release tooling creates `inex-rust-<version>-<platform>.zip`
 with `bin/inex[.exe]`, `bin/inexd[.exe]`, bundled documentation, manifests,
 checksums, a resolved license inventory, and complete collected license/NOTICE
-texts. Release-tool tests pass 19/19, and independent release-tool code review
+texts. Release-tool tests pass 49/49, and independent release-tool code review
 is GO. A final clean-source system-GCC Linux x64 pair is byte-for-byte
 identical and passes strict archive/native-dependency audit plus executable and
 VSIX/bundled-sidecar smoke; its manifest records the canonical repository,
-exact commit, and `dirtySourceTree=false`.
+exact commit, and `dirtySourceTree=false`. That source identity is provenance
+metadata, not an independent attestation that generated binaries or editor
+bundles were built from the commit; reproducible builds, artifact hashes and
+native audits remain separate evidence.
 For a development candidate,
 verify `SHA256SUMS` through a separate trusted channel, inspect the package
 manifest/source revision, extract the complete directory, and keep both

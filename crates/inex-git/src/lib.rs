@@ -245,6 +245,7 @@ impl fmt::Display for GitIoOperation {
 pub fn install_driver(vault_root: &Path) -> Result<InstallReport, GitError> {
     let git = Git::open(vault_root)?;
     validate_locked_vault_metadata(&git.root)?;
+    let driver_command = installed_driver_command()?;
     let vault_tree =
         tree::scan_vault_tree(&git.root).map_err(|_| GitError::UnsafeRepositoryMetadata)?;
     git.sync_configuration()?;
@@ -252,7 +253,6 @@ pub fn install_driver(vault_root: &Path) -> Result<InstallReport, GitError> {
     let attributes_changed =
         ensure_repository_line(&git.root, GIT_ATTRIBUTES_FILE, ATTRIBUTES_RULE)?;
     sync_directory(&git.root).map_err(|_| GitError::DurabilityNotConfirmed)?;
-    let driver_command = installed_driver_command()?;
 
     git.configure("merge.inex.name", DRIVER_NAME)?;
     git.configure("merge.inex.driver", &driver_command)?;
@@ -1371,10 +1371,21 @@ fn installed_driver_command() -> Result<String, GitError> {
             fs::canonicalize(path).map_err(|_| GitError::DriverExecutableUnavailable)
         })?;
     let metadata = fs::metadata(&executable).map_err(|_| GitError::DriverExecutableUnavailable)?;
+    if !metadata.file_type().is_file() {
+        return Err(GitError::DriverExecutableUnavailable);
+    }
+    driver_command_for_canonical_executable(&executable)
+}
+
+fn driver_command_for_canonical_executable(executable: &Path) -> Result<String, GitError> {
     let text = executable
         .to_str()
-        .filter(|_| metadata.file_type().is_file())
         .ok_or(GitError::DriverExecutableUnavailable)?;
+    // Git expands merge-driver `%` placeholders before shell parsing, so
+    // quoting cannot make a percent-bearing executable path literal.
+    if text.contains('%') {
+        return Err(GitError::DriverExecutableUnavailable);
+    }
     Ok(format!("{} merge-driver", shell_quote(text)))
 }
 
@@ -4771,6 +4782,25 @@ mod tests {
         let independent =
             parse_unmerged_entries(independent.as_bytes()).expect("independent records parse");
         assert!(validate_conflict_set(&independent).is_ok());
+    }
+
+    #[test]
+    fn driver_command_rejects_percent_in_canonical_executable_path() {
+        for executable in [
+            Path::new("/opt/inex/%A/inex"),
+            Path::new("/opt/inex/100%/inex"),
+        ] {
+            assert!(matches!(
+                driver_command_for_canonical_executable(executable),
+                Err(GitError::DriverExecutableUnavailable)
+            ));
+        }
+
+        assert_eq!(
+            driver_command_for_canonical_executable(Path::new("/path with space/it's/inex"))
+                .expect("safe driver path formats"),
+            "'/path with space/it'\\''s/inex' merge-driver"
+        );
     }
 
     #[test]

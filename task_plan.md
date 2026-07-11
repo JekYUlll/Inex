@@ -110,6 +110,7 @@ Phase 7 — 跨平台验证、打包与发布准备
 | 发布包采用严格 allowlist、可移植 ZIP key、内部 manifest 与原生依赖审计 | 产物必须拒绝特殊文件、Windows 路径/权限碰撞、伪 VSIX/PE、脏 provenance 和动态 libsodium；独立发布工具代码审计方可进入 clean-source 构建 |
 | Git rename 只由唯一 merge-base 与固定 HEAD/MERGE_HEAD tree entry 证明 | 新 nonce 让密文相似度无意义，file-id 相同也可能是历史副本；detected/split 都必须绑定完整 provenance 与 source-aware journal |
 | Git OID 宽度绑定仓库 object format，恢复按 v1/v2/v3 严格 schema | SHA-256 Git 会把 40 位唯一前缀交给 `cat-file` 解析；journal 必须在任何变更前拒绝缩写/混宽 OID，并固定可跨 merge commit 验证的 provenance |
+| Binding release 只在独立、独占、静止 checkout 与可信不变工具链上形成 | 首尾 blob/config/identity 复核是有界采样而非 OS 锁；同主体并发写者可在样本间改写并恢复，manifest source identity 也不等于生成物 build attestation |
 
 ## Errors Encountered
 
@@ -188,6 +189,27 @@ Phase 7 — 跨平台验证、打包与发布准备
 | First provenance-aware CLI detected test had no active `MERGE_HEAD`; intermediate journal validation patch matched the legacy v1 recovery block | 1 each | Form a real no-renames merge before synthesizing detected stages; remove the misplaced v1 field access, add validation to the exact v3 block, and restart tests/Clippy |
 | Owner scan initially skipped every other unmerged worktree path | 1 | Compare every non-active conflict worktree digest with its authenticated stage objects so a third identity owner aborts before the first plan writes |
 | Final Git audit constructed a conflict path carrying an additional valid stage zero | 1 | Reject stage-zero/unmerged-path intersections from one bounded full-index snapshot, retain local commit/recovery rechecks, and cover a differently identified source-bound EDRY fixture |
+
+| Lifecycle full-snapshot enhancement initially placed restored-repository `git fsck` before `git clone` | 1 | Numbered source inspection caught the ordering error before execution; move `fsck --full` after clone and rerun unit plus real-artifact gates |
+| First final-artifact lifecycle drill stopped on a harness-only password sync output mismatch | 1 | Product prints `ParentSyncStatus::Synced`; update the fixed contract and add secret-free stage labels before rerunning from a fresh temporary root |
+| Second lifecycle drill treated a persistent `.vault-local/mutation.lock` as a frozen-format rewrite | 1 | Preserve the strict hashes of original `vault.json`/EDRY files, allow only new `.vault-local/` runtime files, and reject every other added path |
+| Combined lifecycle hardening patch missed the current function order/context | 1 | No partial edit applied; split environment/RPC/Git/report repairs by exact current function locations and rerun the full drill |
+| Provenance-hardened drill rejected Linux `stat` filesystem type `ext2/ext3` | 1 | Retained the synthetic failure root, inspect only the fixed type bytes, allow the standard slash separator, then explicitly remove the test root and rerun |
+| Hardened process-tree regression passed but emitted two unclosed-pipe `ResourceWarning` messages | 1 | Close every bounded reader stream at EOF, close RPC stdout on abort, and rerun all 45 release tests with `ResourceWarning=error` |
+| Combined source-quality command reached its final step with `actionlint` absent from `PATH` | 1 | Preserve the already-passing Rust results, use the documented pinned `target/tools/actionlint` v1.7.12 directly, then rerun workflow and whitespace checks |
+| Independent probes escaped process cleanup with `setsid()` and bypassed artifact preflight by growing an archive before copy | 1 each | Enable Linux subreaper + bounded procfs census + pidfd termination/reaping; replace generic artifact tree copy with an identity-checked, per-file/total-bounded capture and add both attack regressions |
+| Final review found source empty directories, end-of-run Git provenance, and post-driver-install refs/objects were not rebound | 1 | Bind source directory manifest and non-canary path scan, re-read `source_revision` at the final boundary, and repeat single-ref/commit/HEAD/unreachable checks after every driver reinstall |
+| Untracked-file whitespace probe reused zsh's read-only special variable `status` | 1 | The command stopped without writes; rerun with a neutral `diff_exit_code` variable and preserve the already-passing tracked `git diff --check` result |
+| Clean-provenance probe hid changed tracked bytes with `assume-unchanged` while `git status` remained empty | 1 | Reject every non-normal index flag and bind actual bounded regular-file Git blob OIDs to the fixed HEAD tree before reporting `dirtySourceTree=false` |
+| Follow-up provenance probes used replace refs, redirected `core.worktree`, executable-mode drift, and oversized Git output | 1 | Sanitize the Git environment/config, reject replacement refs, bind canonical root/gitdir/index plus exact mode/blob tree, and route every Git call through a timeout/output-bounded concurrent reader |
+| Expanded provenance regression left its synthetic replace ref active during later assertions | 1 | Assert and delete the replacement immediately after its probe, then rerun all 49 release tests without weakening expected errors |
+| Final provenance probes hid case aliases, widened executable semantics, redirected index/worktree/config scopes, and changed effective origin | 1 | Freeze Git case/Unicode/fileMode semantics; require direct standalone `.git`/index; parse an exact local config snapshot; reject includes, worktree config, URL rewrites, duplicate/empty origins; bind owner execute and peeled commit |
+| A syntax-only Python invocation omitted `PYTHONDONTWRITEBYTECODE` and created three cache files | 1 | Remove only the command-created `scripts/**/__pycache__` directories, record the invocation mistake, and keep every subsequent gate cache-free |
+| Targeted Rust check named a nonexistent inex-cli integration target `git_workflow` | 1 | Keep the already-passing inex-git 31/31 evidence, rerun the actual `git_cli` target, and require its 9/9 result before commit |
+| Final Git review found portable prefix, self-hiding ignore, clean-filter execution, split-index and alternate-object gaps | 1 | Reject file/directory portable prefixes, unsafe local config and untracked active ignore files; require direct standalone index/object storage and prove helpers never run |
+| First strict local-config allowlist omitted checkout-managed `gc.auto=0` and used POSIX fileMode semantics on Windows | 1 | Permit only exact `gc.auto=0`, branch fileMode by OS, require no EOL conversion, and add the matching package-workflow step/regression |
+| Attribute-isolation patch used a non-matching f-string context | 1 | No partial write occurred; patch the exact Git command and environment dictionaries separately, then rerun the provenance test |
+| Exact manifest audit did not validate install format or strict JSON parser semantics | 1 | Require exact schemas/install format, strict UTF-8, no duplicate keys and integer schema 1; cover wrong/missing/ambiguous forms and re-audit the real artifact |
 
 ## Notes
 
