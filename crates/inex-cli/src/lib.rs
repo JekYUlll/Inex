@@ -9,6 +9,7 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 mod args;
+mod import;
 mod password;
 mod query;
 mod verify;
@@ -67,6 +68,11 @@ fn execute(command: Command) -> Result<ExitCode, AppError> {
     match command {
         Command::Init { vault } => command_init(&vault, PasswordInput::from_environment()?),
         Command::Verify { vault } => command_verify(&vault),
+        Command::Import {
+            source,
+            vault,
+            dry_run,
+        } => command_import(&source, &vault, dry_run),
         Command::Password(command) => command_password(command, PasswordInput::from_environment()?),
         Command::Search {
             vault,
@@ -88,6 +94,87 @@ fn execute(command: Command) -> Result<ExitCode, AppError> {
         Command::Serve => command_serve(),
         Command::Help | Command::Version => unreachable!("handled before password input setup"),
     }
+}
+
+fn command_import(source: &Path, vault_path: &Path, dry_run: bool) -> Result<ExitCode, AppError> {
+    let plan = import::scan_source(source, vault_path)?;
+    println!("import-mode: {}", if dry_run { "dry-run" } else { "copy" });
+    println!("source-policy: preserved-copy-only");
+    println!("destination-policy: new-vault-atomic-no-replace");
+    println!("inspected-entries: {}", plan.inspected_entries());
+    println!("source-directories: {}", plan.directory_count());
+    println!("markdown-files: {}", plan.file_count());
+    println!("plaintext-bytes: {}", plan.total_plaintext_bytes());
+    println!("normalized-path-entries: {}", plan.normalized_entries());
+    println!(
+        "skipped-non-markdown-files: {}",
+        plan.skipped_non_markdown()
+    );
+    println!("directories-to-create: {}", plan.directory_count());
+
+    if dry_run {
+        println!("source-preserved: yes");
+        println!("import-writes: none");
+        println!("password-prompted: no");
+        println!("destination-created: no");
+        println!("result: staged copy import plan valid");
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let password_input = PasswordInput::from_environment()?;
+    let password = read_confirmed_password(password_input, "New vault password: ")?;
+    let staging = import::create_staging_root(&plan)?;
+    println!(
+        "staging-vault: {}",
+        staging
+            .path()
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or("[non-unicode-staging-name]")
+    );
+    io::stdout()
+        .flush()
+        .map_err(|error| AppError::io(IoOperation::WriteOutput, &error))?;
+    let mut vault = Vault::create(staging.path(), password.as_slice(), unix_time_ms()?)
+        .map_err(|_| import::ImportError::StagingCreateFailed)?;
+    let mut summary = import::populate_staging(&plan, &staging, &mut vault, unix_time_ms()?)?;
+    drop(vault);
+
+    let mut reopened = Vault::unlock(
+        staging.path(),
+        password.as_slice(),
+        None,
+        KdfPolicy::default(),
+    )
+    .map_err(|_| import::ImportError::StagingVerificationFailed)?;
+    let (warnings, seal) = import::verify_reopened_staging(&plan, &staging, &mut reopened)?;
+    drop(reopened);
+    drop(password);
+    print_warnings(&warnings);
+    summary.publish_parent_sync = import::publish_staging(&plan, &staging, &seal)?;
+
+    println!("committed-directories: {}", summary.committed_directories);
+    println!("committed-encrypted-files: {}", summary.committed_files);
+    println!(
+        "file-parent-sync-not-confirmed: {}",
+        summary.unconfirmed_file_syncs
+    );
+    if summary.unconfirmed_file_syncs != 0 {
+        eprintln!(
+            "warning: one or more imported files returned ParentSyncStatus::NotSynced; encryption commits succeeded, but parent-directory crash durability was not confirmed"
+        );
+    }
+    println!(
+        "publish-parent-sync: {}",
+        match summary.publish_parent_sync {
+            ParentSyncStatus::Synced => "synced",
+            ParentSyncStatus::NotSynced => "not-confirmed",
+        }
+    );
+    println!("source-preserved: yes");
+    println!("destination: published-new-vault");
+    println!("result: staged copy import complete");
+    Ok(ExitCode::SUCCESS)
 }
 
 fn command_init(vault_path: &Path, input: PasswordInput) -> Result<ExitCode, AppError> {
@@ -410,6 +497,7 @@ impl fmt::Display for IoOperation {
 #[derive(Debug)]
 enum AppError {
     Arguments(args::ArgumentError),
+    Import(import::ImportError),
     Password(password::PasswordError),
     Query(query::QueryError),
     Verification(verify::VerifyError),
@@ -438,7 +526,8 @@ impl AppError {
     fn exit_code(&self) -> ExitCode {
         match self {
             Self::Arguments(_) => ExitCode::from(2),
-            Self::Password(_)
+            Self::Import(_)
+            | Self::Password(_)
             | Self::Query(_)
             | Self::Verification(_)
             | Self::Vault(_)
@@ -456,6 +545,7 @@ impl fmt::Display for AppError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Arguments(error) => write!(formatter, "{error}\n\n{}", args::USAGE),
+            Self::Import(error) => error.fmt(formatter),
             Self::Password(error) => error.fmt(formatter),
             Self::Query(error) => error.fmt(formatter),
             Self::Verification(error) => error.fmt(formatter),
@@ -480,6 +570,12 @@ impl std::error::Error for AppError {}
 impl From<args::ArgumentError> for AppError {
     fn from(error: args::ArgumentError) -> Self {
         Self::Arguments(error)
+    }
+}
+
+impl From<import::ImportError> for AppError {
+    fn from(error: import::ImportError) -> Self {
+        Self::Import(error)
     }
 }
 

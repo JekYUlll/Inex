@@ -256,6 +256,7 @@ dependencies = [
  "inex-core",
  "inex-daemon",
  "rpassword",
+ "sha2",
  "uuid",
  "zeroize",
 ]

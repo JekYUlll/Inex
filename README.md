@@ -42,6 +42,7 @@ The non-negotiable storage invariant is:
 - [EDRY v1 encrypted-file format](docs/spec/edry-v1.md)
 - [Vault metadata v1](docs/spec/vault-v1.md)
 - [JSON-RPC v1 protocol](docs/spec/json-rpc-v1.md)
+- [Copy import v1 safety and recovery contract](docs/spec/import-v1.md)
 - [Acceptance matrix](docs/acceptance-matrix.md)
 
 The implementation plan and live development record are kept in

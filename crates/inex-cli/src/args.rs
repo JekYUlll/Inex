@@ -11,6 +11,7 @@ use uuid::Uuid;
 pub(crate) const USAGE: &str = "\
 Usage:
   inex init <vault>
+  inex import <plaintext-source> <new-vault> [--dry-run]
   inex verify <vault>
   inex password add <vault> [--slot <current-slot-uuid>]
   inex password remove <vault> <slot-to-remove> --slot <retained-slot-uuid>
@@ -32,6 +33,22 @@ set for `search`, provide the password line first and the query line second.
 The rpassword 7.5.4 hidden-TTY backend has no caller-supplied input bound, so
 TTY byte limits are checked immediately after Enter. The explicit stdin modes
 apply their byte bounds while reading and are the hard allocation-bounded path.
+
+`import` is copy-only: it never changes or removes the plaintext source, and
+the final vault path must be absent. `--dry-run` only scans and validates; it
+does not prompt for a password, create a staging directory, or unlock a vault.
+A real import prompts for and confirms a new password, builds and re-opens a
+complete encrypted `.inex-import-staging-*` sibling, then atomically publishes
+it with a no-replace rename. The staging name is printed only after create-only
+reservation. A strict physical allowlist rejects `.git`, plaintext, links, and
+all unrelated entries. Failures leave the final path absent or report an
+indeterminate identity-checked OS post-state; staging is retained for recovery.
+Destructive in-place conversion and import into an existing vault are unsupported.
+Only exact lowercase UTF-8 `.md` files are imported; portable paths are NFC
+normalized, while other regular files are skipped and explicitly counted.
+Links, reparse points, special entries, collisions, and unsafe paths fail.
+Limits are 100000 source entries/files, depth 128, 32 MiB of source/target path
+storage, 16 MiB per Markdown file, and 256 MiB total Markdown plaintext.
 
 `verify` performs locked structural validation only. It does not authenticate
 vault metadata or document ciphertext. It acquires the vault mutation lock and
@@ -58,6 +75,11 @@ pub(crate) enum Command {
     Verify {
         vault: PathBuf,
     },
+    Import {
+        source: PathBuf,
+        vault: PathBuf,
+        dry_run: bool,
+    },
     Password(PasswordCommand),
     Search {
         vault: PathBuf,
@@ -75,6 +97,7 @@ impl Command {
         match self {
             Self::Init { .. } => "init",
             Self::Verify { .. } => "verify",
+            Self::Import { .. } => "import",
             Self::Password(PasswordCommand::Add { .. }) => "password add",
             Self::Password(PasswordCommand::Remove { .. }) => "password remove",
             Self::Password(PasswordCommand::Change { .. }) => "password change",
@@ -106,6 +129,7 @@ pub(crate) enum PasswordCommand {
 pub(crate) enum ArgumentError {
     MissingCommand,
     UnknownCommand,
+    MissingSource,
     MissingVault,
     MissingPasswordSubcommand,
     UnknownPasswordSubcommand,
@@ -118,6 +142,7 @@ pub(crate) enum ArgumentError {
     UnexpectedArgument,
     NonUnicodeCommand,
     ForbiddenPasswordArgument,
+    UnsupportedInPlaceImport,
 }
 
 impl fmt::Display for ArgumentError {
@@ -125,6 +150,7 @@ impl fmt::Display for ArgumentError {
         formatter.write_str(match self {
             Self::MissingCommand => "a command is required",
             Self::UnknownCommand => "unknown command",
+            Self::MissingSource => "plaintext source path is required",
             Self::MissingVault => "vault path is required",
             Self::MissingPasswordSubcommand => "password subcommand is required",
             Self::UnknownPasswordSubcommand => "unknown password subcommand",
@@ -138,6 +164,9 @@ impl fmt::Display for ArgumentError {
             Self::NonUnicodeCommand => "command and option names must be valid Unicode",
             Self::ForbiddenPasswordArgument => {
                 "passwords cannot be supplied through command-line arguments"
+            }
+            Self::UnsupportedInPlaceImport => {
+                "destructive in-place import is unsupported; use copy import"
             }
         })
     }
@@ -160,6 +189,7 @@ impl Cli {
             "verify" => Command::Verify {
                 vault: arguments.pop_path()?.ok_or(ArgumentError::MissingVault)?,
             },
+            "import" => parse_import(&mut arguments)?,
             "password" => Command::Password(parse_password(&mut arguments)?),
             "search" => parse_search(&mut arguments)?,
             "serve" => Command::Serve,
@@ -182,7 +212,7 @@ fn parse_password(arguments: &mut Arguments) -> Result<PasswordCommand, Argument
     match subcommand.as_str() {
         "add" => {
             let vault = arguments.pop_path()?.ok_or(ArgumentError::MissingVault)?;
-            let options = parse_options(arguments, false)?;
+            let options = parse_options(arguments, true, false, false)?;
             Ok(PasswordCommand::Add {
                 vault,
                 slot: options.slot,
@@ -194,7 +224,7 @@ fn parse_password(arguments: &mut Arguments) -> Result<PasswordCommand, Argument
                 .pop_text()?
                 .ok_or(ArgumentError::MissingSlotToRemove)?;
             let slot_to_remove = parse_uuid(&slot_to_remove_text)?;
-            let options = parse_options(arguments, false)?;
+            let options = parse_options(arguments, true, false, false)?;
             let retained_slot = options.slot.ok_or(ArgumentError::RetainedSlotRequired)?;
             Ok(PasswordCommand::Remove {
                 vault,
@@ -204,7 +234,7 @@ fn parse_password(arguments: &mut Arguments) -> Result<PasswordCommand, Argument
         }
         "change" => {
             let vault = arguments.pop_path()?.ok_or(ArgumentError::MissingVault)?;
-            let options = parse_options(arguments, false)?;
+            let options = parse_options(arguments, true, false, false)?;
             Ok(PasswordCommand::Change {
                 vault,
                 old_slot: options.slot,
@@ -215,9 +245,20 @@ fn parse_password(arguments: &mut Arguments) -> Result<PasswordCommand, Argument
     }
 }
 
+fn parse_import(arguments: &mut Arguments) -> Result<Command, ArgumentError> {
+    let source = arguments.pop_path()?.ok_or(ArgumentError::MissingSource)?;
+    let vault = arguments.pop_path()?.ok_or(ArgumentError::MissingVault)?;
+    let options = parse_options(arguments, false, false, true)?;
+    Ok(Command::Import {
+        source,
+        vault,
+        dry_run: options.dry_run,
+    })
+}
+
 fn parse_search(arguments: &mut Arguments) -> Result<Command, ArgumentError> {
     let vault = arguments.pop_path()?.ok_or(ArgumentError::MissingVault)?;
-    let options = parse_options(arguments, true)?;
+    let options = parse_options(arguments, true, true, false)?;
     Ok(Command::Search {
         vault,
         slot: options.slot,
@@ -231,16 +272,19 @@ struct Options {
     slot: Option<Uuid>,
     case_sensitive: bool,
     limit: Option<usize>,
+    dry_run: bool,
 }
 
 fn parse_options(
     arguments: &mut Arguments,
+    slot_options: bool,
     search_options: bool,
+    import_options: bool,
 ) -> Result<Options, ArgumentError> {
     let mut options = Options::default();
     while let Some(option) = arguments.pop_text()? {
         match option.as_str() {
-            "--slot" if options.slot.is_none() => {
+            "--slot" if slot_options && options.slot.is_none() => {
                 let slot_text = arguments
                     .pop_text()?
                     .ok_or(ArgumentError::MissingOptionValue)?;
@@ -263,6 +307,12 @@ fn parse_options(
                     return Err(ArgumentError::SearchLimitTooLarge);
                 }
                 options.limit = Some(limit);
+            }
+            "--dry-run" if import_options && !options.dry_run => {
+                options.dry_run = true;
+            }
+            "--in-place" | "--in-place-convert" => {
+                return Err(ArgumentError::UnsupportedInPlaceImport);
             }
             "--password" | "--passphrase" => {
                 return Err(ArgumentError::ForbiddenPasswordArgument);
@@ -356,6 +406,12 @@ mod tests {
             })
         ));
         assert!(matches!(
+            Cli::parse(["import", "/source", "/new-vault", "--dry-run"]),
+            Ok(Cli {
+                command: Command::Import { dry_run: true, .. }
+            })
+        ));
+        assert!(matches!(
             Cli::parse(["serve"]),
             Ok(Cli {
                 command: Command::Serve
@@ -423,6 +479,14 @@ mod tests {
         assert!(matches!(
             Cli::parse(["--password", "secret"]),
             Err(ArgumentError::ForbiddenPasswordArgument)
+        ));
+        assert!(matches!(
+            Cli::parse(["import", "/source", "/vault", "--in-place"]),
+            Err(ArgumentError::UnsupportedInPlaceImport)
+        ));
+        assert!(matches!(
+            Cli::parse(["import", "/source", "/vault", "--slot", SLOT_A]),
+            Err(ArgumentError::UnexpectedArgument)
         ));
     }
 

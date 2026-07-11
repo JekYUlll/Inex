@@ -10,8 +10,10 @@
 //! that stable `MetadataExt` does not expose. Closing the lock file releases
 //! the lock on both platforms.
 //!
-//! Linux commits use `rename(2)` followed by a directory sync. Windows commits
-//! use `MoveFileExW(MOVEFILE_WRITE_THROUGH)` because Win32 does not document
+//! Linux replacement commits use `rename(2)`, while create-only commits and
+//! complete-vault publication use `renameat2(RENAME_NOREPLACE)`; both are
+//! followed by a directory sync. Windows commits use
+//! `MoveFileExW(MOVEFILE_WRITE_THROUGH)` because Win32 does not document
 //! `FlushFileBuffers` as a portable directory-handle barrier. Inex never
 //! removes the destination first. The v1 storage contract is consequently
 //! limited to local filesystems that implement the platform move atomically.
@@ -43,6 +45,12 @@ pub const CIPHERTEXT_STAGING_SUFFIX: &str = ".tmp";
 
 /// Crash-recovery record for a path-rebinding transaction.
 pub const PENDING_REBIND_FILE: &str = "pending-rebind-v1";
+
+/// Prefix used for complete encrypted vaults staged by copy import.
+pub const IMPORT_STAGING_PREFIX: &str = ".inex-import-staging-";
+
+/// Private marker temporarily held open across staged-vault publication.
+pub const IMPORT_PUBLISH_MARKER: &str = "import-publish-marker-v1";
 
 const PENDING_REBIND_STAGING_PREFIX: &str = ".inex-rebind-stage-";
 #[cfg(windows)]
@@ -81,6 +89,46 @@ pub struct AtomicWriteOutcome {
     pub etag: [u8; 32],
     /// Whether the best-effort parent-directory sync succeeded.
     pub parent_sync: ParentSyncStatus,
+}
+
+/// Successful atomic publication of a complete staged vault directory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AtomicDirectoryPublishOutcome {
+    /// Whether the containing directory was synchronized after publication.
+    pub parent_sync: ParentSyncStatus,
+}
+
+/// Failure to atomically publish a complete staged vault without replacement.
+#[derive(Debug, Error)]
+pub enum AtomicDirectoryPublishError {
+    /// The staging/final paths are not distinct direct children of one parent.
+    #[error("staged-vault publication paths are invalid")]
+    InvalidPaths,
+    /// The final destination already has a filesystem entry.
+    #[error("staged-vault destination already exists")]
+    DestinationExists,
+    /// The no-replace move left the exact complete staging tree in place.
+    #[error("staged-vault namespace publication did not move the staging directory")]
+    NotMoved,
+    /// The platform cannot prove whether the complete staging directory moved.
+    #[error("staged-vault namespace publication outcome is indeterminate")]
+    Indeterminate,
+    /// The complete staging tree was published, but its private marker remains.
+    #[error("staged vault was published but private marker cleanup failed")]
+    PublishedCleanupFailed,
+    /// A scrubbed filesystem operation failed before publication.
+    #[error("staged-vault publication I/O failed")]
+    Io {
+        /// Original error without caller data in this error's display text.
+        #[source]
+        source: io::Error,
+    },
+}
+
+impl AtomicDirectoryPublishError {
+    fn io(source: io::Error) -> Self {
+        Self::Io { source }
+    }
 }
 
 /// Successful conditional deletion result.
@@ -445,6 +493,356 @@ pub fn atomic_write_ciphertext(
     atomic_write_ciphertext_with_faults(vault_root, target, ciphertext, condition, &NoFaults)
 }
 
+/// Publish a complete encrypted staging vault as a previously absent vault.
+///
+/// Both paths must be distinct direct children of the same resolved local
+/// filesystem directory, and the staging name must start with
+/// [`IMPORT_STAGING_PREFIX`]. The platform namespace operation is strictly
+/// no-replace (`renameat2(RENAME_NOREPLACE)` on Linux and `MoveFileExW`
+/// without `MOVEFILE_REPLACE_EXISTING` on Windows). A synchronized random
+/// marker inside `.vault-local` permits safe reconciliation when an operating
+/// system reports an error after actually moving the directory.
+///
+/// # Errors
+///
+/// Returns [`AtomicDirectoryPublishError::DestinationExists`] without
+/// replacing an existing entry. An indeterminate result is reported when
+/// post-state does not prove either the old or complete new namespace state.
+/// Inex never falls back to a replacing rename.
+pub fn atomic_publish_directory_no_replace(
+    staging: &Path,
+    destination: &Path,
+) -> Result<AtomicDirectoryPublishOutcome, AtomicDirectoryPublishError> {
+    atomic_publish_directory_no_replace_checked(staging, destination, |_| Ok(()))
+}
+
+/// Publish a staged vault after running one final caller-supplied physical
+/// audit with the synchronized publication marker present.
+///
+/// The audit runs after identities for the parent, staging root, private
+/// directory, and marker have been captured, and immediately before the
+/// no-replace namespace operation. It must inspect only ciphertext metadata
+/// and names and must not mutate the staging tree.
+///
+/// # Errors
+///
+/// Returns the same fail-closed errors as
+/// [`atomic_publish_directory_no_replace`], or a scrubbed I/O error when the
+/// critical audit rejects the tree.
+pub fn atomic_publish_directory_no_replace_checked<F>(
+    staging: &Path,
+    destination: &Path,
+    critical_audit: F,
+) -> Result<AtomicDirectoryPublishOutcome, AtomicDirectoryPublishError>
+where
+    F: FnOnce(&Path) -> io::Result<()>,
+{
+    atomic_publish_directory_no_replace_with_fault(
+        staging,
+        destination,
+        critical_audit,
+        false,
+        false,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn atomic_publish_directory_no_replace_with_fault<F>(
+    staging: &Path,
+    destination: &Path,
+    critical_audit: F,
+    inject_error_after_move: bool,
+    skip_move: bool,
+    inject_marker_cleanup_failure: bool,
+) -> Result<AtomicDirectoryPublishOutcome, AtomicDirectoryPublishError>
+where
+    F: FnOnce(&Path) -> io::Result<()>,
+{
+    let staging_parent = staging
+        .parent()
+        .ok_or(AtomicDirectoryPublishError::InvalidPaths)?;
+    let destination_parent = destination
+        .parent()
+        .ok_or(AtomicDirectoryPublishError::InvalidPaths)?;
+    let staging_name = staging
+        .file_name()
+        .ok_or(AtomicDirectoryPublishError::InvalidPaths)?;
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+    let destination_name = destination
+        .file_name()
+        .ok_or(AtomicDirectoryPublishError::InvalidPaths)?;
+    if !staging_name
+        .to_str()
+        .is_some_and(|name| name.starts_with(IMPORT_STAGING_PREFIX))
+        || staging == destination
+    {
+        return Err(AtomicDirectoryPublishError::InvalidPaths);
+    }
+
+    let resolved_parent =
+        fs::canonicalize(staging_parent).map_err(AtomicDirectoryPublishError::io)?;
+    let resolved_destination_parent =
+        fs::canonicalize(destination_parent).map_err(AtomicDirectoryPublishError::io)?;
+    if resolved_parent != resolved_destination_parent {
+        return Err(AtomicDirectoryPublishError::InvalidPaths);
+    }
+    if !path_is_supported_local_filesystem(&resolved_parent)
+        .map_err(AtomicDirectoryPublishError::io)?
+        || !paths_share_mount(&resolved_parent, staging).map_err(AtomicDirectoryPublishError::io)?
+    {
+        return Err(AtomicDirectoryPublishError::InvalidPaths);
+    }
+    match fs::symlink_metadata(destination) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Ok(_) => return Err(AtomicDirectoryPublishError::DestinationExists),
+        Err(error) => return Err(AtomicDirectoryPublishError::io(error)),
+    }
+
+    let parent_identity =
+        filesystem_directory_identity(&resolved_parent).map_err(AtomicDirectoryPublishError::io)?;
+    let staging_identity =
+        filesystem_directory_identity(staging).map_err(AtomicDirectoryPublishError::io)?;
+    let local = staging.join(VAULT_LOCAL_DIRECTORY);
+    let local_identity =
+        filesystem_directory_identity(&local).map_err(AtomicDirectoryPublishError::io)?;
+
+    #[cfg(target_os = "linux")]
+    let parent_handle = platform::open_source_directory_path(&resolved_parent)
+        .map_err(AtomicDirectoryPublishError::io)?;
+    #[cfg(target_os = "linux")]
+    let staging_handle =
+        platform::open_source_directory_path(staging).map_err(AtomicDirectoryPublishError::io)?;
+    #[cfg(target_os = "linux")]
+    let local_handle =
+        platform::open_source_directory_path(&local).map_err(AtomicDirectoryPublishError::io)?;
+    #[cfg(target_os = "linux")]
+    if linux_directory_identity_from_file(&parent_handle)
+        .ok()
+        .as_ref()
+        != Some(&parent_identity)
+        || linux_directory_identity_from_file(&staging_handle)
+            .ok()
+            .as_ref()
+            != Some(&staging_identity)
+        || linux_directory_identity_from_file(&local_handle)
+            .ok()
+            .as_ref()
+            != Some(&local_identity)
+    {
+        return Err(AtomicDirectoryPublishError::Indeterminate);
+    }
+    #[cfg(target_os = "linux")]
+    let publish_handles_match = || {
+        linux_directory_identity_from_file(&parent_handle)
+            .is_ok_and(|identity| identity == parent_identity)
+            && linux_directory_identity_from_file(&staging_handle)
+                .is_ok_and(|identity| identity == staging_identity)
+            && linux_directory_identity_from_file(&local_handle)
+                .is_ok_and(|identity| identity == local_identity)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let publish_handles_match = || true;
+
+    let marker = local.join(IMPORT_PUBLISH_MARKER);
+    let marker_bytes = *Uuid::new_v4().as_bytes();
+    let mut marker_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)
+        .map_err(AtomicDirectoryPublishError::io)?;
+    marker_file
+        .write_all(&marker_bytes)
+        .and_then(|()| marker_file.sync_all())
+        .map_err(AtomicDirectoryPublishError::io)?;
+    platform::sync_directory(&local).map_err(AtomicDirectoryPublishError::io)?;
+    platform::sync_directory(staging).map_err(AtomicDirectoryPublishError::io)?;
+
+    // Freeze all cooperative Inex mutations from the critical physical audit
+    // through namespace publication and post-state reconciliation.
+    let _vault_lock = VaultMutationLock::acquire(staging).map_err(|error| match error {
+        AtomicWriteError::Io { source, .. } => AtomicDirectoryPublishError::io(source),
+        _ => AtomicDirectoryPublishError::Indeterminate,
+    })?;
+    critical_audit(staging).map_err(AtomicDirectoryPublishError::io)?;
+    if filesystem_directory_identity(&resolved_parent)
+        .ok()
+        .as_ref()
+        != Some(&parent_identity)
+        || filesystem_directory_identity(staging).ok().as_ref() != Some(&staging_identity)
+        || filesystem_directory_identity(&local).ok().as_ref() != Some(&local_identity)
+        || !marker_matches_open_file(&marker, &marker_file, marker_bytes.len())
+        || !publish_handles_match()
+    {
+        return Err(AtomicDirectoryPublishError::Indeterminate);
+    }
+    match inspect_directory_state(destination).map_err(AtomicDirectoryPublishError::io)? {
+        DirectoryState::Absent => {}
+        DirectoryState::Directory(_) | DirectoryState::Other => {
+            return Err(AtomicDirectoryPublishError::DestinationExists);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    let mut move_result = if skip_move {
+        Err(io::Error::other("injected skipped namespace move"))
+    } else {
+        platform::namespace_move_no_replace_in_directory(
+            &parent_handle,
+            staging_name,
+            destination_name,
+        )
+    };
+    #[cfg(not(target_os = "linux"))]
+    let mut move_result = if skip_move {
+        Err(io::Error::other("injected skipped namespace move"))
+    } else {
+        namespace_move(staging, destination, false)
+    };
+    if inject_error_after_move && move_result.is_ok() {
+        move_result = Err(io::Error::other(
+            "injected return error after complete move",
+        ));
+    }
+
+    let parent_unchanged = filesystem_directory_identity(&resolved_parent)
+        .is_ok_and(|identity| identity == parent_identity);
+    let stage_state = inspect_directory_state(staging);
+    let destination_state = inspect_directory_state(destination);
+
+    let exact_published = parent_unchanged
+        && publish_handles_match()
+        && matches!(stage_state, Ok(DirectoryState::Absent))
+        && matches!(
+            destination_state,
+            Ok(DirectoryState::Directory(ref identity)) if *identity == staging_identity
+        )
+        && filesystem_directory_identity(&destination.join(VAULT_LOCAL_DIRECTORY))
+            .is_ok_and(|identity| identity == local_identity)
+        && marker_matches_open_file(
+            &destination
+                .join(VAULT_LOCAL_DIRECTORY)
+                .join(IMPORT_PUBLISH_MARKER),
+            &marker_file,
+            marker_bytes.len(),
+        );
+    if !exact_published {
+        let exact_not_moved = parent_unchanged
+            && matches!(
+                stage_state,
+                Ok(DirectoryState::Directory(ref identity)) if *identity == staging_identity
+            )
+            && matches!(destination_state, Ok(DirectoryState::Absent))
+            && filesystem_directory_identity(&local)
+                .is_ok_and(|identity| identity == local_identity)
+            && marker_matches_open_file(&marker, &marker_file, marker_bytes.len());
+        if exact_not_moved {
+            return Err(AtomicDirectoryPublishError::NotMoved);
+        }
+        let stage_is_exact = matches!(
+            stage_state,
+            Ok(DirectoryState::Directory(ref identity)) if *identity == staging_identity
+        );
+        let final_is_unrelated = !matches!(destination_state, Ok(DirectoryState::Absent))
+            && !matches!(
+                destination_state,
+                Ok(DirectoryState::Directory(ref identity)) if *identity == staging_identity
+            );
+        if parent_unchanged && stage_is_exact && final_is_unrelated {
+            return Err(AtomicDirectoryPublishError::DestinationExists);
+        }
+        let _ = move_result;
+        return Err(AtomicDirectoryPublishError::Indeterminate);
+    }
+
+    let published_marker = destination
+        .join(VAULT_LOCAL_DIRECTORY)
+        .join(IMPORT_PUBLISH_MARKER);
+    let marker_cleanup = if inject_marker_cleanup_failure {
+        Err(io::Error::other(
+            "injected publication-marker cleanup failure",
+        ))
+    } else {
+        fs::remove_file(&published_marker)
+    };
+    if marker_cleanup.is_err() {
+        let exact_published_with_marker = filesystem_directory_identity(&resolved_parent)
+            .is_ok_and(|identity| identity == parent_identity)
+            && filesystem_directory_identity(destination)
+                .is_ok_and(|identity| identity == staging_identity)
+            && filesystem_directory_identity(&destination.join(VAULT_LOCAL_DIRECTORY))
+                .is_ok_and(|identity| identity == local_identity)
+            && marker_matches_open_file(&published_marker, &marker_file, marker_bytes.len())
+            && publish_handles_match();
+        return Err(if exact_published_with_marker {
+            AtomicDirectoryPublishError::PublishedCleanupFailed
+        } else {
+            AtomicDirectoryPublishError::Indeterminate
+        });
+    }
+    drop(marker_file);
+    if !matches!(fs::symlink_metadata(&published_marker), Err(error) if error.kind() == io::ErrorKind::NotFound)
+    {
+        return Err(AtomicDirectoryPublishError::Indeterminate);
+    }
+    let internal_synced = platform::sync_directory(&destination.join(VAULT_LOCAL_DIRECTORY))
+        .is_ok()
+        && platform::sync_directory(destination).is_ok();
+    let parent_synced = sync_namespace_parent(&resolved_parent).is_ok();
+    if !filesystem_directory_identity(&resolved_parent)
+        .is_ok_and(|identity| identity == parent_identity)
+        || !filesystem_directory_identity(destination)
+            .is_ok_and(|identity| identity == staging_identity)
+        || !filesystem_directory_identity(&destination.join(VAULT_LOCAL_DIRECTORY))
+            .is_ok_and(|identity| identity == local_identity)
+        || !publish_handles_match()
+    {
+        return Err(AtomicDirectoryPublishError::Indeterminate);
+    }
+    Ok(AtomicDirectoryPublishOutcome {
+        parent_sync: if internal_synced && parent_synced {
+            ParentSyncStatus::Synced
+        } else {
+            ParentSyncStatus::NotSynced
+        },
+    })
+}
+
+#[derive(Debug)]
+enum DirectoryState {
+    Absent,
+    Directory(FilesystemDirectoryIdentity),
+    Other,
+}
+
+fn inspect_directory_state(path: &Path) -> io::Result<DirectoryState> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(DirectoryState::Absent);
+        }
+        Err(error) => return Err(error),
+    };
+    if is_link_or_reparse_point(&metadata) || !metadata.file_type().is_dir() {
+        return Ok(DirectoryState::Other);
+    }
+    filesystem_directory_identity(path).map(DirectoryState::Directory)
+}
+
+fn marker_matches_open_file(path: &Path, marker_file: &File, expected_len: usize) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if is_link_or_reparse_point(&metadata)
+        || !metadata.file_type().is_file()
+        || metadata.len() != u64::try_from(expected_len).unwrap_or(u64::MAX)
+    {
+        return false;
+    }
+    platform::open_file_matches_path_and_is_single_link_same_tree(path, marker_file)
+        .unwrap_or(false)
+}
+
 fn atomic_write_ciphertext_with_faults<F: FaultInjector>(
     vault_root: &Path,
     target: &Path,
@@ -654,6 +1052,235 @@ pub fn recover_pending_rebind(
 /// identity, file type, reparse, or single-link validation failed.
 pub fn open_file_matches_path_and_is_single_link(path: &Path, file: &File) -> io::Result<bool> {
     platform::open_file_matches_path_and_is_single_link(path, file)
+}
+
+/// Stable identity of one directory on its backing filesystem/volume.
+///
+/// This opaque value is suitable for equality checks that detect bind-mount,
+/// junction, and alternate-spelling aliases without exposing platform handle
+/// structures to callers.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct FilesystemDirectoryIdentity {
+    volume: u64,
+    identifier: [u8; 16],
+}
+
+/// Obtain the filesystem identity of a non-link directory.
+///
+/// # Errors
+///
+/// Returns an I/O error when `path` is not a normal directory, is link-like,
+/// or the platform cannot obtain a stable volume/file identifier.
+pub fn filesystem_directory_identity(path: &Path) -> io::Result<FilesystemDirectoryIdentity> {
+    let metadata = fs::symlink_metadata(path)?;
+    if is_link_or_reparse_point(&metadata) || !metadata.file_type().is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "directory identity requires a non-link directory",
+        ));
+    }
+    platform::filesystem_directory_identity(path, &metadata)
+}
+
+/// A Linux directory handle used for source import traversal without resolving
+/// intermediate components through mutable path strings.
+#[cfg(target_os = "linux")]
+pub struct SecureSourceDirectory {
+    file: File,
+    path: PathBuf,
+    identity: FilesystemDirectoryIdentity,
+    parent: Option<(File, std::ffi::OsString)>,
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for SecureSourceDirectory {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SecureSourceDirectory { path: [REDACTED], .. }")
+    }
+}
+
+/// One child opened relative to a held [`SecureSourceDirectory`] descriptor.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub enum SecureSourceChild {
+    /// A non-link directory on the same mount.
+    Directory(SecureSourceDirectory),
+    /// A single-link regular file on the same mount.
+    File(SecureSourceFile),
+    /// A socket, FIFO, device, or another unsupported filesystem object.
+    Other,
+}
+
+/// A Linux regular-file handle opened relative to a held source directory.
+#[cfg(target_os = "linux")]
+pub struct SecureSourceFile {
+    file: File,
+    parent: File,
+    name: std::ffi::OsString,
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for SecureSourceFile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SecureSourceFile { .. }")
+    }
+}
+
+/// Open a canonical Linux source root as a held, non-link directory handle.
+///
+/// # Errors
+///
+/// Returns an I/O error when the root cannot be opened without following its
+/// final component or its path no longer names the captured directory.
+#[cfg(target_os = "linux")]
+pub fn open_secure_source_root(path: &Path) -> io::Result<SecureSourceDirectory> {
+    let file = platform::open_source_directory_path(path)?;
+    let identity = linux_directory_identity_from_file(&file)?;
+    if filesystem_directory_identity(path)? != identity {
+        return Err(io::Error::other(
+            "source root identity changed while opening",
+        ));
+    }
+    Ok(SecureSourceDirectory {
+        file,
+        path: path.to_path_buf(),
+        identity,
+        parent: None,
+    })
+}
+
+#[cfg(target_os = "linux")]
+impl SecureSourceDirectory {
+    /// Enumerate names through the held directory descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when descriptor-backed enumeration is unavailable.
+    pub fn read_dir(&self) -> io::Result<fs::ReadDir> {
+        platform::read_source_directory_handle(&self.file)
+    }
+
+    /// Open one direct child with `openat2`, `RESOLVE_BENEATH`,
+    /// `RESOLVE_NO_SYMLINKS`, and `RESOLVE_NO_XDEV`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error for a missing/raced name, a link/magic-link,
+    /// mount crossing, or a descriptor query failure.
+    pub fn open_child(&self, name: &std::ffi::OsStr) -> io::Result<SecureSourceChild> {
+        let file = platform::open_source_child(&self.file, name)?;
+        let metadata = file.metadata()?;
+        if metadata.file_type().is_dir() {
+            let identity = linux_directory_identity_from_file(&file)?;
+            return Ok(SecureSourceChild::Directory(SecureSourceDirectory {
+                file,
+                path: self.path.join(name),
+                identity,
+                parent: Some((self.file.try_clone()?, name.to_os_string())),
+            }));
+        }
+        if metadata.file_type().is_file() {
+            use std::os::unix::fs::MetadataExt as _;
+
+            if metadata.nlink() != 1 {
+                return Err(io::Error::other("source regular file is hard linked"));
+            }
+            return Ok(SecureSourceChild::File(SecureSourceFile {
+                file,
+                parent: self.file.try_clone()?,
+                name: name.to_os_string(),
+            }));
+        }
+        Ok(SecureSourceChild::Other)
+    }
+
+    /// Verify that the original namespace name still resolves to this handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the name is missing, link-like, cross-mount,
+    /// or no longer has the captured identity.
+    pub fn verify_binding(&self) -> io::Result<()> {
+        let current = if let Some((parent, name)) = &self.parent {
+            platform::open_source_child(parent, name)?
+        } else {
+            platform::open_source_directory_path(&self.path)?
+        };
+        if !current.metadata()?.file_type().is_dir()
+            || linux_directory_identity_from_file(&current)? != self.identity
+        {
+            return Err(io::Error::other("source directory binding changed"));
+        }
+        Ok(())
+    }
+
+    /// Return the captured opaque directory identity.
+    #[must_use]
+    pub fn identity(&self) -> &FilesystemDirectoryIdentity {
+        &self.identity
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl SecureSourceFile {
+    /// Return the length observed on the held file handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if metadata cannot be queried.
+    pub fn observed_len(&self) -> io::Result<u64> {
+        self.file.metadata().map(|metadata| metadata.len())
+    }
+
+    /// Verify that the parent-relative name still resolves to this exact,
+    /// single-link regular-file handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error for a raced name or identity/link mismatch.
+    pub fn verify_binding(&self) -> io::Result<()> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let current = platform::open_source_child(&self.parent, &self.name)?;
+        let held = self.file.metadata()?;
+        let observed = current.metadata()?;
+        if !observed.file_type().is_file()
+            || held.nlink() != 1
+            || observed.nlink() != 1
+            || held.dev() != observed.dev()
+            || held.ino() != observed.ino()
+        {
+            return Err(io::Error::other("source file binding changed"));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Read for SecureSourceFile {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.file.read(buffer)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_directory_identity_from_file(file: &File) -> io::Result<FilesystemDirectoryIdentity> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "source handle is not a directory",
+        ));
+    }
+    let mut identifier = [0_u8; 16];
+    identifier[..8].copy_from_slice(&metadata.ino().to_le_bytes());
+    identifier[15] = 1;
+    Ok(FilesystemDirectoryIdentity {
+        volume: metadata.dev(),
+        identifier,
+    })
 }
 
 /// Reports whether a vault path resides on a supported local filesystem.
@@ -1527,18 +2154,45 @@ impl FaultInjector for NoFaults {
 
 #[cfg(target_os = "linux")]
 mod platform {
-    use std::fs::{File, Metadata};
+    use std::ffi::CString;
+    use std::fs::{self, File, Metadata};
     use std::io;
-    use std::os::fd::AsRawFd;
-    use std::os::unix::ffi::OsStringExt;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::os::unix::fs::MetadataExt;
     use std::path::{Path, PathBuf};
 
     const LOCK_EX: i32 = 2;
+    const AT_FDCWD: i32 = -100;
+    const RENAME_NOREPLACE: u32 = 1;
+    const O_DIRECTORY: i32 = 0o200_000;
+    const O_NOFOLLOW: i32 = 0o400_000;
+    const O_CLOEXEC: i32 = 0o2_000_000;
+    const O_NONBLOCK: i32 = 0o4_000;
+    const RESOLVE_NO_XDEV: u64 = 0x01;
+    const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+    const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+    const RESOLVE_BENEATH: u64 = 0x08;
+    const SYS_OPENAT2: isize = 437;
+
+    #[repr(C)]
+    struct OpenHow {
+        flags: u64,
+        mode: u64,
+        resolve: u64,
+    }
 
     #[link(name = "c")]
     unsafe extern "C" {
         fn flock(fd: i32, operation: i32) -> i32;
+        fn renameat2(
+            old_directory_fd: i32,
+            old_path: *const std::ffi::c_char,
+            new_directory_fd: i32,
+            new_path: *const std::ffi::c_char,
+            flags: u32,
+        ) -> i32;
+        fn syscall(number: isize, ...) -> isize;
     }
 
     pub(super) fn lock_exclusive(file: &File) -> io::Result<()> {
@@ -1555,8 +2209,107 @@ mod platform {
         }
     }
 
+    pub(super) fn open_source_directory_path(path: &Path) -> io::Result<File> {
+        if !path.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "secure directory root must be absolute",
+            ));
+        }
+        let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "secure directory root contains NUL",
+            )
+        })?;
+        let how = OpenHow {
+            flags: u64::try_from(O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC).unwrap_or(0),
+            mode: 0,
+            resolve: RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS,
+        };
+        // SAFETY: `path` and `how` remain live for the syscall, the size is
+        // the kernel open_how v0 layout, and a successful descriptor is
+        // transferred exactly once into `File`.
+        let descriptor = unsafe {
+            syscall(
+                SYS_OPENAT2,
+                AT_FDCWD,
+                path.as_ptr(),
+                &raw const how,
+                std::mem::size_of::<OpenHow>(),
+            )
+        };
+        if descriptor < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let descriptor = i32::try_from(descriptor)
+            .map_err(|_| io::Error::other("openat2 returned an invalid descriptor"))?;
+        // SAFETY: the successful syscall returned one owned descriptor.
+        Ok(unsafe { File::from_raw_fd(descriptor) })
+    }
+
+    pub(super) fn open_source_child(parent: &File, name: &std::ffi::OsStr) -> io::Result<File> {
+        let name = CString::new(name.as_bytes()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "source child name contains NUL",
+            )
+        })?;
+        if name.as_bytes().contains(&b'/') || matches!(name.as_bytes(), b"." | b"..") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "source child must be one normal component",
+            ));
+        }
+        let how = OpenHow {
+            flags: u64::try_from(O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK).unwrap_or(0),
+            mode: 0,
+            resolve: RESOLVE_NO_XDEV
+                | RESOLVE_NO_MAGICLINKS
+                | RESOLVE_NO_SYMLINKS
+                | RESOLVE_BENEATH,
+        };
+        // SAFETY: `name` and `how` are live for the syscall, the size matches
+        // the kernel open_how v0 layout, and a nonnegative descriptor is
+        // transferred exactly once into `File`.
+        let descriptor = unsafe {
+            syscall(
+                SYS_OPENAT2,
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                &raw const how,
+                std::mem::size_of::<OpenHow>(),
+            )
+        };
+        if descriptor < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let descriptor = i32::try_from(descriptor)
+            .map_err(|_| io::Error::other("openat2 descriptor overflow"))?;
+        // SAFETY: the successful syscall returned one newly owned descriptor.
+        Ok(unsafe { File::from_raw_fd(descriptor) })
+    }
+
+    pub(super) fn read_source_directory_handle(directory: &File) -> io::Result<fs::ReadDir> {
+        fs::read_dir(format!("/proc/self/fd/{}", directory.as_raw_fd()))
+    }
+
     pub(super) fn metadata_is_same_filesystem(first: &Metadata, second: &Metadata) -> bool {
         first.dev() == second.dev()
+    }
+
+    #[allow(clippy::unnecessary_wraps)]
+    pub(super) fn filesystem_directory_identity(
+        _path: &Path,
+        metadata: &Metadata,
+    ) -> io::Result<super::FilesystemDirectoryIdentity> {
+        let mut identifier = [0_u8; 16];
+        identifier[..8].copy_from_slice(&metadata.ino().to_le_bytes());
+        identifier[15] = 1;
+        Ok(super::FilesystemDirectoryIdentity {
+            volume: metadata.dev(),
+            identifier,
+        })
     }
 
     pub(super) fn paths_share_mount(first: &Path, second: &Path) -> io::Result<bool> {
@@ -1585,6 +2338,13 @@ mod platform {
             && handle.nlink() == 1
             && current.dev() == handle.dev()
             && current.ino() == handle.ino())
+    }
+
+    pub(super) fn open_file_matches_path_and_is_single_link_same_tree(
+        path: &Path,
+        file: &File,
+    ) -> io::Result<bool> {
+        open_file_matches_path_and_is_single_link(path, file)
     }
 
     pub(super) fn path_is_supported_local_filesystem(path: &Path) -> io::Result<bool> {
@@ -1634,9 +2394,66 @@ mod platform {
     pub(super) fn namespace_move(
         source: &Path,
         destination: &Path,
-        _replace: bool,
+        replace: bool,
     ) -> io::Result<()> {
-        std::fs::rename(source, destination)
+        if replace {
+            return std::fs::rename(source, destination);
+        }
+        let source = CString::new(source.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "source path contains NUL"))?;
+        let destination = CString::new(destination.as_os_str().as_bytes()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "destination path contains NUL")
+        })?;
+        // SAFETY: both C strings are live and NUL terminated. AT_FDCWD makes
+        // absolute paths resolve independently of any borrowed directory fd.
+        if unsafe {
+            renameat2(
+                AT_FDCWD,
+                source.as_ptr(),
+                AT_FDCWD,
+                destination.as_ptr(),
+                RENAME_NOREPLACE,
+            )
+        } == 0
+        {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    pub(super) fn namespace_move_no_replace_in_directory(
+        parent: &File,
+        source_name: &std::ffi::OsStr,
+        destination_name: &std::ffi::OsStr,
+    ) -> io::Result<()> {
+        let source = CString::new(source_name.as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "source name contains NUL"))?;
+        let destination = CString::new(destination_name.as_bytes()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "destination name contains NUL")
+        })?;
+        if source.as_bytes().contains(&b'/') || destination.as_bytes().contains(&b'/') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "namespace publication requires direct child names",
+            ));
+        }
+        // SAFETY: both names are live/NUL terminated direct-child names and
+        // `parent` keeps the same directory descriptor live for both sides.
+        if unsafe {
+            renameat2(
+                parent.as_raw_fd(),
+                source.as_ptr(),
+                parent.as_raw_fd(),
+                destination.as_ptr(),
+                RENAME_NOREPLACE,
+            )
+        } == 0
+        {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
     }
 
     pub(super) fn sync_namespace_parent(path: &Path) -> io::Result<()> {
@@ -1700,7 +2517,7 @@ mod platform {
     use std::mem::MaybeUninit;
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::fs::OpenOptionsExt;
-    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
     use std::path::Path;
 
     const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
@@ -1850,6 +2667,57 @@ mod platform {
         true
     }
 
+    pub(super) fn filesystem_directory_identity(
+        path: &Path,
+        _metadata: &Metadata,
+    ) -> io::Result<super::FilesystemDirectoryIdentity> {
+        let encoded = extended_path(path)?;
+        // SAFETY: the path is live/NUL terminated and the returned handle is
+        // checked before ownership is transferred exactly once to `File`.
+        let handle = unsafe {
+            CreateFileW(
+                encoded.as_ptr(),
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == std::ptr::without_provenance_mut::<c_void>(usize::MAX) {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `handle` is live and uniquely owned after successful
+        // CreateFileW; `File` closes it once on drop.
+        let file = unsafe { File::from_raw_handle(handle) };
+        let legacy = handle_information(&file)?;
+        if legacy.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "directory identity rejected a reparse point",
+            ));
+        }
+        let modern = file_id_information(&file)?;
+        if modern.file_id.identifier.iter().any(|byte| *byte != 0) {
+            return Ok(super::FilesystemDirectoryIdentity {
+                volume: modern.volume_serial_number,
+                identifier: modern.file_id.identifier,
+            });
+        }
+        let file_index = u64::from(legacy.file_index_high) << 32 | u64::from(legacy.file_index_low);
+        if file_index == 0 {
+            return Err(io::Error::other("directory identity is unavailable"));
+        }
+        let mut identifier = [0_u8; 16];
+        identifier[..8].copy_from_slice(&file_index.to_le_bytes());
+        identifier[15] = 1;
+        Ok(super::FilesystemDirectoryIdentity {
+            volume: u64::from(legacy.volume_serial_number),
+            identifier,
+        })
+    }
+
     #[allow(clippy::unnecessary_wraps)]
     pub(super) fn paths_share_mount(_first: &Path, _second: &Path) -> io::Result<bool> {
         // Traversed mount points are reparse points and fail before this check.
@@ -1876,6 +2744,50 @@ mod platform {
                 && current_info.number_of_links == 1
                 && same_file_identity(&handle_info, &current_info, &handle_id, &current_id),
         )
+    }
+
+    pub(super) fn open_file_matches_path_and_is_single_link_same_tree(
+        path: &Path,
+        file: &File,
+    ) -> io::Result<bool> {
+        // This narrow comparison is used only after the publisher has proven
+        // the parent, staging-root, and private-directory FileIds. Within that
+        // captured tree the file identifier is sufficient; ignoring the
+        // volume field also accommodates Wine changing its synthetic volume
+        // serial when the same directory is renamed.
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        let current = options.open(path)?;
+        let held_legacy = handle_information(file)?;
+        let current_legacy = handle_information(&current)?;
+        let held_modern = file_id_information(file)?;
+        let current_modern = file_id_information(&current)?;
+        if held_legacy.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || current_legacy.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || held_legacy.number_of_links != 1
+            || current_legacy.number_of_links != 1
+        {
+            return Ok(false);
+        }
+        let held_has_modern = held_modern.file_id.identifier.iter().any(|byte| *byte != 0);
+        let current_has_modern = current_modern
+            .file_id
+            .identifier
+            .iter()
+            .any(|byte| *byte != 0);
+        if held_has_modern && current_has_modern {
+            return Ok(held_modern.file_id == current_modern.file_id);
+        }
+        if held_has_modern || current_has_modern {
+            return Ok(false);
+        }
+        let held_index =
+            u64::from(held_legacy.file_index_high) << 32 | u64::from(held_legacy.file_index_low);
+        let current_index = u64::from(current_legacy.file_index_high) << 32
+            | u64::from(current_legacy.file_index_low);
+        Ok(held_index != 0 && held_index == current_index)
     }
 
     fn same_file_identity(
@@ -2186,12 +3098,29 @@ mod platform {
         false
     }
 
+    pub(super) fn filesystem_directory_identity(
+        _path: &Path,
+        _metadata: &Metadata,
+    ) -> io::Result<super::FilesystemDirectoryIdentity> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "directory identity is supported only on Linux and Windows",
+        ))
+    }
+
     #[allow(clippy::unnecessary_wraps)]
     pub(super) fn paths_share_mount(_first: &Path, _second: &Path) -> io::Result<bool> {
         Ok(false)
     }
 
     pub(super) fn open_file_matches_path_and_is_single_link(
+        _path: &Path,
+        _file: &File,
+    ) -> io::Result<bool> {
+        Ok(false)
+    }
+
+    pub(super) fn open_file_matches_path_and_is_single_link_same_tree(
         _path: &Path,
         _file: &File,
     ) -> io::Result<bool> {
@@ -2238,10 +3167,12 @@ mod tests {
     use std::thread;
 
     use super::{
-        AtomicWriteError, AtomicWriteStage, CIPHERTEXT_STAGING_PREFIX, CIPHERTEXT_STAGING_SUFFIX,
-        CurrentTarget, FaultInjector, FaultPoint, MAX_ATOMIC_TARGET_BYTES, ParentSyncStatus,
-        RebindJournal, VAULT_LOCAL_DIRECTORY, VAULT_MUTATION_LOCK_FILE, VaultMutationGuard,
-        VaultMutationLock, WriteCondition, atomic_delete_ciphertext, atomic_rebind_ciphertext,
+        AtomicDirectoryPublishError, AtomicWriteError, AtomicWriteStage, CIPHERTEXT_STAGING_PREFIX,
+        CIPHERTEXT_STAGING_SUFFIX, CurrentTarget, FaultInjector, FaultPoint, IMPORT_STAGING_PREFIX,
+        MAX_ATOMIC_TARGET_BYTES, ParentSyncStatus, RebindJournal, VAULT_LOCAL_DIRECTORY,
+        VAULT_MUTATION_LOCK_FILE, VaultMutationGuard, VaultMutationLock, WriteCondition,
+        atomic_delete_ciphertext, atomic_publish_directory_no_replace,
+        atomic_publish_directory_no_replace_with_fault, atomic_rebind_ciphertext,
         atomic_write_ciphertext, atomic_write_ciphertext_with_faults, digest_bytes,
         install_rebind_journal, pending_rebind_path, reconcile_failed_namespace_commit,
         recover_pending_rebind,
@@ -2252,6 +3183,221 @@ mod tests {
 
     const OLD_CIPHERTEXT: &[u8] = b"EDRY-old-authenticated-ciphertext";
     const NEW_CIPHERTEXT: &[u8] = b"EDRY-new-authenticated-ciphertext";
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn secure_source_handle_detects_intermediate_directory_identity_swap() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        fs::write(fixture.notes().join("original.md"), b"source")?;
+        let root = super::open_secure_source_root(fixture.root())?;
+        let super::SecureSourceChild::Directory(notes) =
+            root.open_child(std::ffi::OsStr::new("notes"))?
+        else {
+            return Err(io::Error::other("notes was not a secure directory"));
+        };
+        let retired = fixture.root().join("retired-notes");
+        fs::rename(fixture.notes(), &retired)?;
+        fs::create_dir(fixture.notes())?;
+        fs::write(fixture.notes().join("original.md"), b"source")?;
+
+        assert!(notes.verify_binding().is_err());
+        let held_names = notes
+            .read_dir()?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<io::Result<Vec<_>>>()?;
+        assert!(held_names.contains(&std::ffi::OsString::from("original.md")));
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn secure_source_root_rejects_symlinked_ancestor() -> io::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let fixture = TestVault::new()?;
+        let real = fixture.root().join("real");
+        let source = real.join("source");
+        fs::create_dir_all(&source)?;
+        let alias = fixture.root().join("alias");
+        symlink(&real, &alias)?;
+
+        assert!(super::open_secure_source_root(&alias.join("source")).is_err());
+        assert!(super::open_secure_source_root(&source).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn complete_directory_publish_is_no_replace_and_removes_marker() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        let staging = fixture.root().join(format!("{IMPORT_STAGING_PREFIX}test"));
+        let local = staging.join(VAULT_LOCAL_DIRECTORY);
+        fs::create_dir_all(&local)?;
+        fs::write(
+            staging.join("vault.json"),
+            b"encrypted-metadata-placeholder",
+        )?;
+        let destination = fixture.root().join("published");
+
+        atomic_publish_directory_no_replace(&staging, &destination).map_err(io::Error::other)?;
+        assert!(!staging.exists());
+        assert!(destination.join("vault.json").is_file());
+        assert!(
+            !destination
+                .join(VAULT_LOCAL_DIRECTORY)
+                .join(super::IMPORT_PUBLISH_MARKER)
+                .exists()
+        );
+
+        let second = fixture
+            .root()
+            .join(format!("{IMPORT_STAGING_PREFIX}second"));
+        fs::create_dir_all(second.join(VAULT_LOCAL_DIRECTORY))?;
+        assert!(matches!(
+            atomic_publish_directory_no_replace(&second, &destination),
+            Err(AtomicDirectoryPublishError::DestinationExists)
+        ));
+        assert!(second.is_dir());
+        assert_eq!(
+            fs::read(destination.join("vault.json"))?,
+            b"encrypted-metadata-placeholder"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn directory_publish_reconciles_error_after_complete_move() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        let staging = fixture
+            .root()
+            .join(format!("{IMPORT_STAGING_PREFIX}post-error"));
+        fs::create_dir_all(staging.join(VAULT_LOCAL_DIRECTORY))?;
+        fs::write(staging.join("vault.json"), b"complete")?;
+        let destination = fixture.root().join("published-after-error");
+
+        atomic_publish_directory_no_replace_with_fault(
+            &staging,
+            &destination,
+            |_| Ok(()),
+            true,
+            false,
+            false,
+        )
+        .map_err(io::Error::other)?;
+        assert!(!staging.exists());
+        assert_eq!(fs::read(destination.join("vault.json"))?, b"complete");
+        assert!(
+            !destination
+                .join(VAULT_LOCAL_DIRECTORY)
+                .join(super::IMPORT_PUBLISH_MARKER)
+                .exists()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn directory_publish_classifies_exact_unmoved_state() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        let staging = fixture
+            .root()
+            .join(format!("{IMPORT_STAGING_PREFIX}not-moved"));
+        fs::create_dir_all(staging.join(VAULT_LOCAL_DIRECTORY))?;
+        let destination = fixture.root().join("still-absent");
+        assert!(matches!(
+            atomic_publish_directory_no_replace_with_fault(
+                &staging,
+                &destination,
+                |_| Ok(()),
+                false,
+                true,
+                false,
+            ),
+            Err(AtomicDirectoryPublishError::NotMoved)
+        ));
+        assert!(staging.is_dir());
+        assert!(!destination.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn directory_publish_reports_marker_cleanup_failure_after_exact_move() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        let staging = fixture
+            .root()
+            .join(format!("{IMPORT_STAGING_PREFIX}cleanup-failure"));
+        fs::create_dir_all(staging.join(VAULT_LOCAL_DIRECTORY))?;
+        fs::write(staging.join("vault.json"), b"complete")?;
+        let destination = fixture.root().join("published-cleanup-failure");
+
+        assert!(matches!(
+            atomic_publish_directory_no_replace_with_fault(
+                &staging,
+                &destination,
+                |_| Ok(()),
+                false,
+                false,
+                true,
+            ),
+            Err(AtomicDirectoryPublishError::PublishedCleanupFailed)
+        ));
+        assert!(!staging.exists());
+        assert_eq!(fs::read(destination.join("vault.json"))?, b"complete");
+        assert!(
+            destination
+                .join(VAULT_LOCAL_DIRECTORY)
+                .join(super::IMPORT_PUBLISH_MARKER)
+                .is_file()
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn directory_publish_rejects_parent_identity_swap_at_critical_audit() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        let parent = fixture.root().join("publish-parent");
+        let staging = parent.join(format!("{IMPORT_STAGING_PREFIX}parent-swap"));
+        fs::create_dir_all(staging.join(VAULT_LOCAL_DIRECTORY))?;
+        let destination = parent.join("published-parent-swap");
+        let retired = fixture.root().join("retired-publish-parent");
+
+        assert!(matches!(
+            super::atomic_publish_directory_no_replace_checked(&staging, &destination, |_| {
+                fs::rename(&parent, &retired)?;
+                fs::create_dir(&parent)?;
+                Ok(())
+            }),
+            Err(AtomicDirectoryPublishError::Indeterminate)
+        ));
+        assert!(!destination.exists());
+        assert!(
+            retired
+                .join(staging.file_name().unwrap_or_default())
+                .is_dir()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn directory_publish_rejects_staging_identity_swap_at_critical_audit() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        let staging = fixture
+            .root()
+            .join(format!("{IMPORT_STAGING_PREFIX}identity-swap"));
+        fs::create_dir_all(staging.join(VAULT_LOCAL_DIRECTORY))?;
+        let destination = fixture.root().join("identity-swap-final");
+        let retired = fixture.root().join("retired-stage");
+        assert!(matches!(
+            super::atomic_publish_directory_no_replace_checked(&staging, &destination, |current| {
+                fs::rename(current, &retired)?;
+                fs::create_dir_all(current.join(VAULT_LOCAL_DIRECTORY))?;
+                Ok(())
+            },),
+            Err(AtomicDirectoryPublishError::Indeterminate | AtomicDirectoryPublishError::Io { .. })
+        ));
+        assert!(!destination.exists());
+        assert!(retired.is_dir() || staging.is_dir());
+        Ok(())
+    }
 
     #[cfg(windows)]
     #[test]
