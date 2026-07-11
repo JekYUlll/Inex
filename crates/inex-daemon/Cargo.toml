@@ -1,0 +1,24 @@
+[package]
+name = "inex-daemon"
+description = "Local session and JSON-RPC sidecar for Inex editor clients"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "inex_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "inexd"
+path = "src/bin/inexd.rs"
+
+[dependencies]
+inex-core = { path = "../inex-core" }
+serde_json.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true

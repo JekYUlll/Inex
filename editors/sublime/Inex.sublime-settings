@@ -1,0 +1,5 @@
+{
+  "sidecar_path": "",
+  "draft_debounce_ms": 250,
+  "session_idle_minutes": 15
+}

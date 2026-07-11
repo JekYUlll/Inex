@@ -13,6 +13,21 @@ target
 # Contains mutation testing data
 **/mutants.out*/
 
+# Node / VS Code extension builds
+node_modules/
+dist/
+coverage/
+.vscode-test/
+*.vsix
+
+# Python / Sublime tests
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Inex vault-local runtime state
+.vault-local/
+
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore

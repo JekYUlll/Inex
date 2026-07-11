@@ -1,0 +1,99 @@
+{
+  "name": "inex-vscode",
+  "displayName": "Inex",
+  "description": "Edit Inex encrypted Markdown vaults without a plaintext mirror.",
+  "version": "0.1.0",
+  "publisher": "horeb",
+  "license": "GPL-3.0-only",
+  "private": true,
+  "engines": {
+    "vscode": "^1.125.0"
+  },
+  "extensionKind": [
+    "ui"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "Inex launches a local cryptographic sidecar and accesses the real ciphertext vault."
+    },
+    "virtualWorkspaces": {
+      "supported": false
+    }
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onCustomEditor:inex.markdownEditor",
+    "onCommand:inex.showSecurityStatus"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "inex.showSecurityStatus",
+        "title": "Inex: Show Security Status"
+      },
+      {
+        "command": "inex.unlockVault",
+        "title": "Inex: Unlock Vault"
+      },
+      {
+        "command": "inex.lockVault",
+        "title": "Inex: Lock Vault"
+      },
+      {
+        "command": "inex.search",
+        "title": "Inex: Search Encrypted Vault"
+      }
+    ],
+    "customEditors": [
+      {
+        "viewType": "inex.markdownEditor",
+        "displayName": "Inex Markdown",
+        "selector": [
+          {
+            "filenamePattern": "**/*.md.enc"
+          }
+        ],
+        "priority": "default"
+      }
+    ],
+    "configuration": {
+      "title": "Inex",
+      "properties": {
+        "inex.sidecarPath": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "description": "Optional absolute path to an audited inexd binary. Empty uses the extension-bundled binary."
+        },
+        "inex.sessionIdleMinutes": {
+          "type": "number",
+          "default": 15,
+          "minimum": 1,
+          "maximum": 1440,
+          "scope": "window",
+          "description": "Lock an idle session after this many minutes when no encrypted documents are open."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "check": "tsc --noEmit",
+    "test": "pnpm run check"
+  },
+  "devDependencies": {
+    "@types/vscode": "1.125.0",
+    "esbuild": "0.28.1",
+    "typescript": "7.0.2"
+  },
+  "packageManager": "pnpm@10.32.1",
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  }
+}

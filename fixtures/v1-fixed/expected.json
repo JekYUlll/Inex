@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "wrappedMasterKeyBase64Url": "aDZgJX9NyZpFXsxpqoj9VN--ylbZYeIZv3UpvEBYq1gSNma4ztWItRHmSsDnprvT",
+  "metadataMacBase64Url": "0jKFTEG0YT_bmaHMdJcqHweR6HV7CokHGEjiYzQA5Pg",
+  "headerCborBase64Url": "rQBQZ-VQRBCxQm-SR7toDl_gyAFQ9HrBC1jMQ3KlZw4CssPUeQJ0MjAyNi8wNy_lhbzlrrnmgKcubWQDAAQBBQEGWBhAQUJDREVGR0hJSktMTU5PUFFSU1RVVlcHAQgbAAABn0zB2GQJGwAAAZ9MwdjICgALgAz2",
+  "ciphertextBodyBase64Url": "ntLMJBG9TvJoV1zETwaPByL0oo-woS001ZzArZR9v-IuQLkih8884tndPhIw0Ivaeq6yqM2qSK4zJDTaUR4V1QEoKSMp",
+  "etag": "sha256:9636b7a9b0c2bf1aa2070df404513f62805e008b5e4d125d1576d3de5204b9c1"
+}

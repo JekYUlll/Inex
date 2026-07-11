@@ -1,0 +1,19 @@
+[package]
+name = "inex-cli"
+description = "Administrative, import, verification, and Git tooling for Inex"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "inex"
+path = "src/main.rs"
+
+[dependencies]
+inex-core = { path = "../inex-core" }
+inex-daemon = { path = "../inex-daemon" }
+
+[lints]
+workspace = true

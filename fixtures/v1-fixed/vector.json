@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "classification": "public-non-secret-test-vector",
+  "description": "Deterministic EDRY/vault v1 interoperability input. Never use these values for real data.",
+  "passwordUtf8": "inex-v1-public-test-password/非秘密",
+  "passwordBase64Url": "aW5leC12MS1wdWJsaWMtdGVzdC1wYXNzd29yZC_pnZ7np5jlr4Y",
+  "masterKeyBase64Url": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+  "vaultId": "67e55044-10b1-426f-9247-bb680e5fe0c8",
+  "slotId": "20ca8a6f-dad1-4f9f-84fc-120c476d3cf1",
+  "saltBase64Url": "EBESExQVFhcYGRobHB0eHw",
+  "argon2id": {
+    "algorithm": "argon2id13",
+    "opsLimit": 1,
+    "memLimitBytes": 8192
+  },
+  "wrapNonceBase64Url": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3",
+  "keyEpoch": 0,
+  "fileId": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+  "documentNonceBase64Url": "QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZX",
+  "logicalPath": "2026/07/兼容性.md",
+  "vaultCreatedAtMs": 1783699200000,
+  "fileCreatedAtMs": 1783699200100,
+  "fileModifiedAtMs": 1783699200200,
+  "plaintextBase64Url": "77u_IyBJbmV4IOWFvOWuueWQkemHjw0KCue7hOWQiDogZcyBCmVtb2ppOiDwn6eKDQplbmQ"
+}

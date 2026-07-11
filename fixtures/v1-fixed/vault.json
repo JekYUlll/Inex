@@ -1,0 +1,33 @@
+{
+  "format": {
+    "major": 1,
+    "minor": 0
+  },
+  "vaultId": "67e55044-10b1-426f-9247-bb680e5fe0c8",
+  "keyEpoch": 0,
+  "createdAt": 1783699200000,
+  "requiredFeatures": [],
+  "keySlots": [
+    {
+      "id": "20ca8a6f-dad1-4f9f-84fc-120c476d3cf1",
+      "kind": "password",
+      "kdf": {
+        "algorithm": "argon2id13",
+        "salt": "EBESExQVFhcYGRobHB0eHw",
+        "opsLimit": 1,
+        "memLimitBytes": 8192
+      },
+      "wrap": {
+        "algorithm": "xchacha20-poly1305-ietf",
+        "nonce": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3",
+        "ciphertext": "aDZgJX9NyZpFXsxpqoj9VN--ylbZYeIZv3UpvEBYq1gSNma4ztWItRHmSsDnprvT"
+      },
+      "createdAt": 1783699200000
+    }
+  ],
+  "features": {
+    "filenameEncryption": false,
+    "streamingBlobs": false
+  },
+  "metadataMac": "0jKFTEG0YT_bmaHMdJcqHweR6HV7CokHGEjiYzQA5Pg"
+}

@@ -1,0 +1,5 @@
+src/**
+tsconfig.json
+esbuild.mjs
+pnpm-lock.yaml
+**/*.map

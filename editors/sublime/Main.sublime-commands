@@ -1,0 +1,6 @@
+[
+  {
+    "caption": "Inex: Show Security Status",
+    "command": "inex_show_security_status"
+  }
+]
