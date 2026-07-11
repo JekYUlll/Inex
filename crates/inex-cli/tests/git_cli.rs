@@ -172,6 +172,210 @@ fn git_merge_with_inex(root: &Path, branch: &str) -> Output {
         .unwrap_or_else(|error| panic!("git merge spawn failed: {error}"))
 }
 
+fn git_merge_without_rename_detection(root: &Path, branch: &str) -> Output {
+    Command::new("git")
+        .current_dir(root)
+        .args([
+            "merge",
+            "--no-edit",
+            "-s",
+            "recursive",
+            "-Xno-renames",
+            branch,
+        ])
+        .output()
+        .unwrap_or_else(|error| panic!("no-renames git merge spawn failed: {error}"))
+}
+
+fn git_with_input(root: &Path, arguments: &[&str], input: &[u8]) -> Output {
+    let mut child = Command::new("git")
+        .current_dir(root)
+        .args(arguments)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|error| panic!("git with input spawn failed: {error}"));
+    child
+        .stdin
+        .take()
+        .unwrap_or_else(|| panic!("git stdin was not piped"))
+        .write_all(input)
+        .unwrap_or_else(|error| panic!("git input write failed: {error}"));
+    child
+        .wait_with_output()
+        .unwrap_or_else(|error| panic!("git with input wait failed: {error}"))
+}
+
+fn hash_git_blob(root: &Path, bytes: &[u8]) -> String {
+    let output = git_with_input(root, &["hash-object", "-w", "--stdin"], bytes);
+    assert!(
+        output.status.success(),
+        "hash-object stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let oid = std::str::from_utf8(&output.stdout)
+        .unwrap_or_else(|error| panic!("hash-object output UTF-8 failed: {error}"))
+        .trim()
+        .to_owned();
+    assert!(matches!(oid.len(), 40 | 64), "unexpected OID width");
+    assert!(
+        oid.bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "unexpected OID encoding"
+    );
+    oid
+}
+
+fn synthesize_detected_rename_conflict(
+    root: &Path,
+    source_physical_path: &str,
+    destination_physical_path: &str,
+    stage_oids: [&str; 3],
+) {
+    assert_eq!(stage_oids[0].len(), stage_oids[1].len());
+    assert_eq!(stage_oids[0].len(), stage_oids[2].len());
+    let zero_oid = "0".repeat(stage_oids[0].len());
+    let mut input = Vec::new();
+    for path in [source_physical_path, destination_physical_path] {
+        input.extend_from_slice(b"0 ");
+        input.extend_from_slice(zero_oid.as_bytes());
+        input.push(b'\t');
+        input.extend_from_slice(path.as_bytes());
+        input.push(0);
+    }
+    for (stage, oid) in (1_u8..=3).zip(stage_oids) {
+        input.extend_from_slice(b"100644 ");
+        input.extend_from_slice(oid.as_bytes());
+        input.push(b' ');
+        input.extend_from_slice(stage.to_string().as_bytes());
+        input.push(b'\t');
+        input.extend_from_slice(destination_physical_path.as_bytes());
+        input.push(0);
+    }
+    let output = git_with_input(root, &["update-index", "-z", "--index-info"], &input);
+    assert!(
+        output.status.success(),
+        "update-index stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn stage_zero_oid(root: &Path, physical_path: &str) -> String {
+    let output = git_output(root, ["ls-files", "--stage", "--", physical_path]);
+    assert!(
+        output.status.success(),
+        "ls-files stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let record = std::str::from_utf8(&output.stdout)
+        .unwrap_or_else(|error| panic!("ls-files output UTF-8 failed: {error}"))
+        .trim_end();
+    let (metadata, listed_path) = record
+        .split_once('\t')
+        .unwrap_or_else(|| panic!("missing path separator in index record"));
+    assert_eq!(listed_path, physical_path);
+    let fields = metadata.split_ascii_whitespace().collect::<Vec<_>>();
+    assert_eq!(fields.len(), 3);
+    assert_eq!(fields[0], "100644");
+    assert_eq!(fields[2], "0");
+    assert!(matches!(fields[1].len(), 40 | 64));
+    fields[1].to_owned()
+}
+
+fn file_id(root: &Path, logical_path: &LogicalPath) -> String {
+    let vault = Vault::unlock(root, PASSWORD, None, KdfPolicy::default())
+        .unwrap_or_else(|error| panic!("file-id unlock failed: {error}"));
+    vault
+        .read(logical_path)
+        .unwrap_or_else(|error| panic!("file-id read failed: {error}"))
+        .header
+        .file_id
+        .to_string()
+}
+
+fn rename_and_save(
+    root: &Path,
+    old_path: &LogicalPath,
+    new_path: &LogicalPath,
+    plaintext: &[u8],
+    renamed_at_ms: i64,
+    saved_at_ms: i64,
+) {
+    let mut vault = Vault::unlock(root, PASSWORD, None, KdfPolicy::default())
+        .unwrap_or_else(|error| panic!("rename unlock failed: {error}"));
+    let current = vault
+        .read(old_path)
+        .unwrap_or_else(|error| panic!("rename read failed: {error}"));
+    let etag = current.etag.clone();
+    drop(current);
+    vault
+        .rename_document(old_path, new_path, &etag, renamed_at_ms)
+        .unwrap_or_else(|error| panic!("rename failed: {error}"));
+    drop(vault);
+    save(root, new_path, plaintext, saved_at_ms);
+}
+
+fn assert_clean_renamed_result(
+    root: &Path,
+    old_path: &LogicalPath,
+    new_path: &LogicalPath,
+    expected_plaintext: &[u8],
+    expected_file_id: &str,
+    canaries: &[&[u8]],
+) {
+    let old_physical_path = format!("{}.enc", old_path.as_str());
+    let new_physical_path = format!("{}.enc", new_path.as_str());
+    assert!(git_output(root, ["ls-files", "-u"]).stdout.is_empty());
+    assert!(!root.join(&old_physical_path).exists());
+    assert!(
+        !git_output(
+            root,
+            [
+                "ls-files",
+                "--error-unmatch",
+                "--",
+                old_physical_path.as_str()
+            ]
+        )
+        .status
+        .success()
+    );
+
+    let oid = stage_zero_oid(root, &new_physical_path);
+    let blob = git_output(root, ["cat-file", "blob", oid.as_str()]);
+    assert!(
+        blob.status.success(),
+        "cat-file stderr: {}",
+        String::from_utf8_lossy(&blob.stderr)
+    );
+    let worktree = fs::read(root.join(&new_physical_path))
+        .unwrap_or_else(|error| panic!("renamed worktree read failed: {error}"));
+    assert_eq!(blob.stdout, worktree);
+    assert!(worktree.starts_with(b"EDRY"));
+
+    let vault = Vault::unlock(root, PASSWORD, None, KdfPolicy::default())
+        .unwrap_or_else(|error| panic!("post-rename-merge unlock failed: {error}"));
+    let document = vault
+        .read(new_path)
+        .unwrap_or_else(|error| panic!("post-rename-merge read failed: {error}"));
+    assert_eq!(document.plaintext.as_slice(), expected_plaintext);
+    assert_eq!(document.header.file_id.to_string(), expected_file_id);
+    assert!(
+        !document
+            .header
+            .content_flags
+            .contains(ContentFlags::UNRESOLVED_MERGE)
+    );
+    drop(document);
+    drop(vault);
+
+    for canary in canaries {
+        assert!(scan_for_canary(root, canary).is_empty());
+    }
+    assert!(!root.join(".vault-local/git-merge-journal-v1.json").exists());
+}
+
 fn run_unlocked_merge(root: &Path) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_inex"))
         .args(["git", "merge"])
@@ -537,68 +741,210 @@ fn unlocked_delete_modify_conflict_replaces_only_expected_ciphertext() {
 }
 
 #[test]
-fn cross_path_rename_modify_is_detected_and_left_untouched() {
-    let (directory, old_path) = create_repository(b"rename base\n");
+fn split_ours_rename_and_modify_merges_theirs_modify_at_destination() {
+    const BASE: &[u8] = b"top anchor\nmiddle one\nmiddle two\nbottom anchor\n";
+    const OURS: &[u8] =
+        b"INEX_SPLIT_OURS_RENAME_CANARY_44A1\ntop anchor\nmiddle one\nmiddle two\nbottom anchor\n";
+    const THEIRS: &[u8] =
+        b"top anchor\nmiddle one\nmiddle two\nbottom anchor\nINEX_SPLIT_THEIRS_MODIFY_CANARY_2E73\n";
+    const EXPECTED: &[u8] = b"INEX_SPLIT_OURS_RENAME_CANARY_44A1\ntop anchor\nmiddle one\nmiddle two\nbottom anchor\nINEX_SPLIT_THEIRS_MODIFY_CANARY_2E73\n";
+
+    let (directory, old_path) = create_repository(BASE);
     let new_path = LogicalPath::parse_canonical("renamed.md")
         .unwrap_or_else(|error| panic!("renamed path failed: {error}"));
+    let original_file_id = file_id(directory.path(), &old_path);
+
     git(directory.path(), ["checkout", "-q", "-b", "ours"]);
-    let mut vault = Vault::unlock(directory.path(), PASSWORD, None, KdfPolicy::default())
-        .unwrap_or_else(|error| panic!("rename unlock failed: {error}"));
-    let current = vault
-        .read(&old_path)
-        .unwrap_or_else(|error| panic!("rename read failed: {error}"));
-    vault
-        .rename_document(&old_path, &new_path, &current.etag, 1_783_699_202_000)
-        .unwrap_or_else(|error| panic!("rename failed: {error}"));
-    drop(current);
-    drop(vault);
-    git(directory.path(), ["add", "--all"]);
-    git(directory.path(), ["commit", "-q", "-m", "ours rename"]);
-    git(directory.path(), ["checkout", "-q", "master"]);
-    git(directory.path(), ["checkout", "-q", "-b", "theirs"]);
-    save(
+    rename_and_save(
         directory.path(),
         &old_path,
-        b"rename modified on theirs\n",
+        &new_path,
+        OURS,
+        1_783_699_202_000,
         1_783_699_203_000,
     );
+    git(directory.path(), ["add", "--all"]);
+    git(
+        directory.path(),
+        ["commit", "-q", "-m", "ours rename and modify"],
+    );
+    git(directory.path(), ["checkout", "-q", "master"]);
+    git(directory.path(), ["checkout", "-q", "-b", "theirs"]);
+    save(directory.path(), &old_path, THEIRS, 1_783_699_204_000);
     git(directory.path(), ["add", "entry.md.enc"]);
     git(directory.path(), ["commit", "-q", "-m", "theirs modify"]);
     git(directory.path(), ["checkout", "-q", "ours"]);
-    assert!(
-        !git_merge_with_inex(directory.path(), "theirs")
-            .status
-            .success()
-    );
-    let old_ciphertext = fs::read(directory.path().join("entry.md.enc"))
-        .unwrap_or_else(|error| panic!("old conflict read failed: {error}"));
-    let new_ciphertext = fs::read(directory.path().join("renamed.md.enc"))
-        .unwrap_or_else(|error| panic!("renamed read failed: {error}"));
 
-    let merged = run_unlocked_merge(directory.path());
-    assert!(!merged.status.success());
-    assert!(
-        String::from_utf8_lossy(&merged.stderr).contains("unsupported encrypted conflict entry")
-    );
+    let git_merge = git_merge_without_rename_detection(directory.path(), "theirs");
+    assert!(!git_merge.status.success());
     assert!(
         !git_output(directory.path(), ["ls-files", "-u"])
             .stdout
             .is_empty()
     );
-    assert_eq!(
-        fs::read(directory.path().join("entry.md.enc"))
-            .unwrap_or_else(|error| panic!("old post-state read failed: {error}")),
-        old_ciphertext
-    );
-    assert_eq!(
-        fs::read(directory.path().join("renamed.md.enc"))
-            .unwrap_or_else(|error| panic!("new post-state read failed: {error}")),
-        new_ciphertext
-    );
+    assert!(directory.path().join("entry.md.enc").is_file());
+    assert!(directory.path().join("renamed.md.enc").is_file());
+
+    let merged = run_unlocked_merge(directory.path());
     assert!(
-        !directory
-            .path()
-            .join(".vault-local/git-merge-journal-v1.json")
-            .exists()
+        merged.status.success(),
+        "merge stderr: {}",
+        String::from_utf8_lossy(&merged.stderr)
+    );
+    assert_clean_renamed_result(
+        directory.path(),
+        &old_path,
+        &new_path,
+        EXPECTED,
+        &original_file_id,
+        &[
+            b"INEX_SPLIT_OURS_RENAME_CANARY_44A1",
+            b"INEX_SPLIT_THEIRS_MODIFY_CANARY_2E73",
+        ],
+    );
+}
+
+#[test]
+fn split_theirs_rename_and_modify_merges_ours_modify_at_destination() {
+    const BASE: &[u8] = b"top anchor\nmiddle one\nmiddle two\nbottom anchor\n";
+    const OURS: &[u8] =
+        b"top anchor\nmiddle one\nmiddle two\nbottom anchor\nINEX_SPLIT_OURS_MODIFY_CANARY_8C10\n";
+    const THEIRS: &[u8] =
+        b"INEX_SPLIT_THEIRS_RENAME_CANARY_D519\ntop anchor\nmiddle one\nmiddle two\nbottom anchor\n";
+    const EXPECTED: &[u8] = b"INEX_SPLIT_THEIRS_RENAME_CANARY_D519\ntop anchor\nmiddle one\nmiddle two\nbottom anchor\nINEX_SPLIT_OURS_MODIFY_CANARY_8C10\n";
+
+    let (directory, old_path) = create_repository(BASE);
+    let new_path = LogicalPath::parse_canonical("renamed.md")
+        .unwrap_or_else(|error| panic!("renamed path failed: {error}"));
+    let original_file_id = file_id(directory.path(), &old_path);
+
+    git(directory.path(), ["checkout", "-q", "-b", "ours"]);
+    save(directory.path(), &old_path, OURS, 1_783_699_202_000);
+    git(directory.path(), ["add", "entry.md.enc"]);
+    git(directory.path(), ["commit", "-q", "-m", "ours modify"]);
+    git(directory.path(), ["checkout", "-q", "master"]);
+    git(directory.path(), ["checkout", "-q", "-b", "theirs"]);
+    rename_and_save(
+        directory.path(),
+        &old_path,
+        &new_path,
+        THEIRS,
+        1_783_699_203_000,
+        1_783_699_204_000,
+    );
+    git(directory.path(), ["add", "--all"]);
+    git(
+        directory.path(),
+        ["commit", "-q", "-m", "theirs rename and modify"],
+    );
+    git(directory.path(), ["checkout", "-q", "ours"]);
+
+    let git_merge = git_merge_without_rename_detection(directory.path(), "theirs");
+    assert!(!git_merge.status.success());
+    assert!(
+        !git_output(directory.path(), ["ls-files", "-u"])
+            .stdout
+            .is_empty()
+    );
+    assert!(directory.path().join("entry.md.enc").is_file());
+    assert!(directory.path().join("renamed.md.enc").is_file());
+
+    let merged = run_unlocked_merge(directory.path());
+    assert!(
+        merged.status.success(),
+        "merge stderr: {}",
+        String::from_utf8_lossy(&merged.stderr)
+    );
+    assert_clean_renamed_result(
+        directory.path(),
+        &old_path,
+        &new_path,
+        EXPECTED,
+        &original_file_id,
+        &[
+            b"INEX_SPLIT_OURS_MODIFY_CANARY_8C10",
+            b"INEX_SPLIT_THEIRS_RENAME_CANARY_D519",
+        ],
+    );
+}
+
+#[test]
+fn detected_rename_three_stage_destination_merges_without_similarity_heuristics() {
+    const BASE: &[u8] = b"top anchor\nmiddle one\nmiddle two\nbottom anchor\n";
+    const OURS: &[u8] =
+        b"INEX_DETECTED_RENAME_CANARY_A611\ntop anchor\nmiddle one\nmiddle two\nbottom anchor\n";
+    const THEIRS: &[u8] =
+        b"top anchor\nmiddle one\nmiddle two\nbottom anchor\nINEX_DETECTED_MODIFY_CANARY_B28F\n";
+    const EXPECTED: &[u8] = b"INEX_DETECTED_RENAME_CANARY_A611\ntop anchor\nmiddle one\nmiddle two\nbottom anchor\nINEX_DETECTED_MODIFY_CANARY_B28F\n";
+
+    let (directory, old_path) = create_repository(BASE);
+    let new_path = LogicalPath::parse_canonical("renamed.md")
+        .unwrap_or_else(|error| panic!("renamed path failed: {error}"));
+    let original_file_id = file_id(directory.path(), &old_path);
+    let ancestor_ciphertext = fs::read(directory.path().join("entry.md.enc"))
+        .unwrap_or_else(|error| panic!("ancestor ciphertext read failed: {error}"));
+
+    git(directory.path(), ["checkout", "-q", "-b", "ours"]);
+    rename_and_save(
+        directory.path(),
+        &old_path,
+        &new_path,
+        OURS,
+        1_783_699_202_000,
+        1_783_699_203_000,
+    );
+    let ours_ciphertext = fs::read(directory.path().join("renamed.md.enc"))
+        .unwrap_or_else(|error| panic!("ours ciphertext read failed: {error}"));
+    git(directory.path(), ["add", "--all"]);
+    git(
+        directory.path(),
+        ["commit", "-q", "-m", "ours detected rename"],
+    );
+    git(directory.path(), ["checkout", "-q", "master"]);
+    git(directory.path(), ["checkout", "-q", "-b", "theirs"]);
+    save(directory.path(), &old_path, THEIRS, 1_783_699_204_000);
+    let theirs_ciphertext = fs::read(directory.path().join("entry.md.enc"))
+        .unwrap_or_else(|error| panic!("theirs ciphertext read failed: {error}"));
+    git(directory.path(), ["add", "entry.md.enc"]);
+    git(directory.path(), ["commit", "-q", "-m", "theirs modify"]);
+    git(directory.path(), ["checkout", "-q", "ours"]);
+
+    let git_merge = git_merge_without_rename_detection(directory.path(), "theirs");
+    assert!(!git_merge.status.success());
+
+    let ancestor_oid = hash_git_blob(directory.path(), &ancestor_ciphertext);
+    let ours_oid = hash_git_blob(directory.path(), &ours_ciphertext);
+    let theirs_oid = hash_git_blob(directory.path(), &theirs_ciphertext);
+    synthesize_detected_rename_conflict(
+        directory.path(),
+        "entry.md.enc",
+        "renamed.md.enc",
+        [&ancestor_oid, &ours_oid, &theirs_oid],
+    );
+    fs::write(directory.path().join("renamed.md.enc"), &ours_ciphertext)
+        .unwrap_or_else(|error| panic!("detected rename worktree write failed: {error}"));
+    fs::remove_file(directory.path().join("entry.md.enc"))
+        .unwrap_or_else(|error| panic!("detected rename source removal failed: {error}"));
+    assert!(!directory.path().join("entry.md.enc").exists());
+    let unmerged = git_output(directory.path(), ["ls-files", "-u"]);
+    assert!(unmerged.status.success());
+    assert_eq!(unmerged.stdout.split(|byte| *byte == b'\n').count(), 4);
+
+    let merged = run_unlocked_merge(directory.path());
+    assert!(
+        merged.status.success(),
+        "merge stderr: {}",
+        String::from_utf8_lossy(&merged.stderr)
+    );
+    assert_clean_renamed_result(
+        directory.path(),
+        &old_path,
+        &new_path,
+        EXPECTED,
+        &original_file_id,
+        &[
+            b"INEX_DETECTED_RENAME_CANARY_A611",
+            b"INEX_DETECTED_MODIFY_CANARY_B28F",
+        ],
     );
 }

@@ -11,7 +11,7 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File, Metadata, OpenOptions};
@@ -79,7 +79,7 @@ pub struct MergeReport {
 /// Result of an explicit recovery command.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RecoveryReport {
-    /// Number of pending transactions completed (zero or one in v1).
+    /// Number of pending transactions completed (zero or one per invocation).
     pub recovered_transactions: usize,
 }
 
@@ -148,7 +148,7 @@ pub enum GitError {
     /// Effective attributes do not force ciphertext-safe handling.
     #[error("effective Git attributes do not select the locked-safe Inex driver")]
     IneffectiveAttributes,
-    /// Split indexes reference a second file outside the v1 durability model.
+    /// Split indexes reference a second file outside the durability model.
     #[error("Git split-index repositories are unsupported for durable encrypted merges")]
     SplitIndexUnsupported,
     /// The merged body exceeded the frozen EDRY plaintext limit.
@@ -181,6 +181,7 @@ impl From<VaultError> for GitError {
 pub enum GitOperation {
     DiscoverRepository,
     ConfigureRepository,
+    InspectHistory,
     ReadIndex,
     ReadObject,
     WriteObject,
@@ -192,6 +193,7 @@ impl fmt::Display for GitOperation {
         formatter.write_str(match self {
             Self::DiscoverRepository => "repository discovery",
             Self::ConfigureRepository => "repository-local configuration",
+            Self::InspectHistory => "merge history inspection",
             Self::ReadIndex => "index inspection",
             Self::ReadObject => "encrypted object read",
             Self::WriteObject => "encrypted object write",
@@ -317,7 +319,7 @@ pub fn recover(vault: &Vault) -> Result<RecoveryReport, GitError> {
 /// # Errors
 ///
 /// Returns [`GitError`] when the journal entry is link-like, hard-linked,
-/// oversized, truncated, or fails the strict v1 schema.
+/// oversized, truncated, or fails the strict versioned schema.
 pub fn has_pending_recovery(vault_root: &Path) -> Result<bool, GitError> {
     let _guard = VaultMutationGuard::acquire(vault_root).map_err(map_atomic_error)?;
     Ok(read_journal(vault_root)?.is_some())
@@ -344,20 +346,80 @@ pub fn merge(vault: &Vault, modified_at_ms: i64) -> Result<MergeReport, GitError
     drop(tree_guard);
     let conflicts = git.unmerged_entries()?;
     validate_conflict_set(&conflicts)?;
+    reject_conflict_stage_zero(&git, &conflicts)?;
     let tracked_identities = tracked_identity_index(vault, &git)?;
-    for conflict in conflicts.values() {
-        git.verify_attributes_for_path(&conflict.physical_path)?;
-    }
-    preflight_conflict_identities(vault, &git, &conflicts, &tracked_identities)?;
+    let plans = preflight_conflict_identities(vault, &git, &conflicts, &tracked_identities)?;
+    let attribute_paths = merge_plan_attribute_paths(&plans)?;
+    let attribute_path_refs = attribute_paths
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    git.verify_attributes_for_paths(&attribute_path_refs)?;
     let mut report = MergeReport {
         recovered_transactions: usize::from(recovered),
         ..MergeReport::default()
     };
 
-    for conflict in conflicts.values() {
-        let prepared = prepare_result(vault, &git, conflict, &tracked_identities, modified_at_ms)?;
-        commit_result(vault, &git, conflict, &prepared)?;
-        if prepared.unresolved {
+    for plan in plans {
+        let unresolved = match plan {
+            MergePlan::InPlace { conflict } => {
+                let prepared =
+                    prepare_result(vault, &git, &conflict, &tracked_identities, modified_at_ms)?;
+                commit_result(vault, &git, &conflict, &prepared)?;
+                prepared.unresolved
+            }
+            MergePlan::DetectedRename {
+                conflict,
+                stage_paths,
+                renamed_side,
+                provenance,
+            } => {
+                let prepared = prepare_detected_rename_result(
+                    vault,
+                    &git,
+                    &conflict,
+                    &stage_paths,
+                    renamed_side,
+                    modified_at_ms,
+                )?;
+                commit_detected_rename_result(
+                    vault,
+                    &git,
+                    &conflict,
+                    &stage_paths,
+                    renamed_side,
+                    &provenance,
+                    &prepared,
+                )?;
+                prepared.unresolved
+            }
+            MergePlan::SplitRename {
+                source,
+                destination,
+                renamed_side,
+                provenance,
+            } => {
+                let prepared = prepare_split_rename_result(
+                    vault,
+                    &git,
+                    &source,
+                    &destination,
+                    renamed_side,
+                    modified_at_ms,
+                )?;
+                commit_split_rename_result(
+                    vault,
+                    &git,
+                    &source,
+                    &destination,
+                    renamed_side,
+                    &provenance,
+                    &prepared,
+                )?;
+                prepared.unresolved
+            }
+        };
+        if unresolved {
             report.unresolved_results = report.unresolved_results.saturating_add(1);
         } else {
             report.clean_results = report.clean_results.saturating_add(1);
@@ -373,6 +435,31 @@ struct StageEntry {
     oid: String,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum GitObjectFormat {
+    Sha1,
+    Sha256,
+}
+
+impl GitObjectFormat {
+    const fn oid_hex_len(self) -> usize {
+        match self {
+            Self::Sha1 => 40,
+            Self::Sha256 => 64,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RenameProvenance {
+    object_format: GitObjectFormat,
+    ours_commit: String,
+    theirs_commit: String,
+    base_commit: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ConflictEntry {
     physical_path: String,
@@ -380,11 +467,69 @@ struct ConflictEntry {
     stages: [Option<StageEntry>; 3],
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TrackedIdentity {
+    physical_path: String,
+    logical_path: LogicalPath,
+    entry: StageEntry,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AuthenticatedStageIdentity {
+    logical_path: LogicalPath,
+    file_id: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum RenameSide {
+    Ours,
+    Theirs,
+}
+
+impl RenameSide {
+    const fn stage_index(self) -> usize {
+        match self {
+            Self::Ours => 1,
+            Self::Theirs => 2,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum MergePlan {
+    InPlace {
+        conflict: ConflictEntry,
+    },
+    DetectedRename {
+        conflict: ConflictEntry,
+        stage_paths: [Option<LogicalPath>; 3],
+        renamed_side: RenameSide,
+        provenance: RenameProvenance,
+    },
+    SplitRename {
+        source: ConflictEntry,
+        destination: TrackedIdentity,
+        renamed_side: RenameSide,
+        provenance: RenameProvenance,
+    },
+}
+
 struct PreparedResult {
     encrypted: EncryptedDocument,
     result_oid: String,
+    file_id: String,
     unresolved: bool,
     stage_ciphertexts: [Option<Vec<u8>>; 3],
+}
+
+struct PreparedRenameResult {
+    encrypted: EncryptedDocument,
+    result_oid: String,
+    file_id: String,
+    unresolved: bool,
+    source_stage_ciphertexts: [Option<Vec<u8>>; 3],
+    destination_ciphertext: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -399,9 +544,75 @@ struct MergeJournal {
     result_sha256: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RenameMergeJournal {
+    version: u32,
+    source_physical_path: String,
+    destination_physical_path: String,
+    result_mode: String,
+    source_stages: [Option<StageEntry>; 3],
+    destination_stage: StageEntry,
+    renamed_side: RenameSide,
+    provenance: RenameProvenance,
+    file_id: String,
+    expected_source_worktree_sha256: Option<String>,
+    expected_destination_worktree_sha256: String,
+    result_oid: String,
+    result_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DetectedRenameJournal {
+    version: u32,
+    source_physical_path: String,
+    destination_physical_path: String,
+    result_mode: String,
+    stages: [Option<StageEntry>; 3],
+    renamed_side: RenameSide,
+    provenance: RenameProvenance,
+    file_id: String,
+    expected_destination_worktree_sha256: String,
+    result_oid: String,
+    result_sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PendingMergeJournal {
+    InPlace(MergeJournal),
+    Rename(RenameMergeJournal),
+    DetectedRename(DetectedRenameJournal),
+}
+
+struct AuthenticatedRenameRecovery {
+    source: ConflictEntry,
+    destination: TrackedIdentity,
+    result: Vec<u8>,
+    result_digest: [u8; 32],
+    expected_source_state: CurrentTarget,
+    expected_destination_digest: [u8; 32],
+    file_id: String,
+}
+
+struct AuthenticatedDetectedRenameRecovery {
+    conflict: ConflictEntry,
+    source_logical_path: LogicalPath,
+    result: Vec<u8>,
+    result_digest: [u8; 32],
+    expected_destination_digest: [u8; 32],
+    file_id: String,
+}
+
+#[derive(Deserialize)]
+struct JournalVersion {
+    version: u32,
+}
+
 struct Git {
     executable: PathBuf,
     root: PathBuf,
+    object_format: GitObjectFormat,
 }
 
 impl Git {
@@ -419,11 +630,23 @@ impl Git {
             return Err(GitError::UnsafeRoot);
         }
         validate_git_directory(&root)?;
-        let git = Self {
+        let mut git = Self {
             executable: discover_git_executable()?,
             root,
+            object_format: GitObjectFormat::Sha1,
         };
         git.ensure_supported_version()?;
+        let object_format = git.run(
+            GitOperation::DiscoverRepository,
+            ["rev-parse", "--show-object-format"],
+            None,
+            16,
+        )?;
+        git.object_format = match one_text_line(&object_format)? {
+            "sha1" => GitObjectFormat::Sha1,
+            "sha256" => GitObjectFormat::Sha256,
+            _ => return Err(GitError::MalformedGitOutput),
+        };
         git.ensure_full_index()?;
         let inside = git.run(
             GitOperation::DiscoverRepository,
@@ -449,6 +672,14 @@ impl Git {
     fn ensure_supported_version(&self) -> Result<(), GitError> {
         let output = self.run(GitOperation::DiscoverRepository, ["version"], None, 256)?;
         validate_git_version(&output)
+    }
+
+    fn validate_oid(&self, oid: &str) -> Result<(), GitError> {
+        validate_oid(oid)?;
+        if oid.len() != self.object_format.oid_hex_len() {
+            return Err(GitError::MalformedGitOutput);
+        }
+        Ok(())
     }
 
     fn ensure_full_index(&self) -> Result<(), GitError> {
@@ -581,7 +812,14 @@ impl Git {
             None,
             MAX_GIT_OUTPUT_BYTES,
         )?;
-        parse_unmerged_entries(&output)
+        let entries = parse_unmerged_entries(&output)?;
+        for stage in entries
+            .values()
+            .flat_map(|conflict| conflict.stages.iter().flatten())
+        {
+            self.validate_oid(&stage.oid)?;
+        }
+        Ok(entries)
     }
 
     fn staged_entries(&self) -> Result<Vec<(u8, StageEntry, String)>, GitError> {
@@ -602,11 +840,14 @@ impl Git {
             entries.push((stage, entry, path));
             Ok(())
         })?;
+        for (_, entry, _) in &entries {
+            self.validate_oid(&entry.oid)?;
+        }
         Ok(entries)
     }
 
     fn read_object(&self, oid: &str) -> Result<Vec<u8>, GitError> {
-        validate_oid(oid)?;
+        self.validate_oid(oid)?;
         self.run(
             GitOperation::ReadObject,
             ["cat-file", "blob", oid],
@@ -623,7 +864,7 @@ impl Git {
             128,
         )?;
         let oid = one_text_line(&output)?.to_owned();
-        validate_oid(&oid)?;
+        self.validate_oid(&oid)?;
         let verified = self.read_object(&oid)?;
         if verified != ciphertext {
             return Err(GitError::MalformedGitOutput);
@@ -650,21 +891,139 @@ impl Git {
             return Ok(None);
         }
         let records = nul_records(&output)?;
+        let mut stage_zero = None;
+        for record in records {
+            let ((stage, entry), path) = parse_index_record(record)?;
+            if path != physical_path {
+                return Err(GitError::MalformedGitOutput);
+            }
+            validate_mode(&entry.mode)?;
+            self.validate_oid(&entry.oid)?;
+            if stage == 0 && stage_zero.replace(entry).is_some() {
+                return Err(GitError::MalformedGitOutput);
+            }
+        }
+        Ok(stage_zero)
+    }
+
+    fn resolve_commit(&self, revision: &str) -> Result<String, GitError> {
+        if !matches!(revision, "HEAD" | "MERGE_HEAD") {
+            return Err(GitError::UnsupportedConflictEntry);
+        }
+        let revision = format!("{revision}^{{commit}}");
+        let output = self.run_os(
+            GitOperation::InspectHistory,
+            &[
+                OsString::from("rev-parse"),
+                OsString::from("--verify"),
+                OsString::from(revision),
+            ],
+            None,
+            256,
+        )?;
+        let oid = one_text_line(&output)?.to_owned();
+        self.validate_oid(&oid)?;
+        Ok(oid)
+    }
+
+    fn single_merge_head(&self) -> Result<String, GitError> {
+        let bytes = read_regular_bounded(
+            &self.root.join(".git").join("MERGE_HEAD"),
+            MAX_REPOSITORY_METADATA_BYTES,
+        )?;
+        let oid = one_text_line(&bytes)?.to_owned();
+        self.validate_oid(&oid)?;
+        let resolved = self.resolve_commit("MERGE_HEAD")?;
+        if resolved != oid {
+            return Err(GitError::UnsupportedConflictEntry);
+        }
+        Ok(oid)
+    }
+
+    fn unique_merge_base(&self, ours: &str, theirs: &str) -> Result<String, GitError> {
+        self.validate_oid(ours)?;
+        self.validate_oid(theirs)?;
+        if ours.len() != theirs.len() {
+            return Err(GitError::UnsupportedConflictEntry);
+        }
+        let output = self.run_os(
+            GitOperation::InspectHistory,
+            &[
+                OsString::from("merge-base"),
+                OsString::from("--all"),
+                OsString::from(ours),
+                OsString::from(theirs),
+            ],
+            None,
+            1024,
+        )?;
+        let base = one_text_line(&output)?.to_owned();
+        self.validate_oid(&base)?;
+        if base.len() != ours.len() {
+            return Err(GitError::UnsupportedConflictEntry);
+        }
+        Ok(base)
+    }
+
+    fn tree_entry(
+        &self,
+        commit: &str,
+        physical_path: &str,
+    ) -> Result<Option<StageEntry>, GitError> {
+        self.validate_oid(commit)?;
+        validate_physical_path(physical_path)?;
+        let output = self.run_os(
+            GitOperation::InspectHistory,
+            &[
+                OsString::from("ls-tree"),
+                OsString::from("-z"),
+                OsString::from("--full-tree"),
+                OsString::from(commit),
+                OsString::from("--"),
+                OsString::from(physical_path),
+            ],
+            None,
+            4096_usize.saturating_add(physical_path.len()),
+        )?;
+        if output.is_empty() {
+            return Ok(None);
+        }
+        let records = nul_records(&output)?;
         if records.len() != 1 {
             return Err(GitError::MalformedGitOutput);
         }
-        let (stage, path) = parse_index_record(records[0])?;
-        if path != physical_path || stage.0 != 0 {
+        let record = records[0];
+        let tab = record
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .ok_or(GitError::MalformedGitOutput)?;
+        if &record[tab.saturating_add(1)..] != physical_path.as_bytes() {
             return Err(GitError::MalformedGitOutput);
         }
-        validate_mode(&stage.1.mode)?;
-        Ok(Some(stage.1))
+        let metadata =
+            std::str::from_utf8(&record[..tab]).map_err(|_| GitError::MalformedGitOutput)?;
+        let mut fields = metadata.split(' ');
+        let mode = fields.next().ok_or(GitError::MalformedGitOutput)?;
+        let object_type = fields.next().ok_or(GitError::MalformedGitOutput)?;
+        let oid = fields.next().ok_or(GitError::MalformedGitOutput)?;
+        if fields.next().is_some() || object_type != "blob" {
+            return Err(GitError::UnsupportedConflictEntry);
+        }
+        validate_mode(mode)?;
+        self.validate_oid(oid)?;
+        if oid.len() != commit.len() {
+            return Err(GitError::UnsupportedConflictEntry);
+        }
+        Ok(Some(StageEntry {
+            mode: mode.to_owned(),
+            oid: oid.to_owned(),
+        }))
     }
 
     fn update_index(&self, physical_path: &str, mode: &str, oid: &str) -> Result<(), GitError> {
         validate_physical_path(physical_path)?;
         validate_mode(mode)?;
-        validate_oid(oid)?;
+        self.validate_oid(oid)?;
         self.ensure_full_index()?;
         let mut input = Vec::with_capacity(mode.len() + oid.len() + physical_path.len() + 3);
         input.extend_from_slice(mode.as_bytes());
@@ -683,8 +1042,58 @@ impl Git {
         Ok(())
     }
 
+    fn update_index_rename(
+        &self,
+        source_physical_path: &str,
+        destination_physical_path: &str,
+        mode: &str,
+        oid: &str,
+    ) -> Result<(), GitError> {
+        validate_physical_path(source_physical_path)?;
+        validate_physical_path(destination_physical_path)?;
+        if source_physical_path == destination_physical_path {
+            return Err(GitError::UnsupportedConflictEntry);
+        }
+        validate_mode(mode)?;
+        self.validate_oid(oid)?;
+        self.ensure_full_index()?;
+
+        // `--index-info` applies all records under one Git index lock and
+        // publishes one replacement index. Mode zero removes every stage for
+        // the source path; the all-zero object id must match the repository's
+        // SHA-1 or SHA-256 object-id width.
+        let zero_oid = "0".repeat(oid.len());
+        let mut input = Vec::with_capacity(
+            source_physical_path
+                .len()
+                .saturating_add(destination_physical_path.len())
+                .saturating_add(oid.len().saturating_mul(2))
+                .saturating_add(mode.len())
+                .saturating_add(8),
+        );
+        input.extend_from_slice(b"0 ");
+        input.extend_from_slice(zero_oid.as_bytes());
+        input.push(b'\t');
+        input.extend_from_slice(source_physical_path.as_bytes());
+        input.push(0);
+        input.extend_from_slice(mode.as_bytes());
+        input.push(b' ');
+        input.extend_from_slice(oid.as_bytes());
+        input.push(b'\t');
+        input.extend_from_slice(destination_physical_path.as_bytes());
+        input.push(0);
+        self.run(
+            GitOperation::UpdateIndex,
+            ["update-index", "-z", "--index-info"],
+            Some(&input),
+            1024,
+        )?;
+        self.sync_index()?;
+        Ok(())
+    }
+
     fn sync_object(&self, oid: &str) -> Result<(), GitError> {
-        validate_oid(oid)?;
+        self.validate_oid(oid)?;
         let object_directory = self.root.join(".git").join("objects");
         let fanout = object_directory.join(&oid[..2]);
         let object = fanout.join(&oid[2..]);
@@ -1186,6 +1595,18 @@ fn validate_conflict_set(conflicts: &BTreeMap<String, ConflictEntry>) -> Result<
     Ok(())
 }
 
+fn reject_conflict_stage_zero(
+    git: &Git,
+    conflicts: &BTreeMap<String, ConflictEntry>,
+) -> Result<(), GitError> {
+    for (stage, _, physical_path) in git.staged_entries()? {
+        if stage == 0 && conflicts.contains_key(&physical_path) {
+            return Err(GitError::UnsupportedConflictEntry);
+        }
+    }
+    Ok(())
+}
+
 fn nul_records(output: &[u8]) -> Result<Vec<&[u8]>, GitError> {
     let mut records = Vec::new();
     for_each_nul_record(output, |record| {
@@ -1309,30 +1730,193 @@ fn prepare_result(
     vault: &Vault,
     git: &Git,
     conflict: &ConflictEntry,
-    tracked_identities: &BTreeMap<String, String>,
+    tracked_identities: &BTreeMap<String, TrackedIdentity>,
+    modified_at_ms: i64,
+) -> Result<PreparedResult, GitError> {
+    let stage_paths = std::array::from_fn(|index| {
+        conflict.stages[index]
+            .as_ref()
+            .map(|_| conflict.logical_path.clone())
+    });
+    prepare_result_for_paths(
+        vault,
+        git,
+        conflict,
+        &stage_paths,
+        None,
+        Some(tracked_identities),
+        modified_at_ms,
+    )
+}
+
+fn prepare_detected_rename_result(
+    vault: &Vault,
+    git: &Git,
+    conflict: &ConflictEntry,
+    stage_paths: &[Option<LogicalPath>; 3],
+    renamed_side: RenameSide,
+    modified_at_ms: i64,
+) -> Result<PreparedResult, GitError> {
+    prepare_result_for_paths(
+        vault,
+        git,
+        conflict,
+        stage_paths,
+        Some(renamed_side.stage_index()),
+        None,
+        modified_at_ms,
+    )
+}
+
+fn prepare_result_for_paths(
+    vault: &Vault,
+    git: &Git,
+    conflict: &ConflictEntry,
+    stage_paths: &[Option<LogicalPath>; 3],
+    identity_stage: Option<usize>,
+    tracked_identities: Option<&BTreeMap<String, TrackedIdentity>>,
     modified_at_ms: i64,
 ) -> Result<PreparedResult, GitError> {
     let mut stage_ciphertexts: [Option<Vec<u8>>; 3] = [None, None, None];
     let mut documents: [Option<DecryptedDocument>; 3] = [None, None, None];
     for (index, stage) in conflict.stages.iter().enumerate() {
         if let Some(stage) = stage {
+            let logical_path = stage_paths[index]
+                .as_ref()
+                .ok_or(GitError::UnsupportedConflictEntry)?;
             let ciphertext = git.read_object(&stage.oid)?;
             let document = vault
-                .authenticate_committed_envelope(&conflict.logical_path, &ciphertext)
+                .authenticate_committed_envelope(logical_path, &ciphertext)
                 .map_err(|_| GitError::StageAuthenticationFailed)?;
             stage_ciphertexts[index] = Some(ciphertext);
             documents[index] = Some(document);
-        }
-    }
-    for document in documents.iter().flatten() {
-        if tracked_identities
-            .get(&document.header.file_id.to_string())
-            .is_some_and(|path| path != conflict.logical_path.as_str())
-        {
+        } else if stage_paths[index].is_some() {
             return Err(GitError::UnsupportedConflictEntry);
         }
     }
+    if let Some(tracked_identities) = tracked_identities {
+        for document in documents.iter().flatten() {
+            if tracked_identities
+                .get(&document.header.file_id.to_string())
+                .is_some_and(|tracked| tracked.logical_path != conflict.logical_path)
+            {
+                return Err(GitError::UnsupportedConflictEntry);
+            }
+        }
+    }
 
+    let identity = if let Some(index) = identity_stage {
+        documents
+            .get(index)
+            .and_then(Option::as_ref)
+            .ok_or(GitError::UnsupportedConflictEntry)?
+    } else {
+        documents[1]
+            .as_ref()
+            .or(documents[2].as_ref())
+            .or(documents[0].as_ref())
+            .ok_or(GitError::UnsupportedConflictEntry)?
+    };
+    if identity.header.logical_path != conflict.logical_path.as_str() {
+        return Err(GitError::UnsupportedConflictEntry);
+    }
+    let file_id = identity.header.file_id.to_string();
+    let (encrypted, unresolved) = merge_and_encrypt_documents(
+        vault,
+        &conflict.logical_path,
+        &documents,
+        identity,
+        modified_at_ms,
+    )?;
+    drop(documents);
+    let result_oid = git.write_object(&encrypted.bytes)?;
+    Ok(PreparedResult {
+        encrypted,
+        result_oid,
+        file_id,
+        unresolved,
+        stage_ciphertexts,
+    })
+}
+
+fn prepare_split_rename_result(
+    vault: &Vault,
+    git: &Git,
+    source: &ConflictEntry,
+    destination: &TrackedIdentity,
+    renamed_side: RenameSide,
+    modified_at_ms: i64,
+) -> Result<PreparedRenameResult, GitError> {
+    let mut source_stage_ciphertexts: [Option<Vec<u8>>; 3] = [None, None, None];
+    let mut source_documents: [Option<DecryptedDocument>; 3] = [None, None, None];
+    for (index, stage) in source.stages.iter().enumerate() {
+        if let Some(stage) = stage {
+            let ciphertext = git.read_object(&stage.oid)?;
+            let document = vault
+                .authenticate_committed_envelope(&source.logical_path, &ciphertext)
+                .map_err(|_| GitError::StageAuthenticationFailed)?;
+            source_stage_ciphertexts[index] = Some(ciphertext);
+            source_documents[index] = Some(document);
+        }
+    }
+    let destination_ciphertext = git.read_object(&destination.entry.oid)?;
+    let destination_document = vault
+        .authenticate_committed_envelope(&destination.logical_path, &destination_ciphertext)
+        .map_err(|_| GitError::StageAuthenticationFailed)?;
+    let destination_file_id = destination_document.header.file_id;
+    if source_documents
+        .iter()
+        .flatten()
+        .any(|document| document.header.file_id != destination_file_id)
+        || source_documents[0].is_none()
+        || source_documents[renamed_side.stage_index()].is_some()
+    {
+        return Err(GitError::UnsupportedConflictEntry);
+    }
+
+    let mut documents: [Option<DecryptedDocument>; 3] = [None, None, None];
+    documents[0] = source_documents[0].take();
+    match renamed_side {
+        RenameSide::Ours => {
+            documents[1] = Some(destination_document);
+            documents[2] = source_documents[2].take();
+        }
+        RenameSide::Theirs => {
+            documents[1] = source_documents[1].take();
+            documents[2] = Some(destination_document);
+        }
+    }
+    let identity = documents[renamed_side.stage_index()]
+        .as_ref()
+        .ok_or(GitError::UnsupportedConflictEntry)?;
+    let file_id = identity.header.file_id.to_string();
+    let (encrypted, unresolved) = merge_and_encrypt_documents(
+        vault,
+        &destination.logical_path,
+        &documents,
+        identity,
+        modified_at_ms,
+    )?;
+    drop(documents);
+    drop(source_documents);
+    let result_oid = git.write_object(&encrypted.bytes)?;
+    Ok(PreparedRenameResult {
+        encrypted,
+        result_oid,
+        file_id,
+        unresolved,
+        source_stage_ciphertexts,
+        destination_ciphertext,
+    })
+}
+
+fn merge_and_encrypt_documents(
+    vault: &Vault,
+    output_path: &LogicalPath,
+    documents: &[Option<DecryptedDocument>; 3],
+    identity: &DecryptedDocument,
+    modified_at_ms: i64,
+) -> Result<(EncryptedDocument, bool), GitError> {
     let ancestor = plaintext_or_empty(documents[0].as_ref())?;
     let ours = plaintext_or_empty(documents[1].as_ref())?;
     let theirs = plaintext_or_empty(documents[2].as_ref())?;
@@ -1351,30 +1935,21 @@ fn prepare_result(
     if merged.len() > format::MAX_PLAINTEXT_LEN {
         return Err(GitError::MergeOutputTooLarge);
     }
-    let identity = documents[1]
-        .as_ref()
-        .or(documents[2].as_ref())
-        .or(documents[0].as_ref())
-        .ok_or(GitError::UnsupportedConflictEntry)?;
     let encrypted = vault.encrypt_merge_result(
-        &conflict.logical_path,
+        output_path,
         &identity.header,
         merged.as_bytes(),
         modified_at_ms.max(identity.header.created_at_ms),
         unresolved,
     )?;
     drop(merged);
-    drop(documents);
-    let result_oid = git.write_object(&encrypted.bytes)?;
-    Ok(PreparedResult {
-        encrypted,
-        result_oid,
-        unresolved,
-        stage_ciphertexts,
-    })
+    Ok((encrypted, unresolved))
 }
 
-fn tracked_identity_index(vault: &Vault, git: &Git) -> Result<BTreeMap<String, String>, GitError> {
+fn tracked_identity_index(
+    vault: &Vault,
+    git: &Git,
+) -> Result<BTreeMap<String, TrackedIdentity>, GitError> {
     let mut identities = BTreeMap::new();
     for (stage, entry, physical_path) in git.staged_entries()? {
         if stage != 0 || !physical_path.ends_with(".md.enc") {
@@ -1394,7 +1969,14 @@ fn tracked_identity_index(vault: &Vault, git: &Git) -> Result<BTreeMap<String, S
         }
         let file_id = parts.header.file_id.to_string();
         if identities
-            .insert(file_id, logical_path.as_str().to_owned())
+            .insert(
+                file_id,
+                TrackedIdentity {
+                    physical_path,
+                    logical_path,
+                    entry,
+                },
+            )
             .is_some()
         {
             return Err(GitError::UnsupportedConflictEntry);
@@ -1403,32 +1985,472 @@ fn tracked_identity_index(vault: &Vault, git: &Git) -> Result<BTreeMap<String, S
     Ok(identities)
 }
 
+fn verify_tracked_identity_owner(
+    vault: &Vault,
+    git: &Git,
+    file_id: &str,
+    expected_physical_path: Option<&str>,
+) -> Result<(), GitError> {
+    let identities = tracked_identity_index(vault, git)?;
+    match (identities.get(file_id), expected_physical_path) {
+        (None, None) => Ok(()),
+        (Some(identity), Some(expected)) if identity.physical_path == expected => Ok(()),
+        _ => Err(GitError::IndexChanged),
+    }
+}
+
+fn verify_worktree_identity_owner(
+    vault: &Vault,
+    git: &Git,
+    guard: &VaultMutationGuard,
+    file_id: &str,
+    allowed_physical_paths: &[&str],
+) -> Result<(), GitError> {
+    let allowed = allowed_physical_paths
+        .iter()
+        .map(|path| validate_physical_path(path).map(|logical| logical.case_fold_key()))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let unmerged = git.unmerged_entries()?;
+    let tree = tree::scan_vault_tree(vault.root()).map_err(|_| GitError::WorktreeChanged)?;
+    for entry in tree.entries() {
+        if entry.kind() != TreeEntryKind::File {
+            continue;
+        }
+        let logical_path = LogicalPath::parse_canonical(entry.logical_path())
+            .map_err(|_| GitError::WorktreeChanged)?;
+        let folded = logical_path.case_fold_key();
+        if allowed.contains(&folded) {
+            continue;
+        }
+        let physical_path = physical_path_for_logical(&logical_path);
+        if let Some(conflict) = unmerged.get(&physical_path) {
+            let target = vault
+                .root()
+                .join(logical_path.to_ciphertext_relative_path());
+            let CurrentTarget::File(actual) = guard.inspect(&target).map_err(map_atomic_error)?
+            else {
+                return Err(GitError::WorktreeChanged);
+            };
+            let mut matched_stage = false;
+            for stage in conflict.stages.iter().flatten() {
+                let ciphertext = git.read_object(&stage.oid)?;
+                if digest(&ciphertext) != actual {
+                    continue;
+                }
+                matched_stage = true;
+                if authenticate_stage_identity(vault, git, stage)?.file_id == file_id {
+                    return Err(GitError::WorktreeChanged);
+                }
+            }
+            if !matched_stage {
+                return Err(GitError::WorktreeChanged);
+            }
+            continue;
+        }
+        let document = vault
+            .read(&logical_path)
+            .map_err(|_| GitError::WorktreeChanged)?;
+        if document.header.file_id.to_string() == file_id {
+            return Err(GitError::WorktreeChanged);
+        }
+    }
+    Ok(())
+}
+
+fn verify_merge_identity_owners(
+    vault: &Vault,
+    git: &Git,
+    guard: &VaultMutationGuard,
+    file_id: &str,
+    expected_index_path: Option<&str>,
+    allowed_worktree_paths: &[&str],
+) -> Result<(), GitError> {
+    verify_tracked_identity_owner(vault, git, file_id, expected_index_path)?;
+    verify_worktree_identity_owner(vault, git, guard, file_id, allowed_worktree_paths)
+}
+
 fn preflight_conflict_identities(
     vault: &Vault,
     git: &Git,
     conflicts: &BTreeMap<String, ConflictEntry>,
-    tracked_identities: &BTreeMap<String, String>,
-) -> Result<(), GitError> {
-    let mut identity_paths = tracked_identities.clone();
+    tracked_identities: &BTreeMap<String, TrackedIdentity>,
+) -> Result<Vec<MergePlan>, GitError> {
+    let authenticated = authenticate_conflict_identities(vault, git, conflicts)?;
+    let mut plans = Vec::with_capacity(conflicts.len());
+    let mut claimed_paths = BTreeSet::new();
     for conflict in conflicts.values() {
-        for stage in conflict.stages.iter().flatten() {
-            let ciphertext = git.read_object(&stage.oid)?;
-            let document = vault
-                .authenticate_committed_envelope(&conflict.logical_path, &ciphertext)
-                .map_err(|_| GitError::StageAuthenticationFailed)?;
-            let file_id = document.header.file_id.to_string();
-            match identity_paths.get(&file_id) {
-                Some(existing_path) if existing_path != conflict.logical_path.as_str() => {
+        let stages = authenticated
+            .get(&conflict.physical_path)
+            .ok_or(GitError::UnsupportedConflictEntry)?;
+        let plan =
+            classify_conflict_plan(vault, git, conflicts, tracked_identities, conflict, stages)?;
+        for path in merge_plan_paths(&plan) {
+            if !claimed_paths.insert(path.case_fold_key()) {
+                return Err(GitError::UnsupportedConflictEntry);
+            }
+        }
+        plans.push(plan);
+    }
+    Ok(plans)
+}
+
+fn authenticate_conflict_identities(
+    vault: &Vault,
+    git: &Git,
+    conflicts: &BTreeMap<String, ConflictEntry>,
+) -> Result<BTreeMap<String, [Option<AuthenticatedStageIdentity>; 3]>, GitError> {
+    let mut authenticated = BTreeMap::new();
+    let mut conflict_identity_owners = BTreeMap::<String, String>::new();
+    for conflict in conflicts.values() {
+        let mut stages: [Option<AuthenticatedStageIdentity>; 3] = std::array::from_fn(|_| None);
+        let mut identities_in_conflict = BTreeSet::new();
+        for (index, stage) in conflict.stages.iter().enumerate() {
+            if let Some(stage) = stage {
+                let identity = authenticate_stage_identity(vault, git, stage)?;
+                identities_in_conflict.insert(identity.file_id.clone());
+                stages[index] = Some(identity);
+            }
+        }
+        for file_id in identities_in_conflict {
+            match conflict_identity_owners.get(&file_id) {
+                Some(existing) if existing != &conflict.physical_path => {
                     return Err(GitError::UnsupportedConflictEntry);
                 }
                 Some(_) => {}
                 None => {
-                    identity_paths.insert(file_id, conflict.logical_path.as_str().to_owned());
+                    conflict_identity_owners.insert(file_id, conflict.physical_path.clone());
                 }
             }
         }
+        authenticated.insert(conflict.physical_path.clone(), stages);
+    }
+    Ok(authenticated)
+}
+
+fn classify_conflict_plan(
+    vault: &Vault,
+    git: &Git,
+    conflicts: &BTreeMap<String, ConflictEntry>,
+    tracked_identities: &BTreeMap<String, TrackedIdentity>,
+    conflict: &ConflictEntry,
+    stages: &[Option<AuthenticatedStageIdentity>; 3],
+) -> Result<MergePlan, GitError> {
+    if stages
+        .iter()
+        .flatten()
+        .all(|stage| stage.logical_path == conflict.logical_path)
+    {
+        classify_same_path_plan(vault, git, conflicts, tracked_identities, conflict, stages)
+    } else {
+        classify_detected_rename_plan(git, conflicts, tracked_identities, conflict, stages)
+    }
+}
+
+fn classify_same_path_plan(
+    vault: &Vault,
+    git: &Git,
+    conflicts: &BTreeMap<String, ConflictEntry>,
+    tracked_identities: &BTreeMap<String, TrackedIdentity>,
+    conflict: &ConflictEntry,
+    stages: &[Option<AuthenticatedStageIdentity>; 3],
+) -> Result<MergePlan, GitError> {
+    let cross_path_ids = stages
+        .iter()
+        .flatten()
+        .filter(|stage| {
+            tracked_identities
+                .get(&stage.file_id)
+                .is_some_and(|tracked| tracked.logical_path != conflict.logical_path)
+        })
+        .map(|stage| stage.file_id.clone())
+        .collect::<BTreeSet<_>>();
+    if cross_path_ids.is_empty() {
+        return Ok(MergePlan::InPlace {
+            conflict: conflict.clone(),
+        });
+    }
+    if cross_path_ids.len() != 1
+        || conflict.stages[0].is_none()
+        || conflict.stages[1].is_some() == conflict.stages[2].is_some()
+    {
+        return Err(GitError::UnsupportedConflictEntry);
+    }
+    let file_id = cross_path_ids
+        .first()
+        .ok_or(GitError::UnsupportedConflictEntry)?;
+    if stages
+        .iter()
+        .flatten()
+        .any(|stage| &stage.file_id != file_id)
+    {
+        return Err(GitError::UnsupportedConflictEntry);
+    }
+    let destination = tracked_identities
+        .get(file_id)
+        .ok_or(GitError::UnsupportedConflictEntry)?
+        .clone();
+    if conflicts.contains_key(&destination.physical_path)
+        || destination.logical_path == conflict.logical_path
+        || destination.logical_path.case_fold_key() == conflict.logical_path.case_fold_key()
+    {
+        return Err(GitError::UnsupportedConflictEntry);
+    }
+    let destination_identity = authenticate_stage_identity(vault, git, &destination.entry)?;
+    if destination_identity.logical_path != destination.logical_path
+        || &destination_identity.file_id != file_id
+    {
+        return Err(GitError::UnsupportedConflictEntry);
+    }
+    let renamed_side = if conflict.stages[1].is_none() {
+        RenameSide::Ours
+    } else {
+        RenameSide::Theirs
+    };
+    let ancestor = conflict.stages[0]
+        .as_ref()
+        .ok_or(GitError::UnsupportedConflictEntry)?;
+    let other_source = conflict.stages[match renamed_side {
+        RenameSide::Ours => RenameSide::Theirs.stage_index(),
+        RenameSide::Theirs => RenameSide::Ours.stage_index(),
+    }]
+    .as_ref()
+    .ok_or(GitError::UnsupportedConflictEntry)?;
+    let provenance = current_rename_provenance(git)?;
+    verify_rename_provenance(
+        git,
+        &provenance,
+        &conflict.physical_path,
+        &destination.physical_path,
+        [ancestor, &destination.entry, other_source],
+        renamed_side,
+    )?;
+    Ok(MergePlan::SplitRename {
+        source: conflict.clone(),
+        destination,
+        renamed_side,
+        provenance,
+    })
+}
+
+fn classify_detected_rename_plan(
+    git: &Git,
+    conflicts: &BTreeMap<String, ConflictEntry>,
+    tracked_identities: &BTreeMap<String, TrackedIdentity>,
+    conflict: &ConflictEntry,
+    stages: &[Option<AuthenticatedStageIdentity>; 3],
+) -> Result<MergePlan, GitError> {
+    let ancestor = stages[0]
+        .as_ref()
+        .ok_or(GitError::UnsupportedConflictEntry)?;
+    let ours = stages[1]
+        .as_ref()
+        .ok_or(GitError::UnsupportedConflictEntry)?;
+    let theirs = stages[2]
+        .as_ref()
+        .ok_or(GitError::UnsupportedConflictEntry)?;
+    if ours.file_id != ancestor.file_id || theirs.file_id != ancestor.file_id {
+        return Err(GitError::UnsupportedConflictEntry);
+    }
+    let (destination, renamed_side) = if ours.logical_path != ancestor.logical_path
+        && theirs.logical_path == ancestor.logical_path
+    {
+        (&ours.logical_path, RenameSide::Ours)
+    } else if theirs.logical_path != ancestor.logical_path
+        && ours.logical_path == ancestor.logical_path
+    {
+        (&theirs.logical_path, RenameSide::Theirs)
+    } else {
+        return Err(GitError::UnsupportedConflictEntry);
+    };
+    if destination != &conflict.logical_path
+        || destination.case_fold_key() == ancestor.logical_path.case_fold_key()
+        || stages.iter().flatten().any(|stage| {
+            stage.logical_path != ancestor.logical_path && stage.logical_path != *destination
+        })
+        || tracked_identities.contains_key(&ancestor.file_id)
+    {
+        return Err(GitError::UnsupportedConflictEntry);
+    }
+    let source_physical = physical_path_for_logical(&ancestor.logical_path);
+    if conflicts
+        .get(&source_physical)
+        .is_some_and(|other| other.physical_path != conflict.physical_path)
+    {
+        return Err(GitError::UnsupportedConflictEntry);
+    }
+    let provenance = current_rename_provenance(git)?;
+    verify_rename_provenance(
+        git,
+        &provenance,
+        &source_physical,
+        &conflict.physical_path,
+        [
+            conflict.stages[0]
+                .as_ref()
+                .ok_or(GitError::UnsupportedConflictEntry)?,
+            conflict.stages[renamed_side.stage_index()]
+                .as_ref()
+                .ok_or(GitError::UnsupportedConflictEntry)?,
+            conflict.stages[match renamed_side {
+                RenameSide::Ours => RenameSide::Theirs.stage_index(),
+                RenameSide::Theirs => RenameSide::Ours.stage_index(),
+            }]
+            .as_ref()
+            .ok_or(GitError::UnsupportedConflictEntry)?,
+        ],
+        renamed_side,
+    )?;
+    Ok(MergePlan::DetectedRename {
+        conflict: conflict.clone(),
+        stage_paths: std::array::from_fn(|index| {
+            stages[index]
+                .as_ref()
+                .map(|stage| stage.logical_path.clone())
+        }),
+        renamed_side,
+        provenance,
+    })
+}
+
+fn current_rename_provenance(git: &Git) -> Result<RenameProvenance, GitError> {
+    let ours_commit = git.resolve_commit("HEAD")?;
+    let theirs_commit = git.single_merge_head()?;
+    let base_commit = git.unique_merge_base(&ours_commit, &theirs_commit)?;
+    Ok(RenameProvenance {
+        object_format: git.object_format,
+        ours_commit,
+        theirs_commit,
+        base_commit,
+    })
+}
+
+fn verify_rename_provenance(
+    git: &Git,
+    provenance: &RenameProvenance,
+    source_physical_path: &str,
+    destination_physical_path: &str,
+    tree_entries: [&StageEntry; 3],
+    renamed_side: RenameSide,
+) -> Result<(), GitError> {
+    let [ancestor, renamed_entry, other_source] = tree_entries;
+    validate_physical_path(source_physical_path)?;
+    validate_physical_path(destination_physical_path)?;
+    if source_physical_path == destination_physical_path {
+        return Err(GitError::UnsupportedConflictEntry);
+    }
+    validate_rename_provenance(git, provenance)?;
+    let (renamed_commit, other_commit) = match renamed_side {
+        RenameSide::Ours => (&provenance.ours_commit, &provenance.theirs_commit),
+        RenameSide::Theirs => (&provenance.theirs_commit, &provenance.ours_commit),
+    };
+    if git
+        .tree_entry(&provenance.base_commit, source_physical_path)?
+        .as_ref()
+        != Some(ancestor)
+        || git
+            .tree_entry(&provenance.base_commit, destination_physical_path)?
+            .is_some()
+        || git
+            .tree_entry(renamed_commit, source_physical_path)?
+            .is_some()
+        || git
+            .tree_entry(renamed_commit, destination_physical_path)?
+            .as_ref()
+            != Some(renamed_entry)
+        || git.tree_entry(other_commit, source_physical_path)?.as_ref() != Some(other_source)
+        || git
+            .tree_entry(other_commit, destination_physical_path)?
+            .is_some()
+    {
+        return Err(GitError::UnsupportedConflictEntry);
     }
     Ok(())
+}
+
+fn validate_rename_provenance(git: &Git, provenance: &RenameProvenance) -> Result<(), GitError> {
+    if provenance.object_format != git.object_format {
+        return Err(GitError::UnsupportedConflictEntry);
+    }
+    for oid in [
+        &provenance.ours_commit,
+        &provenance.theirs_commit,
+        &provenance.base_commit,
+    ] {
+        git.validate_oid(oid)?;
+    }
+    let base = git.unique_merge_base(&provenance.ours_commit, &provenance.theirs_commit)?;
+    if base != provenance.base_commit {
+        return Err(GitError::UnsupportedConflictEntry);
+    }
+    Ok(())
+}
+
+fn verify_active_rename_provenance(git: &Git, expected: &RenameProvenance) -> Result<(), GitError> {
+    if current_rename_provenance(git)? != *expected {
+        return Err(GitError::IndexChanged);
+    }
+    Ok(())
+}
+
+fn authenticate_stage_identity(
+    vault: &Vault,
+    git: &Git,
+    stage: &StageEntry,
+) -> Result<AuthenticatedStageIdentity, GitError> {
+    let ciphertext = git.read_object(&stage.oid)?;
+    let parts =
+        format::split_envelope(&ciphertext).map_err(|_| GitError::StageAuthenticationFailed)?;
+    let logical_path = LogicalPath::parse_canonical(&parts.header.logical_path)
+        .map_err(|_| GitError::StageAuthenticationFailed)?;
+    let document = vault
+        .authenticate_committed_envelope(&logical_path, &ciphertext)
+        .map_err(|_| GitError::StageAuthenticationFailed)?;
+    let file_id = document.header.file_id.to_string();
+    drop(document);
+    Ok(AuthenticatedStageIdentity {
+        logical_path,
+        file_id,
+    })
+}
+
+fn physical_path_for_logical(logical_path: &LogicalPath) -> String {
+    format!("{}.enc", logical_path.as_str())
+}
+
+fn merge_plan_paths(plan: &MergePlan) -> Vec<&LogicalPath> {
+    match plan {
+        MergePlan::InPlace { conflict } => vec![&conflict.logical_path],
+        MergePlan::DetectedRename {
+            conflict,
+            stage_paths,
+            ..
+        } => {
+            let mut paths = vec![&conflict.logical_path];
+            for path in stage_paths.iter().flatten() {
+                if !paths.contains(&path) {
+                    paths.push(path);
+                }
+            }
+            paths
+        }
+        MergePlan::SplitRename {
+            source,
+            destination,
+            ..
+        } => vec![&source.logical_path, &destination.logical_path],
+    }
+}
+
+fn merge_plan_attribute_paths(plans: &[MergePlan]) -> Result<Vec<String>, GitError> {
+    let mut paths = BTreeSet::new();
+    for plan in plans {
+        for logical_path in merge_plan_paths(plan) {
+            let physical_path = physical_path_for_logical(logical_path);
+            validate_physical_path(&physical_path)?;
+            paths.insert(physical_path);
+        }
+    }
+    Ok(paths.into_iter().collect())
 }
 
 fn plaintext_or_empty(document: Option<&DecryptedDocument>) -> Result<&str, GitError> {
@@ -1479,9 +2501,19 @@ fn commit_result(
     let guard = VaultMutationGuard::acquire(vault.root()).map_err(map_atomic_error)?;
     ensure_no_journal(vault.root())?;
     let current = git.unmerged_entries()?;
-    if current.get(&conflict.physical_path) != Some(conflict) {
+    if current.get(&conflict.physical_path) != Some(conflict)
+        || git.stage_zero(&conflict.physical_path)?.is_some()
+    {
         return Err(GitError::IndexChanged);
     }
+    verify_merge_identity_owners(
+        vault,
+        git,
+        &guard,
+        &prepared.file_id,
+        None,
+        &[&conflict.physical_path],
+    )?;
 
     let target = vault
         .root()
@@ -1502,7 +2534,8 @@ fn commit_result(
         result_oid: prepared.result_oid.clone(),
         result_sha256: hex_digest(result_digest),
     };
-    write_journal(vault.root(), &journal)?;
+    let pending = PendingMergeJournal::InPlace(journal.clone());
+    write_journal(vault.root(), &pending)?;
 
     let outcome = guard
         .write(&target, &prepared.encrypted.bytes, condition)
@@ -1510,44 +2543,450 @@ fn commit_result(
     if outcome.parent_sync != ParentSyncStatus::Synced {
         return Err(GitError::DurabilityNotConfirmed);
     }
-    if git.unmerged_entries()?.get(&conflict.physical_path) != Some(conflict) {
+    if git.unmerged_entries()?.get(&conflict.physical_path) != Some(conflict)
+        || git.stage_zero(&conflict.physical_path)?.is_some()
+    {
         return Err(GitError::IndexChanged);
     }
+    verify_merge_identity_owners(
+        vault,
+        git,
+        &guard,
+        &prepared.file_id,
+        None,
+        &[&conflict.physical_path],
+    )?;
     git.update_index(
         &conflict.physical_path,
         &journal.result_mode,
         &prepared.result_oid,
     )?;
+    verify_merge_identity_owners(
+        vault,
+        git,
+        &guard,
+        &prepared.file_id,
+        Some(&conflict.physical_path),
+        &[&conflict.physical_path],
+    )?;
     verify_committed_state(git, &guard, &target, &journal, result_digest)?;
-    remove_journal(vault.root(), &journal)
+    remove_journal(vault.root(), &pending)
+}
+
+#[allow(clippy::too_many_lines)] // Keep the ordered crash transaction visible in one state machine.
+fn commit_detected_rename_result(
+    vault: &Vault,
+    git: &Git,
+    conflict: &ConflictEntry,
+    stage_paths: &[Option<LogicalPath>; 3],
+    renamed_side: RenameSide,
+    provenance: &RenameProvenance,
+    prepared: &PreparedResult,
+) -> Result<(), GitError> {
+    let source_logical_path = stage_paths[0]
+        .as_ref()
+        .ok_or(GitError::UnsupportedConflictEntry)?;
+    if stage_paths[renamed_side.stage_index()].as_ref() != Some(&conflict.logical_path)
+        || stage_paths[match renamed_side {
+            RenameSide::Ours => RenameSide::Theirs.stage_index(),
+            RenameSide::Theirs => RenameSide::Ours.stage_index(),
+        }]
+        .as_ref()
+            != Some(source_logical_path)
+    {
+        return Err(GitError::UnsupportedConflictEntry);
+    }
+    let source_physical_path = physical_path_for_logical(source_logical_path);
+    let guard = VaultMutationGuard::acquire(vault.root()).map_err(map_atomic_error)?;
+    ensure_no_journal(vault.root())?;
+    if !detected_index_is_original(git, conflict, &source_physical_path)? {
+        return Err(GitError::IndexChanged);
+    }
+    verify_merge_identity_owners(
+        vault,
+        git,
+        &guard,
+        &prepared.file_id,
+        None,
+        &[&source_physical_path, &conflict.physical_path],
+    )?;
+    verify_active_rename_provenance(git, provenance)?;
+    verify_rename_provenance(
+        git,
+        provenance,
+        &source_physical_path,
+        &conflict.physical_path,
+        [
+            conflict.stages[0]
+                .as_ref()
+                .ok_or(GitError::UnsupportedConflictEntry)?,
+            conflict.stages[renamed_side.stage_index()]
+                .as_ref()
+                .ok_or(GitError::UnsupportedConflictEntry)?,
+            conflict.stages[match renamed_side {
+                RenameSide::Ours => RenameSide::Theirs.stage_index(),
+                RenameSide::Theirs => RenameSide::Ours.stage_index(),
+            }]
+            .as_ref()
+            .ok_or(GitError::UnsupportedConflictEntry)?,
+        ],
+        renamed_side,
+    )?;
+
+    let source_target = vault
+        .root()
+        .join(source_logical_path.to_ciphertext_relative_path());
+    let destination_target = vault
+        .root()
+        .join(conflict.logical_path.to_ciphertext_relative_path());
+    if guard.inspect(&source_target).map_err(map_atomic_error)? != CurrentTarget::Absent {
+        return Err(GitError::WorktreeChanged);
+    }
+    sync_directory(
+        source_target
+            .parent()
+            .ok_or(GitError::DurabilityNotConfirmed)?,
+    )
+    .map_err(|_| GitError::DurabilityNotConfirmed)?;
+    let expected_destination_digest =
+        expected_worktree_digest(prepared).ok_or(GitError::UnsupportedConflictEntry)?;
+    if guard
+        .inspect(&destination_target)
+        .map_err(map_atomic_error)?
+        != CurrentTarget::File(expected_destination_digest)
+    {
+        return Err(GitError::WorktreeChanged);
+    }
+    let result_digest = digest(&prepared.encrypted.bytes);
+    let journal = DetectedRenameJournal {
+        version: 3,
+        source_physical_path: source_physical_path.clone(),
+        destination_physical_path: conflict.physical_path.clone(),
+        result_mode: result_mode(conflict)?.to_owned(),
+        stages: conflict.stages.clone(),
+        renamed_side,
+        provenance: provenance.clone(),
+        file_id: prepared.file_id.clone(),
+        expected_destination_worktree_sha256: hex_digest(expected_destination_digest),
+        result_oid: prepared.result_oid.clone(),
+        result_sha256: hex_digest(result_digest),
+    };
+    let pending = PendingMergeJournal::DetectedRename(journal.clone());
+    write_journal(vault.root(), &pending)?;
+
+    let outcome = guard
+        .write(
+            &destination_target,
+            &prepared.encrypted.bytes,
+            WriteCondition::IfMatch(expected_destination_digest),
+        )
+        .map_err(map_atomic_error)?;
+    if outcome.parent_sync != ParentSyncStatus::Synced {
+        return Err(GitError::DurabilityNotConfirmed);
+    }
+    if guard.inspect(&source_target).map_err(map_atomic_error)? != CurrentTarget::Absent {
+        return Err(GitError::WorktreeChanged);
+    }
+    sync_directory(
+        source_target
+            .parent()
+            .ok_or(GitError::DurabilityNotConfirmed)?,
+    )
+    .map_err(|_| GitError::DurabilityNotConfirmed)?;
+    if !detected_index_is_original(git, conflict, &source_physical_path)? {
+        return Err(GitError::IndexChanged);
+    }
+    verify_merge_identity_owners(
+        vault,
+        git,
+        &guard,
+        &prepared.file_id,
+        None,
+        &[&source_physical_path, &conflict.physical_path],
+    )?;
+    verify_active_rename_provenance(git, provenance)?;
+    git.update_index(
+        &conflict.physical_path,
+        &journal.result_mode,
+        &journal.result_oid,
+    )?;
+    verify_detected_rename_committed_state(
+        vault,
+        git,
+        &guard,
+        &source_target,
+        &destination_target,
+        &journal,
+        result_digest,
+    )?;
+    remove_journal(vault.root(), &pending)
+}
+
+fn detected_index_is_original(
+    git: &Git,
+    conflict: &ConflictEntry,
+    source_physical_path: &str,
+) -> Result<bool, GitError> {
+    let unmerged = git.unmerged_entries()?;
+    if unmerged.get(&conflict.physical_path) != Some(conflict)
+        || unmerged.contains_key(source_physical_path)
+        || git.stage_zero(&conflict.physical_path)?.is_some()
+    {
+        return Ok(false);
+    }
+    Ok(git.stage_zero(source_physical_path)?.is_none())
+}
+
+fn detected_index_is_final(git: &Git, journal: &DetectedRenameJournal) -> Result<bool, GitError> {
+    let unmerged = git.unmerged_entries()?;
+    if unmerged.contains_key(&journal.source_physical_path)
+        || unmerged.contains_key(&journal.destination_physical_path)
+        || git.stage_zero(&journal.source_physical_path)?.is_some()
+    {
+        return Ok(false);
+    }
+    Ok(git
+        .stage_zero(&journal.destination_physical_path)?
+        .is_some_and(|entry| entry.mode == journal.result_mode && entry.oid == journal.result_oid))
+}
+
+#[allow(clippy::too_many_lines)] // Keep the ordered crash transaction visible in one state machine.
+fn commit_split_rename_result(
+    vault: &Vault,
+    git: &Git,
+    source: &ConflictEntry,
+    destination: &TrackedIdentity,
+    renamed_side: RenameSide,
+    provenance: &RenameProvenance,
+    prepared: &PreparedRenameResult,
+) -> Result<(), GitError> {
+    let guard = VaultMutationGuard::acquire(vault.root()).map_err(map_atomic_error)?;
+    ensure_no_journal(vault.root())?;
+    if !split_index_is_original(git, source, destination)? {
+        return Err(GitError::IndexChanged);
+    }
+    verify_merge_identity_owners(
+        vault,
+        git,
+        &guard,
+        &prepared.file_id,
+        Some(&destination.physical_path),
+        &[&source.physical_path, &destination.physical_path],
+    )?;
+    verify_active_rename_provenance(git, provenance)?;
+    verify_rename_provenance(
+        git,
+        provenance,
+        &source.physical_path,
+        &destination.physical_path,
+        [
+            source.stages[0]
+                .as_ref()
+                .ok_or(GitError::UnsupportedConflictEntry)?,
+            &destination.entry,
+            source.stages[match renamed_side {
+                RenameSide::Ours => RenameSide::Theirs.stage_index(),
+                RenameSide::Theirs => RenameSide::Ours.stage_index(),
+            }]
+            .as_ref()
+            .ok_or(GitError::UnsupportedConflictEntry)?,
+        ],
+        renamed_side,
+    )?;
+
+    let source_target = vault
+        .root()
+        .join(source.logical_path.to_ciphertext_relative_path());
+    let destination_target = vault
+        .root()
+        .join(destination.logical_path.to_ciphertext_relative_path());
+    let expected_source_digest = prepared.source_stage_ciphertexts[1]
+        .as_ref()
+        .or(prepared.source_stage_ciphertexts[2].as_ref())
+        .map(|bytes| digest(bytes));
+    let source_state = guard.inspect(&source_target).map_err(map_atomic_error)?;
+    let expected_source_worktree_sha256 = match source_state {
+        CurrentTarget::File(actual) if Some(actual) == expected_source_digest => {
+            Some(hex_digest(actual))
+        }
+        CurrentTarget::Absent if renamed_side == RenameSide::Ours => None,
+        CurrentTarget::Absent | CurrentTarget::File(_) | CurrentTarget::Other => {
+            return Err(GitError::WorktreeChanged);
+        }
+    };
+    let expected_destination_digest = digest(&prepared.destination_ciphertext);
+    if guard
+        .inspect(&destination_target)
+        .map_err(map_atomic_error)?
+        != CurrentTarget::File(expected_destination_digest)
+    {
+        return Err(GitError::WorktreeChanged);
+    }
+
+    let result_digest = digest(&prepared.encrypted.bytes);
+    let journal = RenameMergeJournal {
+        version: 2,
+        source_physical_path: source.physical_path.clone(),
+        destination_physical_path: destination.physical_path.clone(),
+        result_mode: destination.entry.mode.clone(),
+        source_stages: source.stages.clone(),
+        destination_stage: destination.entry.clone(),
+        renamed_side,
+        provenance: provenance.clone(),
+        file_id: prepared.file_id.clone(),
+        expected_source_worktree_sha256,
+        expected_destination_worktree_sha256: hex_digest(expected_destination_digest),
+        result_oid: prepared.result_oid.clone(),
+        result_sha256: hex_digest(result_digest),
+    };
+    let pending = PendingMergeJournal::Rename(journal.clone());
+    write_journal(vault.root(), &pending)?;
+
+    let destination_outcome = guard
+        .write(
+            &destination_target,
+            &prepared.encrypted.bytes,
+            WriteCondition::IfMatch(expected_destination_digest),
+        )
+        .map_err(map_atomic_error)?;
+    if destination_outcome.parent_sync != ParentSyncStatus::Synced {
+        return Err(GitError::DurabilityNotConfirmed);
+    }
+    match source_state {
+        CurrentTarget::File(expected) => {
+            let outcome = guard
+                .delete(&source_target, WriteCondition::IfMatch(expected))
+                .map_err(map_atomic_error)?;
+            if outcome.parent_sync != ParentSyncStatus::Synced {
+                return Err(GitError::DurabilityNotConfirmed);
+            }
+        }
+        CurrentTarget::Absent => {
+            let parent = source_target.parent().ok_or(GitError::RecoveryConflict)?;
+            sync_directory(parent).map_err(|_| GitError::DurabilityNotConfirmed)?;
+        }
+        CurrentTarget::Other => return Err(GitError::WorktreeChanged),
+    }
+
+    if !split_index_is_original(git, source, destination)? {
+        return Err(GitError::IndexChanged);
+    }
+    verify_merge_identity_owners(
+        vault,
+        git,
+        &guard,
+        &prepared.file_id,
+        Some(&destination.physical_path),
+        &[&source.physical_path, &destination.physical_path],
+    )?;
+    verify_active_rename_provenance(git, provenance)?;
+    git.update_index_rename(
+        &source.physical_path,
+        &destination.physical_path,
+        &journal.result_mode,
+        &journal.result_oid,
+    )?;
+    verify_split_rename_committed_state(
+        vault,
+        git,
+        &guard,
+        &source_target,
+        &destination_target,
+        &journal,
+        result_digest,
+    )?;
+    remove_journal(vault.root(), &pending)
+}
+
+fn split_index_is_original(
+    git: &Git,
+    source: &ConflictEntry,
+    destination: &TrackedIdentity,
+) -> Result<bool, GitError> {
+    let unmerged = git.unmerged_entries()?;
+    if unmerged.get(&source.physical_path) != Some(source)
+        || unmerged.contains_key(&destination.physical_path)
+        || git.stage_zero(&source.physical_path)?.is_some()
+    {
+        return Ok(false);
+    }
+    Ok(git.stage_zero(&destination.physical_path)?.as_ref() == Some(&destination.entry))
 }
 
 fn recover_pending(vault: &Vault, git: &Git) -> Result<bool, GitError> {
     let guard = VaultMutationGuard::acquire(vault.root()).map_err(map_atomic_error)?;
-    let Some(journal) = read_journal(vault.root())? else {
+    let Some(pending) = read_journal(vault.root())? else {
         return Ok(false);
     };
-    validate_journal(&journal)?;
+    match &pending {
+        PendingMergeJournal::InPlace(journal) => {
+            recover_in_place_pending(vault, git, &guard, journal)?;
+        }
+        PendingMergeJournal::Rename(journal) => {
+            recover_split_rename_pending(vault, git, &guard, journal)?;
+        }
+        PendingMergeJournal::DetectedRename(journal) => {
+            recover_detected_rename_pending(vault, git, &guard, journal)?;
+        }
+    }
+    remove_journal(vault.root(), &pending)?;
+    Ok(true)
+}
+
+#[allow(clippy::too_many_lines)] // Authentication and forward recovery share one audit sequence.
+fn recover_in_place_pending(
+    vault: &Vault,
+    git: &Git,
+    guard: &VaultMutationGuard,
+    journal: &MergeJournal,
+) -> Result<(), GitError> {
+    validate_journal(journal)?;
+    git.validate_oid(&journal.result_oid)
+        .map_err(|_| GitError::InvalidJournal)?;
+    for stage in journal.stages.iter().flatten() {
+        git.validate_oid(&stage.oid)
+            .map_err(|_| GitError::InvalidJournal)?;
+    }
     let logical_path = validate_physical_path(&journal.physical_path)?;
     let result = git.read_object(&journal.result_oid)?;
     let result_digest = digest(&result);
     if hex_digest(result_digest) != journal.result_sha256 {
         return Err(GitError::RecoveryConflict);
     }
-    vault
+    let result_document = vault
         .authenticate_committed_envelope(&logical_path, &result)
         .map_err(|_| GitError::RecoveryConflict)?;
+    let file_id = result_document.header.file_id.to_string();
+    let identity_stage = journal.stages[1]
+        .as_ref()
+        .or(journal.stages[2].as_ref())
+        .or(journal.stages[0].as_ref())
+        .ok_or(GitError::RecoveryConflict)?;
+    let identity_ciphertext = git.read_object(&identity_stage.oid)?;
+    let identity_document = vault
+        .authenticate_committed_envelope(&logical_path, &identity_ciphertext)
+        .map_err(|_| GitError::RecoveryConflict)?;
+    if identity_document.header.file_id.to_string() != file_id {
+        return Err(GitError::RecoveryConflict);
+    }
+    let expected_stage = journal.stages[1]
+        .as_ref()
+        .or(journal.stages[2].as_ref())
+        .ok_or(GitError::RecoveryConflict)?;
+    let expected_ciphertext = git.read_object(&expected_stage.oid)?;
+    if hex_digest(digest(&expected_ciphertext)) != journal.expected_worktree_sha256 {
+        return Err(GitError::RecoveryConflict);
+    }
 
     let target = vault
         .root()
         .join(logical_path.to_ciphertext_relative_path());
     let unmerged = git.unmerged_entries()?;
     let current_conflict = unmerged.get(&journal.physical_path);
-    let stage_zero = if current_conflict.is_none() {
-        git.stage_zero(&journal.physical_path)?
-    } else {
-        None
-    };
+    let stage_zero = git.stage_zero(&journal.physical_path)?;
+    if current_conflict.is_some() && stage_zero.is_some() {
+        return Err(GitError::RecoveryConflict);
+    }
     let index_done = stage_zero
         .as_ref()
         .is_some_and(|entry| entry.mode == journal.result_mode && entry.oid == journal.result_oid)
@@ -1562,6 +3001,15 @@ fn recover_pending(vault: &Vault, git: &Git) -> Result<bool, GitError> {
             return Err(GitError::RecoveryConflict);
         }
     }
+    verify_merge_identity_owners(
+        vault,
+        git,
+        guard,
+        &file_id,
+        index_done.then_some(journal.physical_path.as_str()),
+        &[&journal.physical_path],
+    )
+    .map_err(|_| GitError::RecoveryConflict)?;
 
     let current_target = guard.inspect(&target).map_err(map_atomic_error)?;
     let worktree_done =
@@ -1591,15 +3039,559 @@ fn recover_pending(vault: &Vault, git: &Git) -> Result<bool, GitError> {
         {
             return Err(GitError::RecoveryConflict);
         }
+        verify_merge_identity_owners(vault, git, guard, &file_id, None, &[&journal.physical_path])
+            .map_err(|_| GitError::RecoveryConflict)?;
         git.update_index(
             &journal.physical_path,
             &journal.result_mode,
             &journal.result_oid,
         )?;
     }
-    verify_committed_state(git, &guard, &target, &journal, result_digest)?;
-    remove_journal(vault.root(), &journal)?;
-    Ok(true)
+    verify_merge_identity_owners(
+        vault,
+        git,
+        guard,
+        &file_id,
+        Some(&journal.physical_path),
+        &[&journal.physical_path],
+    )
+    .map_err(|_| GitError::RecoveryConflict)?;
+    verify_committed_state(git, guard, &target, journal, result_digest)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)] // Recovery order is security-critical and intentionally linear.
+fn recover_detected_rename_pending(
+    vault: &Vault,
+    git: &Git,
+    guard: &VaultMutationGuard,
+    journal: &DetectedRenameJournal,
+) -> Result<(), GitError> {
+    let authenticated = authenticate_detected_rename_recovery(vault, git, journal)?;
+    let index_original =
+        detected_index_is_original(git, &authenticated.conflict, &journal.source_physical_path)?;
+    let index_final = detected_index_is_final(git, journal)?;
+    if index_original == index_final {
+        return Err(GitError::RecoveryConflict);
+    }
+    if index_original {
+        verify_active_rename_provenance(git, &journal.provenance)
+            .map_err(|_| GitError::RecoveryConflict)?;
+    }
+    verify_merge_identity_owners(
+        vault,
+        git,
+        guard,
+        &authenticated.file_id,
+        index_final.then_some(journal.destination_physical_path.as_str()),
+        &[
+            &journal.source_physical_path,
+            &journal.destination_physical_path,
+        ],
+    )
+    .map_err(|_| GitError::RecoveryConflict)?;
+
+    let source_target = vault.root().join(
+        authenticated
+            .source_logical_path
+            .to_ciphertext_relative_path(),
+    );
+    let destination_target = vault.root().join(
+        authenticated
+            .conflict
+            .logical_path
+            .to_ciphertext_relative_path(),
+    );
+    if guard.inspect(&source_target).map_err(map_atomic_error)? != CurrentTarget::Absent {
+        return Err(GitError::RecoveryConflict);
+    }
+    sync_directory(source_target.parent().ok_or(GitError::RecoveryConflict)?)
+        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+    let destination_state = guard
+        .inspect(&destination_target)
+        .map_err(map_atomic_error)?;
+    if index_final {
+        if destination_state != CurrentTarget::File(authenticated.result_digest) {
+            return Err(GitError::RecoveryConflict);
+        }
+        return verify_detected_rename_committed_state(
+            vault,
+            git,
+            guard,
+            &source_target,
+            &destination_target,
+            journal,
+            authenticated.result_digest,
+        );
+    }
+
+    match destination_state {
+        CurrentTarget::File(actual) if actual == authenticated.expected_destination_digest => {
+            let outcome = guard
+                .write(
+                    &destination_target,
+                    &authenticated.result,
+                    WriteCondition::IfMatch(authenticated.expected_destination_digest),
+                )
+                .map_err(map_atomic_error)?;
+            if outcome.parent_sync != ParentSyncStatus::Synced {
+                return Err(GitError::DurabilityNotConfirmed);
+            }
+        }
+        CurrentTarget::File(actual) if actual == authenticated.result_digest => {
+            sync_directory(
+                destination_target
+                    .parent()
+                    .ok_or(GitError::RecoveryConflict)?,
+            )
+            .map_err(|_| GitError::DurabilityNotConfirmed)?;
+        }
+        CurrentTarget::Absent | CurrentTarget::File(_) | CurrentTarget::Other => {
+            return Err(GitError::RecoveryConflict);
+        }
+    }
+    if guard.inspect(&source_target).map_err(map_atomic_error)? != CurrentTarget::Absent {
+        return Err(GitError::RecoveryConflict);
+    }
+    sync_directory(source_target.parent().ok_or(GitError::RecoveryConflict)?)
+        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+    if !detected_index_is_original(git, &authenticated.conflict, &journal.source_physical_path)? {
+        if detected_index_is_final(git, journal)? {
+            return verify_detected_rename_committed_state(
+                vault,
+                git,
+                guard,
+                &source_target,
+                &destination_target,
+                journal,
+                authenticated.result_digest,
+            );
+        }
+        return Err(GitError::RecoveryConflict);
+    }
+    verify_merge_identity_owners(
+        vault,
+        git,
+        guard,
+        &authenticated.file_id,
+        None,
+        &[
+            &journal.source_physical_path,
+            &journal.destination_physical_path,
+        ],
+    )
+    .map_err(|_| GitError::RecoveryConflict)?;
+    git.update_index(
+        &journal.destination_physical_path,
+        &journal.result_mode,
+        &journal.result_oid,
+    )?;
+    verify_detected_rename_committed_state(
+        vault,
+        git,
+        guard,
+        &source_target,
+        &destination_target,
+        journal,
+        authenticated.result_digest,
+    )
+}
+
+fn authenticate_detected_rename_recovery(
+    vault: &Vault,
+    git: &Git,
+    journal: &DetectedRenameJournal,
+) -> Result<AuthenticatedDetectedRenameRecovery, GitError> {
+    validate_detected_rename_journal(journal)?;
+    git.validate_oid(&journal.result_oid)
+        .map_err(|_| GitError::InvalidJournal)?;
+    for stage in journal.stages.iter().flatten() {
+        git.validate_oid(&stage.oid)
+            .map_err(|_| GitError::InvalidJournal)?;
+    }
+    validate_rename_provenance(git, &journal.provenance).map_err(|_| GitError::InvalidJournal)?;
+    let source_logical_path = validate_physical_path(&journal.source_physical_path)?;
+    let destination_logical_path = validate_physical_path(&journal.destination_physical_path)?;
+    let mut identities: [Option<AuthenticatedStageIdentity>; 3] = std::array::from_fn(|_| None);
+    for (index, stage) in journal.stages.iter().enumerate() {
+        identities[index] = Some(authenticate_stage_identity(
+            vault,
+            git,
+            stage.as_ref().ok_or(GitError::RecoveryConflict)?,
+        )?);
+    }
+    let ancestor = identities[0].as_ref().ok_or(GitError::RecoveryConflict)?;
+    let renamed = identities[journal.renamed_side.stage_index()]
+        .as_ref()
+        .ok_or(GitError::RecoveryConflict)?;
+    let other_index = match journal.renamed_side {
+        RenameSide::Ours => RenameSide::Theirs.stage_index(),
+        RenameSide::Theirs => RenameSide::Ours.stage_index(),
+    };
+    let other = identities[other_index]
+        .as_ref()
+        .ok_or(GitError::RecoveryConflict)?;
+    if ancestor.logical_path != source_logical_path
+        || other.logical_path != source_logical_path
+        || renamed.logical_path != destination_logical_path
+        || ancestor.file_id != renamed.file_id
+        || ancestor.file_id != other.file_id
+        || journal.file_id != ancestor.file_id
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    verify_rename_provenance(
+        git,
+        &journal.provenance,
+        &journal.source_physical_path,
+        &journal.destination_physical_path,
+        [
+            journal.stages[0]
+                .as_ref()
+                .ok_or(GitError::RecoveryConflict)?,
+            journal.stages[journal.renamed_side.stage_index()]
+                .as_ref()
+                .ok_or(GitError::RecoveryConflict)?,
+            journal.stages[other_index]
+                .as_ref()
+                .ok_or(GitError::RecoveryConflict)?,
+        ],
+        journal.renamed_side,
+    )
+    .map_err(|_| GitError::RecoveryConflict)?;
+
+    let result = git.read_object(&journal.result_oid)?;
+    let result_digest = digest(&result);
+    if hex_digest(result_digest) != journal.result_sha256 {
+        return Err(GitError::RecoveryConflict);
+    }
+    let result_document = vault
+        .authenticate_committed_envelope(&destination_logical_path, &result)
+        .map_err(|_| GitError::RecoveryConflict)?;
+    if result_document.header.file_id.to_string() != ancestor.file_id {
+        return Err(GitError::RecoveryConflict);
+    }
+    let expected_ciphertext = git.read_object(
+        &journal.stages[1]
+            .as_ref()
+            .or(journal.stages[2].as_ref())
+            .ok_or(GitError::RecoveryConflict)?
+            .oid,
+    )?;
+    let expected_destination_digest =
+        parse_hex_digest(&journal.expected_destination_worktree_sha256)
+            .map_err(|_| GitError::RecoveryConflict)?;
+    if digest(&expected_ciphertext) != expected_destination_digest {
+        return Err(GitError::RecoveryConflict);
+    }
+    Ok(AuthenticatedDetectedRenameRecovery {
+        conflict: ConflictEntry {
+            physical_path: journal.destination_physical_path.clone(),
+            logical_path: destination_logical_path,
+            stages: journal.stages.clone(),
+        },
+        source_logical_path,
+        result,
+        result_digest,
+        expected_destination_digest,
+        file_id: ancestor.file_id.clone(),
+    })
+}
+
+#[allow(clippy::too_many_lines)] // Recovery order is security-critical and intentionally linear.
+fn recover_split_rename_pending(
+    vault: &Vault,
+    git: &Git,
+    guard: &VaultMutationGuard,
+    journal: &RenameMergeJournal,
+) -> Result<(), GitError> {
+    let authenticated = authenticate_rename_recovery(vault, git, journal)?;
+    let index_original =
+        split_index_is_original(git, &authenticated.source, &authenticated.destination)?;
+    let index_final = split_index_is_final(git, journal)?;
+    if index_original == index_final {
+        return Err(GitError::RecoveryConflict);
+    }
+    if index_original {
+        verify_active_rename_provenance(git, &journal.provenance)
+            .map_err(|_| GitError::RecoveryConflict)?;
+    }
+    verify_merge_identity_owners(
+        vault,
+        git,
+        guard,
+        &authenticated.file_id,
+        Some(&journal.destination_physical_path),
+        &[
+            &journal.source_physical_path,
+            &journal.destination_physical_path,
+        ],
+    )
+    .map_err(|_| GitError::RecoveryConflict)?;
+
+    let source_target = vault.root().join(
+        authenticated
+            .source
+            .logical_path
+            .to_ciphertext_relative_path(),
+    );
+    let destination_target = vault.root().join(
+        authenticated
+            .destination
+            .logical_path
+            .to_ciphertext_relative_path(),
+    );
+    let source_state = guard.inspect(&source_target).map_err(map_atomic_error)?;
+    let destination_state = guard
+        .inspect(&destination_target)
+        .map_err(map_atomic_error)?;
+    if index_final {
+        if source_state != CurrentTarget::Absent
+            || destination_state != CurrentTarget::File(authenticated.result_digest)
+        {
+            return Err(GitError::RecoveryConflict);
+        }
+        return verify_split_rename_committed_state(
+            vault,
+            git,
+            guard,
+            &source_target,
+            &destination_target,
+            journal,
+            authenticated.result_digest,
+        );
+    }
+
+    advance_split_rename_worktree(
+        guard,
+        &source_target,
+        &destination_target,
+        source_state,
+        destination_state,
+        &authenticated,
+    )?;
+
+    if !split_index_is_original(git, &authenticated.source, &authenticated.destination)? {
+        if split_index_is_final(git, journal)? {
+            return verify_split_rename_committed_state(
+                vault,
+                git,
+                guard,
+                &source_target,
+                &destination_target,
+                journal,
+                authenticated.result_digest,
+            );
+        }
+        return Err(GitError::RecoveryConflict);
+    }
+    verify_merge_identity_owners(
+        vault,
+        git,
+        guard,
+        &authenticated.file_id,
+        Some(&journal.destination_physical_path),
+        &[
+            &journal.source_physical_path,
+            &journal.destination_physical_path,
+        ],
+    )
+    .map_err(|_| GitError::RecoveryConflict)?;
+    git.update_index_rename(
+        &journal.source_physical_path,
+        &journal.destination_physical_path,
+        &journal.result_mode,
+        &journal.result_oid,
+    )?;
+    verify_split_rename_committed_state(
+        vault,
+        git,
+        guard,
+        &source_target,
+        &destination_target,
+        journal,
+        authenticated.result_digest,
+    )
+}
+
+fn authenticate_rename_recovery(
+    vault: &Vault,
+    git: &Git,
+    journal: &RenameMergeJournal,
+) -> Result<AuthenticatedRenameRecovery, GitError> {
+    validate_rename_journal(journal)?;
+    git.validate_oid(&journal.result_oid)
+        .map_err(|_| GitError::InvalidJournal)?;
+    git.validate_oid(&journal.destination_stage.oid)
+        .map_err(|_| GitError::InvalidJournal)?;
+    for stage in journal.source_stages.iter().flatten() {
+        git.validate_oid(&stage.oid)
+            .map_err(|_| GitError::InvalidJournal)?;
+    }
+    validate_rename_provenance(git, &journal.provenance).map_err(|_| GitError::InvalidJournal)?;
+    let source_logical = validate_physical_path(&journal.source_physical_path)?;
+    let destination_logical = validate_physical_path(&journal.destination_physical_path)?;
+    let result = git.read_object(&journal.result_oid)?;
+    let result_digest = digest(&result);
+    if hex_digest(result_digest) != journal.result_sha256 {
+        return Err(GitError::RecoveryConflict);
+    }
+    let result_document = vault
+        .authenticate_committed_envelope(&destination_logical, &result)
+        .map_err(|_| GitError::RecoveryConflict)?;
+
+    let mut source_ciphertexts: [Option<Vec<u8>>; 3] = [None, None, None];
+    let mut expected_file_id = None;
+    for (index, stage) in journal.source_stages.iter().enumerate() {
+        if let Some(stage) = stage {
+            let ciphertext = git.read_object(&stage.oid)?;
+            let document = vault
+                .authenticate_committed_envelope(&source_logical, &ciphertext)
+                .map_err(|_| GitError::RecoveryConflict)?;
+            let file_id = document.header.file_id.to_string();
+            if expected_file_id
+                .as_ref()
+                .is_some_and(|expected| expected != &file_id)
+            {
+                return Err(GitError::RecoveryConflict);
+            }
+            expected_file_id.get_or_insert(file_id);
+            source_ciphertexts[index] = Some(ciphertext);
+        }
+    }
+    let destination_ciphertext = git.read_object(&journal.destination_stage.oid)?;
+    let destination_document = vault
+        .authenticate_committed_envelope(&destination_logical, &destination_ciphertext)
+        .map_err(|_| GitError::RecoveryConflict)?;
+    let expected_file_id = expected_file_id.ok_or(GitError::RecoveryConflict)?;
+    if destination_document.header.file_id.to_string() != expected_file_id
+        || result_document.header.file_id.to_string() != expected_file_id
+        || journal.file_id != expected_file_id
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    verify_rename_provenance(
+        git,
+        &journal.provenance,
+        &journal.source_physical_path,
+        &journal.destination_physical_path,
+        [
+            journal.source_stages[0]
+                .as_ref()
+                .ok_or(GitError::RecoveryConflict)?,
+            &journal.destination_stage,
+            journal.source_stages[match journal.renamed_side {
+                RenameSide::Ours => RenameSide::Theirs.stage_index(),
+                RenameSide::Theirs => RenameSide::Ours.stage_index(),
+            }]
+            .as_ref()
+            .ok_or(GitError::RecoveryConflict)?,
+        ],
+        journal.renamed_side,
+    )
+    .map_err(|_| GitError::RecoveryConflict)?;
+    let expected_source_digest = source_ciphertexts[1]
+        .as_ref()
+        .or(source_ciphertexts[2].as_ref())
+        .map(|bytes| digest(bytes))
+        .ok_or(GitError::RecoveryConflict)?;
+    let expected_source_state = expected_rename_source_state(journal, expected_source_digest)?;
+    let expected_destination_digest =
+        parse_hex_digest(&journal.expected_destination_worktree_sha256)
+            .map_err(|_| GitError::RecoveryConflict)?;
+    if digest(&destination_ciphertext) != expected_destination_digest {
+        return Err(GitError::RecoveryConflict);
+    }
+    Ok(AuthenticatedRenameRecovery {
+        source: ConflictEntry {
+            physical_path: journal.source_physical_path.clone(),
+            logical_path: source_logical,
+            stages: journal.source_stages.clone(),
+        },
+        destination: TrackedIdentity {
+            physical_path: journal.destination_physical_path.clone(),
+            logical_path: destination_logical,
+            entry: journal.destination_stage.clone(),
+        },
+        result,
+        result_digest,
+        expected_source_state,
+        expected_destination_digest,
+        file_id: expected_file_id,
+    })
+}
+
+fn expected_rename_source_state(
+    journal: &RenameMergeJournal,
+    expected_source_digest: [u8; 32],
+) -> Result<CurrentTarget, GitError> {
+    match &journal.expected_source_worktree_sha256 {
+        Some(encoded) => {
+            let recorded = parse_hex_digest(encoded).map_err(|_| GitError::RecoveryConflict)?;
+            if recorded != expected_source_digest {
+                return Err(GitError::RecoveryConflict);
+            }
+            Ok(CurrentTarget::File(recorded))
+        }
+        None if journal.renamed_side == RenameSide::Ours => Ok(CurrentTarget::Absent),
+        None => Err(GitError::RecoveryConflict),
+    }
+}
+
+fn advance_split_rename_worktree(
+    guard: &VaultMutationGuard,
+    source_target: &Path,
+    destination_target: &Path,
+    source_state: CurrentTarget,
+    destination_state: CurrentTarget,
+    authenticated: &AuthenticatedRenameRecovery,
+) -> Result<(), GitError> {
+    match destination_state {
+        CurrentTarget::File(actual) if actual == authenticated.expected_destination_digest => {
+            if source_state != authenticated.expected_source_state {
+                return Err(GitError::RecoveryConflict);
+            }
+            let outcome = guard
+                .write(
+                    destination_target,
+                    &authenticated.result,
+                    WriteCondition::IfMatch(authenticated.expected_destination_digest),
+                )
+                .map_err(map_atomic_error)?;
+            if outcome.parent_sync != ParentSyncStatus::Synced {
+                return Err(GitError::DurabilityNotConfirmed);
+            }
+        }
+        CurrentTarget::File(actual) if actual == authenticated.result_digest => {
+            let parent = destination_target
+                .parent()
+                .ok_or(GitError::RecoveryConflict)?;
+            sync_directory(parent).map_err(|_| GitError::DurabilityNotConfirmed)?;
+        }
+        CurrentTarget::Absent | CurrentTarget::File(_) | CurrentTarget::Other => {
+            return Err(GitError::RecoveryConflict);
+        }
+    }
+    match guard.inspect(source_target).map_err(map_atomic_error)? {
+        CurrentTarget::File(actual)
+            if authenticated.expected_source_state == CurrentTarget::File(actual) =>
+        {
+            let outcome = guard
+                .delete(source_target, WriteCondition::IfMatch(actual))
+                .map_err(map_atomic_error)?;
+            if outcome.parent_sync != ParentSyncStatus::Synced {
+                return Err(GitError::DurabilityNotConfirmed);
+            }
+        }
+        CurrentTarget::Absent => {
+            let parent = source_target.parent().ok_or(GitError::RecoveryConflict)?;
+            sync_directory(parent).map_err(|_| GitError::DurabilityNotConfirmed)?;
+        }
+        CurrentTarget::File(_) | CurrentTarget::Other => {
+            return Err(GitError::RecoveryConflict);
+        }
+    }
+    Ok(())
 }
 
 fn verify_committed_state(
@@ -1631,6 +3623,103 @@ fn verify_committed_state(
     Ok(())
 }
 
+fn verify_detected_rename_committed_state(
+    vault: &Vault,
+    git: &Git,
+    guard: &VaultMutationGuard,
+    source_target: &Path,
+    destination_target: &Path,
+    journal: &DetectedRenameJournal,
+    result_digest: [u8; 32],
+) -> Result<(), GitError> {
+    if guard.inspect(source_target).map_err(map_atomic_error)? != CurrentTarget::Absent
+        || guard
+            .inspect(destination_target)
+            .map_err(map_atomic_error)?
+            != CurrentTarget::File(result_digest)
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    for target in [source_target, destination_target] {
+        let parent = target.parent().ok_or(GitError::RecoveryConflict)?;
+        sync_directory(parent).map_err(|_| GitError::DurabilityNotConfirmed)?;
+    }
+    if !detected_index_is_final(git, journal)? {
+        return Err(GitError::RecoveryConflict);
+    }
+    verify_merge_identity_owners(
+        vault,
+        git,
+        guard,
+        &journal.file_id,
+        Some(&journal.destination_physical_path),
+        &[
+            &journal.source_physical_path,
+            &journal.destination_physical_path,
+        ],
+    )
+    .map_err(|_| GitError::RecoveryConflict)?;
+    git.sync_object(&journal.result_oid)?;
+    git.sync_index()?;
+    Ok(())
+}
+
+fn split_index_is_final(git: &Git, journal: &RenameMergeJournal) -> Result<bool, GitError> {
+    let unmerged = git.unmerged_entries()?;
+    if unmerged.contains_key(&journal.source_physical_path)
+        || unmerged.contains_key(&journal.destination_physical_path)
+    {
+        return Ok(false);
+    }
+    if git.stage_zero(&journal.source_physical_path)?.is_some() {
+        return Ok(false);
+    }
+    Ok(git
+        .stage_zero(&journal.destination_physical_path)?
+        .is_some_and(|entry| entry.mode == journal.result_mode && entry.oid == journal.result_oid))
+}
+
+fn verify_split_rename_committed_state(
+    vault: &Vault,
+    git: &Git,
+    guard: &VaultMutationGuard,
+    source_target: &Path,
+    destination_target: &Path,
+    journal: &RenameMergeJournal,
+    result_digest: [u8; 32],
+) -> Result<(), GitError> {
+    if guard.inspect(source_target).map_err(map_atomic_error)? != CurrentTarget::Absent
+        || guard
+            .inspect(destination_target)
+            .map_err(map_atomic_error)?
+            != CurrentTarget::File(result_digest)
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    for target in [source_target, destination_target] {
+        let parent = target.parent().ok_or(GitError::RecoveryConflict)?;
+        sync_directory(parent).map_err(|_| GitError::DurabilityNotConfirmed)?;
+    }
+    if !split_index_is_final(git, journal)? {
+        return Err(GitError::RecoveryConflict);
+    }
+    verify_merge_identity_owners(
+        vault,
+        git,
+        guard,
+        &journal.file_id,
+        Some(&journal.destination_physical_path),
+        &[
+            &journal.source_physical_path,
+            &journal.destination_physical_path,
+        ],
+    )
+    .map_err(|_| GitError::RecoveryConflict)?;
+    git.sync_object(&journal.result_oid)?;
+    git.sync_index()?;
+    Ok(())
+}
+
 fn validate_journal(journal: &MergeJournal) -> Result<(), GitError> {
     if journal.version != 1 {
         return Err(GitError::InvalidJournal);
@@ -1638,12 +3727,103 @@ fn validate_journal(journal: &MergeJournal) -> Result<(), GitError> {
     validate_physical_path(&journal.physical_path).map_err(|_| GitError::InvalidJournal)?;
     validate_mode(&journal.result_mode).map_err(|_| GitError::InvalidJournal)?;
     validate_oid(&journal.result_oid).map_err(|_| GitError::InvalidJournal)?;
+    let oid_width = journal.result_oid.len();
     parse_hex_digest(&journal.result_sha256).map_err(|_| GitError::InvalidJournal)?;
     parse_hex_digest(&journal.expected_worktree_sha256).map_err(|_| GitError::InvalidJournal)?;
     validate_conflict_modes(&journal.stages).map_err(|_| GitError::InvalidJournal)?;
     for stage in journal.stages.iter().flatten() {
         validate_mode(&stage.mode).map_err(|_| GitError::InvalidJournal)?;
         validate_oid(&stage.oid).map_err(|_| GitError::InvalidJournal)?;
+        if stage.oid.len() != oid_width {
+            return Err(GitError::InvalidJournal);
+        }
+    }
+    Ok(())
+}
+
+fn validate_rename_journal(journal: &RenameMergeJournal) -> Result<(), GitError> {
+    if journal.version != 2 {
+        return Err(GitError::InvalidJournal);
+    }
+    let source = validate_physical_path(&journal.source_physical_path)
+        .map_err(|_| GitError::InvalidJournal)?;
+    let destination = validate_physical_path(&journal.destination_physical_path)
+        .map_err(|_| GitError::InvalidJournal)?;
+    if source == destination || source.case_fold_key() == destination.case_fold_key() {
+        return Err(GitError::InvalidJournal);
+    }
+    validate_mode(&journal.result_mode).map_err(|_| GitError::InvalidJournal)?;
+    validate_mode(&journal.destination_stage.mode).map_err(|_| GitError::InvalidJournal)?;
+    validate_oid(&journal.destination_stage.oid).map_err(|_| GitError::InvalidJournal)?;
+    validate_oid(&journal.result_oid).map_err(|_| GitError::InvalidJournal)?;
+    let oid_width = journal.result_oid.len();
+    if journal.destination_stage.oid.len() != oid_width
+        || journal
+            .source_stages
+            .iter()
+            .flatten()
+            .any(|stage| stage.oid.len() != oid_width)
+    {
+        return Err(GitError::InvalidJournal);
+    }
+    parse_hex_digest(&journal.result_sha256).map_err(|_| GitError::InvalidJournal)?;
+    parse_hex_digest(&journal.expected_destination_worktree_sha256)
+        .map_err(|_| GitError::InvalidJournal)?;
+    if let Some(expected) = &journal.expected_source_worktree_sha256 {
+        parse_hex_digest(expected).map_err(|_| GitError::InvalidJournal)?;
+    } else if journal.renamed_side != RenameSide::Ours {
+        return Err(GitError::InvalidJournal);
+    }
+    validate_conflict_modes(&journal.source_stages).map_err(|_| GitError::InvalidJournal)?;
+    if journal.source_stages[0].is_none()
+        || journal.source_stages[journal.renamed_side.stage_index()].is_some()
+        || journal.source_stages[match journal.renamed_side {
+            RenameSide::Ours => RenameSide::Theirs.stage_index(),
+            RenameSide::Theirs => RenameSide::Ours.stage_index(),
+        }]
+        .is_none()
+    {
+        return Err(GitError::InvalidJournal);
+    }
+    for stage in journal.source_stages.iter().flatten() {
+        validate_mode(&stage.mode).map_err(|_| GitError::InvalidJournal)?;
+        validate_oid(&stage.oid).map_err(|_| GitError::InvalidJournal)?;
+        if stage.mode != journal.result_mode {
+            return Err(GitError::InvalidJournal);
+        }
+    }
+    if journal.destination_stage.mode != journal.result_mode {
+        return Err(GitError::InvalidJournal);
+    }
+    Ok(())
+}
+
+fn validate_detected_rename_journal(journal: &DetectedRenameJournal) -> Result<(), GitError> {
+    if journal.version != 3 {
+        return Err(GitError::InvalidJournal);
+    }
+    let source = validate_physical_path(&journal.source_physical_path)
+        .map_err(|_| GitError::InvalidJournal)?;
+    let destination = validate_physical_path(&journal.destination_physical_path)
+        .map_err(|_| GitError::InvalidJournal)?;
+    if source == destination || source.case_fold_key() == destination.case_fold_key() {
+        return Err(GitError::InvalidJournal);
+    }
+    validate_mode(&journal.result_mode).map_err(|_| GitError::InvalidJournal)?;
+    validate_oid(&journal.result_oid).map_err(|_| GitError::InvalidJournal)?;
+    let oid_width = journal.result_oid.len();
+    parse_hex_digest(&journal.result_sha256).map_err(|_| GitError::InvalidJournal)?;
+    parse_hex_digest(&journal.expected_destination_worktree_sha256)
+        .map_err(|_| GitError::InvalidJournal)?;
+    if journal.stages.iter().any(Option::is_none) {
+        return Err(GitError::InvalidJournal);
+    }
+    for stage in journal.stages.iter().flatten() {
+        validate_mode(&stage.mode).map_err(|_| GitError::InvalidJournal)?;
+        validate_oid(&stage.oid).map_err(|_| GitError::InvalidJournal)?;
+        if stage.mode != journal.result_mode || stage.oid.len() != oid_width {
+            return Err(GitError::InvalidJournal);
+        }
     }
     Ok(())
 }
@@ -1660,7 +3840,7 @@ fn ensure_no_journal(root: &Path) -> Result<(), GitError> {
     }
 }
 
-fn write_journal(root: &Path, journal: &MergeJournal) -> Result<(), GitError> {
+fn write_journal(root: &Path, journal: &PendingMergeJournal) -> Result<(), GitError> {
     ensure_no_journal(root)?;
     let local = root.join(VAULT_LOCAL_DIRECTORY);
     let local_metadata = fs::symlink_metadata(&local)
@@ -1668,7 +3848,12 @@ fn write_journal(root: &Path, journal: &MergeJournal) -> Result<(), GitError> {
     if is_link_or_reparse_point(&local_metadata) || !local_metadata.file_type().is_dir() {
         return Err(GitError::InvalidJournal);
     }
-    let bytes = serde_json::to_vec(journal).map_err(|_| GitError::InvalidJournal)?;
+    let bytes = match journal {
+        PendingMergeJournal::InPlace(journal) => serde_json::to_vec(journal),
+        PendingMergeJournal::Rename(journal) => serde_json::to_vec(journal),
+        PendingMergeJournal::DetectedRename(journal) => serde_json::to_vec(journal),
+    }
+    .map_err(|_| GitError::InvalidJournal)?;
     if bytes.len() > MAX_JOURNAL_BYTES {
         return Err(GitError::InvalidJournal);
     }
@@ -1692,7 +3877,7 @@ fn write_journal(root: &Path, journal: &MergeJournal) -> Result<(), GitError> {
     sync_directory(&local).map_err(|error| io_error(GitIoOperation::WriteJournal, &error))
 }
 
-fn read_journal(root: &Path) -> Result<Option<MergeJournal>, GitError> {
+fn read_journal(root: &Path) -> Result<Option<PendingMergeJournal>, GitError> {
     let path = journal_path(root);
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
@@ -1727,13 +3912,34 @@ fn read_journal(root: &Path) -> Result<Option<MergeJournal>, GitError> {
     if bytes.len() > MAX_JOURNAL_BYTES {
         return Err(GitError::InvalidJournal);
     }
-    let journal =
-        serde_json::from_slice::<MergeJournal>(&bytes).map_err(|_| GitError::InvalidJournal)?;
-    validate_journal(&journal)?;
+    let version = serde_json::from_slice::<JournalVersion>(&bytes)
+        .map_err(|_| GitError::InvalidJournal)?
+        .version;
+    let journal = match version {
+        1 => {
+            let journal = serde_json::from_slice::<MergeJournal>(&bytes)
+                .map_err(|_| GitError::InvalidJournal)?;
+            validate_journal(&journal)?;
+            PendingMergeJournal::InPlace(journal)
+        }
+        2 => {
+            let journal = serde_json::from_slice::<RenameMergeJournal>(&bytes)
+                .map_err(|_| GitError::InvalidJournal)?;
+            validate_rename_journal(&journal)?;
+            PendingMergeJournal::Rename(journal)
+        }
+        3 => {
+            let journal = serde_json::from_slice::<DetectedRenameJournal>(&bytes)
+                .map_err(|_| GitError::InvalidJournal)?;
+            validate_detected_rename_journal(&journal)?;
+            PendingMergeJournal::DetectedRename(journal)
+        }
+        _ => return Err(GitError::InvalidJournal),
+    };
     Ok(Some(journal))
 }
 
-fn remove_journal(root: &Path, expected: &MergeJournal) -> Result<(), GitError> {
+fn remove_journal(root: &Path, expected: &PendingMergeJournal) -> Result<(), GitError> {
     if read_journal(root)?.as_ref() != Some(expected) {
         return Err(GitError::RecoveryConflict);
     }
@@ -1916,6 +4122,28 @@ mod tests {
             .expect("test document saves");
     }
 
+    fn initialize_test_repository(root: &Path) {
+        initialize_test_repository_with_format(root, GitObjectFormat::Sha1);
+    }
+
+    fn initialize_test_repository_with_format(root: &Path, object_format: GitObjectFormat) {
+        match object_format {
+            GitObjectFormat::Sha1 => assert!(test_git(root, ["init", "-q"])),
+            GitObjectFormat::Sha256 => {
+                assert!(test_git(root, ["init", "-q", "--object-format=sha256"]));
+            }
+        }
+        assert!(test_git(
+            root,
+            ["symbolic-ref", "HEAD", "refs/heads/baseline"]
+        ));
+        assert!(test_git(
+            root,
+            ["config", "user.email", "inex-tests@example.invalid"]
+        ));
+        assert!(test_git(root, ["config", "user.name", "Inex Tests"]));
+    }
+
     fn create_conflicted_repository() -> (TestDirectory, Vault) {
         let directory = TestDirectory::new();
         assert!(test_git(directory.path(), ["init", "-q"]));
@@ -1986,6 +4214,521 @@ mod tests {
         let vault = Vault::unlock(directory.path(), PASSWORD, None, KdfPolicy::default())
             .expect("conflicted vault unlocks");
         (directory, vault)
+    }
+
+    fn create_rename_modify_repository(
+        detect_renames: bool,
+    ) -> (TestDirectory, Vault, LogicalPath, LogicalPath, String) {
+        create_rename_modify_repository_with_format(detect_renames, GitObjectFormat::Sha1)
+    }
+
+    fn create_rename_modify_repository_with_format(
+        detect_renames: bool,
+        object_format: GitObjectFormat,
+    ) -> (TestDirectory, Vault, LogicalPath, LogicalPath, String) {
+        let directory = TestDirectory::new();
+        initialize_test_repository_with_format(directory.path(), object_format);
+        let source = LogicalPath::parse_canonical("entry.md").expect("source path is valid");
+        let destination =
+            LogicalPath::parse_canonical("renamed file.md").expect("destination path is valid");
+        let mut vault = Vault::create_with_params(
+            directory.path(),
+            PASSWORD,
+            1_783_699_200_000,
+            Argon2idParams {
+                ops_limit: 1,
+                mem_limit_bytes: 8 * 1024,
+            },
+            test_policy(),
+        )
+        .expect("rename test vault creates");
+        let created = vault
+            .create_document(&source, b"first\nbase\nlast\n", 1_783_699_201_000)
+            .expect("rename base document creates");
+        let file_id = created.header.file_id.to_string();
+        drop(vault);
+        fs::write(
+            directory.path().join(GIT_ATTRIBUTES_FILE),
+            format!("{ATTRIBUTES_RULE}\n"),
+        )
+        .expect("attributes write succeeds");
+        assert!(test_git(directory.path(), ["add", "--all"]));
+        assert!(test_git(
+            directory.path(),
+            ["commit", "-q", "-m", "baseline"]
+        ));
+
+        assert!(test_git(directory.path(), ["checkout", "-q", "-b", "ours"]));
+        let mut vault = Vault::unlock(directory.path(), PASSWORD, None, KdfPolicy::default())
+            .expect("ours rename vault unlocks");
+        let current = vault.read(&source).expect("rename source reads");
+        vault
+            .rename_document(&source, &destination, &current.etag, 1_783_699_202_000)
+            .expect("ours rename succeeds");
+        drop(current);
+        drop(vault);
+        assert!(test_git(directory.path(), ["add", "--all"]));
+        assert!(test_git(
+            directory.path(),
+            ["commit", "-q", "-m", "ours rename"]
+        ));
+
+        assert!(test_git(directory.path(), ["checkout", "-q", "baseline"]));
+        assert!(test_git(
+            directory.path(),
+            ["checkout", "-q", "-b", "theirs"]
+        ));
+        save_test_document(
+            directory.path(),
+            b"first\nbase\ntheirs changed\n",
+            1_783_699_203_000,
+        );
+        assert!(test_git(directory.path(), ["add", "entry.md.enc"]));
+        assert!(test_git(
+            directory.path(),
+            ["commit", "-q", "-m", "theirs modify"]
+        ));
+        assert!(test_git(directory.path(), ["checkout", "-q", "ours"]));
+        assert!(test_git(
+            directory.path(),
+            [
+                "config",
+                "--local",
+                "merge.inex.driver",
+                "git config --get inex.driver.must.fail"
+            ]
+        ));
+        let mut command = TestCommand::new("git");
+        command
+            .current_dir(directory.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if detect_renames {
+            command.args(["merge", "--no-edit", "theirs"]);
+        } else {
+            command.args([
+                "merge",
+                "-s",
+                "recursive",
+                "-Xno-renames",
+                "--no-edit",
+                "theirs",
+            ]);
+        }
+        assert!(!command.status().expect("rename merge starts").success());
+        if detect_renames {
+            force_detected_rename_conflict(directory.path(), &source, &destination);
+        }
+        let vault = Vault::unlock(directory.path(), PASSWORD, None, KdfPolicy::default())
+            .expect("rename conflict vault unlocks");
+        (directory, vault, source, destination, file_id)
+    }
+
+    fn force_detected_rename_conflict(
+        root: &Path,
+        source: &LogicalPath,
+        destination: &LogicalPath,
+    ) {
+        // EDRY's fresh nonce normally defeats similarity detection. Normalize
+        // the real no-rename result into the exact unmerged index shape Git
+        // emits when its rename detector does match: stages 1/2/3 all live at
+        // D, while the authenticated ancestor/other-side envelopes remain
+        // bound to S.
+        let git = Git::open(root).expect("Git fixture opens");
+        let source_physical = physical_path_for_logical(source);
+        let destination_physical = physical_path_for_logical(destination);
+        let conflicts = git.unmerged_entries().expect("source conflict enumerates");
+        let source_conflict = conflicts
+            .get(&source_physical)
+            .expect("source conflict exists");
+        let destination_stage = git
+            .stage_zero(&destination_physical)
+            .expect("destination stage inspects")
+            .expect("destination stage exists");
+        let ancestor = source_conflict.stages[0]
+            .as_ref()
+            .expect("source ancestor exists");
+        let theirs = source_conflict.stages[2]
+            .as_ref()
+            .expect("source other side exists");
+        let zero_oid = "0".repeat(destination_stage.oid.len());
+        let mut input = Vec::new();
+        for path in [&source_physical, &destination_physical] {
+            input.extend_from_slice(b"0 ");
+            input.extend_from_slice(zero_oid.as_bytes());
+            input.push(b'\t');
+            input.extend_from_slice(path.as_bytes());
+            input.push(0);
+        }
+        for (stage, entry) in [(1_u8, ancestor), (2, &destination_stage), (3, theirs)] {
+            input.extend_from_slice(entry.mode.as_bytes());
+            input.push(b' ');
+            input.extend_from_slice(entry.oid.as_bytes());
+            input.push(b' ');
+            input.extend_from_slice(stage.to_string().as_bytes());
+            input.push(b'\t');
+            input.extend_from_slice(destination_physical.as_bytes());
+            input.push(0);
+        }
+        git.run(
+            GitOperation::UpdateIndex,
+            ["update-index", "-z", "--index-info"],
+            Some(&input),
+            1024,
+        )
+        .expect("detected rename index fixture installs");
+        git.sync_index().expect("detected fixture index syncs");
+        fs::remove_file(root.join(source.to_ciphertext_relative_path()))
+            .expect("detected fixture source worktree is absent");
+        sync_directory(root).expect("detected fixture worktree parent syncs");
+    }
+
+    struct RenameRecoveryFixture {
+        _directory: TestDirectory,
+        vault: Vault,
+        git: Git,
+        source: ConflictEntry,
+        destination: TrackedIdentity,
+        destination_path: LogicalPath,
+        prepared: PreparedRenameResult,
+        source_target: PathBuf,
+        destination_target: PathBuf,
+        expected_source: [u8; 32],
+        expected_destination: [u8; 32],
+        result_digest: [u8; 32],
+        journal: RenameMergeJournal,
+    }
+
+    impl RenameRecoveryFixture {
+        fn write_journal(&self) {
+            write_journal(
+                self.vault.root(),
+                &PendingMergeJournal::Rename(self.journal.clone()),
+            )
+            .expect("rename journal syncs");
+        }
+
+        fn write_result_to_destination(&self) {
+            let guard = VaultMutationGuard::acquire(self.vault.root())
+                .expect("destination write lock acquires");
+            guard
+                .write(
+                    &self.destination_target,
+                    &self.prepared.encrypted.bytes,
+                    WriteCondition::IfMatch(self.expected_destination),
+                )
+                .expect("destination ciphertext commits");
+        }
+
+        fn delete_source(&self) {
+            let guard = VaultMutationGuard::acquire(self.vault.root())
+                .expect("source delete lock acquires");
+            guard
+                .delete(
+                    &self.source_target,
+                    WriteCondition::IfMatch(self.expected_source),
+                )
+                .expect("source ciphertext deletes");
+        }
+
+        fn update_index(&self) {
+            self.git
+                .update_index_rename(
+                    &self.source.physical_path,
+                    &self.destination.physical_path,
+                    &self.journal.result_mode,
+                    &self.journal.result_oid,
+                )
+                .expect("rename index commits");
+        }
+
+        fn ciphertext_for_third_owner(&self, logical_path: &LogicalPath) -> Vec<u8> {
+            let destination = self
+                .vault
+                .authenticate_committed_envelope(
+                    &self.destination.logical_path,
+                    &self.prepared.destination_ciphertext,
+                )
+                .expect("destination identity authenticates");
+            let mut identity = destination.header.clone();
+            identity.logical_path = logical_path.as_str().to_owned();
+            self.vault
+                .encrypt_merge_result(
+                    logical_path,
+                    &identity,
+                    b"third owner",
+                    1_783_699_205_000,
+                    false,
+                )
+                .expect("third owner encrypts")
+                .bytes
+        }
+
+        fn assert_original_index(&self) {
+            assert!(
+                split_index_is_original(&self.git, &self.source, &self.destination)
+                    .expect("original split index inspects")
+            );
+            assert!(
+                !split_index_is_final(&self.git, &self.journal)
+                    .expect("final split index inspects")
+            );
+        }
+
+        fn assert_final_state(&self) {
+            assert!(!self.source_target.exists());
+            assert_eq!(
+                VaultMutationGuard::acquire(self.vault.root())
+                    .expect("final-state lock acquires")
+                    .inspect(&self.destination_target)
+                    .expect("final destination inspects"),
+                CurrentTarget::File(self.result_digest)
+            );
+            assert_eq!(
+                fs::read(&self.destination_target).expect("final destination reads"),
+                self.prepared.encrypted.bytes
+            );
+            assert!(
+                split_index_is_final(&self.git, &self.journal).expect("final split index verifies")
+            );
+            let document = self
+                .vault
+                .read(&self.destination_path)
+                .expect("recovered destination authenticates");
+            assert_eq!(
+                document.plaintext.as_slice(),
+                b"first\nbase\ntheirs changed\n"
+            );
+        }
+    }
+
+    fn create_rename_recovery_fixture() -> RenameRecoveryFixture {
+        let (directory, vault, source_path, destination_path, _) =
+            create_rename_modify_repository(false);
+        let git = Git::open(directory.path()).expect("Git repository opens");
+        let conflicts = git.unmerged_entries().expect("split conflict enumerates");
+        let source = conflicts
+            .get(&physical_path_for_logical(&source_path))
+            .expect("source conflict exists")
+            .clone();
+        let tracked = tracked_identity_index(&vault, &git).expect("identities inspect");
+        let destination = tracked
+            .values()
+            .find(|tracked| tracked.logical_path == destination_path)
+            .expect("destination identity exists")
+            .clone();
+        let prepared = prepare_split_rename_result(
+            &vault,
+            &git,
+            &source,
+            &destination,
+            RenameSide::Ours,
+            1_783_699_204_000,
+        )
+        .expect("split result prepares");
+        let source_target = vault
+            .root()
+            .join(source.logical_path.to_ciphertext_relative_path());
+        let destination_target = vault
+            .root()
+            .join(destination.logical_path.to_ciphertext_relative_path());
+        let expected_source = digest(
+            prepared.source_stage_ciphertexts[2]
+                .as_ref()
+                .expect("theirs source ciphertext exists"),
+        );
+        let expected_destination = digest(&prepared.destination_ciphertext);
+        let result_digest = digest(&prepared.encrypted.bytes);
+        let provenance = current_rename_provenance(&git).expect("merge provenance inspects");
+        let journal = RenameMergeJournal {
+            version: 2,
+            source_physical_path: source.physical_path.clone(),
+            destination_physical_path: destination.physical_path.clone(),
+            result_mode: destination.entry.mode.clone(),
+            source_stages: source.stages.clone(),
+            destination_stage: destination.entry.clone(),
+            renamed_side: RenameSide::Ours,
+            provenance,
+            file_id: prepared.file_id.clone(),
+            expected_source_worktree_sha256: Some(hex_digest(expected_source)),
+            expected_destination_worktree_sha256: hex_digest(expected_destination),
+            result_oid: prepared.result_oid.clone(),
+            result_sha256: hex_digest(result_digest),
+        };
+        RenameRecoveryFixture {
+            _directory: directory,
+            vault,
+            git,
+            source,
+            destination,
+            destination_path,
+            prepared,
+            source_target,
+            destination_target,
+            expected_source,
+            expected_destination,
+            result_digest,
+            journal,
+        }
+    }
+
+    struct DetectedRenameRecoveryFixture {
+        _directory: TestDirectory,
+        vault: Vault,
+        git: Git,
+        destination_path: LogicalPath,
+        conflict: ConflictEntry,
+        prepared: PreparedResult,
+        source_target: PathBuf,
+        destination_target: PathBuf,
+        source_ciphertext: Vec<u8>,
+        expected_destination: [u8; 32],
+        result_digest: [u8; 32],
+        journal: DetectedRenameJournal,
+    }
+
+    impl DetectedRenameRecoveryFixture {
+        fn write_journal(&self) {
+            write_journal(
+                self.vault.root(),
+                &PendingMergeJournal::DetectedRename(self.journal.clone()),
+            )
+            .expect("detected rename journal syncs");
+        }
+
+        fn write_result_to_destination(&self) {
+            let guard = VaultMutationGuard::acquire(self.vault.root())
+                .expect("detected destination lock acquires");
+            guard
+                .write(
+                    &self.destination_target,
+                    &self.prepared.encrypted.bytes,
+                    WriteCondition::IfMatch(self.expected_destination),
+                )
+                .expect("detected destination commits");
+        }
+
+        fn update_index(&self) {
+            self.git
+                .update_index(
+                    &self.conflict.physical_path,
+                    &self.journal.result_mode,
+                    &self.journal.result_oid,
+                )
+                .expect("detected rename index commits");
+        }
+
+        fn assert_original_index(&self) {
+            assert!(
+                detected_index_is_original(
+                    &self.git,
+                    &self.conflict,
+                    &self.journal.source_physical_path,
+                )
+                .expect("detected original index inspects")
+            );
+            assert!(
+                !detected_index_is_final(&self.git, &self.journal)
+                    .expect("detected final index inspects")
+            );
+        }
+
+        fn assert_final_state(&self) {
+            assert!(!self.source_target.exists());
+            assert_eq!(
+                VaultMutationGuard::acquire(self.vault.root())
+                    .expect("detected final lock acquires")
+                    .inspect(&self.destination_target)
+                    .expect("detected destination inspects"),
+                CurrentTarget::File(self.result_digest)
+            );
+            assert!(
+                detected_index_is_final(&self.git, &self.journal)
+                    .expect("detected final index verifies")
+            );
+            let document = self
+                .vault
+                .read(&self.destination_path)
+                .expect("detected destination authenticates");
+            assert_eq!(
+                document.plaintext.as_slice(),
+                b"first\nbase\ntheirs changed\n"
+            );
+        }
+    }
+
+    fn create_detected_rename_recovery_fixture() -> DetectedRenameRecoveryFixture {
+        let (directory, vault, source_path, destination_path, _) =
+            create_rename_modify_repository(true);
+        let git = Git::open(directory.path()).expect("Git repository opens");
+        let conflicts = git
+            .unmerged_entries()
+            .expect("detected conflict enumerates");
+        let tracked = tracked_identity_index(&vault, &git).expect("tracked identities inspect");
+        let mut plans = preflight_conflict_identities(&vault, &git, &conflicts, &tracked)
+            .expect("detected plan preflights");
+        let MergePlan::DetectedRename {
+            conflict,
+            stage_paths,
+            renamed_side,
+            provenance,
+        } = plans.pop().expect("one detected plan exists")
+        else {
+            panic!("expected detected rename plan");
+        };
+        assert!(plans.is_empty());
+        let prepared = prepare_detected_rename_result(
+            &vault,
+            &git,
+            &conflict,
+            &stage_paths,
+            renamed_side,
+            1_783_699_204_000,
+        )
+        .expect("detected result prepares");
+        let source_target = vault.root().join(source_path.to_ciphertext_relative_path());
+        let destination_target = vault
+            .root()
+            .join(destination_path.to_ciphertext_relative_path());
+        let source_ciphertext = prepared.stage_ciphertexts[match renamed_side {
+            RenameSide::Ours => RenameSide::Theirs.stage_index(),
+            RenameSide::Theirs => RenameSide::Ours.stage_index(),
+        }]
+        .as_ref()
+        .expect("source-bound stage exists")
+        .clone();
+        let expected_destination =
+            expected_worktree_digest(&prepared).expect("detected worktree stage exists");
+        let result_digest = digest(&prepared.encrypted.bytes);
+        let journal = DetectedRenameJournal {
+            version: 3,
+            source_physical_path: physical_path_for_logical(&source_path),
+            destination_physical_path: conflict.physical_path.clone(),
+            result_mode: result_mode(&conflict)
+                .expect("result mode exists")
+                .to_owned(),
+            stages: conflict.stages.clone(),
+            renamed_side,
+            provenance,
+            file_id: prepared.file_id.clone(),
+            expected_destination_worktree_sha256: hex_digest(expected_destination),
+            result_oid: prepared.result_oid.clone(),
+            result_sha256: hex_digest(result_digest),
+        };
+        DetectedRenameRecoveryFixture {
+            _directory: directory,
+            vault,
+            git,
+            destination_path,
+            conflict,
+            prepared,
+            source_target,
+            destination_target,
+            source_ciphertext,
+            expected_destination,
+            result_digest,
+            journal,
+        }
     }
 
     #[test]
@@ -2126,6 +4869,27 @@ mod tests {
     }
 
     #[test]
+    fn repository_object_format_rejects_sha256_prefixes_before_git_reads() {
+        let directory = TestDirectory::new();
+        assert!(test_git(
+            directory.path(),
+            ["init", "-q", "--object-format=sha256"]
+        ));
+        let git = Git::open(directory.path()).expect("SHA-256 Git repository opens");
+        assert_eq!(git.object_format, GitObjectFormat::Sha256);
+        let full_oid = git
+            .write_object(b"repository-width regression fixture")
+            .expect("SHA-256 object writes");
+        assert_eq!(full_oid.len(), 64);
+        let prefix = &full_oid[..40];
+        assert!(test_git(directory.path(), ["cat-file", "blob", prefix]));
+        assert!(matches!(
+            git.read_object(prefix),
+            Err(GitError::MalformedGitOutput)
+        ));
+    }
+
+    #[test]
     fn diff3_conflicts_are_memory_values_and_never_files() {
         let merged =
             diffy::merge("base\n", "ours\n", "theirs\n").expect_err("overlapping edits conflict");
@@ -2260,7 +5024,8 @@ mod tests {
             result_oid: prepared.result_oid.clone(),
             result_sha256: hex_digest(result_digest),
         };
-        write_journal(vault.root(), &journal).expect("journal syncs");
+        write_journal(vault.root(), &PendingMergeJournal::InPlace(journal.clone()))
+            .expect("journal syncs");
         guard
             .write(
                 &target,
@@ -2289,6 +5054,710 @@ mod tests {
                 .expect("post-recovery lock acquires")
                 .inspect(&target),
             Ok(CurrentTarget::File(actual)) if actual == result_digest
+        ));
+    }
+
+    #[test]
+    fn detected_rename_modify_merges_at_authenticated_destination() {
+        let (directory, vault, source, destination, file_id) =
+            create_rename_modify_repository(true);
+        let git = Git::open(directory.path()).expect("Git repository opens");
+        let conflicts = git
+            .unmerged_entries()
+            .expect("detected conflict enumerates");
+        assert!(!conflicts.contains_key(&physical_path_for_logical(&source)));
+        let detected = conflicts
+            .get(&physical_path_for_logical(&destination))
+            .expect("detected rename is represented at destination");
+        assert!(detected.stages.iter().all(Option::is_some));
+        let tracked = tracked_identity_index(&vault, &git).expect("stage zero identities inspect");
+        let plans = preflight_conflict_identities(&vault, &git, &conflicts, &tracked)
+            .expect("detected rename preflight succeeds");
+        assert!(matches!(
+            plans.as_slice(),
+            [MergePlan::DetectedRename {
+                renamed_side: RenameSide::Ours,
+                ..
+            }]
+        ));
+
+        let report = merge(&vault, 1_783_699_204_000).expect("detected rename merges");
+        assert_eq!(report.clean_results, 1);
+        assert_eq!(report.unresolved_results, 0);
+        assert!(!directory.path().join("entry.md.enc").exists());
+        let document = vault
+            .read(&destination)
+            .expect("detected rename result authenticates");
+        assert_eq!(document.header.file_id.to_string(), file_id);
+        assert_eq!(
+            document.plaintext.as_slice(),
+            b"first\nbase\ntheirs changed\n"
+        );
+        assert!(git.unmerged_entries().expect("index verifies").is_empty());
+        assert!(
+            read_journal(vault.root())
+                .expect("journal inspects")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn detected_rename_rejects_restored_source_without_touching_destination_or_index() {
+        let (directory, vault, source, destination, _) = create_rename_modify_repository(true);
+        let git = Git::open(directory.path()).expect("Git repository opens");
+        let conflicts = git
+            .unmerged_entries()
+            .expect("detected conflict enumerates");
+        let conflict = conflicts
+            .get(&physical_path_for_logical(&destination))
+            .expect("detected destination conflict exists");
+        let source_stage = conflict.stages[2]
+            .as_ref()
+            .expect("source-bound other-side stage exists");
+        let source_ciphertext = git
+            .read_object(&source_stage.oid)
+            .expect("source-bound stage reads");
+        let source_target = vault.root().join(source.to_ciphertext_relative_path());
+        let destination_target = vault.root().join(destination.to_ciphertext_relative_path());
+        let destination_before =
+            fs::read(&destination_target).expect("destination ciphertext snapshots");
+        fs::write(&source_target, &source_ciphertext).expect("restored source fixture writes");
+
+        assert!(matches!(
+            merge(&vault, 1_783_699_204_000),
+            Err(GitError::WorktreeChanged)
+        ));
+        assert_eq!(
+            fs::read(&source_target).expect("restored source re-reads"),
+            source_ciphertext
+        );
+        assert_eq!(
+            fs::read(&destination_target).expect("destination re-reads"),
+            destination_before
+        );
+        assert_eq!(
+            git.unmerged_entries().expect("index re-inspects"),
+            conflicts
+        );
+        assert!(
+            read_journal(vault.root())
+                .expect("journal inspects")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn detected_rename_recovery_finishes_from_journal_only() {
+        let fixture = create_detected_rename_recovery_fixture();
+        fixture.assert_original_index();
+        fixture.write_journal();
+
+        assert!(recover_pending(&fixture.vault, &fixture.git).expect("v3 recovery succeeds"));
+        assert!(!journal_path(fixture.vault.root()).exists());
+        fixture.assert_final_state();
+    }
+
+    #[test]
+    fn detected_rename_recovery_finishes_after_destination_write() {
+        let fixture = create_detected_rename_recovery_fixture();
+        fixture.write_journal();
+        fixture.write_result_to_destination();
+        fixture.assert_original_index();
+
+        assert!(recover_pending(&fixture.vault, &fixture.git).expect("v3 recovery succeeds"));
+        assert!(!journal_path(fixture.vault.root()).exists());
+        fixture.assert_final_state();
+    }
+
+    #[test]
+    fn detected_rename_final_recovery_survives_merge_commit_ref_transition() {
+        let fixture = create_detected_rename_recovery_fixture();
+        fixture.write_journal();
+        fixture.write_result_to_destination();
+        fixture.update_index();
+        fixture.assert_final_state();
+        assert!(test_git(
+            fixture.vault.root(),
+            ["commit", "-q", "-m", "resolved detected rename"]
+        ));
+
+        assert!(recover_pending(&fixture.vault, &fixture.git).expect("v3 final recovery succeeds"));
+        assert!(!journal_path(fixture.vault.root()).exists());
+        fixture.assert_final_state();
+    }
+
+    #[test]
+    fn detected_rename_recovery_rejects_restored_source_before_destination_mutation() {
+        let fixture = create_detected_rename_recovery_fixture();
+        fixture.write_journal();
+        let destination_before =
+            fs::read(&fixture.destination_target).expect("detected destination snapshots");
+        fs::write(&fixture.source_target, &fixture.source_ciphertext)
+            .expect("detected source restores");
+
+        assert!(matches!(
+            recover_pending(&fixture.vault, &fixture.git),
+            Err(GitError::RecoveryConflict)
+        ));
+        assert!(journal_path(fixture.vault.root()).is_file());
+        assert_eq!(
+            fs::read(&fixture.source_target).expect("detected source re-reads"),
+            fixture.source_ciphertext
+        );
+        assert_eq!(
+            fs::read(&fixture.destination_target).expect("detected destination re-reads"),
+            destination_before
+        );
+        fixture.assert_original_index();
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // The adversarial history is clearest as one real Git fixture.
+    fn split_rename_rejects_destination_that_already_existed_in_merge_base() {
+        let directory = TestDirectory::new();
+        initialize_test_repository(directory.path());
+        let source = LogicalPath::parse_canonical("entry.md").expect("source path parses");
+        let destination =
+            LogicalPath::parse_canonical("historical.md").expect("destination path parses");
+        let mut vault = Vault::create_with_params(
+            directory.path(),
+            PASSWORD,
+            1_783_699_200_000,
+            Argon2idParams {
+                ops_limit: 1,
+                mem_limit_bytes: 8 * 1024,
+            },
+            test_policy(),
+        )
+        .expect("adversarial vault creates");
+        vault
+            .create_document(&source, b"base\n", 1_783_699_201_000)
+            .expect("source document creates");
+        let source_document = vault.read(&source).expect("source identity reads");
+        let mut duplicate_identity = source_document.header.clone();
+        duplicate_identity.logical_path = destination.as_str().to_owned();
+        let historical_destination = vault
+            .encrypt_merge_result(
+                &destination,
+                &duplicate_identity,
+                b"historical duplicate\n",
+                1_783_699_201_500,
+                false,
+            )
+            .expect("historical destination encrypts");
+        drop(source_document);
+        fs::write(
+            directory
+                .path()
+                .join(destination.to_ciphertext_relative_path()),
+            &historical_destination.bytes,
+        )
+        .expect("historical destination writes");
+        drop(vault);
+        fs::write(
+            directory.path().join(GIT_ATTRIBUTES_FILE),
+            format!("{ATTRIBUTES_RULE}\n"),
+        )
+        .expect("attributes write succeeds");
+        assert!(test_git(directory.path(), ["add", "--all"]));
+        assert!(test_git(
+            directory.path(),
+            ["commit", "-q", "-m", "baseline with historical duplicate"]
+        ));
+
+        assert!(test_git(directory.path(), ["checkout", "-q", "-b", "ours"]));
+        let mut ours = Vault::unlock(directory.path(), PASSWORD, None, KdfPolicy::default())
+            .expect("ours vault unlocks");
+        let current = ours.read(&source).expect("ours source reads");
+        ours.delete_document(&source, &current.etag)
+            .expect("ours source deletes");
+        drop(current);
+        drop(ours);
+        assert!(test_git(directory.path(), ["add", "--all"]));
+        assert!(test_git(
+            directory.path(),
+            ["commit", "-q", "-m", "ours deletes source"]
+        ));
+
+        assert!(test_git(directory.path(), ["checkout", "-q", "baseline"]));
+        assert!(test_git(
+            directory.path(),
+            ["checkout", "-q", "-b", "theirs"]
+        ));
+        save_test_document(directory.path(), b"theirs modifies\n", 1_783_699_202_000);
+        assert!(test_git(directory.path(), ["add", "entry.md.enc"]));
+        assert!(test_git(
+            directory.path(),
+            ["commit", "-q", "-m", "theirs modifies source"]
+        ));
+        assert!(test_git(directory.path(), ["checkout", "-q", "ours"]));
+        assert!(test_git(
+            directory.path(),
+            [
+                "config",
+                "--local",
+                "merge.inex.driver",
+                "git config --get inex.driver.must.fail"
+            ]
+        ));
+        let mut merge_command = TestCommand::new("git");
+        merge_command
+            .current_dir(directory.path())
+            .args([
+                "merge",
+                "-s",
+                "recursive",
+                "-Xno-renames",
+                "--no-edit",
+                "theirs",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        assert!(
+            !merge_command
+                .status()
+                .expect("adversarial merge starts")
+                .success()
+        );
+        let vault = Vault::unlock(directory.path(), PASSWORD, None, KdfPolicy::default())
+            .expect("conflicted vault unlocks");
+        let git = Git::open(directory.path()).expect("Git repository opens");
+        let index_before = git.unmerged_entries().expect("index snapshots");
+        let source_before =
+            fs::read(directory.path().join("entry.md.enc")).expect("source worktree snapshots");
+        let destination_before = fs::read(directory.path().join("historical.md.enc"))
+            .expect("destination worktree snapshots");
+
+        assert!(matches!(
+            merge(&vault, 1_783_699_203_000),
+            Err(GitError::UnsupportedConflictEntry)
+        ));
+        assert_eq!(
+            git.unmerged_entries().expect("index re-inspects"),
+            index_before
+        );
+        assert_eq!(
+            fs::read(directory.path().join("entry.md.enc")).expect("source re-reads"),
+            source_before
+        );
+        assert_eq!(
+            fs::read(directory.path().join("historical.md.enc")).expect("destination re-reads"),
+            destination_before
+        );
+        assert!(
+            read_journal(vault.root())
+                .expect("journal inspects")
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // The malformed real-index shape needs an end-to-end fixture.
+    fn conflict_path_with_stage_zero_is_rejected_before_any_merge_mutation() {
+        let (directory, mut vault, source, destination, _) = create_rename_modify_repository(false);
+        let git = Git::open(directory.path()).expect("Git repository opens");
+        let source_physical_path = physical_path_for_logical(&source);
+        let destination_physical_path = physical_path_for_logical(&destination);
+        let source_conflict = git
+            .unmerged_entries()
+            .expect("source conflict enumerates")
+            .remove(&source_physical_path)
+            .expect("source conflict exists");
+        let destination_stage = git
+            .stage_zero(&destination_physical_path)
+            .expect("destination stage inspects")
+            .expect("destination stage exists");
+        let donor_path =
+            LogicalPath::parse_canonical("stage-zero donor.md").expect("donor path parses");
+        vault
+            .create_document(&donor_path, b"unrelated identity", 1_783_699_204_000)
+            .expect("donor identity creates");
+        let donor = vault.read(&donor_path).expect("donor identity reads");
+        let donor_etag = donor.etag.clone();
+        let donor_file_id = donor.header.file_id;
+        let mut source_identity = donor.header.clone();
+        source_identity.logical_path = source.as_str().to_owned();
+        drop(donor);
+        let unexpected_stage_zero = vault
+            .encrypt_merge_result(
+                &source,
+                &source_identity,
+                b"unexpected stage zero",
+                1_783_699_204_500,
+                false,
+            )
+            .expect("unexpected source stage-zero encrypts");
+        vault
+            .delete_document(&donor_path, &donor_etag)
+            .expect("donor worktree entry deletes");
+        let unexpected_stage_zero_oid = git
+            .write_object(&unexpected_stage_zero.bytes)
+            .expect("unexpected source stage-zero object writes");
+        let original_source_stage = source_conflict.stages[2]
+            .as_ref()
+            .expect("source other-side stage exists");
+        let original_source_ciphertext = git
+            .read_object(&original_source_stage.oid)
+            .expect("source conflict stage reads");
+        let original_source_document = vault
+            .authenticate_committed_envelope(&source, &original_source_ciphertext)
+            .expect("source conflict stage authenticates");
+        assert_ne!(original_source_document.header.file_id, donor_file_id);
+        let mut input = format!(
+            "{} {} 0\t{}\0",
+            destination_stage.mode, unexpected_stage_zero_oid, source_physical_path
+        )
+        .into_bytes();
+        for (index, stage) in source_conflict.stages.iter().enumerate() {
+            let Some(stage) = stage else {
+                continue;
+            };
+            input.extend_from_slice(
+                format!(
+                    "{} {} {}\t{}\0",
+                    stage.mode,
+                    stage.oid,
+                    index.saturating_add(1),
+                    source_physical_path
+                )
+                .as_bytes(),
+            );
+        }
+        git.run(
+            GitOperation::UpdateIndex,
+            ["update-index", "-z", "--index-info"],
+            Some(&input),
+            1024,
+        )
+        .expect("coexisting stage-zero fixture installs");
+        git.sync_index().expect("malicious index fixture syncs");
+        assert!(
+            git.stage_zero(&source_physical_path)
+                .expect("source stage-zero inspects")
+                .is_some()
+        );
+        assert!(
+            git.unmerged_entries()
+                .expect("source conflict still exists")
+                .contains_key(&source_physical_path)
+        );
+        let index_before = git.staged_entries().expect("index snapshots");
+        let source_target = vault.root().join(source.to_ciphertext_relative_path());
+        let destination_target = vault.root().join(destination.to_ciphertext_relative_path());
+        let source_before = fs::read(&source_target).expect("source ciphertext snapshots");
+        let destination_before =
+            fs::read(&destination_target).expect("destination ciphertext snapshots");
+
+        assert!(matches!(
+            merge(&vault, 1_783_699_204_000),
+            Err(GitError::UnsupportedConflictEntry)
+        ));
+        assert_eq!(
+            git.staged_entries().expect("index re-inspects"),
+            index_before
+        );
+        assert_eq!(
+            fs::read(&source_target).expect("source ciphertext re-reads"),
+            source_before
+        );
+        assert_eq!(
+            fs::read(&destination_target).expect("destination ciphertext re-reads"),
+            destination_before
+        );
+        assert!(
+            read_journal(vault.root())
+                .expect("journal inspects")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn split_rename_modify_commits_two_path_ciphertext_transaction() {
+        let (directory, vault, source, destination, file_id) =
+            create_rename_modify_repository(false);
+        let git = Git::open(directory.path()).expect("Git repository opens");
+        let conflicts = git.unmerged_entries().expect("split conflict enumerates");
+        let split = conflicts
+            .get(&physical_path_for_logical(&source))
+            .expect("source delete/modify conflict exists");
+        assert!(split.stages[0].is_some());
+        assert!(split.stages[1].is_none());
+        assert!(split.stages[2].is_some());
+        let tracked = tracked_identity_index(&vault, &git).expect("stage zero identities inspect");
+        assert_eq!(
+            tracked
+                .get(&file_id)
+                .expect("destination identity is tracked")
+                .logical_path,
+            destination
+        );
+        let plans = preflight_conflict_identities(&vault, &git, &conflicts, &tracked)
+            .expect("split rename preflight succeeds");
+        assert!(matches!(
+            plans.as_slice(),
+            [MergePlan::SplitRename {
+                renamed_side: RenameSide::Ours,
+                ..
+            }]
+        ));
+
+        let report = merge(&vault, 1_783_699_204_000).expect("split rename merges");
+        assert_eq!(report.clean_results, 1);
+        assert_eq!(report.unresolved_results, 0);
+        assert!(!directory.path().join("entry.md.enc").exists());
+        let document = vault
+            .read(&destination)
+            .expect("split rename result authenticates");
+        assert_eq!(document.header.file_id.to_string(), file_id);
+        assert_eq!(
+            document.plaintext.as_slice(),
+            b"first\nbase\ntheirs changed\n"
+        );
+        assert!(git.unmerged_entries().expect("index verifies").is_empty());
+        assert!(
+            git.stage_zero(&physical_path_for_logical(&source))
+                .expect("source index inspects")
+                .is_none()
+        );
+        assert!(
+            git.stage_zero(&physical_path_for_logical(&destination))
+                .expect("destination index inspects")
+                .is_some()
+        );
+        assert!(
+            read_journal(vault.root())
+                .expect("journal inspects")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn sha256_repository_completes_split_rename_modify_transaction() {
+        let (directory, vault, source, destination, file_id) =
+            create_rename_modify_repository_with_format(false, GitObjectFormat::Sha256);
+        let git = Git::open(directory.path()).expect("SHA-256 Git repository opens");
+        assert_eq!(git.object_format, GitObjectFormat::Sha256);
+        let conflicts = git
+            .unmerged_entries()
+            .expect("SHA-256 split conflict enumerates");
+        assert!(conflicts.contains_key(&physical_path_for_logical(&source)));
+        assert!(
+            conflicts
+                .values()
+                .flat_map(|conflict| conflict.stages.iter().flatten())
+                .all(|stage| stage.oid.len() == 64)
+        );
+
+        let report = merge(&vault, 1_783_699_204_000).expect("SHA-256 split rename merges");
+        assert_eq!(report.clean_results, 1);
+        assert_eq!(report.unresolved_results, 0);
+        assert!(!directory.path().join("entry.md.enc").exists());
+        let document = vault
+            .read(&destination)
+            .expect("SHA-256 destination authenticates");
+        assert_eq!(document.header.file_id.to_string(), file_id);
+        assert_eq!(
+            document.plaintext.as_slice(),
+            b"first\nbase\ntheirs changed\n"
+        );
+        let stage_zero = git
+            .stage_zero(&physical_path_for_logical(&destination))
+            .expect("SHA-256 destination index inspects")
+            .expect("SHA-256 destination stage exists");
+        assert_eq!(stage_zero.oid.len(), 64);
+        assert!(git.unmerged_entries().expect("index verifies").is_empty());
+        assert!(
+            read_journal(vault.root())
+                .expect("journal inspects")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn split_rename_recovery_finishes_from_journal_only() {
+        let fixture = create_rename_recovery_fixture();
+        fixture.assert_original_index();
+        fixture.write_journal();
+
+        assert!(recover_pending(&fixture.vault, &fixture.git).expect("rename recovery succeeds"));
+        assert!(!journal_path(fixture.vault.root()).exists());
+        fixture.assert_final_state();
+    }
+
+    #[test]
+    fn split_rename_recovery_finishes_after_destination_before_source_delete() {
+        let fixture = create_rename_recovery_fixture();
+        fixture.write_journal();
+        fixture.write_result_to_destination();
+
+        assert_eq!(
+            fs::read(&fixture.source_target).expect("source remains before recovery"),
+            fixture.prepared.source_stage_ciphertexts[2]
+                .as_ref()
+                .expect("source ciphertext remains")
+                .as_slice()
+        );
+        fixture.assert_original_index();
+        assert!(recover_pending(&fixture.vault, &fixture.git).expect("rename recovery succeeds"));
+        assert!(!journal_path(fixture.vault.root()).exists());
+        fixture.assert_final_state();
+    }
+
+    #[test]
+    fn split_rename_recovery_finishes_after_source_delete_before_index_update() {
+        let fixture = create_rename_recovery_fixture();
+        fixture.write_journal();
+        fixture.write_result_to_destination();
+        fixture.delete_source();
+
+        assert!(!fixture.source_target.exists());
+        fixture.assert_original_index();
+        assert!(recover_pending(&fixture.vault, &fixture.git).expect("rename recovery succeeds"));
+        assert!(!journal_path(fixture.vault.root()).exists());
+        fixture.assert_final_state();
+    }
+
+    #[test]
+    fn split_rename_recovery_cleans_journal_after_index_commit() {
+        let fixture = create_rename_recovery_fixture();
+        fixture.write_journal();
+        fixture.write_result_to_destination();
+        fixture.delete_source();
+        fixture.update_index();
+
+        fixture.assert_final_state();
+        assert!(journal_path(fixture.vault.root()).is_file());
+        assert!(recover_pending(&fixture.vault, &fixture.git).expect("rename recovery succeeds"));
+        assert!(!journal_path(fixture.vault.root()).exists());
+        fixture.assert_final_state();
+    }
+
+    #[test]
+    fn split_rename_final_recovery_survives_merge_commit_ref_transition() {
+        let fixture = create_rename_recovery_fixture();
+        fixture.write_journal();
+        fixture.write_result_to_destination();
+        fixture.delete_source();
+        fixture.update_index();
+        fixture.assert_final_state();
+        assert!(test_git(
+            fixture.vault.root(),
+            ["commit", "-q", "-m", "resolved encrypted rename"]
+        ));
+
+        assert!(recover_pending(&fixture.vault, &fixture.git).expect("final recovery succeeds"));
+        assert!(!journal_path(fixture.vault.root()).exists());
+        fixture.assert_final_state();
+    }
+
+    #[test]
+    fn split_rename_recovery_rejects_concurrent_destination_change_without_mutation() {
+        let fixture = create_rename_recovery_fixture();
+        fixture.write_journal();
+        let source_before = fs::read(&fixture.source_target).expect("source ciphertext snapshots");
+        let tampered = b"INEX_RECOVERY_CONCURRENT_CHANGE_CANARY";
+        fs::write(&fixture.destination_target, tampered)
+            .expect("concurrent destination fixture writes");
+
+        assert!(matches!(
+            recover_pending(&fixture.vault, &fixture.git),
+            Err(GitError::RecoveryConflict)
+        ));
+        assert!(journal_path(fixture.vault.root()).is_file());
+        assert_eq!(
+            fs::read(&fixture.source_target).expect("source ciphertext re-reads"),
+            source_before
+        );
+        assert_eq!(
+            fs::read(&fixture.destination_target).expect("destination re-reads"),
+            tampered
+        );
+        fixture.assert_original_index();
+    }
+
+    #[test]
+    fn split_rename_recovery_rejects_untracked_third_identity_owner_before_mutation() {
+        let fixture = create_rename_recovery_fixture();
+        fixture.write_journal();
+        let source_before = fs::read(&fixture.source_target).expect("source ciphertext snapshots");
+        let destination_before =
+            fs::read(&fixture.destination_target).expect("destination ciphertext snapshots");
+        let third_path = LogicalPath::parse_canonical("third owner.md").expect("third path parses");
+        let third_ciphertext = fixture.ciphertext_for_third_owner(&third_path);
+        fs::write(
+            fixture
+                .vault
+                .root()
+                .join(third_path.to_ciphertext_relative_path()),
+            &third_ciphertext,
+        )
+        .expect("untracked third owner writes");
+
+        assert!(matches!(
+            recover_pending(&fixture.vault, &fixture.git),
+            Err(GitError::RecoveryConflict)
+        ));
+        assert!(journal_path(fixture.vault.root()).is_file());
+        assert_eq!(
+            fs::read(&fixture.source_target).expect("source ciphertext re-reads"),
+            source_before
+        );
+        assert_eq!(
+            fs::read(&fixture.destination_target).expect("destination ciphertext re-reads"),
+            destination_before
+        );
+        fixture.assert_original_index();
+    }
+
+    #[test]
+    fn split_rename_recovery_rejects_staged_third_identity_owner_before_mutation() {
+        let fixture = create_rename_recovery_fixture();
+        fixture.write_journal();
+        let source_before = fs::read(&fixture.source_target).expect("source ciphertext snapshots");
+        let destination_before =
+            fs::read(&fixture.destination_target).expect("destination ciphertext snapshots");
+        let third_path =
+            LogicalPath::parse_canonical("third staged.md").expect("third path parses");
+        let third_physical_path = physical_path_for_logical(&third_path);
+        let third_ciphertext = fixture.ciphertext_for_third_owner(&third_path);
+        let third_oid = fixture
+            .git
+            .write_object(&third_ciphertext)
+            .expect("third owner object writes");
+        fixture
+            .git
+            .update_index(&third_physical_path, "100644", &third_oid)
+            .expect("third owner stages");
+
+        assert!(matches!(
+            recover_pending(&fixture.vault, &fixture.git),
+            Err(GitError::RecoveryConflict)
+        ));
+        assert!(journal_path(fixture.vault.root()).is_file());
+        assert_eq!(
+            fs::read(&fixture.source_target).expect("source ciphertext re-reads"),
+            source_before
+        );
+        assert_eq!(
+            fs::read(&fixture.destination_target).expect("destination ciphertext re-reads"),
+            destination_before
+        );
+        fixture.assert_original_index();
+    }
+
+    #[test]
+    fn split_rename_journal_rejects_mixed_object_id_widths() {
+        let fixture = create_rename_recovery_fixture();
+        let mut journal = fixture.journal.clone();
+        journal.destination_stage.oid = "a".repeat(if journal.result_oid.len() == 40 {
+            64
+        } else {
+            40
+        });
+
+        assert!(matches!(
+            validate_rename_journal(&journal),
+            Err(GitError::InvalidJournal)
         ));
     }
 
