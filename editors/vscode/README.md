@@ -9,6 +9,11 @@ webview, and the Rust `inexd` child process. It is never registered as a VS Code
 
 - Explicit vault unlock/lock with a hidden password input.
 - A ciphertext-backed Tree View and editable Markdown custom editor.
+- Command Palette and Tree View actions for encrypted Markdown creation,
+  single-directory creation, etag-conditional rename, and non-recursive delete.
+- CRUD path/name prompts are session-scoped sensitive UI; creating a document
+  sends an empty Markdown payload directly to `inexd` and never creates a
+  plaintext file or `TextDocument`.
 - Etag-conditional encrypted saves and authenticated encrypted Hot Exit drafts.
 - Startup recovery after re-unlock, including an explicit stale-draft overwrite
   confirmation when the base ciphertext changed.

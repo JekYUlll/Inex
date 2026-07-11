@@ -103,7 +103,7 @@ if (residueHits.length > 0) {
 
 if (testFailure === undefined) {
   await fs.rm(auditRoot, { recursive: true, force: true });
-  console.log("Inex VS Code backup/recovery Extension Host and residue audit passed");
+  console.log("Inex VS Code CRUD + backup/recovery Extension Host and residue audit passed");
 } else {
   console.error(`Inex VS Code integration audit retained at: ${auditRoot}`);
   console.error(safeError(testFailure, redactions));

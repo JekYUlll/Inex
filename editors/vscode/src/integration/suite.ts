@@ -25,6 +25,15 @@ interface InexIntegrationTestApi {
     logicalPath: string,
     backupPath: string,
   ) => Promise<string>;
+  readonly createFolder: (logicalPath: string) => Promise<void>;
+  readonly createEmptyDocument: (logicalPath: string) => Promise<void>;
+  readonly renameDocument: (source: string, destination: string) => Promise<void>;
+  readonly deleteDocument: (logicalPath: string) => Promise<void>;
+  readonly listTree: () => Promise<readonly {
+    readonly kind: "directory" | "file";
+    readonly logicalPath: string;
+  }[]>;
+  readonly failNextMutationClose: () => void;
   readonly lock: () => Promise<void>;
 }
 
@@ -46,6 +55,15 @@ export async function run(): Promise<void> {
   assert.ok(extension, `Extension ${EXTENSION_ID} is unavailable`);
   const api = await extension.activate();
   assertIntegrationApi(api);
+  const registeredCommands = new Set(await vscode.commands.getCommands(true));
+  for (const command of [
+    "inex.newEncryptedMarkdown",
+    "inex.newFolder",
+    "inex.rename",
+    "inex.delete",
+  ]) {
+    assert.equal(registeredCommands.has(command), true, `Extension did not register ${command}`);
+  }
 
   await runBackupRecoveryCycle(api, fixture);
 }
@@ -55,8 +73,9 @@ async function runBackupRecoveryCycle(
   fixture: FixtureEnvironment,
 ): Promise<void> {
   await api.unlock(fixture.vaultPath, fixture.password, fixture.sidecarPath);
+  await runCrudCycle(api, fixture);
   await api.openDocument(LOGICAL_PATH);
-  const tab = await waitForCustomTab(fixture.vaultPath);
+  const tab = await waitForCustomTab(fixture.vaultPath, LOGICAL_PATH);
   assertNoPlaintextTextDocument(tab.input.uri, fixture.sourcePath);
 
   api.markDirty(LOGICAL_PATH);
@@ -97,14 +116,128 @@ async function runBackupRecoveryCycle(
     );
     await api.lock();
     assertNoPlaintextTextDocument(tab.input.uri, fixture.sourcePath);
-    console.log("Inex Extension Host backup/recovery cycle passed");
+    console.log("Inex Extension Host CRUD and backup/recovery cycles passed");
   } finally {
     await fs.rm(recoveryBackupPath, { force: true });
   }
 }
 
+async function runCrudCycle(
+  api: InexIntegrationTestApi,
+  fixture: FixtureEnvironment,
+): Promise<void> {
+  const source = "crud/new.md";
+  const destination = "crud/renamed.md";
+  const collision = "crud/existing.md";
+  await api.createFolder("crud");
+  await api.createEmptyDocument(source);
+  const sourceTab = await waitForCustomTab(fixture.vaultPath, source);
+  assertNoPlaintextTextDocument(sourceTab.input.uri, fixture.sourcePath);
+  await assert.rejects(fs.lstat(path.join(fixture.vaultPath, "crud", "new.md")));
+  const sourceCiphertext = await fs.lstat(
+    path.join(fixture.vaultPath, "crud", "new.md.enc"),
+  );
+  assert.equal(sourceCiphertext.isFile(), true, "CRUD create did not write ciphertext");
+  assert.equal(sourceCiphertext.isSymbolicLink(), false, "CRUD create wrote a symlink");
+  assert.deepEqual(
+    (await api.listTree()).filter((entry) => entry.logicalPath.startsWith("crud")),
+    [
+      { kind: "directory", logicalPath: "crud" },
+      { kind: "file", logicalPath: source },
+    ],
+    "CRUD create did not refresh the authenticated tree",
+  );
+
+  api.failNextMutationClose();
+  await assert.rejects(
+    api.renameDocument(source, "crud/never-created.md"),
+    "simulated tab-close refusal unexpectedly allowed rename",
+  );
+  await api.waitUntilReady(source);
+  await waitForCustomTab(fixture.vaultPath, source);
+  assert.equal(
+    (await api.listTree()).some(
+      (entry) => entry.logicalPath === "crud/never-created.md",
+    ),
+    false,
+    "failed preparation reached the rename RPC",
+  );
+
+  await api.createEmptyDocument(collision);
+  const collisionTab = await waitForCustomTab(fixture.vaultPath, collision);
+  assert.equal(
+    await vscode.window.tabGroups.close(collisionTab, true),
+    true,
+    "VS Code did not close the collision fixture",
+  );
+  await waitForNoCustomTab(fixture.vaultPath, collision);
+  await assert.rejects(
+    api.renameDocument(source, collision),
+    "etag-conditional rename unexpectedly replaced an existing destination",
+  );
+  const recoveredSourceTab = await waitForCustomTab(fixture.vaultPath, source);
+  assertNoPlaintextTextDocument(recoveredSourceTab.input.uri, fixture.sourcePath);
+  assert.deepEqual(
+    (await api.listTree()).filter((entry) => entry.logicalPath.startsWith("crud")),
+    [
+      { kind: "directory", logicalPath: "crud" },
+      { kind: "file", logicalPath: collision },
+      { kind: "file", logicalPath: source },
+    ],
+    "failed rename did not preserve the authenticated source and destination",
+  );
+  await api.openDocument(collision);
+  await waitForCustomTab(fixture.vaultPath, collision);
+  const crudDirectory = path.join(fixture.vaultPath, "crud");
+  if (process.platform !== "win32" && process.getuid?.() !== 0) {
+    await fs.chmod(crudDirectory, 0o500);
+    try {
+      await assert.rejects(
+        api.deleteDocument(collision),
+        "conditional delete unexpectedly succeeded without parent write permission",
+      );
+      const recoveredCollisionTab = await waitForCustomTab(
+        fixture.vaultPath,
+        collision,
+      );
+      assertNoPlaintextTextDocument(
+        recoveredCollisionTab.input.uri,
+        fixture.sourcePath,
+      );
+    } finally {
+      await fs.chmod(crudDirectory, 0o700);
+    }
+  }
+  await api.deleteDocument(collision);
+
+  await api.renameDocument(source, destination);
+  await waitForNoCustomTab(fixture.vaultPath, source);
+  const destinationTab = await waitForCustomTab(fixture.vaultPath, destination);
+  assertNoPlaintextTextDocument(destinationTab.input.uri, fixture.sourcePath);
+  assert.deepEqual(
+    (await api.listTree()).filter((entry) => entry.logicalPath.startsWith("crud")),
+    [
+      { kind: "directory", logicalPath: "crud" },
+      { kind: "file", logicalPath: destination },
+    ],
+    "CRUD rename left a stale logical tree entry",
+  );
+
+  await api.deleteDocument(destination);
+  await waitForNoCustomTab(fixture.vaultPath, destination);
+  assert.deepEqual(
+    (await api.listTree()).filter((entry) => entry.logicalPath.startsWith("crud")),
+    [{ kind: "directory", logicalPath: "crud" }],
+    "CRUD delete left a stale logical tree entry",
+  );
+  await assert.rejects(
+    fs.lstat(path.join(fixture.vaultPath, "crud", "renamed.md.enc")),
+  );
+}
+
 async function waitForCustomTab(
   vaultPath: string,
+  logicalPath: string,
 ): Promise<CustomEditorTab> {
   let found: vscode.Tab | undefined;
   await waitFor(() => {
@@ -116,7 +249,7 @@ async function waitForCustomTab(
         }
         return (
           tab.input.viewType === VIEW_TYPE &&
-          samePath(tab.input.uri.fsPath, path.join(vaultPath, `${LOGICAL_PATH}.enc`))
+          samePath(tab.input.uri.fsPath, path.join(vaultPath, `${logicalPath}.enc`))
         );
       });
     return found !== undefined;
@@ -126,6 +259,19 @@ async function waitForCustomTab(
   assert.equal(found.input.uri.scheme, "file");
   assert.equal(found.input.viewType, VIEW_TYPE);
   return found as CustomEditorTab;
+}
+
+async function waitForNoCustomTab(vaultPath: string, logicalPath: string): Promise<void> {
+  await waitFor(
+    () =>
+      !vscode.window.tabGroups.all.flatMap((group) => group.tabs).some(
+        (tab) =>
+          tab.input instanceof vscode.TabInputCustom &&
+          tab.input.viewType === VIEW_TYPE &&
+          samePath(tab.input.uri.fsPath, path.join(vaultPath, `${logicalPath}.enc`)),
+      ),
+    `VS Code retained a stale custom-editor tab for ${logicalPath}`,
+  );
 }
 
 function assertNoPlaintextTextDocument(
@@ -211,6 +357,12 @@ function assertIntegrationApi(value: unknown): asserts value is InexIntegrationT
     "waitForBackup",
     "contentSha256",
     "recoverBackupAndSave",
+    "createFolder",
+    "createEmptyDocument",
+    "renameDocument",
+    "deleteDocument",
+    "listTree",
+    "failNextMutationClose",
     "lock",
   ]) {
     assert.equal(typeof candidate[method], "function", `Integration-test API lacks ${method}`);

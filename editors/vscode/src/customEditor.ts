@@ -29,11 +29,20 @@ interface SnapshotRequest {
   readonly cancellation: vscode.Disposable;
 }
 
+export interface FileMutationPreparation {
+  readonly etag: string;
+  readonly wasOpen: boolean;
+}
+
+export type FileMutationKind = "rename" | "delete";
+
 class InexDocument implements vscode.CustomDocument {
   private readonly panels = new Set<vscode.WebviewPanel>();
   private readonly readyPanels = new Set<vscode.WebviewPanel>();
   private disposed = false;
   private locked = false;
+  private mutating = false;
+  private closeHandlePromise: Promise<void> | undefined;
   private revision = 0;
   private savedRevision: number;
   private pendingReveal: { readonly startByte: number; readonly endByte: number } | undefined;
@@ -227,7 +236,7 @@ class InexDocument implements vscode.CustomDocument {
     this.panels.clear();
     this.readyPanels.clear();
     this.onDispose(this);
-    void this.session.sidecar.closeDocument(this.handle).catch(() => undefined);
+    void this.beginCloseHandle().catch(() => undefined);
   }
 
   public wipeForLock(): void {
@@ -241,7 +250,34 @@ class InexDocument implements vscode.CustomDocument {
     for (const panel of this.panels) {
       panel.webview.html = lockedHtml();
     }
-    void this.session.sidecar.closeDocument(this.handle).catch(() => undefined);
+    void this.beginCloseHandle().catch(() => undefined);
+  }
+
+  public freezeForMutation(): void {
+    this.requireUsable();
+    this.mutating = true;
+    this.readyPanels.clear();
+    this.rejectSnapshotRequests(new Error("Inex document is closing for a file mutation"));
+    for (const panel of this.panels) {
+      panel.webview.html = mutationHtml();
+    }
+  }
+
+  public async waitForHandleClose(): Promise<void> {
+    await this.beginCloseHandle();
+  }
+
+  public thawAfterFailedMutation(): boolean {
+    if (!this.mutating || this.disposed || this.locked || this.panels.size === 0) {
+      return false;
+    }
+    this.mutating = false;
+    this.readyPanels.clear();
+    for (const panel of this.panels) {
+      panel.webview.options = { enableScripts: true, localResourceRoots: [] };
+      panel.webview.html = editorHtml();
+    }
+    return true;
   }
 
   private broadcast(): void {
@@ -251,9 +287,14 @@ class InexDocument implements vscode.CustomDocument {
   }
 
   private requireUsable(): void {
-    if (this.locked || this.disposed) {
+    if (this.locked || this.disposed || this.mutating) {
       throw new Error("Inex document is locked; close and reopen it after unlocking the vault");
     }
+  }
+
+  private beginCloseHandle(): Promise<void> {
+    this.closeHandlePromise ??= this.session.sidecar.closeDocument(this.handle);
+    return this.closeHandlePromise;
   }
 
   private rejectSnapshotRequest(requestId: number, error: Error): void {
@@ -282,6 +323,7 @@ export class InexCustomEditorProvider
   private readonly documents = new Set<InexDocument>();
   private readonly lockSubscription: vscode.Disposable;
   private lastBackupUri: vscode.Uri | undefined;
+  private failNextMutationCloseForTest = false;
 
   public readonly onDidChangeCustomDocument = this.changeEmitter.event;
 
@@ -672,19 +714,116 @@ export class InexCustomEditorProvider
     }
   }
 
-  public async waitForIntegrationDocument(logicalPath: string): Promise<void> {
-    this.requireIntegrationTestMode();
+  public async prepareFileMutation(
+    session: VaultSession,
+    logicalPath: string,
+    kind: FileMutationKind,
+  ): Promise<FileMutationPreparation | undefined> {
+    if (!this.controller.isSessionCurrent(session)) {
+      throw new Error("Inex vault session changed before the file operation");
+    }
+    const open = [...this.documents].filter(
+      (document) =>
+        document.logicalPath === logicalPath &&
+        document.session.root === session.root &&
+        document.session.sidecar === session.sidecar &&
+        document.session.generation === session.generation,
+    );
+    if (open.length > 1) {
+      throw new Error("Inex found multiple models for one encrypted document");
+    }
+    const document = open[0];
+    if (document === undefined) {
+      const stat = await this.controller.statFileForSession(session, logicalPath);
+      return { etag: stat.etag, wasOpen: false };
+    }
+
+    const synchronization = new vscode.CancellationTokenSource();
+    try {
+      await document.flushWebview(synchronization.token);
+      if (document.isDirty) {
+        if (kind === "delete") {
+          throw new Error(
+            "Delete was refused because this encrypted document has unsaved edits. Save or close/discard it explicitly, then retry.",
+          );
+        }
+        const selected = await showSensitiveQuickPick(
+          [
+            {
+              label: "Save and Rename",
+              detail: "Encrypt the current edits with an etag check, then rename the ciphertext.",
+              action: "save" as const,
+            },
+            {
+              label: "Cancel",
+              detail: "Keep the encrypted document open and unchanged.",
+              action: "cancel" as const,
+            },
+          ],
+          { title: `Unsaved edits — ${logicalPath}` },
+          this.controller.onDidLock,
+        );
+        if (selected?.action !== "save") {
+          return undefined;
+        }
+        if (!this.controller.isSessionCurrent(session)) {
+          throw new Error("Inex vault session changed before saving for rename");
+        }
+        await this.saveCustomDocument(document, synchronization.token);
+        await document.flushWebview(synchronization.token);
+        if (document.isDirty) {
+          throw new Error(
+            "Rename was refused because the document changed again while it was being saved.",
+          );
+        }
+      }
+      if (!this.controller.isSessionCurrent(session)) {
+        throw new Error("Inex vault session changed before closing the source document");
+      }
+      const etag = document.etag;
+      document.freezeForMutation();
+      try {
+        await this.closeDocumentForMutation(document);
+      } catch (error: unknown) {
+        await this.restoreAfterPreparationFailure(document, session, logicalPath);
+        throw error;
+      }
+      if (!this.controller.isSessionCurrent(session)) {
+        throw new Error("Inex vault session changed while closing the source document");
+      }
+      return { etag, wasOpen: true };
+    } finally {
+      synchronization.dispose();
+    }
+  }
+
+  public async waitForOpenedDocument(
+    logicalPath: string,
+    session: VaultSession,
+  ): Promise<void> {
     const deadline = Date.now() + 10_000;
     while (Date.now() < deadline) {
+      if (!this.controller.isSessionCurrent(session)) {
+        throw new Error("Inex vault session changed while opening the encrypted document");
+      }
       const document = [...this.documents].find(
-        (candidate) => candidate.logicalPath === logicalPath,
+        (candidate) =>
+          candidate.logicalPath === logicalPath &&
+          candidate.session.root === session.root &&
+          candidate.session.sidecar === session.sidecar &&
+          candidate.session.generation === session.generation,
       );
       if (document?.hasReadyPanel === true) {
         return;
       }
       await delay(25);
     }
-    throw new Error("Inex integration editor did not become ready");
+    throw new Error("Inex encrypted editor did not become ready");
+  }
+
+  public async waitForIntegrationDocument(logicalPath: string): Promise<void> {
+    this.requireIntegrationTestMode();
+    await this.waitForOpenedDocument(logicalPath, this.controller.acquireSession());
   }
 
   public markIntegrationDocumentDirty(logicalPath: string): void {
@@ -737,6 +876,11 @@ export class InexCustomEditorProvider
     }
   }
 
+  public failNextMutationCloseForIntegrationTest(): void {
+    this.requireIntegrationTestMode();
+    this.failNextMutationCloseForTest = true;
+  }
+
   public async recoverIntegrationBackupAndSave(
     logicalPath: string,
     backupPath: string,
@@ -785,6 +929,62 @@ export class InexCustomEditorProvider
       throw new Error("Inex document belongs to a locked or replaced vault session");
     }
     return document.session.sidecar;
+  }
+
+  private async closeDocumentForMutation(document: InexDocument): Promise<void> {
+    if (this.failNextMutationCloseForTest) {
+      this.failNextMutationCloseForTest = false;
+      throw new Error("Simulated VS Code tab-close refusal for integration testing");
+    }
+    const uri = document.uri.toString();
+    const tabs = vscode.window.tabGroups.all
+      .flatMap((group) => group.tabs)
+      .filter(
+        (tab) =>
+          tab.input instanceof vscode.TabInputCustom &&
+          tab.input.viewType === VIEW_TYPE &&
+          tab.input.uri.toString() === uri,
+      );
+    if (tabs.length === 0) {
+      document.dispose();
+    } else if (!(await vscode.window.tabGroups.close(tabs, true))) {
+      throw new Error("VS Code did not close the encrypted editor for the file operation");
+    }
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline && this.documents.has(document)) {
+      await delay(25);
+    }
+    if (this.documents.has(document)) {
+      document.dispose();
+    }
+    await document.waitForHandleClose();
+  }
+
+  private async restoreAfterPreparationFailure(
+    document: InexDocument,
+    session: VaultSession,
+    logicalPath: string,
+  ): Promise<void> {
+    if (!this.controller.isSessionCurrent(session)) {
+      return;
+    }
+    if (this.documents.has(document) && document.thawAfterFailedMutation()) {
+      return;
+    }
+    try {
+      await this.controller.evictFileHandlesForSession(session, logicalPath);
+      await vscode.commands.executeCommand(
+        "vscode.openWith",
+        this.controller.ciphertextUriForSession(logicalPath, session),
+        VIEW_TYPE,
+        { preview: false },
+      );
+      await this.waitForOpenedDocument(logicalPath, session);
+    } catch {
+      if (this.controller.isSessionCurrent(session)) {
+        await this.controller.lock().catch(() => undefined);
+      }
+    }
   }
 
   private async closeDirtyEditorsForDiscard(
@@ -1058,6 +1258,10 @@ vscode.postMessage({type:'ready'});
 
 function lockedHtml(): string {
   return "<!doctype html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'\"></head><body><p>Inex vault is locked. Close this editor and reopen it after unlocking.</p></body></html>";
+}
+
+function mutationHtml(): string {
+  return "<!doctype html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'\"></head><body><p>Inex is closing this encrypted document for an authenticated file operation.</p></body></html>";
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

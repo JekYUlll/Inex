@@ -22,6 +22,26 @@ export function logicalDirectoryComponents(value: string): readonly string[] {
   return logicalComponents(value, true);
 }
 
+/** Build one file child without allowing an input value to smuggle separators. */
+export function logicalFileChild(parent: string, name: string): string {
+  const parentComponents = logicalDirectoryComponents(parent);
+  validateChildName(name);
+  const logicalPath = [...parentComponents, name].join("/");
+  logicalFileComponents(logicalPath);
+  return logicalPath;
+}
+
+/** Build one directory child without allowing an input value to smuggle separators. */
+export function logicalDirectoryChild(parent: string, name: string): string {
+  const parentComponents = logicalDirectoryComponents(parent);
+  validateChildName(name);
+  const logicalPath = [...parentComponents, name].join("/");
+  if (logicalDirectoryComponents(logicalPath).length === 0) {
+    throw new LogicalPathError("The vault root already exists");
+  }
+  return logicalPath;
+}
+
 function logicalComponents(value: string, allowRoot: boolean): readonly string[] {
   if (allowRoot && value.length === 0) {
     return [];
@@ -71,6 +91,13 @@ function validateComponent(component: string): void {
   if (isWindowsDeviceBasename(basename) || /~[0-9]$/u.test(basename)) {
     throw new LogicalPathError("Logical path component is not portable to Windows/Git");
   }
+}
+
+function validateChildName(name: string): void {
+  if (name.includes("/")) {
+    throw new LogicalPathError("Enter one child name without / separators");
+  }
+  validateComponent(name);
 }
 
 function isWindowsDeviceBasename(value: string): boolean {

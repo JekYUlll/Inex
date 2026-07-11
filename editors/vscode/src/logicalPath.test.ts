@@ -3,7 +3,9 @@ import test from "node:test";
 
 import {
   LogicalPathError,
+  logicalDirectoryChild,
   logicalDirectoryComponents,
+  logicalFileChild,
   logicalFileComponents,
 } from "./logicalPath.ts";
 
@@ -37,6 +39,20 @@ test("logical file validation reserves physical suffix space", () => {
   assert.doesNotThrow(() => logicalFileComponents(`${"a".repeat(248)}.md`));
   assert.throws(
     () => logicalFileComponents(`${"a".repeat(249)}.md`),
+    LogicalPathError,
+  );
+});
+
+test("logical child builders stay beneath the selected canonical directory", () => {
+  assert.equal(logicalFileChild("", "note.md"), "note.md");
+  assert.equal(logicalFileChild("journal/2026", "july.md"), "journal/2026/july.md");
+  assert.equal(logicalDirectoryChild("journal", "2026"), "journal/2026");
+
+  for (const name of ["../escape.md", "nested/note.md", "NUL.md", "UPPER.MD"]) {
+    assert.throws(() => logicalFileChild("journal", name), LogicalPathError, name);
+  }
+  assert.throws(
+    () => logicalDirectoryChild("journal", "nested/child"),
     LogicalPathError,
   );
 });

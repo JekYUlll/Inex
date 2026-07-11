@@ -71,6 +71,23 @@ export interface WriteResult {
   readonly durability: "synced" | "notSynced";
 }
 
+export interface StatResult {
+  readonly size: number;
+  readonly etag: string;
+  readonly metadata: DocumentMetadata;
+}
+
+export interface RenameResult {
+  readonly etag: string;
+  readonly metadata: DocumentMetadata;
+  readonly sourceDurability: "synced" | "notSynced";
+  readonly destinationDurability: "synced" | "notSynced";
+}
+
+export interface DeleteResult {
+  readonly durability: "synced" | "notSynced";
+}
+
 export interface SearchHit {
   readonly logicalPath: string;
   readonly startByte: number;
@@ -261,6 +278,7 @@ export class InexSidecar {
   }
 
   public async read(logicalPath: string): Promise<ReadResult> {
+    logicalFileComponents(logicalPath);
     const result = await this.callRaw("file.read", {
       ...this.protectedParams(),
       logicalPath,
@@ -268,11 +286,26 @@ export class InexSidecar {
     return parseRead(result, logicalPath);
   }
 
+  public async stat(logicalPath: string): Promise<StatResult> {
+    logicalFileComponents(logicalPath);
+    return parseStatResult(
+      await this.callRaw("file.stat", {
+        ...this.protectedParams(),
+        logicalPath,
+      }),
+      logicalPath,
+    );
+  }
+
   public async write(
     logicalPath: string,
     content: Uint8Array,
     condition: { readonly ifMatch: string } | { readonly ifNoneMatch: "*" },
   ): Promise<WriteResult> {
+    logicalFileComponents(logicalPath);
+    if ("ifMatch" in condition) {
+      validateEtag(condition.ifMatch);
+    }
     const plaintext = Buffer.from(content);
     const contentBase64 = plaintext.toString("base64url");
     plaintext.fill(0);
@@ -282,19 +315,65 @@ export class InexSidecar {
       contentBase64,
       ...condition,
     };
-    const result = expectObject(await this.callRaw("file.write", params));
-    const durability = expectString(result.durability, "write durability");
-    if (durability !== "synced" && durability !== "notSynced") {
-      throw new RpcProtocolError("RPC write durability is invalid");
+    return parseWriteResult(await this.callRaw("file.write", params), logicalPath);
+  }
+
+  public async mkdir(logicalPath: string): Promise<void> {
+    const components = logicalDirectoryComponents(logicalPath);
+    if (components.length === 0) {
+      throw new LogicalPathError("The vault root already exists");
     }
-    return {
-      etag: expectEtag(result.etag, "write etag"),
-      metadata: parseMetadata(result.metadata, logicalPath),
-      durability,
-    };
+    const result = expectObject(
+      await this.callRaw("file.mkdir", {
+        ...this.protectedParams(),
+        logicalPath,
+      }),
+    );
+    expectExactKeys(result, ["ok"], "directory creation");
+    expectAcknowledgement(result);
+  }
+
+  public async renameFile(
+    source: string,
+    destination: string,
+    sourceEtag: string,
+  ): Promise<RenameResult> {
+    logicalFileComponents(source);
+    logicalFileComponents(destination);
+    validateEtag(sourceEtag);
+    if (source === destination) {
+      throw new LogicalPathError("Rename destination must differ from the source");
+    }
+    return parseRenameResult(
+      await this.callRaw("file.rename", {
+        ...this.protectedParams(),
+        from: source,
+        to: destination,
+        sourceEtag,
+        destinationIfNoneMatch: "*",
+      }),
+      destination,
+    );
+  }
+
+  public async deleteFile(
+    logicalPath: string,
+    ifMatch: string,
+  ): Promise<DeleteResult> {
+    logicalFileComponents(logicalPath);
+    validateEtag(ifMatch);
+    return parseDeleteResult(
+      await this.callRaw("file.delete", {
+        ...this.protectedParams(),
+        logicalPath,
+        ifMatch,
+        recursive: false,
+      }),
+    );
   }
 
   public async openDocument(logicalPath: string): Promise<OpenResult> {
+    logicalFileComponents(logicalPath);
     const result = expectObject(
       await this.callRaw("document.open", {
         ...this.protectedParams(),
@@ -388,6 +467,7 @@ export class InexSidecar {
   public async evict(logicalPath?: string): Promise<void> {
     const params = this.protectedParams();
     if (logicalPath !== undefined) {
+      logicalFileComponents(logicalPath);
       params.logicalPath = logicalPath;
     }
     expectAcknowledgement(await this.callRaw("cache.evict", params));
@@ -694,11 +774,89 @@ function parseRead(value: JsonValue, expectedLogicalPath: string): ReadResult {
   }
 }
 
+/** @internal Exported so protocol-shape tests can exercise the frozen v1 contract. */
+export function parseStatResult(
+  value: JsonValue,
+  expectedLogicalPath: string,
+): StatResult {
+  logicalFileComponents(expectedLogicalPath);
+  const result = expectObject(value);
+  expectExactKeys(result, ["etag", "metadata", "size", "type"], "file stat");
+  if (result.type !== "file") {
+    throw new RpcProtocolError("RPC stat entry type is invalid");
+  }
+  const size = expectSafeInteger(result.size, "file size");
+  if (size < 0 || size > MAX_DOCUMENT_BYTES) {
+    throw new RpcProtocolError("RPC file size is outside the v1 range");
+  }
+  return {
+    size,
+    etag: expectEtag(result.etag, "stat etag"),
+    metadata: parseMetadata(result.metadata, expectedLogicalPath),
+  };
+}
+
+/** @internal Exported so protocol-shape tests can exercise the frozen v1 contract. */
+export function parseWriteResult(
+  value: JsonValue,
+  expectedLogicalPath: string,
+): WriteResult {
+  logicalFileComponents(expectedLogicalPath);
+  const result = expectObject(value);
+  expectExactKeys(result, ["durability", "etag", "metadata"], "file write");
+  return {
+    etag: expectEtag(result.etag, "write etag"),
+    metadata: parseMetadata(result.metadata, expectedLogicalPath),
+    durability: expectDurability(result.durability, "write durability"),
+  };
+}
+
+/** @internal Exported so protocol-shape tests can exercise the frozen v1 contract. */
+export function parseRenameResult(
+  value: JsonValue,
+  expectedLogicalPath: string,
+): RenameResult {
+  logicalFileComponents(expectedLogicalPath);
+  const result = expectObject(value);
+  expectExactKeys(
+    result,
+    ["destinationDurability", "etag", "metadata", "sourceDurability"],
+    "file rename",
+  );
+  return {
+    etag: expectEtag(result.etag, "rename etag"),
+    metadata: parseMetadata(result.metadata, expectedLogicalPath),
+    sourceDurability: expectDurability(
+      result.sourceDurability,
+      "rename source durability",
+    ),
+    destinationDurability: expectDurability(
+      result.destinationDurability,
+      "rename destination durability",
+    ),
+  };
+}
+
+/** @internal Exported so protocol-shape tests can exercise the frozen v1 contract. */
+export function parseDeleteResult(value: JsonValue): DeleteResult {
+  const result = expectObject(value);
+  expectExactKeys(result, ["durability", "ok"], "file delete");
+  expectAcknowledgement(result);
+  return {
+    durability: expectDurability(result.durability, "delete durability"),
+  };
+}
+
 function parseMetadata(
   value: JsonValue | undefined,
   expectedLogicalPath: string,
 ): DocumentMetadata {
   const metadata = expectObject(value);
+  expectExactKeys(
+    metadata,
+    ["createdAt", "fileId", "flags", "logicalPath", "modifiedAt"],
+    "document metadata",
+  );
   const logicalPath = expectLogicalFile(metadata.logicalPath, "metadata logical path");
   if (logicalPath !== expectedLogicalPath) {
     throw new RpcProtocolError("RPC metadata logical path does not match the request");
@@ -755,6 +913,12 @@ function expectEtag(value: JsonValue | undefined, _field: string): string {
   return text;
 }
 
+function validateEtag(value: string): void {
+  if (!/^sha256:[0-9a-f]{64}$/u.test(value)) {
+    throw new RpcProtocolError("RPC request etag is invalid");
+  }
+}
+
 function expectUuid(value: JsonValue | undefined, _field: string): string {
   const text = expectString(value, _field);
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(text)) {
@@ -797,6 +961,31 @@ function expectBoundedString(
     throw new RpcProtocolError(`RPC ${field} exceeds its byte limit`);
   }
   return text;
+}
+
+function expectDurability(
+  value: JsonValue | undefined,
+  field: string,
+): "synced" | "notSynced" {
+  const durability = expectString(value, field);
+  if (durability !== "synced" && durability !== "notSynced") {
+    throw new RpcProtocolError(`RPC ${field} is invalid`);
+  }
+  return durability;
+}
+
+function expectExactKeys(
+  value: { [key: string]: JsonValue },
+  expected: readonly string[],
+  resultName: string,
+): void {
+  const keys = Object.keys(value).sort();
+  if (
+    keys.length !== expected.length ||
+    keys.some((key, index) => key !== expected[index])
+  ) {
+    throw new RpcProtocolError(`RPC ${resultName} result has unknown or missing fields`);
+  }
 }
 
 function expectAcknowledgement(value: JsonValue): void {

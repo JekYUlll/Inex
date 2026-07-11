@@ -29,7 +29,11 @@
     "onCustomEditor:inex.markdownEditor",
     "onView:inex.vault",
     "onCommand:inex.showSecurityStatus",
-    "onCommand:inex.unlockVault"
+    "onCommand:inex.unlockVault",
+    "onCommand:inex.newEncryptedMarkdown",
+    "onCommand:inex.newFolder",
+    "onCommand:inex.rename",
+    "onCommand:inex.delete"
   ],
   "contributes": {
     "commands": [
@@ -52,6 +56,26 @@
       {
         "command": "inex.refreshTree",
         "title": "Inex: Refresh Vault Tree"
+      },
+      {
+        "command": "inex.newEncryptedMarkdown",
+        "title": "Inex: New Encrypted Markdown",
+        "icon": "$(new-file)"
+      },
+      {
+        "command": "inex.newFolder",
+        "title": "Inex: New Encrypted Folder",
+        "icon": "$(new-folder)"
+      },
+      {
+        "command": "inex.rename",
+        "title": "Inex: Rename Encrypted Markdown",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "inex.delete",
+        "title": "Inex: Delete Encrypted Markdown",
+        "icon": "$(trash)"
       }
     ],
     "viewsContainers": {
@@ -74,9 +98,61 @@
     "menus": {
       "view/title": [
         {
+          "command": "inex.newEncryptedMarkdown",
+          "when": "view == inex.vault",
+          "group": "navigation@1"
+        },
+        {
+          "command": "inex.newFolder",
+          "when": "view == inex.vault",
+          "group": "navigation@2"
+        },
+        {
           "command": "inex.refreshTree",
           "when": "view == inex.vault",
-          "group": "navigation"
+          "group": "navigation@3"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "inex.newEncryptedMarkdown",
+          "when": "view == inex.vault && viewItem == inex.directory",
+          "group": "inline@1"
+        },
+        {
+          "command": "inex.newFolder",
+          "when": "view == inex.vault && viewItem == inex.directory",
+          "group": "inline@2"
+        },
+        {
+          "command": "inex.rename",
+          "when": "view == inex.vault && viewItem == inex.file",
+          "group": "inline@1"
+        },
+        {
+          "command": "inex.delete",
+          "when": "view == inex.vault && viewItem == inex.file",
+          "group": "inline@2"
+        },
+        {
+          "command": "inex.newEncryptedMarkdown",
+          "when": "view == inex.vault && viewItem == inex.directory",
+          "group": "inex@1"
+        },
+        {
+          "command": "inex.newFolder",
+          "when": "view == inex.vault && viewItem == inex.directory",
+          "group": "inex@2"
+        },
+        {
+          "command": "inex.rename",
+          "when": "view == inex.vault && viewItem == inex.file",
+          "group": "inex@1"
+        },
+        {
+          "command": "inex.delete",
+          "when": "view == inex.vault && viewItem == inex.file",
+          "group": "inex@2"
         }
       ]
     },

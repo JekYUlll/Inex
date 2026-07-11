@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 
 import { VaultController } from "./controller.ts";
+import { InexCrudActions } from "./crud.ts";
 import { InexCustomEditorProvider } from "./customEditor.ts";
 import { RpcRemoteError } from "./rpc.ts";
 import { showSensitiveInputBox, showSensitiveQuickPick } from "./sensitiveUi.ts";
@@ -26,6 +27,12 @@ export interface InexIntegrationTestApi {
     logicalPath: string,
     backupPath: string,
   ) => Promise<string>;
+  readonly createFolder: (logicalPath: string) => Promise<void>;
+  readonly createEmptyDocument: (logicalPath: string) => Promise<void>;
+  readonly renameDocument: (source: string, destination: string) => Promise<void>;
+  readonly deleteDocument: (logicalPath: string) => Promise<void>;
+  readonly listTree: () => Promise<readonly import("./sidecar.ts").TreeEntry[]>;
+  readonly failNextMutationClose: () => void;
   readonly lock: () => Promise<void>;
 }
 
@@ -38,6 +45,7 @@ export function activate(
   const controller = new VaultController(context);
   const tree = new InexTreeProvider(controller);
   const editor = new InexCustomEditorProvider(controller, integrationTestMode);
+  const crud = new InexCrudActions(controller, tree, editor);
   activeController = controller;
   activeEditorProvider = editor;
 
@@ -85,6 +93,18 @@ export function activate(
     }),
     vscode.commands.registerCommand("inex.refreshTree", () => {
       tree.refresh();
+    }),
+    vscode.commands.registerCommand("inex.newEncryptedMarkdown", async (node?: unknown) => {
+      await runUiAction(() => crud.newEncryptedMarkdown(node));
+    }),
+    vscode.commands.registerCommand("inex.newFolder", async (node?: unknown) => {
+      await runUiAction(() => crud.newFolder(node));
+    }),
+    vscode.commands.registerCommand("inex.rename", async (node?: unknown) => {
+      await runUiAction(() => crud.rename(node));
+    }),
+    vscode.commands.registerCommand("inex.delete", async (node?: unknown) => {
+      await runUiAction(() => crud.delete(node));
     }),
     vscode.commands.registerCommand("inex.internal.openTreeEntry", async (node: unknown) => {
       await runUiAction(async () => {
@@ -185,6 +205,14 @@ export function activate(
     contentSha256: (logicalPath: string) => editor.integrationContentSha256(logicalPath),
     recoverBackupAndSave: (logicalPath: string, backupPath: string) =>
       editor.recoverIntegrationBackupAndSave(logicalPath, backupPath),
+    createFolder: (logicalPath: string) => crud.createDirectory(logicalPath),
+    createEmptyDocument: (logicalPath: string) =>
+      crud.createEmptyMarkdown(logicalPath),
+    renameDocument: (source: string, destination: string) =>
+      crud.renameFile(source, destination),
+    deleteDocument: (logicalPath: string) => crud.deleteFile(logicalPath),
+    listTree: () => crud.listTree(),
+    failNextMutationClose: () => editor.failNextMutationCloseForIntegrationTest(),
     lock: () => controller.lock(),
   });
 }

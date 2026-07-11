@@ -54,10 +54,7 @@ export class InexTreeProvider
       return [];
     }
     const base = element?.entry.logicalPath;
-    const entries = await session.sidecar.listTree(base);
-    if (!this.controller.isSessionCurrent(session)) {
-      return [];
-    }
+    const entries = await this.controller.listTreeForSession(session, base);
     return entries.filter((entry) => {
       const relative =
         base === undefined
@@ -78,7 +75,7 @@ export class InexTreeProvider
     }
     await vscode.commands.executeCommand(
       "vscode.openWith",
-      this.controller.ciphertextUri(node.entry.logicalPath),
+      this.controller.ciphertextUriForSession(node.entry.logicalPath, node.session),
       "inex.markdownEditor",
     );
     if (!this.controller.isSessionCurrent(node.session)) {

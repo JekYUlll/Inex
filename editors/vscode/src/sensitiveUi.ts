@@ -5,6 +5,8 @@ export interface SensitiveInputBoxOptions {
   readonly password?: boolean;
   readonly prompt?: string;
   readonly title?: string;
+  readonly value?: string;
+  readonly valueSelection?: readonly [number, number];
   readonly validateInput?: (value: string) => string | undefined;
 }
 
@@ -25,6 +27,10 @@ export function showSensitiveInputBox(
   input.password = options.password ?? false;
   input.prompt = options.prompt;
   input.title = options.title;
+  input.value = options.value ?? "";
+  if (options.valueSelection !== undefined) {
+    input.valueSelection = [...options.valueSelection];
+  }
 
   return new Promise<string | undefined>((resolve) => {
     let settled = false;
@@ -94,6 +100,7 @@ export function showSensitiveQuickPick<T extends vscode.QuickPickItem>(
       for (const subscription of subscriptions) {
         subscription.dispose();
       }
+      picker.items = [];
       picker.hide();
       picker.dispose();
       resolve(value);

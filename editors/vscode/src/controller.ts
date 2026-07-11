@@ -5,7 +5,12 @@ import * as vscode from "vscode";
 import {
   InexSidecar,
   SidecarLifecycleError,
+  type DeleteResult,
+  type RenameResult,
+  type StatResult,
+  type TreeEntry,
   type UnlockResult,
+  type WriteResult,
   resolveSidecarExecutable,
 } from "./sidecar.ts";
 import { logicalFileComponents } from "./logicalPath.ts";
@@ -255,21 +260,93 @@ export class VaultController implements vscode.Disposable {
     return logicalPathRelativeToRoot(uri, session.root);
   }
 
+  public async listTreeForSession(
+    session: VaultSession,
+    prefix?: string,
+  ): Promise<readonly TreeEntry[]> {
+    this.requireCurrentSession(session, "before listing the vault tree");
+    const entries = await session.sidecar.listTree(prefix);
+    this.requireCurrentSession(session, "while listing the vault tree");
+    return entries;
+  }
+
+  public async statFileForSession(
+    session: VaultSession,
+    logicalPath: string,
+  ): Promise<StatResult> {
+    this.requireCurrentSession(session, "before reading the source etag");
+    const result = await session.sidecar.stat(logicalPath);
+    this.requireCurrentSession(session, "while reading the source etag");
+    return result;
+  }
+
+  public async createEmptyMarkdownForSession(
+    session: VaultSession,
+    logicalPath: string,
+  ): Promise<WriteResult> {
+    this.requireCurrentSession(session, "before creating the encrypted document");
+    const result = await session.sidecar.write(logicalPath, Buffer.alloc(0), {
+      ifNoneMatch: "*",
+    });
+    this.requireCurrentSession(session, "while creating the encrypted document");
+    return result;
+  }
+
+  public async createDirectoryForSession(
+    session: VaultSession,
+    logicalPath: string,
+  ): Promise<void> {
+    this.requireCurrentSession(session, "before creating the encrypted directory");
+    await session.sidecar.mkdir(logicalPath);
+    this.requireCurrentSession(session, "while creating the encrypted directory");
+  }
+
+  public async renameFileForSession(
+    session: VaultSession,
+    source: string,
+    destination: string,
+    sourceEtag: string,
+  ): Promise<RenameResult> {
+    this.requireCurrentSession(session, "before renaming the encrypted document");
+    const result = await session.sidecar.renameFile(source, destination, sourceEtag);
+    this.requireCurrentSession(session, "while renaming the encrypted document");
+    return result;
+  }
+
+  public async deleteFileForSession(
+    session: VaultSession,
+    logicalPath: string,
+    ifMatch: string,
+  ): Promise<DeleteResult> {
+    this.requireCurrentSession(session, "before deleting the encrypted document");
+    const result = await session.sidecar.deleteFile(logicalPath, ifMatch);
+    this.requireCurrentSession(session, "while deleting the encrypted document");
+    return result;
+  }
+
+  public async evictFileHandlesForSession(
+    session: VaultSession,
+    logicalPath: string,
+  ): Promise<void> {
+    this.requireCurrentSession(session, "before evicting stale document handles");
+    await session.sidecar.evict(logicalPath);
+    this.requireCurrentSession(session, "while evicting stale document handles");
+  }
+
+  public ciphertextUriForSession(
+    logicalPath: string,
+    session: VaultSession,
+  ): vscode.Uri {
+    this.requireCurrentSession(session, "before resolving the ciphertext URI");
+    return ciphertextUriWithinRoot(logicalPath, session.root);
+  }
+
   public ciphertextUri(logicalPath: string): vscode.Uri {
     const root = this.root;
     if (root === undefined) {
       throw new SidecarLifecycleError("Inex vault is locked");
     }
-    const components = logicalFileComponents(logicalPath);
-    const fileName = components.at(-1);
-    if (fileName === undefined) {
-      throw new SidecarLifecycleError("Logical document path is invalid");
-    }
-    return vscode.Uri.joinPath(
-      root,
-      ...components.slice(0, -1),
-      `${fileName}.enc`,
-    );
+    return ciphertextUriWithinRoot(logicalPath, root);
   }
 
   public dispose(): void {
@@ -288,6 +365,12 @@ export class VaultController implements vscode.Disposable {
   private advanceGeneration(): void {
     this.generation =
       this.generation >= Number.MAX_SAFE_INTEGER ? 1 : this.generation + 1;
+  }
+
+  private requireCurrentSession(session: VaultSession, phase: string): void {
+    if (!this.isSessionCurrent(session)) {
+      throw new SidecarLifecycleError(`Inex vault session changed ${phase}`);
+    }
   }
 
   private resetIdleDeadline(): void {
@@ -382,4 +465,17 @@ function logicalPathRelativeToRoot(uri: vscode.Uri, root: vscode.Uri): string {
   const logicalPath = portable.slice(0, -".enc".length);
   logicalFileComponents(logicalPath);
   return logicalPath;
+}
+
+function ciphertextUriWithinRoot(logicalPath: string, root: vscode.Uri): vscode.Uri {
+  const components = logicalFileComponents(logicalPath);
+  const fileName = components.at(-1);
+  if (fileName === undefined) {
+    throw new SidecarLifecycleError("Logical document path is invalid");
+  }
+  return vscode.Uri.joinPath(
+    root,
+    ...components.slice(0, -1),
+    `${fileName}.enc`,
+  );
 }
