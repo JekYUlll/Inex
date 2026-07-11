@@ -81,6 +81,7 @@ Phase 7 — 跨平台验证、打包与发布准备
 - [x] 完成 threat model、用户指南、安全配置、迁移/升级与故障恢复文档
 - [ ] 审计磁盘明文残留、日志秘密、依赖许可与发布清单
 - [x] 在最终 clean commit 上用 system GCC 完成两次逐字节一致的 Linux x64 package/audit/native-dependency/VSIX-install smoke
+- [x] 从独立 standalone clean clone 对最终 Linux x64 artifact 完成 import/password/Git-bundle/tree-copy restore/frozen-v1/residue lifecycle drill
 - **Status:** in_progress
 
 ## Key Questions

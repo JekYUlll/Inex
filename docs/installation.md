@@ -106,6 +106,11 @@ exact commit, and `dirtySourceTree=false`. That source identity is provenance
 metadata, not an independent attestation that generated binaries or editor
 bundles were built from the commit; reproducible builds, artifact hashes and
 native audits remain separate evidence.
+A clean standalone Linux x64 lifecycle run at harness commit `1e01842` has also
+authenticated all five synthetic bodies after copy import, password rewrap,
+Git-bundle restore and clean regular-file tree-copy restore, with zero sensitive
+residue hits outside the intentionally retained plaintext source. This remains
+a Linux normal-path checkpoint, not native multi-platform or signing evidence.
 For a development candidate,
 verify `SHA256SUMS` through a separate trusted channel, inspect the package
 manifest/source revision, extract the complete directory, and keep both

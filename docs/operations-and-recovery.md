@@ -60,6 +60,12 @@ retains it and prints its path for explicit inspection and cleanup; an early
 dirty-source, Windows, or input-path rejection creates no root. A successful
 run removes its evidence root.
 
+The final Linux x64 artifact set has passed this drill from standalone clean
+harness commit `1e01842`: all five bodies authenticated byte-for-byte, both
+restore paths and driver relocation passed, frozen-v1 product bytes remained
+unchanged, and the sensitive scan found zero hits outside `plaintext-source`.
+The report is lifecycle-only and is not release approval.
+
 Treat that result as binding only from a dedicated standalone, exclusive and
 quiescent release checkout. From interpreter startup through artifact/report
 capture, no editor, sync client, watcher, sibling worktree, build process or

@@ -35,7 +35,7 @@ Status terms in this document mean:
 | VS Code Extension Host | partial | The current local build and 1.125.0 directly drive the production create/folder-create/file-rename/file-delete actions plus encrypted backup/recovery against the daemon/custom editor. Close refusal, rename collision, Unix delete-I/O failure recovery, command registration, and isolated-root residue pass. InputBox/QuickPick mouse interaction is not automated, and test-mode workbench storage is in-memory, so persistent cross-process restore/Local History is unproven |
 | Sublime current source | partial | Pure-Python tests pass 61/61. An exact Build 4200 normal E2E drives unlock/open/edit/save/close and real-panel New Folder/New Markdown/rename/etag-delete through registered commands. Authenticated tree checks pass after each mutation; `folder_created`, `markdown_created`, `renamed`, and `deleted` are present, `crud_complete=true`, `vault_envelope=EDRY`, and `root_scan_hits=0`. The plugin-host SIGKILL probe remains `PASS_WITH_DOCUMENTED_BOUNDARY`: the visible buffer is copyable, the host does not restart in-process, a full Sublime restart is required, `vault_envelope=EDRY`, and roots scanned after application exit remain clean. Its `crud_complete=false` is intentional because the crash branch kills after open/edit/save; this is not crash-time plaintext erasure. The full packaged matrix is pending |
 | Linux x64 packaging | verified clean-source checkpoint, release-tool review GO | Release-tooling unit tests pass 49/49; local `actionlint` and pedantic/all-features Clippy pass. Two system-GCC builds from the final clean source are byte-identical across Rust ZIP, VSIX, unpacked Sublime ZIP, and SHA256SUMS; both pass strict artifact/native-dependency audit and VS Code 1.125.0 CLI install/bundled-sidecar smoke. Manifest provenance records the canonical repository, exact commit, and `dirtySourceTree=false`; it is not independent build attestation for generated inputs |
-| Linux x64 artifact lifecycle | hardened development checkpoint; clean rerun pending | The harness now fails closed on a dirty source tree and binds all three artifact SHA-256 values, artifact source, five harness files, fixture hashes, native runtime, Git and filesystem. Development runs cover copy import, exact physical ciphertext allowlist, password rewrap/current-old-password rejection, historical-metadata scope, exact authenticated RPC tree/full-body reads, a single-ref/single-commit Git bundle with unreachable-object rejection, clean regular-file tree copy/restore with driver relocation, and sensitive content/path residue scanning; only plaintext-source file contents are intentionally excluded while its directory set and non-canary path components remain bound. Commit and rerun with `dirtySourceTree=false` before treating this as binding evidence. This is neither native multi-platform evidence nor fault-state/cross-version upgrade evidence |
+| Linux x64 artifact lifecycle | verified clean standalone checkpoint | Harness commit `1e01842fc26ec24183f911ca38a9eb32924db579` and artifact commit `76ac04aa594001c9259a3117cbd933436357e0ce` both report `dirtySourceTree=false`. SHA-256: Rust ZIP `d551f3ca18f62f954e3f0ffe8c0aac1dad2d3821193ecb2e6116435886595e8a`; Sublime ZIP `590dcd1411312a366d1a82017fee4e8e40ed608941afab3b9cb06f903a35bf02`; VSIX `34d61157cbf570a0e25fb0f4a5d5db27d5e096838056025a89679f5d940f32eb`. Five expected bodies including exact 16 MiB content authenticate after import, password rewrap, single-ref/single-commit Git bundle and clean regular-file tree-copy restores. Driver relocation, frozen-v1 unchanged bytes, exact physical ciphertext allowlist and Linux descendant cleanup pass; sensitive content/path hits outside `plaintext-source` are zero. Report scope is lifecycle-only, not release approval or native/fault-state/two-version evidence |
 | License collection | verified engineering checkpoint | The native-target inventory contains 77 resolved Cargo components and 147 collected license/NOTICE texts: 146 Cargo files plus bundled libsodium 1.0.22 ISC. Independent legal review and license-choice/signature policy remain pending |
 | CI configuration | source-only, non-binding | Linux x64, Windows x64, Linux arm64, and Windows arm64 labels are configured; actions are immutable-SHA pinned and local `actionlint` passes. Push/manual tag refs bind the exact version; the required job runs binding source-quality gates; package targets rerun x64 native tests or ARM no-run compilation, enforce canonical provenance, and install/smoke each platform VSIX. The workflows have not been pushed or run remotely, so every matrix result remains unproven |
 | Native Windows | pending | No native MSVC/NTFS/ReFS/FAT/exFAT release host result is available; GNU cross-check and Wine are non-binding |
@@ -60,8 +60,8 @@ These are not documentation polish items; each changes the release decision:
 5. Build and smoke all four intended platform artifacts on their native target:
    Linux x64/arm64 and Windows x64/arm64. Verify executable architecture and
    dynamic/static native-library expectations, not only archive names.
-6. After the hardened harness passes from its committed clean source, repeat
-   that Linux x64 normal-path lifecycle on every native final artifact, then add
+6. Repeat the verified Linux x64 normal-path lifecycle on every native final
+   artifact, then add
    publication/recovery fault-state preservation and a true two-version
    upgrade/rollback drill. A frozen-v1 read is compatibility evidence, not a
    substitute for two released program versions.
@@ -118,7 +118,7 @@ target/tools/actionlint .github/workflows/*.yml
 
 ## CLI, import, and backup gate
 
-Maintainers can run the pending Linux-only normal-path gate from a source
+Maintainers can reproduce the verified Linux-only normal-path gate from a source
 checkout. The tool first audits clean artifact provenance, creates only an
 isolated disposable tree, never accepts a password in argv/environment, and
 prints a body-free JSON summary:
@@ -166,7 +166,7 @@ directory explicitly after triage.
       destination, disk faults, publication ambiguity, and marker cleanup
       failure.
 - [ ] Source hashes remain unchanged in every import result.
-- [ ] After committing the hardened harness, rerun the final clean Linux x64
+- [x] From committed harness `1e01842`, rerun the final clean Linux x64
       artifact lifecycle with `dirtySourceTree=false`: import to one Git commit,
       require only `refs/heads/main` and no unreachable objects, create and
       verify both a Git bundle and clean regular-file tree copy, restore to

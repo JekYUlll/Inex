@@ -59,6 +59,10 @@ operations limit 3. Readers validate a resource ceiling before calling sodium.
   ELF/archive/native-dependency audit plus executable/VSIX sidecar smoke with
   `dirtySourceTree=false`. The xlings-default local ELF embeds its build-home
   interpreter/RUNPATH and is correctly rejected as non-portable.
+- A clean standalone lifecycle run at harness commit `1e01842` re-audits the
+  final Linux x64 packages, authenticates five imported/restored bodies and
+  reports zero sensitive-residue hits outside the designated plaintext source.
+  This does not attest generated inputs or replace native/signing/legal gates.
 
 ## License inventory and distribution obligations
 

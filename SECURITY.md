@@ -28,8 +28,11 @@ In particular:
   pass, and independent release-tool code review is GO. A system-GCC Linux x64
   clean-source double build is byte-identical and passes strict
   archive/native-dependency audit plus VS Code 1.125.0 CLI
-  install/bundled-sidecar smoke. This local result is not native Windows/arm64,
-  persistent-profile, signed, or independent release evidence.
+  install/bundled-sidecar smoke. A standalone clean-checkout lifecycle run at
+  harness commit `1e01842` also passes authenticated import/password/restore,
+  Git bundle, frozen-v1 compatibility, exact body and bounded residue checks.
+  This local result is not native Windows/arm64, persistent-profile, signed, or
+  independent release evidence.
 
 The current evidence and blockers are maintained in
 [`docs/release-checklist.md`](docs/release-checklist.md). Do not use Inex as the
