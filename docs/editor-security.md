@@ -37,6 +37,25 @@ document instead makes the extension responsible for save and backup.
 - Revert reloads authenticated ciphertext and discards extension-owned edits
   after explicit VS Code confirmation.
 
+### Authenticated file management
+
+- New Markdown uses `file.write` with `ifNoneMatch: "*"`; folder creation uses
+  `file.mkdir`. A successful file create opens only the real ciphertext custom
+  editor resource.
+- File rename reads the authenticated source etag, requires a non-existing
+  destination, coordinates any open custom document, and never replaces a
+  collision. A dirty open source requires explicit Save and Rename; close
+  refusal or edits racing that save abort before mutation.
+- File delete uses the authenticated current etag and explicit confirmation. A
+  dirty open document is refused rather than discarded implicitly.
+- On a mutation error after an open tab was prepared, the client refreshes the
+  authenticated tree and attempts to reopen whichever source/destination is
+  proven to survive. Directory rename/delete and interactive cross-directory
+  moves are not exposed.
+- Filename/path and confirmation UI closes on lock. Extension Host tests drive
+  these same production actions directly, but do not mouse-drive their
+  InputBox/QuickPick widgets.
+
 Plaintext is never placed in `acquireVsCodeApi().setState`, workspace/global
 state, secrets storage, mementos, output channels, telemetry, diagnostics,
 backup identifiers, or URI query/fragment data.
@@ -89,6 +108,10 @@ on isolated-profile black-box residue tests, not on an in-memory wipe claim.
 - Release tests launch VS Code with isolated `--user-data-dir` and
   `--extensions-dir`, exercise dirty/crash/recovery flows, then scan all backup,
   history, storage, log, temp, and vault roots for a unique canary.
+- Current and 1.125.0 Extension Hosts also exercise create/folder-create,
+  close-refused rename, collision, delete I/O failure recovery, successful
+  rename/delete, and tree/tab cleanup. This is checkpoint evidence only because
+  test-mode workbench state is memory-backed and UI widgets are not mouse-driven.
 - Until that exact black-box matrix passes for the packaged VS Code/VSIX pair,
   documentation must label disk-residue assurance as pending rather than
   inferred from the API design.
@@ -121,6 +144,11 @@ erase and must be cleaned by the user/profile owner.
 - Create `new_file()`, set scratch before inserting plaintext, never assign a
   plaintext filename, and keep the physical ciphertext path out of view state
   where it could become a recent-file target.
+- Set one fixed non-secret managed-plaintext marker before insertion. On plugin
+  host load, scrub every orphaned marked view before enabling editing; if
+  fixed-text replacement cannot be acknowledged, block the client. Pure tests
+  enforce this invariant, but it is not evidence that Build 4200 restarts a
+  killed host in-process.
 - Track saved version/hash and dirty status in plugin memory; expose them with
   tab/status UI rather than `view.is_dirty()`.
 - Rewrite Save with `on_text_command`; rewrite known Save As/Save All/close
@@ -132,20 +160,55 @@ erase and must be cleaned by the user/profile owner.
   view exists. An abrupt application exit may lose final edits; the plugin must
   never persist plaintext to avoid that loss.
 
+While the plugin host is dead, none of those hooks runs. A marked buffer already
+owned by the editor remains visible and actively copyable. Exact Build 4200
+black-box evidence shows that a killed plugin host does not restart inside the
+same editor process; the entire Sublime application must be restarted to end
+that editor-process plaintext lifetime. The marker is a load-time defense, not
+observed same-process crash recovery or instantaneous fail-safe containment.
+That state remains inside the editor-memory/active-clipboard exclusion and the
+binding crash matrix.
+
+### Sublime file management
+
+- New Markdown and folder commands accept a complete validated logical path and
+  call create-only daemon methods.
+- Rename/Delete Active require an active clean writable managed Markdown view.
+  Rename is etag-bound and destination-create-only; delete is etag-bound and
+  explicitly confirmed. Dirty, read-only, unmarked, named, or non-scratch views
+  are refused/scrubbed as appropriate.
+- Directory rename/delete is unsupported. Save As and physical `.enc` moves
+  remain blocked substitutes.
+
 ### Experimental release gate
 
-Tests run on Sublime Build 4200 with `.python-version` 3.8, in Safe Mode or an
-isolated data directory. They cover keyboard/menu Save, Save As, Save All,
-tab/window/application close, project/non-project windows, plugin-host crash,
-and forced process termination. Tests scan session/workspace files, Cache,
-Index, temp roots, logs, and the vault for a canary. No Sublime build is called
-supported until its exact matrix passes; APIs marked for builds newer than the
-tested baseline are not used.
+The current pure-Python suite passes 61/61. An isolated exact Build 4200 normal
+E2E drives unlock/open/edit/save/close and registered WindowCommands with real
+InputPanel/QuickPanel interaction for New Folder, New Markdown, rename, and
+etag-bound delete. Authenticated tree checks pass after every mutation; events
+record `folder_created`, `markdown_created`, `renamed`, and `deleted`, with
+`crud_complete=true`, `vault_envelope=EDRY`, and `root_scan_hits=0`.
+Its plugin-host SIGKILL probe reports `PASS_WITH_DOCUMENTED_BOUNDARY`,
+`host_dead_clipboard_read_ok=true`, `host_dead_plaintext_copyable=true`,
+`plugin_host_restarted=false`, and `sublime_restart_required=true`; roots
+scanned after application exit report `root_scan_hits=0` and
+`vault_envelope=EDRY`. The crash branch intentionally reports
+`crud_complete=false` because it kills the host after open/edit/save; the normal
+branch above covers CRUD independently. This proves the boundary was
+reproduced, not that crash-time plaintext was erased.
+
+The remaining exact-package gate covers keyboard/menu Save, Save As, Save All,
+tab/window/application close, project/non-project windows, export/macro routes,
+plugin-host crash, and forced process termination. It scans session/workspace
+files, Cache, Index, temp roots, logs, and the vault for a canary. No Sublime
+build is called supported until its complete matrix passes; APIs marked for
+builds newer than the tested baseline are not used.
 
 ## Shared client rules
 
-- Password input uses editor secret-input UI and goes directly in one framed
-  RPC request; it is never stored in settings/history.
+- VS Code password input uses a secret InputBox; Sublime uses its reviewed
+  external masked helper. Both send the value directly in one framed RPC
+  request and never store it in settings/history.
 - A sidecar crash makes open documents read-only until re-unlock and etag
   revalidation. Clients never retry a write without an etag.
 - Lock prompts save/discard/cancel while dirty models exist. EOF/shutdown then
@@ -160,5 +223,6 @@ tested baseline are not used.
 - https://code.visualstudio.com/api/extension-guides/webview
 - https://github.com/microsoft/vscode/blob/1.126.0/src/vs/workbench/services/workingCopy/common/workingCopyBackupTracker.ts#L82-L209
 - https://www.sublimetext.com/docs/api_reference.html
+- https://www.sublimetext.com/docs/api_environments.html
 - https://www.sublimetext.com/docs/settings.html
 - https://www.sublimetext.com/docs/safe_mode.html

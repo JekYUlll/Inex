@@ -1,0 +1,322 @@
+# Release Checklist and Evidence Snapshot
+
+This is the release decision surface for Inex. It supplements, but does not
+weaken, [the binding acceptance matrix](acceptance-matrix.md). A unit test,
+cross-compile, Wine run, API argument, or source audit cannot substitute for a
+required native/editor/package black-box result.
+
+## Current decision
+
+> **NO-GO for GA, supported VS Code MVP, or supported Sublime release.**
+
+The 2026-07-11 source checkpoint has strong Linux and cross-platform
+development evidence, but the release gates below are intentionally incomplete.
+The project must keep its pre-alpha warning and must not present any generated
+archive as a supported install.
+
+Status terms in this document mean:
+
+- **verified:** the stated command/flow completed against the inspected source;
+- **checkpoint:** useful implementation evidence whose platform/artifact scope
+  is narrower than the binding release row;
+- **partial:** some required cases passed and named cases remain;
+- **pending:** no binding result is available;
+- **not exposed:** required product behavior is not reachable in the current UI.
+
+## Evidence already available
+
+| Area | Status | Evidence and exact boundary |
+|------|--------|-----------------------------|
+| Linux Rust workspace | verified checkpoint | 239/239 workspace tests after Git integration, plus rustfmt, pedantic clippy with warnings denied, rustdoc warnings denied, and whitespace checks |
+| EDRY/vault compatibility | checkpoint | Frozen v1 fixture rebuild/unlock/decrypt and broad format/path/tamper tests pass on Linux; Windows GNU compiles and earlier Wine suites pass, but this is not native Windows evidence |
+| Import | verified checkpoint | Copy-only absent-destination staging, re-open/seal/allowlist/publication, source-preservation, and failure-class tests pass; independent code review gave checkpoint GO |
+| Git | verified checkpoint | Locked-safe driver, local installer, real-repository plumbing, encrypted diff3, unresolved flag, plaintext-free metadata journal, recovery, attribute/identity/split-index/fsmonitor/lazy-fetch regressions pass on Linux; native Windows and cross-path rename/modify acceptance remain pending |
+| VS Code unit/bundle | verified checkpoint | Strict TypeScript, 23/23 Node tests, production bundle, and integration bundle pass |
+| VS Code Extension Host | partial | The current local build and 1.125.0 directly drive the production create/folder-create/file-rename/file-delete actions plus encrypted backup/recovery against the daemon/custom editor. Close refusal, rename collision, Unix delete-I/O failure recovery, command registration, and isolated-root residue pass. InputBox/QuickPick mouse interaction is not automated, and test-mode workbench storage is in-memory, so persistent cross-process restore/Local History is unproven |
+| Sublime current source | partial | Pure-Python tests pass 61/61. An exact Build 4200 normal E2E drives unlock/open/edit/save/close and real-panel New Folder/New Markdown/rename/etag-delete through registered commands. Authenticated tree checks pass after each mutation; `folder_created`, `markdown_created`, `renamed`, and `deleted` are present, `crud_complete=true`, `vault_envelope=EDRY`, and `root_scan_hits=0`. The plugin-host SIGKILL probe remains `PASS_WITH_DOCUMENTED_BOUNDARY`: the visible buffer is copyable, the host does not restart in-process, a full Sublime restart is required, `vault_envelope=EDRY`, and roots scanned after application exit remain clean. Its `crud_complete=false` is intentional because the crash branch kills after open/edit/save; this is not crash-time plaintext erasure. The full packaged matrix is pending |
+| Linux x64 packaging | partial, release-tool review GO | Release-tooling unit tests pass 19/19; local `actionlint` and pedantic/all-features Clippy pass. Strict VSIX identity/content metadata, bounded regular portable ZIP paths/modes, exact TOML/tag version binding, canonical provenance, and PE32+ structure/import checks fail closed. A system-GCC repackage passes strict archive/native-dependency audit plus VS Code 1.125.0 CLI install/bundled-sidecar smoke. A post-hardening clean-source double build is pending |
+| License collection | verified engineering checkpoint | The native-target inventory contains 77 resolved Cargo components and 147 collected license/NOTICE texts: 146 Cargo files plus bundled libsodium 1.0.22 ISC. Independent legal review and license-choice/signature policy remain pending |
+| CI configuration | source-only, non-binding | Linux x64, Windows x64, Linux arm64, and Windows arm64 labels are configured; actions are immutable-SHA pinned and local `actionlint` passes. Push/manual tag refs bind the exact version; the required job runs binding source-quality gates; package targets rerun x64 native tests or ARM no-run compilation, enforce canonical provenance, and install/smoke each platform VSIX. The workflows have not been pushed or run remotely, so every matrix result remains unproven |
+| Native Windows | pending | No native MSVC/NTFS/ReFS/FAT/exFAT release host result is available; GNU cross-check and Wine are non-binding |
+| arm64 | pending | Linux arm64 and Windows arm64 native build/package/runtime matrices are not available |
+
+## Known release blockers
+
+These are not documentation polish items; each changes the release decision:
+
+1. Run all core, import, Git, daemon, fixture, long-path, Unicode, newline, and
+   atomic/recovery tests on native supported Windows filesystems and MSVC.
+2. Prove the final packaged VSIX plus bundled platform `inexd` in persistent
+   Windows and Linux profiles across dirty close, normal restart, forced crash,
+   Hot Exit, Local History, and recovery.
+3. Complete the exact Sublime Build 4200 packaged open/edit/save/close/crash,
+   macro/export/clipboard, draft, project/non-project, and canary residue matrix
+   on every advertised OS.
+4. Resolve the GA contract for Git rename/modify conflicts. The current v1
+   implementation deliberately fails closed on cross-path identity; the
+   acceptance matrix still names rename/modify as required.
+5. Build and smoke all four intended platform artifacts on their native target:
+   Linux x64/arm64 and Windows x64/arm64. Verify executable architecture and
+   dynamic/static native-library expectations, not only archive names.
+6. Run disposable-vault backup/import/restore/upgrade drills from the final
+   artifacts, including publication/recovery fault cases.
+7. Complete independent legal review of the collected 77-component inventory,
+   147 license/NOTICE texts, license-expression choices, and distribution
+   obligations; collection is implemented but is not legal approval.
+8. After the final clean commit, repeat the hardened package/audit/smoke twice
+   from clean source, then push and pass the configured four-platform
+   CI/package matrices. Local `actionlint`, a dirty Linux repackage, and one
+   earlier byte-identical pair do not establish final reproducibility, runner
+   availability, or a native release matrix.
+9. Keep password-slot documentation explicit that rewrapping does not revoke
+    an old password held with historical `vault.json`; master-key rotation is a
+    separate unimplemented migration, not a hidden property of `password
+    change`.
+10. Establish a private vulnerability-reporting channel, supported-version
+    policy, release signing keys, and a separately authenticated checksum/
+    signature publication path.
+
+## Source-quality gate
+
+Run from a clean, reviewed commit with the pinned toolchain and lockfiles:
+
+```sh
+cargo fmt --all -- --check
+cargo test --locked --workspace --all-targets
+cargo clippy --locked --workspace --all-targets --all-features -- \
+  -D warnings -W clippy::pedantic
+RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps
+test -z "$(git status --porcelain=v1 --untracked-files=all)"
+empty_tree=$(git hash-object -t tree /dev/null)
+git diff --check "$empty_tree" HEAD -- .
+actionlint .github/workflows/*.yml
+```
+
+- [ ] The commit is clean, tagged intentionally, and contains no test secret,
+      canary, generated cache, build directory, editor profile, or real vault.
+- [ ] `Cargo.lock`, VS Code `pnpm-lock.yaml`, and packaging-tool lockfile are
+      committed and match the build.
+- [ ] Every third-party CI action is pinned to a reviewed immutable commit SHA;
+      a moving major-version tag is not a reproducible supply-chain pin.
+- [ ] Linux x64, Linux arm64, Windows x64 MSVC, and Windows arm64 native jobs all
+      run the applicable suite; a cross target is supplemental only.
+- [ ] Frozen EDRY fixtures are byte-identical across targets and are opened
+      without rewrite.
+- [ ] Unknown format/protocol/required-feature fixtures fail closed.
+- [ ] Native filesystem cases cover links/reparse points, mount boundaries,
+      case aliases, long paths, atomic replace, durability classification, and
+      recovery after injected interruption.
+- [ ] A release build reports the reviewed libsodium version and is rebuilt
+      offline from a populated, locked dependency cache.
+
+## CLI, import, and backup gate
+
+- [ ] Wrong password/slot, metadata tamper, weak KDF warning/resource ceiling,
+      password add/change/remove, and "change committed, retirement deferred"
+      recovery pass on each native platform.
+- [ ] Conflicting `vault.json` versions are preserved and recovered by selecting
+      one authenticated whole version plus CLI slot recreation; documentation
+      and tests never suggest line-merging authenticated metadata.
+- [ ] `inex verify` documentation and output remain explicit that it mutates
+      recovery state and is structural, not authenticated.
+- [ ] A disposable import covers dry-run, Unicode/newlines/empty/max-size files,
+      skipped attachments, links/junctions, overlap, source mutation, existing
+      destination, disk faults, publication ambiguity, and marker cleanup
+      failure.
+- [ ] Source hashes remain unchanged in every import result.
+- [ ] A successful final-artifact import is committed, backed up, restored to a
+      new path, unlocked, and byte-compared before the source is retired.
+- [ ] Documentation and help continue to reject in-place conversion and import
+      into an existing vault; no release material implies otherwise.
+- [ ] Backup/restore covers `vault.json`, all EDRY files, Git objects/refs, local
+      driver reinstall, and failure-state preservation of `.vault-local`.
+
+## Git gate
+
+- [ ] Fresh clones before and after explicit `inex git install-driver` are
+      tested; only local config changes locally, while managed attributes and
+      ignore rules travel in Git.
+- [ ] The installed driver has one canonical absolute executable word, no
+      placeholders, no `PATH` lookup, and leaves every supplied path
+      byte/metadata unchanged while returning conflict.
+- [ ] Clean/conflicting diff3, add/add, delete/modify, Unicode/space/long path,
+      concurrent mutation, attribute override, and crash recovery pass.
+- [ ] Rename/modify is either implemented and passes the binding row, or the
+      PRD/acceptance/release scope is explicitly revised before release.
+- [ ] Plaintext/password/query/token canaries are absent from Git argv,
+      environment, stderr, object/journal/index/worktree artifacts, hooks, and
+      helper processes.
+- [ ] Native Windows verifies `core.longPaths`, index/object/worktree/journal
+      flush behavior, interrupted transition recovery, and power-loss policy.
+
+## VS Code gate
+
+Run the source gates first:
+
+```sh
+cd editors/vscode
+pnpm install --frozen-lockfile
+pnpm check
+pnpm test
+pnpm build
+pnpm test:extension:local
+pnpm test:extension:1.125
+```
+
+- [ ] Package one platform-specific VSIX per target with exactly one matching
+      regular `bin/<platform>-<architecture>/inexd[.exe]`.
+- [ ] Install each VSIX into a new persistent profile; do not use only
+      `extensionTestsLocationURI` test mode.
+- [ ] Exercise edit/undo/save/revert, dirty close, normal restart, forced kill,
+      backup restore, stale restore, lock/idle/daemon crash, search, headings,
+      links, backlinks, and etag conflict.
+- [ ] Exercise the actual InputBox/QuickPick UI for file/folder create, file
+      rename/delete, cancellation, validation, confirmation, dirty save-before-
+      rename, close refusal, collision, mutation I/O failure, and tree/tab
+      recovery. Direct production-action calls are strong checkpoint evidence
+      but do not prove mouse/keyboard UI wiring.
+- [ ] Repeat with relevant Hot Exit and Local History settings and scan the
+      vault, parent staging, temp, user/workspace storage, backup/history,
+      extension state, logs, telemetry, and crash roots.
+- [ ] Test Linux and native Windows with the exact advertised VS Code versions.
+- [ ] Confirm no plaintext `TextDocument`, backup identifier, URI, output
+      channel, memento, state, filename, log, or package member exists.
+- [ ] Treat JS/webview/VS Code memory wiping as best effort; make no deterministic
+      zeroization claim.
+
+Only after those checks pass may the VS Code client be called an MVP-supported
+artifact. Passing the current in-memory-storage Extension Host harness alone is
+insufficient.
+
+## Sublime gate
+
+Run the pure suite, then the exact-package black-box matrix:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=editors/sublime \
+  python3 -m unittest discover -s editors/sublime/tests -v
+```
+
+- [ ] Build 4200 is exact; the profile/data, cache, temp, D-Bus/X11 control,
+      package, and vault roots are isolated from the user's real profile.
+- [ ] The packaged regular `inexd` and external password helper paths are
+      exercised, not source-only test doubles for the binding flow.
+- [ ] Keyboard/menu Save, Save As, Save All, clipboard, HTML print/export,
+      preview, macro recording/save/playback, tab/window/application close,
+      project/non-project, draft matching/stale/corrupt, idle expiry, daemon and
+      plugin-host crash, and forced process kill are covered.
+- [ ] Markdown/folder create and clean active-file rename/delete cover success,
+      validation, collision, stale etag, cancellation, durability warning, and
+      residue; directory rename/delete remains explicitly unsupported or its
+      release scope is revised.
+- [ ] Plugin-host death is tested as distinct states: while dead, an already
+      visible marked buffer can remain visible and be actively copied; exact
+      Build 4200 does not restart the host in-process, so a full application
+      restart is required. Plugin-load marker scrubbing must complete before
+      editing or block the client, but may not be presented as an observed
+      same-process crash-reload path. Documentation never calls the host-dead
+      state fail-safe or a crash-erasure pass.
+- [ ] A unique dynamic canary scan covers content, filenames, UTF-8/UTF-16,
+      base64/base64url, hex, fragments, logs, sessions, workspace, Cache, Index,
+      temp, drafts, control roots, and vault.
+- [ ] The report contains only fixed event names, booleans, lengths, counts,
+      and digests; no managed text is uploaded or logged.
+- [ ] The complete matrix passes on every advertised OS and exact package hash.
+
+Until every item passes, the word **experimental** must remain in the package,
+README, UI status, and release notes.
+
+## Packaging, provenance, and license gate
+
+The packaging helpers produce one native platform set:
+
+```sh
+test "$(python3.13 --version)" = "Python 3.13.14"
+pnpm --dir editors/vscode install --frozen-lockfile
+pnpm --dir packaging/vsce install --frozen-lockfile
+pnpm --dir editors/vscode build
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=scripts \
+  python3.13 -m unittest discover -s scripts/tests -v
+PLATFORM=linux-x64
+NATIVE_TARGET_DIR=/absolute/native-release-binary-directory
+VSCODE_CLI=/absolute/vscode-1.125.0-cli
+PYTHONPATH=scripts python3.13 scripts/package_release.py --platform "$PLATFORM" \
+  --target-dir "$NATIVE_TARGET_DIR"
+PYTHONPATH=scripts python3.13 scripts/audit_release_artifacts.py \
+  "target/release-artifacts/$PLATFORM"
+PYTHONPATH=scripts python3.13 scripts/audit_native_dependencies.py \
+  --platform "$PLATFORM" "$NATIVE_TARGET_DIR/inex" "$NATIVE_TARGET_DIR/inexd"
+PYTHONPATH=scripts python3.13 scripts/smoke_release_artifacts.py \
+  "target/release-artifacts/$PLATFORM" --vscode-cli "$VSCODE_CLI"
+```
+
+On the current Linux x64 host, release-tool tests pass 19/19. A system-GCC
+repackage passes the artifact and native-dependency audits plus VS Code 1.125.0 CLI
+install/bundled-sidecar smoke. Validation now covers VSIX control metadata,
+bounded regular ZIP members and Windows-portable path/mode collisions, exact
+workspace/tag parsing, canonical provenance, and PE32+ structure/import ranges;
+the original malformed-VSIX and ZIP bypass samples are rejected. Independent
+release-tool code review is GO. The hardened code has not yet completed a
+post-commit clean-source double build. The same helper rejects the xlings-default ELF
+because its interpreter/RUNPATH refers to the build user's xlings home. This is
+valuable local evidence, not a clean-tree, signed, native multi-platform
+release.
+
+- [ ] The helper scripts and pinned `@vscode/vsce` lockfile are committed,
+      reviewed, and tested on each native host.
+- [ ] Rust ZIP, platform VSIX, and unpacked Sublime-package ZIP contain only the
+      explicit allowlist, matching native daemon, project license, package
+      manifest, checksums, and third-party notices.
+- [ ] Each offline artifact includes (or embeds a self-contained equivalent of)
+      its installation, security, backup/recovery, upgrade, troubleshooting,
+      and status documentation; every relative documentation link resolves
+      inside the artifact or is an intentional absolute release URL.
+- [ ] The Sublime artifact is documented as an **unpacked package** because its
+      child daemon must be a real executable file; no compressed
+      `.sublime-package` claim is made.
+- [ ] SHA-256 manifests, internal member hashes, source commit, dirty-state
+      policy, version, platform, and architecture are independently verified.
+- [ ] Rebuilding twice in clean environments produces the expected reproducible
+      result or every nondeterministic field is documented and signed.
+- [ ] The release inventory is generated from locked native-target dependencies;
+      all component license-file references resolve, and the bundled libsodium
+      version/license are verified at runtime and in the archive.
+- [ ] Project GPL-3.0-only terms, the collected Cargo license/NOTICE texts, and
+      bundled libsodium ISC are independently reviewed for legal completeness.
+      Successful automated collection is not legal approval.
+- [ ] Artifacts are installed and smoke-tested offline; creating a valid ZIP or
+      VSIX is not an install/runtime test.
+- [ ] Checksums and signatures are published through a channel distinct from
+      the artifact hosting path, with signing-key handling documented.
+
+## Documentation and release-note gate
+
+- [ ] README status, supported OS/architecture/editor versions, and known
+      limitations match the exact artifact evidence.
+- [ ] Threat model, visible metadata, memory/editor caveats, clipboard/search
+      output, and lack of password recovery are prominent.
+- [ ] Installation, copy import, per-clone Git setup, backup/restore, encrypted
+      conflict recovery, password-slot recovery, upgrade, rollback, and
+      troubleshooting have been rehearsed from the artifacts.
+- [ ] Release notes state EDRY/RPC versions, required Rust/Git/editor baselines,
+      bundled libsodium, fixed security issues, deferred features, and all
+      incompatible or unsupported states.
+- [ ] A private vulnerability reporting path and supported-version policy exist
+      before public distribution.
+- [ ] Every remaining acceptance-matrix exception is either closed or reflected
+      by an explicit PRD/threat-model scope change; no row is silently waived.
+
+## Promotion rules
+
+- **Core pre-alpha exit** requires all non-editor rows through session lifecycle
+  plus compatibility on native Linux and Windows.
+- **VS Code MVP support** additionally requires encrypted-draft and persistent
+  packaged VS Code residue rows.
+- **Sublime support** requires its exact package/build/platform residue row;
+  functional unit tests cannot promote it.
+- **GA** requires Git, import, upgrade, packaging, recovery documentation,
+  license notices, and reproducible/offline release evidence.
+
+If evidence is missing, stale, from a different hash, from Wine instead of
+native Windows, or from an unpackaged source tree instead of the final artifact,
+the corresponding item remains unchecked.

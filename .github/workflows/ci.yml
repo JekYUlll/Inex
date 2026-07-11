@@ -1,0 +1,207 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  rust-quality:
+    name: Rust quality and tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Install exact Rust toolchain
+        run: |
+          rustup set profile minimal
+          rustup toolchain install 1.97.0 --component clippy --component rustfmt
+          rustup override set 1.97.0
+          rustc --version --verbose
+          cargo --version --verbose
+      - name: Verify formatting
+        run: cargo fmt --all -- --check
+      - name: Test workspace
+        run: cargo test --workspace --all-targets --locked
+      - name: Lint workspace
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Build warning-free documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --locked
+      - name: Record pinned libsodium binding
+        run: cargo tree --locked -p libsodium-sys-stable --depth 0
+
+  rust-native:
+    name: Rust ${{ matrix.platform }} ${{ matrix.mode }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64
+            runner: ubuntu-24.04
+            mode: test
+          - platform: windows-x64
+            runner: windows-2025
+            mode: test
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+            mode: compile
+          - platform: windows-arm64
+            runner: windows-11-arm
+            mode: compile
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 50
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Install exact native Rust toolchain
+        shell: bash
+        run: |
+          rustup set profile minimal
+          rustup toolchain install 1.97.0 --component clippy
+          rustup override set 1.97.0
+          rustc --version --verbose
+      - name: Install exact Python for pinned MSVC input
+        if: startsWith(matrix.platform, 'windows-')
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: 3.13.14
+      - name: Fetch hash-pinned libsodium MSVC inputs
+        if: startsWith(matrix.platform, 'windows-')
+        shell: bash
+        run: python scripts/fetch_libsodium_dist.py target/libsodium-dist --github-env
+      - name: Run native tests
+        if: matrix.mode == 'test'
+        shell: bash
+        run: cargo test --workspace --all-targets --locked
+      - name: Compile all native test targets
+        if: matrix.mode == 'compile'
+        shell: bash
+        run: cargo test --workspace --all-targets --locked --no-run
+
+  vscode-unit:
+    name: VS Code static and unit gates
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: editors/vscode
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Install exact Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.23.1
+      - name: Install exact pnpm
+        run: npm install --global pnpm@10.32.1
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Type-check
+        run: pnpm check
+      - name: Run unit and residue-scanner tests
+        run: pnpm test
+      - name: Build production bundle
+        run: pnpm build
+
+  vscode-extension-host:
+    name: VS Code ${{ matrix.vscode }} Extension Host
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        vscode: [1.125.0, 1.126.0]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Install exact Rust toolchain
+        run: |
+          rustup set profile minimal
+          rustup toolchain install 1.97.0
+          rustup override set 1.97.0
+      - name: Install exact Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.23.1
+      - name: Install exact pnpm
+        run: npm install --global pnpm@10.32.1
+      - name: Install locked extension dependencies
+        working-directory: editors/vscode
+        run: pnpm install --frozen-lockfile
+      - name: Build test host and native sidecars
+        run: |
+          pnpm --dir editors/vscode build
+          pnpm --dir editors/vscode test:extension:build
+          cargo build --locked -p inex-cli -p inex-daemon
+      - name: Run isolated Extension Host residue gate
+        run: xvfb-run -a node editors/vscode/test/runIntegration.mjs --version=${{ matrix.vscode }}
+
+  sublime-pure:
+    name: Sublime pure tests (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64
+            runner: ubuntu-24.04
+          - platform: windows-x64
+            runner: windows-2025
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Install exact Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: 3.8.18
+      - name: Run pure-Python plugin tests
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          PYTHONPATH: editors/sublime
+        run: python -m unittest discover -s editors/sublime/tests -v
+
+  release-tooling:
+    name: Release tooling invariants
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Install exact Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: 3.13.14
+      - name: Test deterministic archive and audit helpers
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          PYTHONPATH: scripts
+        run: python -m unittest discover -s scripts/tests -v

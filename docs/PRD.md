@@ -3,9 +3,11 @@
 ## Product statement
 
 Inex lets a person edit a Git-synchronized Markdown journal in VS Code or
-Sublime Text while keeping all repository and filesystem content encrypted at
-rest. The editor renders a virtual plaintext view backed by a local Rust
-sidecar; it never works from a plaintext mirror directory.
+Sublime Text while keeping every managed Markdown body encrypted at rest.
+Vault metadata, directory names, file basenames, sizes, timestamps, and Git
+history shape remain visible in v1. The editor renders a controlled plaintext
+view backed by a local Rust sidecar; it never works from a plaintext mirror
+directory.
 
 ## Personas and primary workflow
 
@@ -43,9 +45,9 @@ on Windows and Linux and uses Git for history/synchronization.
 | P1-01 | Unlock/lock and clear session state. | Required | Required |
 | P1-02 | Browse logical folders and files. | Tree View | Quick Panel |
 | P1-03 | Open/edit/save Markdown without a plaintext mirror or editor backup. | Custom editor + encrypted draft backup | Scratch buffer + encrypted draft (experimental until residue gate passes) |
-| P1-04 | Create, rename, and delete logical entries. | Required | Command based |
+| P1-04 | Create logical Markdown files/folders and rename/delete Markdown files. Multi-file directory rename/delete is deferred. | Required | Command based |
 | P1-05 | Search plaintext using a memory-only index. | Secure extension panel | Results Quick Panel |
-| P1-06 | Follow relative Markdown/wiki links and headings. | Providers | Commands |
+| P1-06 | Follow relative Markdown/wiki links and headings. | Custom-editor navigation/buttons | Commands |
 | P1-07 | Detect or clearly warn about editor persistence risks. | Required | Required |
 | P1-08 | Work with normal Git status/commit/pull/push on ciphertext. | Native Git workspace | External/native Git |
 
@@ -62,6 +64,8 @@ on Windows and Linux and uses Git for history/synchronization.
 - encrypted filenames/directories;
 - attachment streaming/chunked encryption;
 - encrypted on-disk search index;
+- multi-file directory rename/delete transactions;
+- a bulk plaintext export command;
 - OS keychain persistence and a multi-process shared unlock daemon;
 - VS Code proposed/native Search provider integration;
 - advanced resistance to memory/swap/dump inspection.
@@ -76,7 +80,8 @@ on Windows and Linux and uses Git for history/synchronization.
 - KDF work must not block editor UI threads. Unlock progress can be cancelled
   only before or after the non-interruptible library call.
 - Errors are stable machine-readable codes with human-safe messages.
-- A vault remains verifiable and exportable from the CLI without either editor.
+- A vault remains structurally verifiable and administrable from the CLI
+  without either editor. Plaintext export is not implemented in v1.
 - Initial GA support is local filesystems only; network filesystem locking and
   replace semantics are not assumed safe.
 

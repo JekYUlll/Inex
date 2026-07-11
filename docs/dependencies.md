@@ -6,7 +6,9 @@
   freezes Unicode 17 NFC/case behavior; Rust 1.97 is the first verified project
   baseline whose standard-library Unicode tables match that contract. The
   pinned libsodium build chain itself requires at least Rust 1.88.
-- `Cargo.lock` is committed for reproducible application/extension binaries.
+- `Cargo.lock` is committed to freeze resolved Rust inputs. A lockfile alone
+  does not make compiler, linker, native library, or final archive bytes
+  reproducible.
 - Wire-format and cryptographic dependencies are exact-pinned; ordinary
   serialization/error/helper dependencies use compatible semver ranges and are
   frozen transitively by the lockfile.
@@ -44,12 +46,88 @@ operations limit 3. Readers validate a resource ceiling before calling sodium.
 - Release builds use the pinned crate's bundled/static path, not a drifting
   system pkg-config dependency. Distribution builds do not enable moving
   `fetch-latest`, host-specific `optimized`, or API-reducing `minimal` features.
-- CI records `sodium_version_string()` and runs an offline clean rebuild from a
-  populated dependency cache.
+- The configured CI is intended to record `sodium_version_string()` and run an
+  offline clean rebuild from a populated dependency cache. Its four platform
+  workflows have not yet been pushed/run, so this is not current evidence.
 - Linux builders require a C compiler, make, and shell. Windows uses MSVC
   artifacts/source paths supplied and verified by the pinned sys crate.
 - Linux/Windows x64 are the first blocking matrix; Linux/Windows arm64 join
   before GA. Format fixtures must be byte-identical on every target.
+- The release-tool suite passes 19/19, `actionlint` and pedantic/all-features
+  Clippy pass, and independent code review is GO. A local system-GCC Linux x64
+  repackage passes strict ELF/archive/native-dependency audit and executable/
+  VSIX sidecar smoke; a post-hardening clean-source double build remains
+  pending. The xlings-default local ELF embeds its build-home interpreter/
+  RUNPATH and is correctly rejected as non-portable.
+
+## License inventory and distribution obligations
+
+Inex itself is `GPL-3.0-only`. The following table records the direct external
+Rust dependencies resolved by the current manifests; `Cargo.lock` remains the
+authority for exact transitive versions in a particular artifact.
+
+| Component | Current license expression | Distribution role |
+|-----------|----------------------------|-------------------|
+| `libsodium-sys-stable 1.24.0` | MIT OR Apache-2.0 | Rust FFI/build wrapper |
+| bundled libsodium 1.0.22 | ISC | Native cryptographic implementation linked into release binaries |
+| `minicbor 2.2.2` | BlueOak-1.0.0 | Deterministic CBOR |
+| `zeroize 1.9.0` | Apache-2.0 OR MIT | Best-effort owned-buffer wiping |
+| `diffy 0.5.0` | MIT OR Apache-2.0 | In-memory diff3 |
+| `rpassword 7.5.4` | Apache-2.0 | Hidden CLI terminal input |
+| `base64`, `serde`, `serde_json`, `sha2`, `thiserror`, `unicode-normalization`, `uuid` | MIT/Apache-2.0 combinations | Encoding, metadata, errors, hashes, Unicode, and identifiers |
+
+Resolved transitive Cargo metadata also contains permissive license
+families including 0BSD, Apache-2.0 (some with LLVM exception), BlueOak-1.0.0,
+ISC, MIT, Unicode-3.0, Unlicense, and Zlib, plus disjunctive expressions that
+must be resolved deliberately for distribution. Release inventory generation
+filters the locked dependency graph to normal/build packages reachable for the
+selected native target instead of treating every cross-target lock entry as
+shipped.
+
+The shipped VS Code bundle has no npm runtime package dependency: it uses Node
+built-ins and the host-provided `vscode` API. Its pinned TypeScript, esbuild,
+type, test-electron, and packaging dependencies are build/test tools and are
+not copied into the curated VSIX. The Sublime runtime uses Python's standard
+library and the host-provided Sublime API. Build-tool exclusion from a package
+does not remove the need to review those tools' licenses and provenance in the
+release process.
+
+| Direct editor/release tool | Locked version | Declared license | Shipped in curated artifact |
+|----------------------------|----------------|------------------|-----------------------------|
+| `@types/node` | 26.1.1 | MIT | no |
+| `@types/vscode` | 1.125.0 | MIT | no |
+| `@vscode/test-electron` | 3.0.0 | MIT | no |
+| `esbuild` | 0.28.1 | MIT | no |
+| `typescript` | 7.0.2 | Apache-2.0 | no |
+| `@vscode/vsce` | 3.9.2 | MIT | no; packaging process only |
+
+The packaging helper generates `THIRD_PARTY_LICENSES.json` from locked offline
+native-target Cargo metadata, including names, versions, license expressions,
+source, available registry checksums, and per-component archive paths. It also
+collects the referenced complete license/NOTICE files into
+`THIRD_PARTY_LICENSE_TEXTS/` and fails if a resolved component has no acceptable
+text. The verified Linux x64 candidate contains 77 Cargo components, 146 Cargo
+license/NOTICE files, and the bundled libsodium 1.0.22 ISC file: 147 collected
+texts total. The Rust ZIP, VSIX, and unpacked Sublime ZIP all passed the archive
+license-reference audit.
+
+Automated collection is not legal approval. Before public distribution, the
+release owner must still:
+
+1. resolve every `OR`/`AND` expression under a documented license-choice policy;
+2. independently review attribution and redistribution obligations;
+3. repeat inventory/text collection and final-archive audit for each native
+   target;
+4. verify the actual linked libsodium version and ISC text;
+5. retain the exact lockfiles, source commit, package manifest, checksums,
+   signature, and reviewed license report used for that artifact; and
+6. publish through the canonical repository
+   <https://github.com/JekYUlll/Inex> only after the private security-reporting
+   and supported-version policies exist.
+
+The engineering collection gate passes for the local Linux x64 checkpoint;
+independent legal review and public-release approval remain pending. This
+section is an engineering checklist, not legal advice.
 
 ## Git for Windows preflight
 
@@ -74,3 +152,5 @@ operations limit 3. Readers validate a resource ceiling before calling sodium.
 - https://doc.libsodium.org/memory_management
 - https://www.rfc-editor.org/rfc/rfc8949.html#section-4.2.1
 - https://github.com/bmwill/diffy/tree/0.5.0
+- https://spdx.org/licenses/
+- https://github.com/jedisct1/libsodium/blob/1.0.22/LICENSE

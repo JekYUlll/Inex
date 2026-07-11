@@ -1,5 +1,40 @@
 # Security Policy and Threat Model
 
+## Assurance status
+
+No Inex version is currently designated supported for security use. Version
+`0.1.0` is a pre-alpha development checkpoint. Linux unit/integration gates,
+cross-target/Wine checks, and controlled editor harnesses provide useful
+implementation evidence, but they do not satisfy native Windows/arm64,
+persistent-editor-profile, complete Sublime residue, signature, or public
+release gates.
+
+In particular:
+
+- a cross-compiled Windows binary or Wine run is not native MSVC/NTFS/ReFS
+  atomicity, long-path, crash, or residue evidence;
+- the VS Code Extension Host harness proves encrypted backup/recovery and
+  production CRUD-action behavior against a real daemon/custom editor, but its
+  workbench storage is forced in-memory, and InputBox/QuickPick mouse interaction
+  is not automated; it does not prove persistent cross-process Hot Exit or
+  Local History behavior;
+- the Sublime pure suite passes 61/61 and an exact Build 4200 normal E2E drives
+  unlock/open/edit/save/close plus folder/file create, rename, and etag-bound delete,
+  with authenticated tree checks and zero scanned disk residue. Killing the
+  plugin host still leaves the visible buffer actively copyable and requires a
+  full Sublime restart; the client therefore remains experimental until the
+  complete package canary matrix passes; and
+- release-tool tests pass 19/19, `actionlint` and pedantic/all-features Clippy
+  pass, and independent release-tool code review is GO. A system-GCC Linux x64
+  repackage passes strict archive/native-dependency audit plus VS Code 1.125.0
+  CLI install/bundled-sidecar smoke. This local result is not yet a
+  post-hardening clean-source double build, native Windows/arm64,
+  persistent-profile, signed, or independent release evidence.
+
+The current evidence and blockers are maintained in
+[`docs/release-checklist.md`](docs/release-checklist.md). Do not use Inex as the
+only copy of important data.
+
 ## Supported security goal
 
 An Inex vault protects Markdown bodies at rest from ordinary local access by a
@@ -40,6 +75,38 @@ swap/hibernation remain recommended.
 6. Git diff/merge artifacts remain encrypted, including unresolved conflict
    text.
 
+These are invariants of Inex-owned code and artifacts. They do not claim that
+another editor extension, clipboard manager, screen recorder, accessibility
+service, backup agent, terminal transcript, debugger, or operating-system
+facility cannot copy plaintext while a vault is unlocked.
+
+## Credentials and operational disclosure
+
+Passwords are exact UTF-8 bytes and are not normalized or trimmed. There is no
+password reset, escrow, recovery key, or backdoor. A usable backup requires the
+matching `vault.json`, ciphertext, and at least one valid password slot/password.
+
+CLI password and query input must not be placed in argv or environment values.
+The explicit stdin modes are intended for controlled automation, but the pipe
+and supplying process become part of the trusted boundary. `inex search`
+prints plaintext match snippets to stdout; terminal scrollback, redirection,
+and transcript capture are therefore plaintext disclosure surfaces.
+
+Vault directory names, file basenames, file sizes, timestamps, document count,
+Git history shape, and access timing are visible in v1. Do not put secrets in a
+logical path, branch name, commit message, remote URL, package filename, error
+report, or backup label. Git gives versioned ciphertext availability, not
+rollback protection against replacing the repository with an older valid
+state.
+
+Password add/change/remove operations rewrap the same stable master key; they
+are not master-key rotation. A person who retains an older `vault.json` from Git
+history or backup and knows its old password can recover that master key and
+decrypt later same-epoch EDRY files. Removing a current slot therefore does not
+revoke historical access. Master-key rotation and a supported re-encryption
+migration are not implemented in this checkpoint; treat a disclosed password
+plus historical metadata as a vault-key compromise.
+
 ## Editor caveat
 
 The sidecar can control its own storage, but it cannot prove that another
@@ -51,9 +118,18 @@ the writable journal as an ordinary TextDocument/FileSystemProvider. The client
 also audits relevant persistence settings and runs release-time residue tests.
 The Sublime client uses scratch buffers and self-managed encrypted drafts,
 requires safe application-global persistence settings before writable mode,
-and remains experimental until equivalent black-box residue tests pass. Its API
-cannot veto every application-exit path, so safety takes precedence over
-guaranteeing the final unsent keystrokes survive an abrupt exit.
+and marks managed plaintext views with a fixed non-secret setting. Plugin-load
+code and pure tests require orphaned marked views to be scrubbed before editing
+resumes, or the client blocks. Exact Build 4200 black-box evidence shows a
+hard boundary: after the plugin host is killed, Sublime does not restart it in
+the same editor process. No Inex code is then running, the already open buffer
+remains visible and actively copyable, and the user must restart the entire
+Sublime application to end that editor-process plaintext lifetime. The marker
+is a load-time defense, not observed same-process crash recovery or
+instantaneous containment. Sublime remains experimental until the complete
+black-box residue matrix passes. Its API cannot veto every application-exit
+path, so safety takes precedence over guaranteeing the final unsent keystrokes
+survive an abrupt exit.
 
 ## Cryptographic design
 
@@ -68,11 +144,18 @@ guaranteeing the final unsent keystrokes survive an abrupt exit.
 
 Changing a password rewraps the stable master key and does not rewrite journal
 files. Master-key rotation is represented by a key epoch and is a distinct,
-explicit migration.
+explicit migration that is not implemented by the current CLI.
 
 ## Reporting vulnerabilities
 
 Do not include real passwords, keys, plaintext journals, session tokens, or
 vaults in an issue. Until a private reporting channel is published, create a
-minimal report stating that a security issue exists and request a private
-contact path.
+minimal report stating that a security issue exists, the affected Inex/editor
+version and platform, and request a private contact path. Do not include a
+plaintext canary body; a path category and digest are sufficient for initial
+triage.
+
+Public distribution remains blocked until a private reporting path and a
+supported-version policy are published. Security fixes must retain a minimal
+reproducer using synthetic data, update the acceptance matrix, and rerun the
+exact native/package/editor gate affected by the issue.

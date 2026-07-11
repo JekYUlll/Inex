@@ -44,7 +44,7 @@ vault/
   .gitignore
   2026/07/2026-07-10.md.enc
   topics/example.md.enc
-  .vault-local/          ignored; non-secret logs/config only
+  .vault-local/          ignored; plaintext-free locks/recovery metadata/tombstones
 ```
 
 Logical `2026/07/2026-07-10.md` maps to physical
@@ -126,12 +126,13 @@ The editor must ask the user to reload/compare through a protected view.
 
 An ordinary writable virtual TextDocument is not the primary editor surface.
 VS Code's working-copy backup tracker can persist modified working copies even
-when Hot Exit is disabled. The Inex extension therefore registers an `inex:`
-CustomEditorProvider whose document model and undo state remain controlled by
-the extension/webview. Its `backupCustomDocument` implementation asks `inexd`
-to encrypt the unsaved draft, then writes only that EDRY ciphertext to the
-backup destination supplied by VS Code. Restore presents a locked document
-until the vault is unlocked and the backup authenticates.
+when Hot Exit is disabled. The Inex extension therefore registers the
+`inex.markdownEditor` CustomEditorProvider for real `file:` resources matching
+`**/*.md.enc`; its document model and undo state remain controlled by the
+extension/webview. Its `backupCustomDocument` implementation asks `inexd` to
+encrypt the unsaved draft, then writes only that EDRY ciphertext to the backup
+destination supplied by VS Code. Restore presents a locked document until the
+vault is unlocked and the backup authenticates.
 
 The extension never places plaintext in webview persisted state, workspace
 state, global state, logs, telemetry, or command arguments. Markdown links,
