@@ -3,18 +3,22 @@ from __future__ import annotations
 import json
 import os
 import stat
+import sys
 import tempfile
+import time
 import unittest
 
 from inex_rpc import (
     ERROR_CONTRACT,
     MAX_FRAME_BYTES,
+    MAX_PIPE_READ_BYTES,
     FrameDecoder,
     InexRpcClient,
     MAX_PENDING_CALLS,
     RpcLifecycleError,
     RpcProtocolError,
     RpcRemoteError,
+    _read_pipe_once,
     decode_base64url,
     encode_request,
     resolve_sidecar,
@@ -83,6 +87,54 @@ class FrameTests(unittest.TestCase):
         encoded = frame({"jsonrpc": "2.0", "id": 1, "result": value})
         with self.assertRaises(RpcProtocolError):
             FrameDecoder().feed(encoded)
+
+
+class PipeReadTests(unittest.TestCase):
+    def test_read1_is_bounded_retries_interrupt_and_reports_eof(self):
+        class InterruptedThenData:
+            def __init__(self):
+                self.calls = 0
+
+            def read1(self, maximum):
+                self.calls += 1
+                self.maximum = maximum
+                if self.calls == 1:
+                    raise InterruptedError()
+                return b"fragment"
+
+        stream = InterruptedThenData()
+        self.assertEqual(_read_pipe_once(stream), b"fragment")
+        self.assertEqual(stream.calls, 2)
+        self.assertEqual(stream.maximum, MAX_PIPE_READ_BYTES)
+
+        class Eof:
+            def read1(self, maximum):
+                return b""
+
+        self.assertEqual(_read_pipe_once(Eof()), b"")
+
+        class Oversized:
+            def read1(self, maximum):
+                return b"x" * (maximum + 1)
+
+        with self.assertRaisesRegex(RpcLifecycleError, "invalid chunk"):
+            _read_pipe_once(Oversized())
+
+    def test_os_read_fallback_returns_short_fragment_while_pipe_stays_open(self):
+        read_descriptor, write_descriptor = os.pipe()
+        stream = os.fdopen(read_descriptor, "rb", buffering=0)
+        try:
+            os.write(write_descriptor, b"short")
+            started = time.monotonic()
+            self.assertEqual(_read_pipe_once(stream), b"short")
+            self.assertLess(time.monotonic() - started, 0.5)
+            os.close(write_descriptor)
+            write_descriptor = -1
+            self.assertEqual(_read_pipe_once(stream), b"")
+        finally:
+            if write_descriptor >= 0:
+                os.close(write_descriptor)
+            stream.close()
 
 
 class RequestAndResponseTests(unittest.TestCase):
@@ -242,6 +294,97 @@ class ClientBoundTests(unittest.TestCase):
         client._process = process
         client._call_raw("system.ping", {})
         self.assertEqual(activities, ["renew"])
+
+    def test_stdout_eof_and_reader_failures_are_terminal(self):
+        class Eof:
+            def read1(self, maximum):
+                return b""
+
+        eof_client = InexRpcClient("/unused")
+        eof_process = self.SilentProcess()
+        eof_process.stdout = Eof()
+        eof_client._process = eof_process
+        eof_client._read_stdout()
+        self.assertTrue(eof_process.killed)
+        self.assertIsInstance(eof_client._terminal_error, RpcLifecycleError)
+
+        class Oversized:
+            def read1(self, maximum):
+                return b"x" * (maximum + 1)
+
+        stdout_client = InexRpcClient("/unused")
+        stdout_process = self.SilentProcess()
+        stdout_process.stdout = Oversized()
+        stdout_client._process = stdout_process
+        stdout_client._read_stdout()
+        self.assertTrue(stdout_process.killed)
+        self.assertIsInstance(stdout_client._terminal_error, RpcLifecycleError)
+
+        class Broken:
+            def read1(self, maximum):
+                raise RuntimeError("broken pipe reader")
+
+        stderr_client = InexRpcClient("/unused")
+        stderr_process = self.SilentProcess()
+        stderr_process.stderr = Broken()
+        stderr_client._process = stderr_process
+        stderr_client._drain_stderr()
+        self.assertTrue(stderr_process.killed)
+        self.assertIsInstance(stderr_client._terminal_error, RpcLifecycleError)
+
+    @unittest.skipUnless(os.name == "posix", "requires an executable script")
+    def test_real_short_fragmented_frame_decodes_while_child_keeps_pipes_open(self):
+        hello = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "server": "inexd",
+                "serverVersion": "test",
+                "protocolMajor": 1,
+                "capabilities": sorted(InexRpcClient.REQUIRED_CAPABILITIES),
+            },
+        }
+        encoded = frame(hello)
+        diagnostic = b"short-stderr"
+        with tempfile.TemporaryDirectory() as root:
+            executable = os.path.join(root, "short-frame-child")
+            script = (
+                "#!%s\n"
+                "import os, time\n"
+                "payload = %r\n"
+                "os.write(1, payload[:7])\n"
+                "time.sleep(0.05)\n"
+                "os.write(1, payload[7:])\n"
+                "os.write(2, %r)\n"
+                "time.sleep(5)\n"
+            ) % (sys.executable, encoded, diagnostic)
+            with open(executable, "w", encoding="utf-8", newline="\n") as stream:
+                stream.write(script)
+            os.chmod(executable, 0o700)
+
+            client = InexRpcClient(executable, timeout_seconds=1.5)
+            started = time.monotonic()
+            try:
+                result = client.start("test")
+                self.assertEqual(result["server"], "inexd")
+                self.assertLess(time.monotonic() - started, 1.0)
+                self.assertIsNotNone(client._process)
+                self.assertIsNone(client._process.poll())
+                deadline = time.monotonic() + 1.0
+                while (
+                    client._stderr_bytes < len(diagnostic)
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.01)
+                self.assertEqual(client._stderr_bytes, len(diagnostic))
+            finally:
+                process = client._process
+                client.dispose()
+                if process is not None:
+                    process.wait(timeout=2.0)
+                    for pipe in (process.stdin, process.stdout, process.stderr):
+                        if pipe is not None:
+                            pipe.close()
 
 
 if __name__ == "__main__":

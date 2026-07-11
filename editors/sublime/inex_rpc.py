@@ -21,6 +21,7 @@ MAX_HEADER_BYTES = 8 * 1024
 MAX_PENDING_CALLS = 128
 MAX_OUTSTANDING_FRAME_BYTES = MAX_FRAME_BYTES + 64 * 1024
 MAX_STDERR_BYTES = 64 * 1024
+MAX_PIPE_READ_BYTES = 64 * 1024
 MAX_DOCUMENT_BYTES = 16 * 1024 * 1024
 MAX_DRAFT_BYTES = MAX_DOCUMENT_BYTES + 12 + 4096 + 16
 REQUEST_TIMEOUT_SECONDS = 120.0
@@ -92,6 +93,28 @@ _UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
 _CAPABILITY_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+
+def _read_pipe_once(stream: Any) -> bytes:
+    """Return at most one available pipe chunk without waiting to fill it."""
+
+    while True:
+        try:
+            read_once = getattr(stream, "read1", None)
+            if read_once is not None:
+                if not callable(read_once):
+                    raise RpcLifecycleError("Inex sidecar pipe reader is invalid")
+                chunk = read_once(MAX_PIPE_READ_BYTES)
+            else:
+                descriptor = stream.fileno()
+                if isinstance(descriptor, bool) or not isinstance(descriptor, int):
+                    raise RpcLifecycleError("Inex sidecar pipe descriptor is invalid")
+                chunk = os.read(descriptor, MAX_PIPE_READ_BYTES)
+        except InterruptedError:
+            continue
+        if not isinstance(chunk, bytes) or len(chunk) > MAX_PIPE_READ_BYTES:
+            raise RpcLifecycleError("Inex sidecar pipe returned an invalid chunk")
+        return chunk
 
 
 def _valid_id(value: Any) -> bool:
@@ -781,15 +804,20 @@ class InexRpcClient:
             return
         try:
             while True:
-                chunk = process.stdout.read(65536)
+                chunk = _read_pipe_once(process.stdout)
                 if not chunk:
                     self._decoder.finish()
+                    self._fail_terminal(
+                        RpcLifecycleError("Inex sidecar stdout closed")
+                    )
                     return
                 for response in self._decoder.feed(chunk):
                     self._accept_response(response)
         except Exception as error:
             self._fail_terminal(
-                error if isinstance(error, Exception) else RpcLifecycleError("Inex sidecar stdout failed")
+                error
+                if isinstance(error, (RpcLifecycleError, RpcProtocolError))
+                else RpcLifecycleError("Inex sidecar stdout failed")
             )
 
     def _drain_stderr(self) -> None:
@@ -798,12 +826,12 @@ class InexRpcClient:
             return
         try:
             while True:
-                chunk = process.stderr.read(4096)
+                chunk = _read_pipe_once(process.stderr)
                 if not chunk:
                     return
                 # Count and discard. Never echo child stderr into console or UI.
                 self._stderr_bytes = min(MAX_STDERR_BYTES, self._stderr_bytes + len(chunk))
-        except OSError:
+        except Exception:
             self._fail_terminal(RpcLifecycleError("Inex sidecar stderr failed"))
 
     def _watch_process(self) -> None:
