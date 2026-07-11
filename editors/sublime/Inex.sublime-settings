@@ -1,5 +1,15 @@
 {
+  // Absolute ciphertext vault root. Relative paths are rejected.
+  "vault_path": "",
+
+  // Absolute inexd executable. If empty, only bin/inexd inside this package
+  // (bin/inexd.exe on Windows) is considered; PATH is never searched.
   "sidecar_path": "",
-  "draft_debounce_ms": 250,
-  "session_idle_minutes": 15
+
+  // Linux only. If empty, /usr/bin/zenity then /usr/local/bin/zenity are
+  // checked. An override must be an absolute, non-symlink regular executable.
+  "zenity_path": "",
+
+  // Bounded to 100..5000 ms by the client.
+  "draft_debounce_ms": 250
 }

@@ -1,5 +1,29 @@
 [
   {
+    "caption": "Inex: Unlock and Browse Vault",
+    "command": "inex_unlock"
+  },
+  {
+    "caption": "Inex: Browse Vault",
+    "command": "inex_browse"
+  },
+  {
+    "caption": "Inex: Search Vault",
+    "command": "inex_search"
+  },
+  {
+    "caption": "Inex: Show Markdown Headings",
+    "command": "inex_show_headings"
+  },
+  {
+    "caption": "Inex: Follow Relative/Wiki Link",
+    "command": "inex_follow_link"
+  },
+  {
+    "caption": "Inex: Lock Vault",
+    "command": "inex_lock"
+  },
+  {
     "caption": "Inex: Show Security Status",
     "command": "inex_show_security_status"
   }
