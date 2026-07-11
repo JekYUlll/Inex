@@ -27,10 +27,10 @@ Status terms in this document mean:
 
 | Area | Status | Evidence and exact boundary |
 |------|--------|-----------------------------|
-| Linux Rust workspace | verified checkpoint | 239/239 workspace tests after Git integration, plus rustfmt, pedantic clippy with warnings denied, rustdoc warnings denied, and whitespace checks |
+| Linux Rust workspace | verified checkpoint | 261/261 workspace tests after rename/modify hardening, plus rustfmt, all-features pedantic Clippy with warnings denied, rustdoc warnings denied, and whitespace checks |
 | EDRY/vault compatibility | checkpoint | Frozen v1 fixture rebuild/unlock/decrypt and broad format/path/tamper tests pass on Linux; Windows GNU compiles and earlier Wine suites pass, but this is not native Windows evidence |
 | Import | verified checkpoint | Copy-only absent-destination staging, re-open/seal/allowlist/publication, source-preservation, and failure-class tests pass; independent code review gave checkpoint GO |
-| Git | verified checkpoint | Locked-safe driver, local installer, real-repository plumbing, encrypted diff3, unresolved flag, plaintext-free metadata journal, recovery, attribute/identity/split-index/fsmonitor/lazy-fetch regressions pass on Linux; native Windows and cross-path rename/modify acceptance remain pending |
+| Git | verified checkpoint | Locked-safe driver, local installer, real-repository plumbing, encrypted diff3, unresolved flag, versioned plaintext-free journals, fixed tree provenance, full-width SHA-1/SHA-256 validation, detected/split rename/modify, owner drift rejection, and v1/v2/v3 recovery regressions pass on Linux; native Windows power-loss and a true cross-process index CAS remain pending |
 | VS Code unit/bundle | verified checkpoint | Strict TypeScript, 23/23 Node tests, production bundle, and integration bundle pass |
 | VS Code Extension Host | partial | The current local build and 1.125.0 directly drive the production create/folder-create/file-rename/file-delete actions plus encrypted backup/recovery against the daemon/custom editor. Close refusal, rename collision, Unix delete-I/O failure recovery, command registration, and isolated-root residue pass. InputBox/QuickPick mouse interaction is not automated, and test-mode workbench storage is in-memory, so persistent cross-process restore/Local History is unproven |
 | Sublime current source | partial | Pure-Python tests pass 61/61. An exact Build 4200 normal E2E drives unlock/open/edit/save/close and real-panel New Folder/New Markdown/rename/etag-delete through registered commands. Authenticated tree checks pass after each mutation; `folder_created`, `markdown_created`, `renamed`, and `deleted` are present, `crud_complete=true`, `vault_envelope=EDRY`, and `root_scan_hits=0`. The plugin-host SIGKILL probe remains `PASS_WITH_DOCUMENTED_BOUNDARY`: the visible buffer is copyable, the host does not restart in-process, a full Sublime restart is required, `vault_envelope=EDRY`, and roots scanned after application exit remain clean. Its `crud_complete=false` is intentional because the crash branch kills after open/edit/save; this is not crash-time plaintext erasure. The full packaged matrix is pending |
@@ -52,9 +52,10 @@ These are not documentation polish items; each changes the release decision:
 3. Complete the exact Sublime Build 4200 packaged open/edit/save/close/crash,
    macro/export/clipboard, draft, project/non-project, and canary residue matrix
    on every advertised OS.
-4. Resolve the GA contract for Git rename/modify conflicts. The current v1
-   implementation deliberately fails closed on cross-path identity; the
-   acceptance matrix still names rename/modify as required.
+4. Close the GA Git transaction boundary. Authenticated rename/modify now passes
+   Linux source and real-repository tests, but native Windows power-loss remains
+   unproven and external Git porcelain is forbidden because the final verified
+   index snapshot and `update-index` do not share a cross-process CAS/held lock.
 5. Build and smoke all four intended platform artifacts on their native target:
    Linux x64/arm64 and Windows x64/arm64. Verify executable architecture and
    dynamic/static native-library expectations, not only archive names.
@@ -144,8 +145,12 @@ target/tools/actionlint .github/workflows/*.yml
       byte/metadata unchanged while returning conflict.
 - [ ] Clean/conflicting diff3, add/add, delete/modify, Unicode/space/long path,
       concurrent mutation, attribute override, and crash recovery pass.
-- [ ] Rename/modify is either implemented and passes the binding row, or the
-      PRD/acceptance/release scope is explicitly revised before release.
+- [x] Rename/modify is implemented for exact detected and split Git shapes,
+      with fixed tree provenance, source-aware recovery, ambiguity rejection,
+      and Linux real-repository tests for both renamed sides.
+- [ ] Native supported filesystems reproduce rename recovery and power-loss
+      behavior; the no-parallel-Git boundary is either retained in supported
+      scope or replaced by a real index CAS before GA.
 - [ ] Plaintext/password/query/token canaries are absent from Git argv,
       environment, stderr, object/journal/index/worktree artifacts, hooks, and
       helper processes.

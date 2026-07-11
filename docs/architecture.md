@@ -161,11 +161,14 @@ and `/.vault-local/` rules by atomic metadata replacement and writes only
 
 `inex git merge <vault>` is the separate unlocked path. It reads stages through
 bounded `ls-files -u -z` and `cat-file blob` plumbing, authenticates every EDRY
-stage, and globally rejects a file identity assigned to multiple conflict paths
-before any merge write. It performs diff3 only in zeroizing process memory,
-writes only the new EDRY envelope to `hash-object -w --stdin`, and changes the
-worktree/index under a ciphertext-only
-`.vault-local/git-merge-journal-v1.json`. A clean result
+stage, proves rename provenance against the unique merge base plus exact
+`HEAD`/`MERGE_HEAD` trees, and rejects tracked or untracked third owners of the
+same file identity before any merge write. It performs diff3 only in zeroizing
+process memory, writes only the new EDRY envelope to
+`hash-object -w --stdin`, and changes the worktree/index under a
+ciphertext-only `.vault-local/git-merge-journal-v1.json`. The stable filename
+contains strict version 1 in-place, version 2 split-rename, or version 3
+detected-rename metadata. A clean result
 clears the merge flag. A conflict result contains encrypted diff3 markers and
 sets authenticated `ContentFlags::UNRESOLVED_MERGE`; a later ordinary editor
 save clears the flag only after all canonical marker lines have been removed.
@@ -175,11 +178,15 @@ finishes an interrupted worktree/index transition.
 Git is resolved to one absolute regular executable before use. Plumbing uses a
 fixed argument grammar, bounded stdin/stdout, a cleared environment with only
 fixed safe Git variables, `-c core.fsmonitor=false`, and lazy fetching disabled.
-Split indexes fail closed before mutation because the v1 recovery barrier covers
-one full `.git/index`. Diagnostics use scrubbed stderr and validated portable
-paths/modes/OIDs; no password, key, session token, or plaintext reaches Git.
-Fully automatic locked Git integration remains deferred until an authenticated
-local broker exists.
+Split indexes fail closed before mutation because the recovery barrier covers
+one full `.git/index`. Object IDs must match the repository's full SHA-1 or
+SHA-256 width; abbreviated prefixes are rejected. Diagnostics use scrubbed
+stderr and validated portable paths/modes/OIDs; no password, key, session token,
+or plaintext reaches Git. Fully automatic locked Git integration remains
+deferred until an authenticated local broker exists. No Git porcelain may run
+in parallel with merge/recovery: Git offers no compare-and-swap spanning the
+last verified index snapshot and `update-index`, so that race remains outside
+the pre-alpha guarantee.
 
 ## Failure principles
 

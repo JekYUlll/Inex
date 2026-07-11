@@ -99,6 +99,13 @@ report, or backup label. Git gives versioned ciphertext availability, not
 rollback protection against replacing the repository with an older valid
 state.
 
+Stop every editor-integrated or command-line Git operation before running
+`inex git merge` or `inex git recover`. Inex rechecks exact stages, worktree
+digests, authenticated owners, and fixed merge provenance, but Git provides no
+cross-process compare-and-swap between the last verified index snapshot and
+`update-index`. Concurrent external Git porcelain is outside the checkpoint
+guarantee and remains a GA transaction-boundary item.
+
 Password add/change/remove operations rewrap the same stable master key; they
 are not master-key rotation. A person who retains an older `vault.json` from Git
 history or backup and knows its old password can recover that master key and

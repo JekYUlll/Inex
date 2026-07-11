@@ -174,11 +174,17 @@ The unresolved marker body is encrypted at rest and its EDRY flag is
 authenticated. A normal editor save clears the flag only after all canonical
 marker lines are absent.
 
-The v1 unlocked merge supports bounded normal-file conflict stages. It fails
-closed on split index, unsafe Git directories, attribute overrides, non-regular
-modes, identity reuse, concurrent index/worktree changes, and unsupported
-cross-path rename/modify cases. Native Windows and the full rename/modify
-acceptance row remain pending release evidence.
+The v1 unlocked merge supports bounded normal-file stages plus authenticated
+rename/modify in two Git representations: a detected three-stage destination
+and a split delete/modify source with a stage-zero destination. A rename must be
+proved by the unique merge base and exact `HEAD`/`MERGE_HEAD` trees; historical
+copies, rename/rename, multiple merge bases, executable/mode disagreement, and
+ambiguous identities fail closed. Versioned source-aware journals recover both
+paths without deleting an unexpected source. Split indexes, unsafe Git
+directories, attribute overrides, non-regular modes, and observed concurrent
+changes also fail closed. Do not run other Git porcelain concurrently: the
+final `update-index` boundary has no cross-process compare-and-swap. Native
+Windows power-loss evidence for these transitions remains pending.
 
 ### Resolve a `vault.json` conflict
 

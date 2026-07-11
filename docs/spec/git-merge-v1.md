@@ -94,28 +94,44 @@ The password follows the normal hidden-TTY or bounded
 The workflow is:
 
 1. Reconcile one pending encrypted transaction, if present.
-2. Read `git ls-files -u -z` with a 64 MiB output and 100,000-conflict bound.
-3. Accept only canonical UTF-8 `*.md.enc` paths, ordinary `100644` modes,
-   and lowercase SHA-1/SHA-256
-   object IDs.
+2. Read `git ls-files -u -z` and one complete staged-index snapshot with a
+   64 MiB output and 100,000-conflict bound. Reject any physical path that has
+   both stage zero and stages 1/2/3; no update may silently replace an
+   unrecorded coexisting entry.
+3. Accept only canonical UTF-8 `*.md.enc` paths, ordinary `100644` modes, and
+   lowercase full-width object IDs matching the repository's frozen
+   `rev-parse --show-object-format` result. A SHA-256 repository never accepts
+   a 40-character prefix as a complete ID.
 4. Read each existing stage with `git cat-file blob <oid>`, bounded to the EDRY
    maximum, then authenticate vault id, epoch, logical path, committed kind,
    AEAD, and UTF-8 before exposing plaintext to diff3.
 5. Treat a missing stage as the empty side for add/add and delete/modify
-   conflicts. Use ours, then theirs, then ancestor as the stable EDRY file
-   identity source.
-6. Run pinned `diffy 0.5.0` diff3 in memory. Its returned `String` is wrapped in
+   conflicts. For a rename candidate, require one unique merge base and prove
+   the exact source/destination mode and object IDs in the base, `HEAD`, and
+   `MERGE_HEAD` trees. Only one side may move the authenticated identity; the
+   other side must modify the original source. Historical destinations,
+   copies, rename/rename, ambiguous identities, and multiple merge bases fail
+   closed.
+6. Revalidate the target file identity across the complete stage-zero index and
+   authenticated worktree. The only temporary duplicate allowed is the exact
+   source/destination pair of the active split-rename transaction; any third
+   tracked or untracked owner fails before mutation.
+7. Use ours, then theirs, then ancestor as the stable EDRY identity source and
+   run pinned `diffy 0.5.0` diff3 in memory. Its returned `String` is wrapped in
    `Zeroizing`; all authenticated stage plaintext allocations already zeroize.
-7. Encrypt with a fresh nonce. Clean output clears
+8. Encrypt with a fresh nonce. Clean output clears
    `UNRESOLVED_MERGE`; conflict-marker output sets it.
-8. Send only the complete encrypted result to
+9. Send only the complete encrypted result to
    `git hash-object -w --stdin`, read the named blob back byte-for-byte with
    replacement objects disabled, synchronize its loose object and directories.
-9. Recheck the exact index-stage snapshot and expected worktree ciphertext
-   SHA-256 under the Inex mutation lock, synchronize a recovery journal, then
-   atomically replace the worktree ciphertext and update stage zero via
-   `git update-index -z --index-info`.
-10. Re-read both worktree digest and index. Only then remove and synchronize the
+10. Recheck the relevant original index stages and stage-zero owners, fixed
+    merge provenance, and expected worktree ciphertext SHA-256 under the Inex
+    mutation lock, then synchronize a recovery journal. In-place conflicts and
+    detected renames conditionally replace the destination; split renames
+    replace the destination, conditionally delete the source, and publish
+    source removal plus destination stage zero in one NUL-delimited
+    `git update-index -z --index-info` batch.
+11. Re-read both worktree state and index. Only then remove and synchronize the
     journal. The Git index file and `.git` directory are explicitly synchronized
     first. Any `ParentSyncStatus::NotSynced` or Git/object/index barrier failure
     retains the journal and returns nonzero for authenticated recovery.
@@ -129,21 +145,24 @@ continue the Git operation. A normal file never gains the flag merely because
 its body contains marker-like text.
 
 Because every authenticated rename uses a fresh nonce and path-bound AAD, Git's
-ciphertext similarity heuristic cannot reliably identify rename/modify pairs.
-The merge pass inventories stage-zero EDRY file IDs, then authenticates every
-conflict stage in a global preflight and compares all identities against both
-that inventory and one another. If a conflicted identity exists at another
-logical path, it rejects the complete pass before writing rather than creating
-duplicate identities. Cross-path rename/modify,
-rename/rename, executable modes, and mode disagreements therefore remain
-unmerged for explicit user restructuring in this checkpoint. Split indexes are
-also rejected before merge mutation: an effective `core.splitIndex=true` or any
-top-level `.git/sharedindex.*` artifact fails closed because v1's durability
-barrier intentionally covers one full `.git/index`. Run no other Git porcelain
-in parallel with `inex git merge` or recovery: Git's own `index.lock`, exact
-pre/post stage checks, worktree SHA-256 conditions, and the Inex journal detect
-and fail on observed races, but Git exposes no cross-process compare-and-swap
-primitive spanning both its index and the worktree.
+ciphertext similarity heuristic is not trusted. Inex accepts both the detected
+three-stage destination shape and the split source-conflict/destination-stage0
+shape only after comparing their exact entries with the unique base,
+`HEAD`, and `MERGE_HEAD` trees. The journal fixes those commit IDs so a final
+index can still be verified after the user completes the merge commit and
+`MERGE_HEAD` disappears. Rename/rename, historical destination copies,
+multiple destinations/bases, executable modes, and mode disagreements remain
+unsupported and fail closed.
+
+Split indexes are rejected before merge mutation: an effective
+`core.splitIndex=true` or any top-level `.git/sharedindex.*` artifact fails
+closed because the durability barrier intentionally covers one full
+`.git/index`. Run no other Git porcelain in parallel with `inex git merge` or
+recovery. Exact pre/post stage checks, authenticated owner scans, worktree
+SHA-256 conditions, and the journal detect observed races, but Git exposes no
+cross-process compare-and-swap primitive spanning the last verified index and
+`update-index`. An external process in that final window is an explicit non-GA
+boundary, not a claimed fail-closed case.
 
 ## Subprocess boundary
 
@@ -167,13 +186,19 @@ is discarded and errors retain only a fixed operation category and
 
 ## Journal and recovery
 
-`.vault-local/git-merge-journal-v1.json` contains only:
+The stable filename `.vault-local/git-merge-journal-v1.json` contains one strict
+schema selected by its internal version: v1 for an in-place path, v2 for a
+split rename, and v3 for a detected rename. Depending on that schema it contains
+only:
 
-- the portable ciphertext path and regular mode;
-- the exact stage modes/object IDs;
-- the expected old worktree ciphertext SHA-256;
+- one portable ciphertext path, or exact source/destination paths and regular
+  mode;
+- exact original stage modes/full object IDs and the repository object format;
+- for rename transactions, side, authenticated file ID, and fixed
+  base/`HEAD`/`MERGE_HEAD` commit IDs;
+- expected original source/destination ciphertext state and SHA-256 digests;
 - the new encrypted object ID and ciphertext SHA-256; and
-- a format version.
+- the schema version.
 
 It never contains a password, key, session token, decrypted bytes, snippets, or
 conflict labels. The file is create-only, permission-restricted where supported,
@@ -197,10 +222,17 @@ Locked `inex verify <vault>` reports whether a structurally valid pending Git
 merge journal exists, but deliberately does not authenticate its result object
 or complete the transaction without a password.
 
-Recovery fetches the recorded Git blob, checks its ciphertext digest, and
-authenticates it with the unlocked vault before mutation. It accepts only four
-safe post-crash facts: original index stages or exact result stage zero, and
-original/absent worktree ciphertext or exact result ciphertext. It completes
-the missing side, verifies both, and removes the journal. Any other index,
-worktree, object, path, mode, or digest state reports a recovery conflict and is
+Recovery first validates every recorded ID against the repository object
+format, rechecks the fixed tree provenance, fetches the result blob, checks its
+ciphertext digest, and authenticates its path and file identity. It accepts only
+the schema's enumerated original, forward intermediate, or exact final
+index/worktree states. A detected rename requires the source to remain absent;
+a split rename may advance destination write, conditional source deletion, and
+the single index batch, never backward. Final-index recovery uses the fixed
+commit IDs and therefore does not require a still-present `MERGE_HEAD`. It
+revalidates tracked and untracked identity owners before worktree advancement,
+again before index publication, and in the final state, then removes the
+journal. Any other index, worktree,
+object, path, mode, owner, provenance, format, or digest state reports a
+recovery conflict and is
 left untouched for audit.

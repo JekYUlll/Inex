@@ -66,6 +66,11 @@
 - “精确路径存在”不等于“路径无别名”。Linux 可同时存在 `notes`/`NOTES` 或 Unicode full-fold 等价 sibling；direct read/save/delete 也必须枚举每级 parent，要求唯一 exact portable-casefold child，不能只在 list/create 时 tree-scan。
 - 文件 size/mtime/creation time 可被同步工具保留，不能作为 plaintext search cache 的安全 freshness key。每次 search query 在 mutation guard 内对当前完整 ciphertext 计算 SHA-256；任何外部 replacement、等长就地篡改或时间戳恢复都会先使索引失效。
 - Git for Windows 的产品 release notes 记录了 DOS `~digit` 名限制，而 Git core 的静态 path verifier 规则并不等价于“拒绝所有 8.3-looking name”。EDRY v1 只冻结明确的 basename-final `~0`–`~9` 保守互操作规则；Phase 6 需用真实 Git for Windows 测试。
+- EDRY rename 每次都会换 nonce，Git 的密文相似度不构成 provenance；相同 authenticated file-id 也可能来自历史副本。rename/modify 只能由唯一 merge-base 与固定 `HEAD`/`MERGE_HEAD` 的 source/destination mode+OID 精确树状态证明。
+- SHA-256 Git 会让 `cat-file` 接受唯一的 40 位十六进制前缀，因此“语法上允许 40 或 64 位”不足以安全恢复。Git wrapper 必须冻结仓库 object format，所有 index/tree/ref/result/journal OID 都要求对应完整宽度，zero OID 也从该宽度生成。
+- rename journal 必须区分 in-place v1、split v2 与 detected v3；固定 commit provenance 让 index 已 final 后即使 merge commit 删除 `MERGE_HEAD` 仍可清理 journal。检测型 rename 始终要求旧 source 不存在，split 只允许精确 S/D 暂态 owner，任何第三 tracked/untracked owner 在前滚前拒绝。
+- 重复读取 index 不能消除最后一次检查到 `git update-index` 的跨进程 race；在没有持有同一 `index.lock` 或候选 index CAS 前，“不得并行运行其他 Git porcelain”是产品边界，不能宣称任意外部 Git 并发均 fail-closed。
+- Git index plumbing 允许同一 physical path 同时出现 stage 0 与 stages 1/2/3；只读 `ls-files -u` 会漏掉前者，而 mode-zero rename batch 会删除全部 stages。全局预检和每个 original-state commit/recovery 判定都必须显式拒绝这种交集。
 
 ## Technical Decisions
 
@@ -98,7 +103,9 @@
 | Recovery 对 journal path 重新执行 no-link/no-mount/identity 验证 | 合法 journal 创建后祖先仍可能被换成 symlink/junction/mount；不重新验证会让 recovery 在 vault 外 inspect/remove |
 | Search 查询用完整 ciphertext fingerprint 而非 metadata fast path | 正确性和不返回 stale plaintext 优先于查询前的额外密文 I/O；metadata-preserving external mutation 必须可检测 |
 | Windows GNU shim 仅服务交叉验证，发布矩阵以原生 MSVC 为主 | shim 已通过 link/Wine ABI 测试，但 Wine 不能替代 NTFS/ReFS power-loss 和 native handle semantics evidence |
-| 开发过程以 Git verified checkpoint 管理 | Phase 1/2 基线为 `075f8fd`，Phase 3 foundation 为 `99044dc`，CLI hardening 为 `7128a8b`，watchdog-backed daemon 为 `815f216`，authenticated keepalive 为 `cb8e17c`，failure-safe import 为 `2f287e3`，VS Code base/CRUD 为 `f51d4e9`/`b3bad32`，Sublime client/read/capability/final 为 `ee09d60`/`bc10b85`/`2211e55`/`b124170`，encrypted Git merge 为 `02260d8`，audited release pipeline/docs 为 `d042360` |
+| 开发过程以 Git verified checkpoint 管理 | Phase 1/2 基线为 `075f8fd`，Phase 3 foundation 为 `99044dc`，CLI hardening 为 `7128a8b`，watchdog-backed daemon 为 `815f216`，authenticated keepalive 为 `cb8e17c`，failure-safe import 为 `2f287e3`，VS Code base/CRUD 为 `f51d4e9`/`b3bad32`，Sublime client/read/capability/final 为 `ee09d60`/`bc10b85`/`2211e55`/`b124170`，encrypted Git merge/rename hardening 为 `02260d8`/`862d28c`，audited release pipeline/docs 为 `d042360` |
+| Git rename provenance 绑定唯一 base 与固定两侧 commit tree | file-id 只证明身份，不能证明一次 move；tree mode/full OID 同时约束 source 缺失、destination 新增和另一侧 source 修改，拒绝 copy/rename-rename/歧义 |
+| Git merge journal 保持稳定文件名并以内层 v1/v2/v3 演进 | v1 兼容单路径恢复，v2/v3 分别保存 split/detected 双路径、object format、file-id 与固定 provenance；严格 version dispatch 可避免宽松 optional 字段造成降级 |
 | v1 目录 CRUD 明确限定为 mkdir + Markdown 文件 rename/delete | 目录 rename 必须为子树内每个 EDRY 重新绑定 authenticated path，普通循环无法提供 crash atomicity；在设计多文件 journal 前必须 deferred 并如实写入 PRD |
 | 发布文档中的命令本身也是验收面 | clean checkout 必须显式准备锁定的 vsce/extension dependencies、构建 `dist/extension.js`、调用 Python 3.13.14、审计原生依赖并给 smoke 传 exact VS Code CLI；不能用前文隐含状态或 PATH 假设 |
 | v1 导入只支持 absent-destination copy import，明确拒绝 in-place | 先删除/改写源目录无法给出跨平台可证明的失败安全语义；copy-only 让源明文保持只读，并允许完整 encrypted staging 复验后一次性 no-replace 发布 |

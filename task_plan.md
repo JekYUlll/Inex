@@ -75,7 +75,8 @@ Phase 7 — 跨平台验证、打包与发布准备
 ### Phase 7: 跨平台验证、打包与发布准备
 
 - [ ] 跑通格式、性质、RPC、编辑器、Git、Unicode/长路径/换行的验证矩阵
-- [ ] 闭合 binding Git rename/modify 场景；若不实现，必须同步修订 PRD、acceptance matrix 与 release scope，不得静默豁免
+- [x] 闭合 binding Git rename/modify 源码契约：detected 形态、split 两侧 rename、精确 tree provenance、v2/v3 journal 与恢复负测均通过
+- [ ] 在原生支持平台复验 Git rename/power-loss，并在 GA 前保留“禁止并行 Git porcelain”边界或实现真正的 index CAS
 - [x] 配置 Linux/Windows x64/arm64 CI、Rust 二进制、VSIX 与 Sublime 包产物；远端 hosted jobs 尚待执行
 - [x] 完成 threat model、用户指南、安全配置、迁移/升级与故障恢复文档
 - [ ] 审计磁盘明文残留、日志秘密、依赖许可与发布清单
@@ -107,6 +108,8 @@ Phase 7 — 跨平台验证、打包与发布准备
 | Sublime Build 4200 客户端保持 experimental | 宿主 SIGKILL 后官方恢复方式是重启整个 Sublime；实测缓冲区仍可复制，插件无法在死亡窗口运行，故只承诺应用退出后的零磁盘残留，不宣称崩溃瞬时擦除 |
 | v1 只承诺目录创建与 Markdown 文件 rename/delete | 目录 rename 会重绑整个子树的 authenticated logical path，需要独立的多文件 crash transaction；在该事务存在前显式 deferred，不用非原子循环伪装支持 |
 | 发布包采用严格 allowlist、可移植 ZIP key、内部 manifest 与原生依赖审计 | 产物必须拒绝特殊文件、Windows 路径/权限碰撞、伪 VSIX/PE、脏 provenance 和动态 libsodium；独立发布工具代码审计方可进入 clean-source 构建 |
+| Git rename 只由唯一 merge-base 与固定 HEAD/MERGE_HEAD tree entry 证明 | 新 nonce 让密文相似度无意义，file-id 相同也可能是历史副本；detected/split 都必须绑定完整 provenance 与 source-aware journal |
+| Git OID 宽度绑定仓库 object format，恢复按 v1/v2/v3 严格 schema | SHA-256 Git 会把 40 位唯一前缀交给 `cat-file` 解析；journal 必须在任何变更前拒绝缩写/混宽 OID，并固定可跨 merge commit 验证的 provenance |
 
 ## Errors Encountered
 
@@ -181,6 +184,10 @@ Phase 7 — 跨平台验证、打包与发布准备
 | Initial release audit found permissive VSIX/ZIP/version/PE checks; follow-up found Win32 names, privileged modes, tag/native gate and provenance bypasses | 2 | Add strict negative tests and workflow bindings until 19/19, actionlint, pedantic/all-features, native audit and independent re-review all return GO |
 | Main release-test invocations first omitted `PYTHONPATH=scripts`, then reused zsh's special `path` variable and invalidated PATH | 2 | Treat both chains as invalid evidence, remove generated caches, use fail-fast plus a non-special loop variable, and rerun the complete 19-test/actionlint/Clippy/diff gate |
 | Documentation audit found overbroad encryption claims, an incorrect VS Code resource scheme, non-runnable PATH/Python/package examples, and ambiguous support wording | 1 | Align every claim and command with current code, use explicit absolute binaries/Python 3.13.14/build prerequisites, then require an independent zero-blocker/zero-major rereview |
+| Rename/modify security audit found detected source omission, historical-copy misclassification, SHA-256 OID-prefix acceptance, and recovery owner-order gaps | 1 | Replace heuristic identity matching with fixed tree provenance, repository-width OIDs, source-aware v2/v3 journals, pre-mutation global owner checks, and adversarial real-Git regressions |
+| First provenance-aware CLI detected test had no active `MERGE_HEAD`; intermediate journal validation patch matched the legacy v1 recovery block | 1 each | Form a real no-renames merge before synthesizing detected stages; remove the misplaced v1 field access, add validation to the exact v3 block, and restart tests/Clippy |
+| Owner scan initially skipped every other unmerged worktree path | 1 | Compare every non-active conflict worktree digest with its authenticated stage objects so a third identity owner aborts before the first plan writes |
+| Final Git audit constructed a conflict path carrying an additional valid stage zero | 1 | Reject stage-zero/unmerged-path intersections from one bounded full-index snapshot, retain local commit/recovery rechecks, and cover a differently identified source-bound EDRY fixture |
 
 ## Notes
 

@@ -262,10 +262,14 @@ sets an authenticated unresolved flag; the command exits nonzero. Open that
 document through Inex, remove every conflict marker, save, stage the new
 ciphertext, and continue the Git operation.
 
-The current checkpoint fails closed on unsupported Git shapes, including
-linked/external gitdirs, split indexes, attribute overrides, non-regular modes,
-and cross-path rename/modify identity. It does not provide a transparent
-unlocked broker for normal `git merge`.
+The current checkpoint resolves authenticated rename/modify when the unique
+merge base and exact `HEAD`/`MERGE_HEAD` trees prove one source-to-destination
+move, including Git's detected and split conflict representations. It fails
+closed on linked/external gitdirs, split indexes, attribute overrides,
+non-regular modes, historical copies, rename/rename, multiple merge bases,
+ambiguous identity owners, or changed provenance. Do not run other Git
+porcelain concurrently with `inex git merge` or recovery. Inex does not provide
+a transparent unlocked broker for normal `git merge`.
 
 The encrypted merge driver applies only to `*.md.enc`. A Git conflict in
 `vault.json` must **not** be resolved by combining JSON or conflict-marker

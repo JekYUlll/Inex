@@ -177,7 +177,7 @@
 - Actions taken:
   - 新增 `inex-git` crate 与 `inex merge-driver`、`inex git install-driver/merge/recover`；locked driver 安装为 canonical absolute `inex` + 零 placeholders，不读取 Git 临时路径且固定返回冲突。
   - 实现 local-only `.gitattributes`/`.gitignore` 安装、有效属性复核、Git ≥2.36、清空环境、禁用 fsmonitor/lazy fetch、bounded plumbing 与动态 Windows argv 预算。
-  - 实现 stage AEAD 认证、内存 diff3、clean/unresolved EDRY 标志、全局 file-id 预检、密文 worktree/index transaction journal 与认证恢复；split-index、非 `100644`、跨路径 rename/modify 和并行 Git porcelain 均失败关闭。
+  - 实现 stage AEAD 认证、内存 diff3、clean/unresolved EDRY 标志、全局 file-id 预检、密文 worktree/index transaction journal 与认证恢复；split-index、非 `100644` 与当时未支持的跨路径 rename/modify 失败关闭，并行 Git porcelain 明确不受支持。
   - 独立审计闭合 file-id late-write、Windows batch、split-index durability、fsmonitor/lazy-fetch 四项 blocker，最终判定 Checkpoint GO；GA 的原生 Windows 与 rename/modify 证据留给 Phase 7。
   - 主线程复验 workspace 239/239 tests、fmt、pedantic clippy、rustdoc、Windows GNU workspace check 与 diff-check 全部通过。
   - 将 Rust/CLI/spec 增量独立提交为 `02260d8`（`feat: add encrypted Git merge and recovery`），未混入 planning 或 Sublime E2E harness。
@@ -195,6 +195,10 @@
   - 使用 system GCC 重建可移植 ELF；precommit 两轮 Rust ZIP/VSIX/Sublime ZIP/SHA256SUMS 逐字节一致，严格 artifact/native-dependency audit、三个 executable smoke 与 VS Code 1.125.0 CLI 安装均通过（manifest 如实标记 dirty，不能替代最终 clean-source 证据）。
   - 独立文档审计修复过度安全声明、`.vault-local`/CustomEditor 事实、绝对 CLI 路径、Python/pnpm/build 前提与可执行发布命令；复审为零 blocker、零 major。
   - 将发布流水线、24 个代码/配置/文档文件独立提交为 `d042360`（`feat: add audited cross-platform release pipeline`）；planning 与后续 completion 证据未混入该功能提交。
+  - 在 `feature/git-rename-modify` 分支闭合 binding rename/modify：同时支持 Git detected 三阶段 destination 与 no-renames split source/destination，使用唯一 merge-base + 固定 `HEAD`/`MERGE_HEAD` tree entry 证明 rename，不把相同 file-id 或密文相似度当 provenance。
+  - 引入稳定 journal 文件内的 v2 split/v3 detected 严格 schema、source-aware forward recovery、固定 commit provenance、repository-aware SHA-1/SHA-256 全宽 OID 与 tracked/untracked third-owner 预变更复核；rename/rename、历史 destination、multiple merge-base 与歧义均失败关闭。
+  - 独立安全审计发现并闭合 detected source 遗留、历史副本误判、SHA-256 OID prefix、stage-zero/unmerged overlap、recovery owner 顺序与 final-after-commit recovery 等 major；最新定向门禁为 `inex-git` 30/30、真实 CLI Git 9/9、pedantic Clippy 与 diff-check 全通过。外部 Git 在最后检查至 `update-index` 的无 CAS 窗口保留为明确 non-GA 边界。
+  - 将经终审 GO 的 rename/modify 源码与真实 Git 测试独立提交为 `862d28c`（`feat: merge encrypted rename-modify conflicts`）；文档/planning 与后续 clean-source 证据另行提交。
 
 ## Test Results
 
@@ -239,6 +243,9 @@
 | release-tool independent re-review | replay both audit rounds against current scripts/workflow | every reported bypass is rejected; no code blocker/major remains | final code-audit verdict GO | PASS |
 | precommit deterministic Linux package | system-GCC release build + two package directories + strict audits/smoke | all four outputs are byte-identical and install/run while dirty provenance remains explicit | two `cmp` chains pass; artifact/native audits and VS Code 1.125.0 CLI smoke pass | PASS (precommit only) |
 | documentation consistency audit | README/security/PRD/architecture/install/operations/release commands vs implementation | no overclaim or non-runnable binding command remains | independent rereview reports 0 blocker, 0 major; noted minors repaired | PASS |
+| Git rename/modify security gate | detected/split real Git shapes, exact merge-tree provenance, SHA-256 prefix/E2E, stage-zero overlap, third owners, v1/v2/v3 fault states and post-commit recovery | supported shapes merge ciphertext-only; ambiguity/tamper/drift fail before mutation | `inex-git` 30/30, CLI Git 9/9, independent review GO with no blocker/major | PASS (Linux source checkpoint) |
+| post-rename full Rust gate | fmt + workspace tests + all-features pedantic Clippy + rustdoc `-D warnings` + diff-check | no regression or static warning across all crates | 261/261 tests; all static gates pass | PASS |
+| post-rename Windows GNU gate | workspace all-targets no-run + all-features pedantic Clippy | every crate/test executable links and cfg-specific lints pass | 9 Windows test executables produced; Clippy pass | PASS (cross-only, non-native) |
 
 ## Error Log
 
@@ -295,13 +302,17 @@
 | 2026-07-11 | Two independent release audits exposed permissive VSIX/ZIP/version/PE checks and later Win32-name/mode/tag/native/provenance bypasses | 2 | Add strict negative tests and exact workflow bindings; final 19/19/actionlint/pedantic/native-smoke re-review is GO |
 | 2026-07-11 | Default xlings release binary used a build-home ELF interpreter/RUNPATH | 1 | Reject it as non-portable, rebuild with `/usr/bin/gcc`, and require strict ELF/native-dependency audit before packaging |
 | 2026-07-11 | Documentation audit found overbroad encryption/support claims and release/CLI examples that were not self-contained | 1 | Correct the threat/resource model and exact commands, then obtain a zero-blocker/zero-major independent rereview |
+| 2026-07-11 | Rename/modify audit found detected source omission, copy-vs-rename ambiguity, SHA-256 abbreviated OID acceptance, recovery owner ordering, and final-ref recovery gaps | 1 | Bind exact merge trees/full OID width, introduce source-aware v2/v3 journals and owner prechecks, then add the full negative/crash-state suite |
+| 2026-07-11 | Provenance-aware detected CLI fixture lacked `MERGE_HEAD`, and a broad patch inserted v3 validation into legacy v1 recovery | 1 each | Start a real merge before stage normalization, patch the exact version block, and restart all targeted gates |
+| 2026-07-11 | First global worktree owner pass skipped all non-active unmerged paths | 1 | Validate their current digest against authenticated stage objects and reject target identity reuse before any earlier conflict result is written |
+| 2026-07-11 | Final Git audit proved one path can carry stage zero and unmerged stages simultaneously | 1 | Reject the intersection from one full-index snapshot plus local original-state rechecks; use a valid different-identity source-bound stage-zero regression to avoid false coverage |
 
 ## 5-Question Reboot Check
 
 | Question | Answer |
 |----------|--------|
 | Where am I? | Phase 7 — 跨平台验证、打包与发布准备 |
-| Where am I going? | Git rename/modify contract → final clean-source deterministic build/audit/smoke → completion audit |
+| Where am I going? | Final clean-source deterministic build/audit/smoke → completion audit |
 | What's the goal? | 交付 init plan 定义的跨平台密文仓库与编辑器虚拟明文系统 |
 | What have I learned? | 见 `findings.md`：冻结格式、依赖、编辑器备份风险与失败安全边界 |
-| What have I done? | Phase 1–6 与发布流水线已以 Git checkpoints 固化；代码/文档审计 GO，正在闭合最后的本地产品与 clean-source 证据 |
+| What have I done? | Phase 1–6、发布流水线与 Git rename/modify 源码契约已闭合并固化为 Git checkpoint；正在生成最终 clean-source 证据 |

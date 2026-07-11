@@ -245,11 +245,13 @@ explicitly.
 
 ### Encrypted merge or recovery refuses the repository
 
-Preserve `.git`, worktree ciphertext, and `.vault-local`. Unsupported
-rename/modify identity, split index, mode, attribute, concurrent-change, or
-journal facts fail closed. If `inex git recover` reports a conflict, do not
-delete the journal or force stage zero; compare current OIDs/digests against a
-copy and the [Git recovery contract](spec/git-merge-v1.md).
+Preserve `.git`, worktree ciphertext, and `.vault-local`. Ambiguous rename
+provenance, rename/rename, multiple merge bases, split index, mode, attribute,
+object-format, owner, concurrent-change, or journal facts fail closed. Stop all
+other Git porcelain before retrying. If `inex git recover` reports a conflict,
+do not delete the journal or force stage zero; compare current OIDs/digests and
+the recorded fixed provenance against a copy and the
+[Git recovery contract](spec/git-merge-v1.md).
 
 ### Git reports a conflict in `vault.json`
 
