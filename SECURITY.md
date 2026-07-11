@@ -26,9 +26,9 @@ In particular:
   complete package canary matrix passes; and
 - release-tool tests pass 19/19, `actionlint` and pedantic/all-features Clippy
   pass, and independent release-tool code review is GO. A system-GCC Linux x64
-  repackage passes strict archive/native-dependency audit plus VS Code 1.125.0
-  CLI install/bundled-sidecar smoke. This local result is not yet a
-  post-hardening clean-source double build, native Windows/arm64,
+  clean-source double build is byte-identical and passes strict
+  archive/native-dependency audit plus VS Code 1.125.0 CLI
+  install/bundled-sidecar smoke. This local result is not native Windows/arm64,
   persistent-profile, signed, or independent release evidence.
 
 The current evidence and blockers are maintained in

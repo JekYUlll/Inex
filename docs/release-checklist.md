@@ -34,7 +34,7 @@ Status terms in this document mean:
 | VS Code unit/bundle | verified checkpoint | Strict TypeScript, 23/23 Node tests, production bundle, and integration bundle pass |
 | VS Code Extension Host | partial | The current local build and 1.125.0 directly drive the production create/folder-create/file-rename/file-delete actions plus encrypted backup/recovery against the daemon/custom editor. Close refusal, rename collision, Unix delete-I/O failure recovery, command registration, and isolated-root residue pass. InputBox/QuickPick mouse interaction is not automated, and test-mode workbench storage is in-memory, so persistent cross-process restore/Local History is unproven |
 | Sublime current source | partial | Pure-Python tests pass 61/61. An exact Build 4200 normal E2E drives unlock/open/edit/save/close and real-panel New Folder/New Markdown/rename/etag-delete through registered commands. Authenticated tree checks pass after each mutation; `folder_created`, `markdown_created`, `renamed`, and `deleted` are present, `crud_complete=true`, `vault_envelope=EDRY`, and `root_scan_hits=0`. The plugin-host SIGKILL probe remains `PASS_WITH_DOCUMENTED_BOUNDARY`: the visible buffer is copyable, the host does not restart in-process, a full Sublime restart is required, `vault_envelope=EDRY`, and roots scanned after application exit remain clean. Its `crud_complete=false` is intentional because the crash branch kills after open/edit/save; this is not crash-time plaintext erasure. The full packaged matrix is pending |
-| Linux x64 packaging | partial, release-tool review GO | Release-tooling unit tests pass 19/19; local `actionlint` and pedantic/all-features Clippy pass. Strict VSIX identity/content metadata, bounded regular portable ZIP paths/modes, exact TOML/tag version binding, canonical provenance, and PE32+ structure/import checks fail closed. A system-GCC repackage passes strict archive/native-dependency audit plus VS Code 1.125.0 CLI install/bundled-sidecar smoke. A post-hardening clean-source double build is pending |
+| Linux x64 packaging | verified clean-source checkpoint, release-tool review GO | Release-tooling unit tests pass 19/19; local `actionlint` and pedantic/all-features Clippy pass. Two system-GCC builds from the final clean source are byte-identical across Rust ZIP, VSIX, unpacked Sublime ZIP, and SHA256SUMS; both pass strict artifact/native-dependency audit and VS Code 1.125.0 CLI install/bundled-sidecar smoke. Manifest provenance records the canonical repository, exact commit, and `dirtySourceTree=false` |
 | License collection | verified engineering checkpoint | The native-target inventory contains 77 resolved Cargo components and 147 collected license/NOTICE texts: 146 Cargo files plus bundled libsodium 1.0.22 ISC. Independent legal review and license-choice/signature policy remain pending |
 | CI configuration | source-only, non-binding | Linux x64, Windows x64, Linux arm64, and Windows arm64 labels are configured; actions are immutable-SHA pinned and local `actionlint` passes. Push/manual tag refs bind the exact version; the required job runs binding source-quality gates; package targets rerun x64 native tests or ARM no-run compilation, enforce canonical provenance, and install/smoke each platform VSIX. The workflows have not been pushed or run remotely, so every matrix result remains unproven |
 | Native Windows | pending | No native MSVC/NTFS/ReFS/FAT/exFAT release host result is available; GNU cross-check and Wine are non-binding |
@@ -64,11 +64,10 @@ These are not documentation polish items; each changes the release decision:
 7. Complete independent legal review of the collected 77-component inventory,
    147 license/NOTICE texts, license-expression choices, and distribution
    obligations; collection is implemented but is not legal approval.
-8. After the final clean commit, repeat the hardened package/audit/smoke twice
-   from clean source, then push and pass the configured four-platform
-   CI/package matrices. Local `actionlint`, a dirty Linux repackage, and one
-   earlier byte-identical pair do not establish final reproducibility, runner
-   availability, or a native release matrix.
+8. Push the exact clean source and pass the configured four-platform CI/package
+   matrices. The local byte-identical Linux x64 pair establishes that checkpoint
+   only; it does not establish hosted-runner availability or a native
+   multi-platform release matrix.
 9. Keep password-slot documentation explicit that rewrapping does not revoke
     an old password held with historical `vault.json`; master-key rotation is a
     separate unimplemented migration, not a hidden property of `password
@@ -261,14 +260,13 @@ PYTHONPATH=scripts python3.13 scripts/smoke_release_artifacts.py \
   "target/release-artifacts/$PLATFORM" --vscode-cli "$VSCODE_CLI"
 ```
 
-On the current Linux x64 host, release-tool tests pass 19/19. A system-GCC
-repackage passes the artifact and native-dependency audits plus VS Code 1.125.0 CLI
-install/bundled-sidecar smoke. Validation now covers VSIX control metadata,
+On the current Linux x64 host, release-tool tests pass 19/19. Two clean-source
+system-GCC packages are byte-identical and both pass artifact/native-dependency
+audits plus VS Code 1.125.0 CLI install/bundled-sidecar smoke. Validation covers VSIX control metadata,
 bounded regular ZIP members and Windows-portable path/mode collisions, exact
 workspace/tag parsing, canonical provenance, and PE32+ structure/import ranges;
 the original malformed-VSIX and ZIP bypass samples are rejected. Independent
-release-tool code review is GO. The hardened code has not yet completed a
-post-commit clean-source double build. The same helper rejects the xlings-default ELF
+release-tool code review is GO. The same helper rejects the xlings-default ELF
 because its interpreter/RUNPATH refers to the build user's xlings home. This is
 valuable local evidence, not a clean-tree, signed, native multi-platform
 release.

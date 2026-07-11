@@ -80,7 +80,7 @@ Phase 7 — 跨平台验证、打包与发布准备
 - [x] 配置 Linux/Windows x64/arm64 CI、Rust 二进制、VSIX 与 Sublime 包产物；远端 hosted jobs 尚待执行
 - [x] 完成 threat model、用户指南、安全配置、迁移/升级与故障恢复文档
 - [ ] 审计磁盘明文残留、日志秘密、依赖许可与发布清单
-- [ ] 在最终 clean commit 上用 system GCC 完成两次逐字节一致的 Linux x64 package/audit/native-dependency/VSIX-install smoke
+- [x] 在最终 clean commit 上用 system GCC 完成两次逐字节一致的 Linux x64 package/audit/native-dependency/VSIX-install smoke
 - **Status:** in_progress
 
 ## Key Questions

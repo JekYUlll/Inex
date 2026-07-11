@@ -199,6 +199,8 @@
   - 引入稳定 journal 文件内的 v2 split/v3 detected 严格 schema、source-aware forward recovery、固定 commit provenance、repository-aware SHA-1/SHA-256 全宽 OID 与 tracked/untracked third-owner 预变更复核；rename/rename、历史 destination、multiple merge-base 与歧义均失败关闭。
   - 独立安全审计发现并闭合 detected source 遗留、历史副本误判、SHA-256 OID prefix、stage-zero/unmerged overlap、recovery owner 顺序与 final-after-commit recovery 等 major；最新定向门禁为 `inex-git` 30/30、真实 CLI Git 9/9、pedantic Clippy 与 diff-check 全通过。外部 Git 在最后检查至 `update-index` 的无 CAS 窗口保留为明确 non-GA 边界。
   - 将经终审 GO 的 rename/modify 源码与真实 Git 测试独立提交为 `862d28c`（`feat: merge encrypted rename-modify conflicts`）；文档/planning 与后续 clean-source 证据另行提交。
+  - 将 rename 合同、安全/运维/release scope 与 261/261 全量门禁同步提交为 `9d27250`（`docs: record audited rename merge contract`），随后 fast-forward 合并回 `master` 并删除功能分支，未推送远端。
+  - 在 clean `9d27250` 与最终 evidence-only successor 上分别执行 system-GCC release build；每个提交均双打包，Rust ZIP、VSIX、unpacked Sublime ZIP 与 SHA256SUMS 逐字节一致，严格 artifact/native-dependency audit 和两轮 VS Code 1.125.0 package smoke 全通过，manifest 为 canonical origin、exact commit、`dirtySourceTree=false`。
 
 ## Test Results
 
@@ -246,6 +248,7 @@
 | Git rename/modify security gate | detected/split real Git shapes, exact merge-tree provenance, SHA-256 prefix/E2E, stage-zero overlap, third owners, v1/v2/v3 fault states and post-commit recovery | supported shapes merge ciphertext-only; ambiguity/tamper/drift fail before mutation | `inex-git` 30/30, CLI Git 9/9, independent review GO with no blocker/major | PASS (Linux source checkpoint) |
 | post-rename full Rust gate | fmt + workspace tests + all-features pedantic Clippy + rustdoc `-D warnings` + diff-check | no regression or static warning across all crates | 261/261 tests; all static gates pass | PASS |
 | post-rename Windows GNU gate | workspace all-targets no-run + all-features pedantic Clippy | every crate/test executable links and cfg-specific lints pass | 9 Windows test executables produced; Clippy pass | PASS (cross-only, non-native) |
+| final clean-source Linux package | system-GCC release build + two independent package directories + byte comparison + strict artifact/native/smoke | all outputs deterministic, clean provenance, portable ELF, installable VSIX and runnable bundled sidecars | both four-file sets byte-identical; both audits/smokes pass; `dirtySourceTree=false` | PASS (Linux x64 checkpoint) |
 
 ## Error Log
 
@@ -312,7 +315,7 @@
 | Question | Answer |
 |----------|--------|
 | Where am I? | Phase 7 — 跨平台验证、打包与发布准备 |
-| Where am I going? | Final clean-source deterministic build/audit/smoke → completion audit |
+| Where am I going? | Completion audit and external/native gate handoff |
 | What's the goal? | 交付 init plan 定义的跨平台密文仓库与编辑器虚拟明文系统 |
 | What have I learned? | 见 `findings.md`：冻结格式、依赖、编辑器备份风险与失败安全边界 |
-| What have I done? | Phase 1–6、发布流水线与 Git rename/modify 源码契约已闭合并固化为 Git checkpoint；正在生成最终 clean-source 证据 |
+| What have I done? | Phase 1–6、发布流水线、Git rename/modify 与最终 clean-source Linux x64 双构建证据均已固化；未完成项均为明确外部/native gate |

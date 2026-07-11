@@ -55,10 +55,10 @@ operations limit 3. Readers validate a resource ceiling before calling sodium.
   before GA. Format fixtures must be byte-identical on every target.
 - The release-tool suite passes 19/19, `actionlint` and pedantic/all-features
   Clippy pass, and independent code review is GO. A local system-GCC Linux x64
-  repackage passes strict ELF/archive/native-dependency audit and executable/
-  VSIX sidecar smoke; a post-hardening clean-source double build remains
-  pending. The xlings-default local ELF embeds its build-home interpreter/
-  RUNPATH and is correctly rejected as non-portable.
+  clean-source double build is byte-identical and passes strict
+  ELF/archive/native-dependency audit plus executable/VSIX sidecar smoke with
+  `dirtySourceTree=false`. The xlings-default local ELF embeds its build-home
+  interpreter/RUNPATH and is correctly rejected as non-portable.
 
 ## License inventory and distribution obligations
 

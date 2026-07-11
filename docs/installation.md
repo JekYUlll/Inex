@@ -99,15 +99,16 @@ The implemented release tooling creates `inex-rust-<version>-<platform>.zip`
 with `bin/inex[.exe]`, `bin/inexd[.exe]`, bundled documentation, manifests,
 checksums, a resolved license inventory, and complete collected license/NOTICE
 texts. Release-tool tests pass 19/19, and independent release-tool code review
-is GO. A system-GCC Linux x64 repackage passes strict archive/native-dependency
-audit and executable smoke; an earlier dirty-tree pair was byte-for-byte
-identical. The code still requires a post-hardening clean-source double build
-after the final commit.
+is GO. A final clean-source system-GCC Linux x64 pair is byte-for-byte
+identical and passes strict archive/native-dependency audit plus executable and
+VSIX/bundled-sidecar smoke; its manifest records the canonical repository,
+exact commit, and `dirtySourceTree=false`.
 For a development candidate,
 verify `SHA256SUMS` through a separate trusted channel, inspect the package
 manifest/source revision, extract the complete directory, and keep both
-binaries together. There are no official signatures yet, the tested manifest
-records a dirty development tree, and no candidate is currently supported.
+binaries together. There are no official signatures yet, and native
+multi-platform/editor-profile gates remain incomplete, so no candidate is
+currently supported.
 
 ## Create a disposable vault
 
