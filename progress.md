@@ -130,10 +130,21 @@
   - 完成 production `inexd`：zero-capacity reader backpressure、1 秒 idle watchdog、aligned-body error continuation、desync termination、response/request scrub、clean EOF/shutdown wipe；Linux daemon 57/57 + process E2E 1/1 通过。
   - 通过最终 workspace gate：CLI 22/22、core 119/119、daemon 57/57、process E2E 1/1，fmt、pedantic clippy `-D warnings`、rustdoc `-D warnings` 与 whitespace check 全部通过。
   - 通过 Windows GNU workspace clippy 与全 target no-run link；Wine 实跑 CLI 21/21、daemon 57/57、`inexd` process E2E 1/1。原生 NTFS/ReFS 与 MSVC 仍保留为 Phase 7 发布门禁。
+  - daemon runtime 终审无阻断项；将 handler/params/watchdog server/binary/E2E/spec 作为独立 checkpoint 提交为 `815f216`（`feat: ship watchdog-backed stdio daemon`）。
+  - 在 Phase 3 import 并行实现期间启动 Phase 4 foundation：严格 Node framing/sidecar、fail-closed bundled binary resolution、vault tree、可写 CustomEditor 与 encrypted draft backup；首轮 typecheck 的两个 exact-type 错误已先记录再修复。
+  - VS Code foundation 修复后通过 `pnpm check`、6/6 Node 单测与 production bundle；并行安全审计已启动，尚未把该基础门禁误记为 Extension Host/残留审计完成。
+  - VS Code 安全审计后闭合 session失效/stdio/EPIPE、dirty lock、open-vs-lock/dual-unlock 竞态、authenticated keepalive + 本地 idle deadline、bounded encrypted restore、stale-draft 双确认、portable path 与大帧队列边界；导航新增 heading/link/backlink，spellcheck 默认关闭，编辑消息改为 debounce + save-time snapshot。
+  - 将 daemon `system.ping` 的可选 session 续期语义、能力协商与回归测试作为独立 Git checkpoint 提交为 `cb8e17c`（`feat: add authenticated session keepalive`）；未混入正在重构的 import 或未完成的编辑器包。
+  - 完成 copy-only `inex import <plaintext-source> <new-vault> [--dry-run]`：dry-run 不取口令/不写盘，真实导入只写 sibling encrypted staging，完整重开验证后以 no-replace 原子发布；源明文始终只读，破坏性 in-place 明确拒绝。
+  - import 的最终安全审阅闭合 publication marker 清理失败分类、seal 后最终 exact allowlist、Windows `as_encoded_bytes` 路径预算，以及 Linux `openat2`/P-S-L descriptor identity 四项问题；独立终审给出 GO。
+  - Phase 3 最终本机 workspace 221/221 tests、fmt、pedantic clippy `-D warnings`、rustdoc `-D warnings`、whitespace gate 全部通过；Windows GNU workspace no-run/clippy 与 Wine 215/215 通过，原生 Windows/NTFS 证据保留到 Phase 7。
+  - 将 failure-safe staged import 独立提交为 `2f287e3`（`feat: add failure-safe staged vault import`），未混入 VS Code/Sublime/planning 工作树。
+- **Completed:** 2026-07-11 (Asia/Shanghai)
 
 ### Phase 4: VS Code 主客户端
 
-- **Status:** pending
+- **Status:** in_progress
+- **Started:** 2026-07-11 (Asia/Shanghai)
 
 ### Phase 5: Sublime 轻量客户端
 
@@ -172,6 +183,12 @@
 | Windows API/ABI smoke | linked core test exe under Wine | Win32 lock/identity/write-through move, aliases and >260-char paths work | 116/116 passed; exe SHA-256 `a41b8fcd…1328` | PASS (non-native) |
 | search freshness adversary | same-size ciphertext tamper + restore accessed/modified timestamps | query invalidates plaintext index before returning stale hit | `SearchIndexNotReady` regression passes | PASS |
 | rebind recovery escape adversary | valid journal then replace source ancestor with symlink | recovery conflicts and leaves redirected ciphertext untouched | regression passes | PASS |
+| VS Code Phase 4 foundation | `pnpm check && pnpm test && pnpm build` | strict TypeScript, framing/sidecar unit tests, and production bundle all pass | passed; 6/6 Node tests; 43.5 KiB bundle | PASS |
+| VS Code hardened client/navigation | `pnpm check && pnpm test && pnpm build` | strict TypeScript, bounded protocol/path/file/Markdown/EPIPE tests, and production bundle pass | passed; 14/14 Node tests; 83.3 KiB bundle | PASS |
+| authenticated keepalive daemon | daemon 57 tests + process E2E + pedantic clippy + rustdoc | optional-session ping renews idle deadline without weakening session errors | all passed; committed as `cb8e17c` | PASS |
+| Phase 3 staged import | `cargo test --workspace --all-targets` | dry-run/copy import, verified staging, source preservation, no-replace publication and failure classification pass | 221/221 passed | PASS |
+| Phase 3 import static gates | fmt + pedantic clippy + rustdoc `-D warnings` + diff check | no formatting, lint, documentation or whitespace failures | all passed | PASS |
+| Phase 3 import Windows smoke | Windows GNU no-run/clippy + Wine tests | cross-platform API/link behavior compiles and Wine suite passes | no-run/clippy passed; Wine 215/215 | PASS (non-native) |
 
 ## Error Log
 
@@ -196,13 +213,19 @@
 | 2026-07-11 | First Wine run passed 105/106 but case-only rename test did not actually recase `vault.json` | 1 | Recreate the wrong-case entry after removing canonical metadata; final Wine suite passes |
 | 2026-07-11 | Portability hardening introduced rustfmt drift, one unused wrapper and cfg-specific clippy warnings | 1 each | Log each gate, apply canonical formatting/narrow cfg fixes, then rerun native and Windows gates |
 | 2026-07-11 | Combined Windows long-path test patch missed shifted context | 1 | No partial edit; inspect exact locations and apply two smaller patches |
+| 2026-07-11 | Combined VS Code icon/ignore patch missed current `.vscodeignore` context | 1 | No partial edit; add the icon separately after verifying existing `src/**` packaging exclusion |
+| 2026-07-11 | Combined planning update missed the timestamped error-row context | 1 | No partial edit; inspect exact rows and apply smaller planning-file patches |
+| 2026-07-11 | Node strip-only test loader rejected the new `sidecar.ts` constructor parameter property | 1 | Replace it with an explicit field assignment and restart the complete VS Code gate |
+| 2026-07-11 | Combined VS Code session-epoch patch missed current controller context | 1 | No partial edit; inspect the exact file and split the open-vs-lock race fix into smaller patches |
+| 2026-07-11 | VS Code post-race-fix gate used a duplicated relative path from the package directory | 1 | Treat all chained gates as not executed, correct `rg` to `src`, and restart check/test/build |
+| 2026-07-11 | VS Code typecheck rejected nonexistent `CancellationToken.None` | 1 | Use a scoped `CancellationTokenSource` for pre-lock snapshots and restart check/test/build |
 
 ## 5-Question Reboot Check
 
 | Question | Answer |
 |----------|--------|
-| Where am I? | Phase 3 — `inexd`、CLI 与本地协议 |
-| Where am I going? | Rust core → sidecar/CLI → VS Code → Sublime → Git/import → release verification |
+| Where am I? | Phase 4 — VS Code 主客户端 |
+| Where am I going? | VS Code → Sublime → Git merge/recovery → release verification |
 | What's the goal? | 交付 init plan 定义的跨平台密文仓库与编辑器虚拟明文系统 |
 | What have I learned? | 见 `findings.md`：冻结格式、依赖、编辑器备份风险与失败安全边界 |
-| What have I done? | 完成 Phase 1 基线与 Phase 2 Rust crypto/vault 生命周期；开始 sidecar/CLI 协议实现 |
+| What have I done? | 完成 Phase 1/2 与 Phase 3 sidecar/CLI/import，并以独立 Git checkpoint 固化；正在验收 VS Code 主客户端 |

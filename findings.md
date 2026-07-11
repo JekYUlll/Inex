@@ -92,7 +92,10 @@
 | Recovery 对 journal path 重新执行 no-link/no-mount/identity 验证 | 合法 journal 创建后祖先仍可能被换成 symlink/junction/mount；不重新验证会让 recovery 在 vault 外 inspect/remove |
 | Search 查询用完整 ciphertext fingerprint 而非 metadata fast path | 正确性和不返回 stale plaintext 优先于查询前的额外密文 I/O；metadata-preserving external mutation 必须可检测 |
 | Windows GNU shim 仅服务交叉验证，发布矩阵以原生 MSVC 为主 | shim 已通过 link/Wine ABI 测试，但 Wine 不能替代 NTFS/ReFS power-loss 和 native handle semantics evidence |
-| 开发过程以 Git verified checkpoint 管理 | Phase 1/2 基线为 `075f8fd`，Phase 3 协议/session/CLI foundation 为 `99044dc`；后续继续按 handler/server/editor 等可独立回滚的验收增量提交，禁止把未过门禁状态混入 checkpoint |
+| 开发过程以 Git verified checkpoint 管理 | Phase 1/2 基线为 `075f8fd`，Phase 3 foundation 为 `99044dc`，CLI hardening 为 `7128a8b`，watchdog-backed daemon 为 `815f216`，authenticated keepalive 为 `cb8e17c`，failure-safe import 为 `2f287e3`；后续继续按 editor/Git 等可独立回滚的验收增量提交 |
+| v1 导入只支持 absent-destination copy import，明确拒绝 in-place | 先删除/改写源目录无法给出跨平台可证明的失败安全语义；copy-only 让源明文保持只读，并允许完整 encrypted staging 复验后一次性 no-replace 发布 |
+| import 发布使用私有 ciphertext-only marker 区分 OS 模糊结果 | rename 返回错误不能证明目录未移动；P/S/L/marker identity 可重建 exact moved、exact unmoved 或 indeterminate，marker 清理失败必须返回独立非零结果并告知不得重跑同一目的地 |
+| VS Code 明文清理必须区分确定性与 best effort | Rust sidecar key/cache 可明确清零；Node Buffer 由扩展覆写，但 JS string、V8/Chromium/VS Code 内部副本无法确定性 zeroize，因此锁定会销毁 webview/drop references，最终磁盘残留结论必须来自 isolated-profile canary 审计 |
 | stdio server 必须以 bounded reader channel + 定时主循环驱动 idle expiry | 单线程阻塞读取下一帧会让无请求会话的 master key/search index 超过 15 分钟驻留；session 的惰性 expiry 只有配合 watchdog 才满足协议 |
 | `inex serve` 只信任同目录 `inexd` 或显式 `INEXD_PATH` | sibling 缺失时隐式 PATH 搜索可能把后续解锁口令交给同名恶意程序，生产启动路径必须失败关闭 |
 | CLI hidden-TTY 的读取期硬上限需要修补/替换 `rpassword` | 7.5.4 的公开 TTY 路径在 Enter 前持续增长私有 `SafeString`，自定义 bounded Reader 又失去 Unix echo-off/Windows Console mode；当前显式 stdin 是硬上限路径，TTY 限制如实文档化且不得假称已解决 |

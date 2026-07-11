@@ -6,7 +6,7 @@
 
 ## Current Phase
 
-Phase 3 — `inexd`、CLI 与本地协议
+Phase 4 — VS Code 主客户端
 
 ## Scope and Acceptance Baseline
 
@@ -41,9 +41,9 @@ Phase 3 — `inexd`、CLI 与本地协议
 
 - [x] 实现 stdio JSON-RPC 2.0 server、结构化错误与无秘密日志策略
 - [x] 实现 session token、空闲锁定、缓存淘汰、并发/etag 冲突与 shutdown 清理
-- [ ] 实现 `inex` CLI 的 init/import/verify/password/search/serve 命令
+- [x] 实现 `inex` CLI 的 init/import/verify/password/search/serve 命令
 - [x] 添加协议契约测试与端到端进程测试
-- **Status:** in_progress
+- **Status:** complete
 
 ### Phase 4: VS Code 主客户端
 
@@ -52,7 +52,7 @@ Phase 3 — `inexd`、CLI 与本地协议
 - [ ] 在受控编辑器内实现 Markdown link/heading/backlink、内存搜索结果面板与定位
 - [ ] 黑盒审计 VS Code backup/Local History，并检测相关明文残留风险、提供工作区级安全引导
 - [ ] 添加 lint、类型检查、单元测试与 Extension Host 集成测试基础
-- **Status:** pending
+- **Status:** in_progress
 
 ### Phase 5: Sublime 轻量客户端
 
@@ -67,7 +67,7 @@ Phase 3 — `inexd`、CLI 与本地协议
 
 - [ ] 实现 `.gitattributes`、locked-safe `inex merge-driver` 与已解锁插件/CLI 三方合并
 - [ ] 实现加密冲突状态与编辑器内解决流程
-- [ ] 实现 plaintext copy-import/dry-run/显式 in-place，以及校验报告
+- [x] 实现 plaintext copy-import/dry-run、校验报告，并明确拒绝破坏性 in-place 转换
 - [ ] 实现 vault verify/备份恢复说明，确保失败不破坏源数据
 - **Status:** pending
 
@@ -142,6 +142,14 @@ Phase 3 — `inexd`、CLI 与本地协议
 | Handler audit regression additions introduced two rustfmt-only differences | 1 | Record the gate stop, run canonical workspace formatting, and restart daemon tests/clippy/rustdoc |
 | Audit-hardened daemon passed 57/57 tests, then clippy found identical fail-closed branches for terminal and pre-hello states | 1 | Combine the two predicates into one unavailable-state guard and rerun the complete daemon gate |
 | Process E2E passed, then clippy rejected its single 108-line lifecycle scenario | 1 | Keep the framed unlock/write/read/search/lock/shutdown flow as one auditable scenario and add a narrow documented test-only allowance |
+| First VS Code client typecheck found exact-optional `defaultUri` and readonly tree-array mismatches | 1 | Build dialog options conditionally and return the mutable array shape required by `TreeDataProvider`, then rerun the TypeScript gate |
+| Combined VS Code icon/ignore patch missed the current `.vscodeignore` context | 1 | No partial edit was applied; add the icon asset separately after inspecting the existing ignore rules |
+| Combined planning update missed the timestamped `progress.md` error-row context | 1 | No partial edit was applied; inspect exact rows and update the planning files with smaller patches |
+| VS Code Node strip-only tests rejected a TypeScript constructor parameter property in `sidecar.ts` | 1 | Preserve the callback contract with an explicit class field/assignment, then restart check/test/build |
+| Combined VS Code session-epoch patch missed the current controller method context | 1 | No partial edit was applied; inspect the exact controller and land the race fix in smaller patches |
+| VS Code post-race-fix gate used a workspace-relative `editors/vscode/src` path from inside that same directory | 1 | Record later gates as not executed, use local `src`, and rerun the complete check/test/build sequence |
+| VS Code typecheck found no `CancellationToken.None` API for pre-lock webview synchronization | 1 | Use a scoped `CancellationTokenSource`, dispose it after synchronization, and restart the complete client gate |
+| VS Code backup-recovery test seam omitted required `untitledDocumentData` from `CustomDocumentOpenContext` | 1 | Pass explicit `undefined`, then restart check/test/build; the parallel build result is not a complete gate |
 
 ## Notes
 
