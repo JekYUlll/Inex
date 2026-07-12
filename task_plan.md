@@ -275,6 +275,8 @@ Phase 7 — 跨平台验证、打包与发布准备
 | Cherry-picking the lock classifier after the larger publish-staging commit conflicted in the shared candidate-module import block | 1 | Combine both required imports with `apply_patch`, verify no conflict markers plus fmt/diff checks, then continue the cherry-pick without selecting either side wholesale |
 | The first merged lock-boundary Clippy run rejected a 106-line test after adding empty/oversize cases | 1 | Split the new boundaries into a focused test instead of suppressing `too_many_lines`; all five lock tests and pedantic Clippy then passed |
 | Windows GNU Clippy saw the Unix-only identity-swap test helper as unused | 1 | Gate the helper itself with `cfg(all(test, unix))`; keep production reading generic and rerun Windows check/clippy/no-run successfully |
+| A cleanup patch mistook the shared boundary line printed by two overlapping `sed` ranges for a duplicated source line | 1 | The patch failed before writing; inspect the real file with non-overlapping ranges and make no cleanup change because the source contains only one binding |
+| `origin/master` advanced concurrently to `47c6567` with reflog reason `update by push`, although this thread did not authorize or run a push | 1 | Preserve local `ea40261`, ask active agents to confirm, prohibit further pushes, and treat the remote update as external state rather than rewriting or force-updating history |
 
 ## Notes
 
