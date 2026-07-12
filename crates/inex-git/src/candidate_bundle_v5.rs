@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 use super::{
     Git, GitError, GitIoOperation, GitObjectFormat, MAX_GIT_OUTPUT_BYTES, MAX_JOURNAL_BYTES,
     MergeJournalPayload, apply_payload_to_index, ascii_casefold_starts_with, digest,
-    ensure_no_journal, exact_reserved_private_names, hex_digest, index_entry_map, index_path,
-    io_error, is_link_or_reparse_point, parse_duplicate_free_json, parse_hex_digest,
+    ensure_no_journal, exact_reserved_private_names, hex_digest, index_entry_map, index_lock_path,
+    index_path, io_error, is_link_or_reparse_point, parse_duplicate_free_json, parse_hex_digest,
     path_entry_is_absent, payload_oids, payload_rename_provenance, read_index_snapshot,
     restrict_file_permissions_best_effort, sync_regular_file, validate_local_directory,
     validate_lock_token, validate_oid, validate_payload, verify_candidate_index,
@@ -96,6 +96,26 @@ pub(super) struct IndexLockMarkerV5 {
 pub(super) struct CanonicalBytesReferenceV5 {
     pub(super) size: u64,
     pub(super) sha256: String,
+}
+
+/// Read-only classification of the real Git index lock for one exact v5
+/// transaction.
+///
+/// `Candidate` proves only that the lock bytes match the immutable manifest's
+/// final-index size and digest. It does not prove the candidate's Git stage
+/// map, the live expected-old index, or worktree ownership; the recovery
+/// caller must revalidate those semantic boundaries separately before any
+/// mutation.
+#[allow(
+    dead_code,
+    reason = "the recovery-first v5 writer consumes this strict classifier in the next slice"
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum IndexLockStateV5 {
+    Absent,
+    Marker,
+    Candidate,
+    Foreign,
 }
 
 /// Filesystem-inventory proof for one immutable v5 candidate bundle.
@@ -526,6 +546,98 @@ pub(super) fn parse_index_lock_marker_v5(
         return Err(GitError::InvalidJournal);
     }
     Ok(marker.reference)
+}
+
+fn index_lock_bytes_v5(path: &Path) -> Result<Option<Vec<u8>>, GitError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_error(GitIoOperation::InspectMetadata, &error)),
+    };
+    if is_link_or_reparse_point(&metadata) || !metadata.file_type().is_file() {
+        return Err(GitError::RecoveryConflict);
+    }
+    let mut file = File::open(path).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            GitError::RecoveryConflict
+        } else {
+            io_error(GitIoOperation::ReadMetadata, &error)
+        }
+    })?;
+    if !open_file_matches_path_and_is_single_link(path, &file)
+        .map_err(|_| GitError::RecoveryConflict)?
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    if metadata.len() > u64::try_from(MAX_GIT_OUTPUT_BYTES).unwrap_or(u64::MAX) {
+        return Ok(Some(Vec::new()));
+    }
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len())
+            .unwrap_or(MAX_GIT_OUTPUT_BYTES)
+            .min(MAX_GIT_OUTPUT_BYTES),
+    );
+    (&mut file)
+        .take(
+            u64::try_from(MAX_GIT_OUTPUT_BYTES)
+                .unwrap_or(u64::MAX)
+                .saturating_add(1),
+        )
+        .read_to_end(&mut bytes)
+        .map_err(|error| io_error(GitIoOperation::ReadMetadata, &error))?;
+    if bytes.len() > MAX_GIT_OUTPUT_BYTES
+        || u64::try_from(bytes.len()).unwrap_or(u64::MAX) != metadata.len()
+        || !open_file_matches_path_and_is_single_link(path, &file)
+            .map_err(|_| GitError::RecoveryConflict)?
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    Ok(Some(bytes))
+}
+
+/// Classifies `.git/index.lock` without changing or removing any namespace
+/// entry. The immutable inventory must have been loaded for `reference`; this
+/// binds an exact candidate lock to the referenced manifest's final-index
+/// bytes while leaving Git stage-map validation to the caller.
+#[allow(
+    dead_code,
+    reason = "the recovery-first v5 writer consumes this strict classifier in the next slice"
+)]
+pub(super) fn classify_index_lock_v5(
+    root: &Path,
+    reference: &CandidateBundleTransactionReferenceV5,
+    inventory: &InventoryVerifiedCandidateBundleV5,
+) -> Result<IndexLockStateV5, GitError> {
+    validate_candidate_bundle_transaction_reference_v5(reference)?;
+    validate_candidate_bundle_manifest_v5(&inventory.manifest)?;
+    if inventory.manifest_reference != reference.manifest
+        || inventory.manifest.object_format != reference.object_format
+        || inventory.manifest.token != reference.token
+        || inventory.manifest.bundle_basename != reference.bundle_basename
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+
+    let Some(bytes) = index_lock_bytes_v5(&index_lock_path(root))? else {
+        return Ok(IndexLockStateV5::Absent);
+    };
+    if bytes.starts_with(INDEX_LOCK_MARKER_MAGIC_V5) {
+        let found = parse_index_lock_marker_v5(&bytes).map_err(|_| GitError::RecoveryConflict)?;
+        return Ok(if found == *reference {
+            IndexLockStateV5::Marker
+        } else {
+            IndexLockStateV5::Foreign
+        });
+    }
+    if !bytes.is_empty() && INDEX_LOCK_MARKER_MAGIC_V5.starts_with(&bytes) {
+        return Err(GitError::RecoveryConflict);
+    }
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) == inventory.manifest.final_index.size
+        && hex_digest(digest(&bytes)) == inventory.manifest.final_index.sha256
+    {
+        return Ok(IndexLockStateV5::Candidate);
+    }
+    Ok(IndexLockStateV5::Foreign)
 }
 
 pub(super) fn canonical_bytes_reference_v5(

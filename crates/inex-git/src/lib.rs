@@ -10152,6 +10152,216 @@ mod tests {
     }
 
     #[test]
+    fn v5_index_lock_classifier_binds_real_sha1_and_sha256_marker_and_candidate() {
+        use candidate_bundle_v5::IndexLockStateV5 as State;
+
+        for object_format in [GitObjectFormat::Sha1, GitObjectFormat::Sha256] {
+            let fixture = create_candidate_bundle_preparation_fixture(object_format);
+            let root = fixture.vault.root();
+            let mut hooks = CandidateBundleTestHooks::new(None);
+            let prepared = prepare_test_candidate_bundle(&fixture, &mut hooks)
+                .expect("v5 candidate bundle prepares");
+            let lock = index_lock_path(root);
+
+            assert_eq!(
+                candidate_bundle_v5::classify_index_lock_v5(
+                    root,
+                    &prepared.transaction_reference,
+                    &prepared.inventory,
+                )
+                .expect("absent index lock classifies"),
+                State::Absent
+            );
+
+            fs::write(&lock, &prepared.index_lock_marker).expect("exact marker lock writes");
+            assert_eq!(
+                candidate_bundle_v5::classify_index_lock_v5(
+                    root,
+                    &prepared.transaction_reference,
+                    &prepared.inventory,
+                )
+                .expect("exact marker lock classifies"),
+                State::Marker
+            );
+            assert_eq!(
+                fs::read(&lock).expect("marker lock re-reads"),
+                prepared.index_lock_marker
+            );
+
+            let stable = candidate_bundle_v5::candidate_bundle_stable_path_v5(
+                root,
+                &prepared.bundle_basename,
+            )
+            .expect("stable candidate path validates");
+            let candidate = fs::read(stable.join(candidate_bundle_v5::CANDIDATE_BUNDLE_INDEX_V5))
+                .expect("final candidate reads");
+            fs::write(&lock, &candidate).expect("exact candidate lock writes");
+            assert_eq!(
+                candidate_bundle_v5::classify_index_lock_v5(
+                    root,
+                    &prepared.transaction_reference,
+                    &prepared.inventory,
+                )
+                .expect("exact candidate lock classifies"),
+                State::Candidate
+            );
+
+            let mut tampered_candidate = candidate;
+            tampered_candidate[0] ^= 1;
+            fs::write(&lock, &tampered_candidate).expect("tampered candidate lock writes");
+            assert_eq!(
+                candidate_bundle_v5::classify_index_lock_v5(
+                    root,
+                    &prepared.transaction_reference,
+                    &prepared.inventory,
+                )
+                .expect("tampered candidate is a foreign lock"),
+                State::Foreign
+            );
+            assert_eq!(
+                fs::read(&lock).expect("tampered candidate lock remains"),
+                tampered_candidate
+            );
+        }
+    }
+
+    #[test]
+    fn v5_index_lock_classifier_preserves_foreign_and_rejects_corrupt_marker_bytes() {
+        use candidate_bundle_v5::IndexLockStateV5 as State;
+
+        let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+        let root = fixture.vault.root();
+        let mut hooks = CandidateBundleTestHooks::new(None);
+        let prepared = prepare_test_candidate_bundle(&fixture, &mut hooks)
+            .expect("v5 candidate bundle prepares");
+        let lock = index_lock_path(root);
+        let ordinary = b"ordinary Git-owned index lock";
+        fs::write(&lock, ordinary).expect("ordinary foreign lock writes");
+        assert_eq!(
+            candidate_bundle_v5::classify_index_lock_v5(
+                root,
+                &prepared.transaction_reference,
+                &prepared.inventory,
+            )
+            .expect("ordinary foreign lock classifies"),
+            State::Foreign
+        );
+        assert_eq!(fs::read(&lock).expect("foreign lock remains"), ordinary);
+
+        let other_token = "11111111111111111111111111111111";
+        let mut wrong_reference = prepared.transaction_reference.clone();
+        wrong_reference.token = other_token.to_owned();
+        wrong_reference.bundle_basename =
+            candidate_bundle_v5::candidate_bundle_stable_basename_v5(other_token)
+                .expect("other stable basename validates");
+        wrong_reference.publish_staging_basename =
+            candidate_bundle_v5::candidate_bundle_publish_basename_v5(other_token)
+                .expect("other publish basename validates");
+        let wrong_marker = candidate_bundle_v5::index_lock_marker_bytes_v5(&wrong_reference)
+            .expect("other transaction marker serializes");
+        fs::write(&lock, &wrong_marker).expect("other transaction marker writes");
+        assert_eq!(
+            candidate_bundle_v5::classify_index_lock_v5(
+                root,
+                &prepared.transaction_reference,
+                &prepared.inventory,
+            )
+            .expect("other transaction marker is foreign"),
+            State::Foreign
+        );
+        assert_eq!(
+            fs::read(&lock).expect("other transaction marker remains"),
+            wrong_marker
+        );
+
+        for corrupt in [
+            b"INEXIDX".to_vec(),
+            {
+                let mut bytes = prepared.index_lock_marker.clone();
+                bytes.push(b'\n');
+                bytes
+            },
+            {
+                let mut bytes = prepared.index_lock_marker.clone();
+                let last = bytes.last_mut().expect("marker is nonempty");
+                *last ^= 1;
+                bytes
+            },
+        ] {
+            fs::write(&lock, &corrupt).expect("corrupt v5 marker writes");
+            assert!(matches!(
+                candidate_bundle_v5::classify_index_lock_v5(
+                    root,
+                    &prepared.transaction_reference,
+                    &prepared.inventory,
+                ),
+                Err(GitError::RecoveryConflict)
+            ));
+            assert_eq!(fs::read(&lock).expect("corrupt v5 marker remains"), corrupt);
+        }
+    }
+
+    #[test]
+    fn v5_index_lock_classifier_rejects_linked_or_nonregular_owners_without_removal() {
+        let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+        let root = fixture.vault.root();
+        let mut hooks = CandidateBundleTestHooks::new(None);
+        let prepared = prepare_test_candidate_bundle(&fixture, &mut hooks)
+            .expect("v5 candidate bundle prepares");
+        let lock = index_lock_path(root);
+        let owner = lock.with_extension("lock-owner");
+        fs::write(&owner, &prepared.index_lock_marker).expect("hard-link owner writes");
+        fs::hard_link(&owner, &lock).expect("hard-linked lock creates");
+        assert!(matches!(
+            candidate_bundle_v5::classify_index_lock_v5(
+                root,
+                &prepared.transaction_reference,
+                &prepared.inventory,
+            ),
+            Err(GitError::RecoveryConflict)
+        ));
+        assert!(lock.exists());
+        assert_eq!(
+            fs::read(&owner).expect("hard-link owner remains"),
+            prepared.index_lock_marker
+        );
+
+        fs::remove_file(&lock).expect("hard-linked lock test fixture removes");
+        fs::create_dir(&lock).expect("directory lock creates");
+        assert!(matches!(
+            candidate_bundle_v5::classify_index_lock_v5(
+                root,
+                &prepared.transaction_reference,
+                &prepared.inventory,
+            ),
+            Err(GitError::RecoveryConflict)
+        ));
+        assert!(lock.is_dir());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            fs::remove_dir(&lock).expect("directory lock test fixture removes");
+            symlink(&owner, &lock).expect("symlink lock creates");
+            assert!(matches!(
+                candidate_bundle_v5::classify_index_lock_v5(
+                    root,
+                    &prepared.transaction_reference,
+                    &prepared.inventory,
+                ),
+                Err(GitError::RecoveryConflict)
+            ));
+            assert!(
+                fs::symlink_metadata(&lock)
+                    .expect("symlink lock remains")
+                    .file_type()
+                    .is_symlink()
+            );
+        }
+    }
+
+    #[test]
     fn v5_reference_loader_preserves_bundle_on_reference_or_live_index_drift() {
         let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
         let root = fixture.vault.root();
