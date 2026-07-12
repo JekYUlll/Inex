@@ -212,6 +212,15 @@
 - Superseding pre-lock resolution：strict reservation + initial/final candidate ownership receipts 已闭合首版复审的 clean-miss/误删边界。目录枚举拒绝 wrong-case reserved aliases；canonical orphan staging 可精确清理，partial/multiple/link/reparse/foreign/未知 state 全部保留冲突；stable v4 journal 双可见只在完整绑定相等时移除 receipts/prelock。最终冻结复审为 0 blocker/0 major/0 required minor。
 - Receipt 安全性与可用性边界必须分开：candidate 已持久化但 initial receipt 尚未发布、Git 已改写 candidate 但 final receipt 尚未发布、或 partial receipt 都会被发现并保留，不会误报 clean 或误删；但 fresh recovery 不能自动判归属，仍返回 `RecoveryConflict`。该点与 native NTFS/ReFS power-loss 继续阻止 GA，不否定本次 fail-closed checkpoint。
 
+## 2026-07-12 Argon2id creation calibration
+
+- v1 production calibration 固定 64 MiB 与 parallelism 1，只在 ops 3..20 内搜索；默认策略的结果或失败用 `OnceLock` 每进程缓存，自定义测试策略取 v1/creation/reader 三者交集。计时循环只使用固定公开 dummy password/salt，不接触调用者口令。
+- 搜索必须精确定义不可达窗口：floor 已慢则选 floor，全区间过快则选 cap，离散跳跃越过 250–750 ms 时保留已测的 above-window 点。该窗口只约束单次 dummy KDF 测量；真实 create/import 还要做实际 KDF、wrap、原子提交与 reopen，因此本机端到端约 1.26 s 不矛盾。
+- creation cap 与 reader ceiling 是不同信任边界：默认新 vault 仅允许 ops 3..20 且内存精确 64 MiB；旧 slot reader 仍允许 ops 20/1 GiB。RPC 的 nonnegative integer 越界返回 `KDF_POLICY`，负数/小数/字符串/未知字段返回 `INVALID_PARAMS`，host calibration failure 返回固定 `INTERNAL_ERROR`。
+- 直接/daemon 显式策略和自动校准都在创建 absent root 前纯验证；无效策略不会留下目录。Import dry-run 在校准前返回，真实 import/init 在读取新密码和创建 staging 前取得缓存参数，缩短口令驻留。
+- no-downgrade 需要绑定 authenticated slot，而不是只在 CLI 选一次参数。首轮组合审计发现“已继承的 >64 MiB 参数再被 Vault 当作 new-vault candidate”会二次拒绝，修正为 Vault add/change 对最终参数按分量取 max 并只受 password-slot floor/reader ceiling。随后独立复审又发现公开低层 `crypto::add_password_slot` 可绕过 authenticated binding，现已收窄为 `pub(crate)`；公共写槽入口仅剩 Vault。
+- Frozen v1 fixture 与显式 `create_with_params` 保持确定性。真实 CLI `init` 与 `password add` 进程测试分别绑定 3..20/64 MiB 创建和 stronger-slot 继承，daemon unit/stdio 绑定 absent/explicit/error mapping 与 root 无副作用；安全与文档复核最终均为 GO。
+
 ## Visual/Browser Findings
 
 - 2026-07-10 官方 VS Code 文档明确区分 `CustomTextEditorProvider`（标准 TextDocument，VS Code 管 save/backup）与 `CustomEditorProvider`（扩展自管 document model/save/backup）；Inex 必须使用后者。

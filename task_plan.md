@@ -75,7 +75,8 @@ Phase 7 — 跨平台验证、打包与发布准备
 ### Phase 7: 跨平台验证、打包与发布准备
 
 - [ ] 跑通格式、性质、RPC、编辑器、Git、Unicode/长路径/换行的验证矩阵
-- [ ] 闭合 init plan 的 creation-time Argon2id 校准：v1 固定 64 MiB/parallelism 1，有界选择 ops 以目标 250–750 ms；显式 fixture 参数不漂移，RPC creation cap 与 password rewrap 不降级
+- [x] 闭合 init plan 的 creation-time Argon2id 校准：v1 固定 64 MiB/parallelism 1，有界选择 ops 以目标 250–750 ms；显式 fixture 参数不漂移，RPC creation cap 与 password rewrap 不降级
+- [ ] 在所有原生发布目标复验 Argon2id 计时/资源行为，记录落在 ops 3/20 或 interior above-window fallback 的主机；不得把单次测量窗口表述为端到端 SLA
 - [x] 闭合 binding Git rename/modify 源码契约：detected 形态、split 两侧 rename、精确 tree provenance、v2/v3 journal 与恢复负测均通过
 - [ ] 在原生支持平台复验 Git rename/power-loss，并在 GA 前保留“禁止并行 Git porcelain”边界或实现真正的 index CAS
   - [x] 实现 alternate-index candidate、Inex 自持真实 `.git/index.lock`、old/candidate digest 绑定与 create-only journal v4
