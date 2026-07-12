@@ -92,6 +92,9 @@ Phase 7 — 跨平台验证、打包与发布准备
   - [x] 修复并复审 Git v4 candidate 创建前的 durable pre-lock intent：orphan staging、foreign ownership、Windows exact-name 与 link/reparse 全部 fail closed
   - [ ] 闭合 candidate/initial/final ownership receipt 之间的强杀自动恢复，或在 GA scope 中明确这些可见状态只能保留并人工处置
     - [ ] 设计并实现 v5 immutable candidate bundle：只在未发布 scratch 完成 Git mutation、final digest 与完整 payload，再以 verified no-replace directory move 一次性发布；partial scratch 保留但不阻塞，active namespace 不再暴露多文件 receipt gap
+      - [x] 抽取跨平台 verified no-replace directory move，并冻结 audit-path/public API；Linux 与 Windows GNU/Wine 定向门禁通过
+      - [x] 定义 strict canonical v5 manifest、exact two-file inventory、stable/scratch namespace 与 `RecoveryStatus`；明确 inventory 验证不替代真实 Git stage-map/expected-old/transaction 语义验证
+      - [ ] 在 scratch 完成 alternate-index mutation 与完整语义验证，一次性发布 immutable stable bundle，再接入 v5 marker/journal/index recovery 与强杀矩阵
   - [ ] 原生 Windows NTFS/ReFS 复验 replace/write-through/power-loss，并由绑定证据决定是否取消 no-parallel-Git 边界
 - [x] 配置 Linux/Windows x64/arm64 CI、Rust 二进制、VSIX 与 Sublime 包产物；远端 hosted jobs 尚待执行
 - [x] 完成 threat model、用户指南、安全配置、迁移/升级与故障恢复文档
@@ -102,7 +105,8 @@ Phase 7 — 跨平台验证、打包与发布准备
   - [x] Sublime Build 4200 residue runner 改用真实 masked zenity，口令仅从 stdin 注入并纳入全根动态扫描；正常与 plugin-host kill 两路均零磁盘命中
   - [x] 将 Sublime Build 4200 runner 从 source/debug smoke 升级为 strict packaged baseline：私有四文件 snapshot/seal、包内 CLI/daemon、原样 package tree、normal/crash 两路与外部 canonical evidence；该增量不得被表述为完整 persistent-profile matrix
     - [x] 经独立 mutation 复核补齐 canonical Rust/Sublime manifest、完整 installed inventory、`SHA256SUMS` 与 crash fingerprint 交叉绑定，并从 clean successor harness 重跑两路证据
-  - [ ] 在同一已安装 Build 4200 profile 上补 application restart/full-process kill，再覆盖 keyboard/menu Save/Save As/Save All、export/clipboard/macro、draft matching/stale/corrupt、project/non-project、idle/daemon kill 与 CRUD 负路径
+  - [x] 在同一已安装隔离 Build 4200 profile/package 上完成 full-application SIGKILL/restart schema v4：subreaper/pidfd closure、零 root-bound process/mount、解锁前两秒全 view 扫描、同一密文重开与零 residue 均通过
+  - [ ] 继续覆盖 keyboard/menu Save/Save As/Save All、export/clipboard/macro、draft matching/stale/corrupt、project/non-project、其他 application/idle/daemon kill、CRUD 负路径与真实用户 persistent profile
   - [ ] VS Code persistent-profile UI 自动化仍缺可靠可观测 driver；已撤销无法触发 extension activation 的 X11 原型，不以坐标猜测形成证据
   - [ ] 在所有原生目标重复许可/残留证据并完成独立法务、签名与发布渠道审查
 - [x] 在 clean `40ff728` checkpoint 上用 system GCC 完成两次逐字节一致的 Linux x64 package/audit/native-dependency/VSIX-install smoke
@@ -254,6 +258,11 @@ Phase 7 — 跨平台验证、打包与发布准备
 | KDF diagnostic real-process regression passed but pedantic Clippy rejected its 143-line test function | 1 | Split static schema and dynamic outcome validation into focused helpers, keep every assertion, and rerun the CLI/core Clippy and process gates |
 | Initial cross-platform KDF harness could emit a Windows PASS despite pre-Job process execution and NTFS ADS being absent from ordinary tree snapshots | 1 | Fail closed before artifact use in Windows run/main/report validation, restrict CI evidence to Linux, and keep the two Windows native rows explicitly open until suspended Job, Job-empty, ADS enumeration, and native tests exist |
 | Independent KDF harness probe modified an extracted executable after its initial hash while the report still bound the old digest | 1 | Seal both executables and all four artifact snapshot files by physical identity, metadata, and SHA-256; remove POSIX write bits and revalidate before/after every probe/attempt and before report creation |
+| First full-restart v3 review found argv-only survivor detection could miss a `setsid` descendant and mis-signal an unrelated process | 1 | Replace it with confirmed subreaper adoption, stable session/descendant closure, pidfd-only signals, exact env/cwd/root/fd/exe census, and a schema-v4 report that rejects the predecessor v3 |
+| First portal-safe exact restart attempt failed closed on an unverified root-bound process and left a dead `fuse.portal` mount that made `rmtree` return `ENOTCONN` | 1 | Preserve and inspect the failure root; disable portals in the fixed child environment/private D-Bus config, add bounded mountinfo gates, allow only exact dead-portal non-lazy failure cleanup, remove the proven root, then rerun all three scenarios from a clean harness |
+| Git v5 preflight found a Windows canonical-vs-caller audit-path mismatch, a crate-private primitive, and a case-only wrong-case fixture that did not create a distinct stored name | 1 each | Freeze the callback on the caller path while retaining internal canonical identity checks, expose a constrained documented API, create the wrong-case member directly, and require Windows GNU/Wine targeted gates before integration |
+| Combined current-checkpoint planning patch targeted an earlier progress tail and failed context verification | 1 | No partial planning write occurred; split task-plan edits from append-only progress/findings sections and anchor each patch to the actual current tail |
+| First split findings append omitted the literal space in `power-loss 证据` and failed exact context matching | 1 | No partial findings write occurred; copy the exact current tail before the append-only patch and rerun `git diff --check` |
 
 ## Notes
 

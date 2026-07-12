@@ -151,7 +151,8 @@ Current checkpoint evidence is deliberately split: 84/84 Python tests pass
 (61 product tests plus 23 runner/evidence tests), and separately preserved
 canonical reports bind three exact packaged Build 4200 Linux scenarios: normal
 schema v2, plugin-host-crash schema v2, and full-application SIGKILL/restart
-schema v4 (`PASS`) against the same isolated profile and installed package. The
+schema v4. Each starts from a fresh isolated profile and the same audited
+package bytes; restart v4 alone reuses its profile/install across both launches. The
 normal scenario passed unlock/open/edit/save/close plus real InputPanel/QuickPanel New
 Folder, New Markdown, rename, and etag-bound delete. Authenticated tree state
 was checked after every mutation; the report records all four CRUD events,

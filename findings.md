@@ -274,3 +274,17 @@
 - v4 prelock 只绑定 old index/token/candidate basename；initial receipt 前无法区分 Inex candidate 与同-token foreign regular file，initial 后 Git 可留下 candidate.lock/partial/final candidate，而 final receipt 前没有最终 digest 或完整 transaction payload。Partial receipt 同样无法区分 torn publication 与 foreign bytes，因此猜测删除会降低现有 foreign-preservation 标准。
 - 可保持 fail-closed 的 v5 方向是 immutable bundle：在非 active scratch 内完成 alternate-index mutation、stage-map 验证、old/final digest、完整 merge payload、exact inventory 与 file identity，fsync 后以 verified no-replace directory move 一次性发布 stable token directory；稳定 bundle 不再原地修改，marker/journal 只引用 manifest digest。
 - 未发布 partial scratch 默认保留、报告但不阻塞新事务，就无需把未知对象当作 Inex 所有而删除；若产品要求自动删除所有 partial scratch 或零残片，则仍需要新的信任/scope 决策。原生 NTFS/ReFS directory move、file-ID 与 power-loss 证据仍不可由 Linux SIGKILL 替代。
+
+## 2026-07-13 portal-safe Sublime restart findings
+
+- “杀掉已知三角色/同 session”不等价于“杀掉应用闭包”。子进程可以在 capture 前后 `setsid()` 或 double-fork；可靠的 Linux harness 必须先成为 confirmed child subreaper，稳定枚举 session 与 descendant closure，为每个 `(pid,starttime,parent,session)` 打开 pidfd 并复核，之后才发 SIGKILL。任何未进入已验证闭包的 root-bound survivor 都只能让 evidence fail closed，不能按 argv 猜测后直接 kill。
+- 进程是否绑定隔离根不能由 argv substring 推导。当前 census 只接受 exact isolated HOME/XDG/TMP 环境值，或 `/proc/<pid>/{exe,cwd,root,fd}` 指向根内路径；argv-only 明确不是 binding。对已验证 closure/adopted candidate 的 EACCES/EPERM 是证据失败，只有 ENOENT/稳定 identity 消失可当作已退出。
+- GUI harness 还必须把 mount namespace 纳入 residue 结论。D-Bus activation 曾在 private `XDG_RUNTIME_DIR/doc` 留下 dead `fuse.portal`，即使 process census 归零，普通 `rmtree` 仍以 `ENOTCONN` 失败。Success path 现在要求 checkpoint/final mount count 都为零且绝不 unmount；failure cleanup 只对零 live binding、唯一 exact `portal` source + `fuse.portal` type 使用 sealed `fusermount3 -u`（非 lazy），未知/活/额外 mount 均保留并失败。
+- Schema v4 的新增字段不是装饰性声明：isolated environment 可重建 profile/package-owned sidecar 路径和 process environment digest；state token fingerprint-set digest 必须同时匹配 helper normalized observation、state seal 与 lifecycle；两份 profile binding、两次 sidecar path 或 token/state 联动伪造均由 validator 拒绝。旧 v3 因 root schema 不同保留为 predecessor 而不是原地升级。
+- 当前 full-restart PASS 证明的是同一 exact package/隔离 profile 在一次完整 SIGKILL 路径上的磁盘与 restart 行为。它不消除 plugin-host-dead 时可复制明文的既有边界，也不覆盖真实用户 profile、Hot Exit/history/sync/backup、keyboard/menu variants、其他 kill 路径或其他平台；Sublime 必须继续 experimental。
+
+## 2026-07-13 Git v5 prerequisite findings
+
+- Stable v5 bundle 必须保持 immutable，因此后续不能像 v4 一样把唯一 candidate member 移动到 `.git/index.lock`；writer/recovery 应从 sealed bundle 复制到 token-derived publish staging，再在持有 real Git lock 时替换 exact marker，stable bundle 直到 journal 和最终状态确认后才按 exact inventory 清理。
+- v5 manifest/inventory validator 只证明 canonical schema、member physical shape、size/digest 与 exact namespace；任意伪 `DIRC...` bytes 仍可能通过 inventory 层。任何 worktree/index mutation 前必须在真实 Git 上下文验证 candidate 完整 stage map、object format/OID width、live expected-old 和 transaction payload 语义，不能因类型名包含 verified 就跳过这一层。
+- Portable Windows test 不能用 case-only rename 假设制造 wrong-case entry，也不能让 API callback 在 Windows 悄然收到 `\\?\` canonical path 而 Linux 收到 caller path。测试现直接创建并枚举 wrong-case member；directory primitive 冻结 callback caller-path 契约，内部另持 canonical identity。Native NTFS/ReFS ADS、file-ID abrupt-kill/power-loss 仍是独立 GA gate，Wine 只验证代码路径与 fixture。

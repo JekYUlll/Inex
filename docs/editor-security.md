@@ -190,8 +190,9 @@ binding crash matrix.
 The current Python suite passes 84/84: 61 product tests plus 23 runner/evidence
 tests. On Linux, separately preserved canonical reports bind three exact
 packaged Build 4200 scenarios: normal schema v2, plugin-host-crash schema v2,
-and full-application SIGKILL/restart schema v4 (`PASS`) against the same
-isolated profile and installed package.
+and full-application SIGKILL/restart schema v4. Each starts from a fresh
+isolated profile and the same audited package bytes; restart v4 alone reuses
+its profile/install across both launches.
 The normal scenario drives unlock/open/edit/save/close and registered
 WindowCommands with real InputPanel/QuickPanel interaction for New Folder, New
 Markdown, rename, and etag-bound delete. Authenticated tree checks pass after

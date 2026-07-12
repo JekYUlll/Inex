@@ -391,8 +391,9 @@ The suite passes 84/84: 61 product tests plus 23 runner/evidence tests. It does
 not by itself replace exact-package black-box evidence. On Linux, separately
 preserved canonical reports bind three exact packaged Build 4200 scenarios:
 normal schema v2, plugin-host-crash schema v2, and full-application
-SIGKILL/restart schema v4 (`PASS`) against the same isolated profile and
-installed package. The normal scenario passed unlock/open/edit/save/close and
+SIGKILL/restart schema v4. Each starts from a fresh isolated profile and the
+same audited package bytes; restart v4 alone reuses its profile/install across
+both launches. The normal scenario passed unlock/open/edit/save/close and
 used registered WindowCommands plus real InputPanel/QuickPanel interaction for
 New Folder, New Markdown, rename, and etag-bound delete. Authenticated `listTree`
 checks passed after each step, `crud_complete=true`, events record

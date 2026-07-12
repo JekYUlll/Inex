@@ -21,8 +21,9 @@ In particular:
 - the Sublime Python suite passes 84/84: 61 product tests plus 23
   runner/evidence tests. On Linux, separately preserved canonical reports bind
   three exact packaged Build 4200 scenarios: normal schema v2,
-  plugin-host-crash schema v2, and full-application SIGKILL/restart schema v4
-  (`PASS`) against the same isolated profile and installed package. Before the
+  plugin-host-crash schema v2, and full-application SIGKILL/restart schema v4.
+  Each starts from a fresh isolated profile and the same audited package bytes;
+  restart v4 alone reuses its profile/install across both launches. Before the
   second unlock, the restart flow scans every view continuously for two seconds with
   no known content/token fingerprint or Inex state; after unlock it reopens the
   same encrypted saved-content fingerprint. Killing only the plugin host still
