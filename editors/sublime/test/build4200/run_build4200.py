@@ -390,6 +390,39 @@ def seal_record(name: str, seal: PhysicalFileSeal) -> Dict[str, object]:
     }
 
 
+def directory_binding(path: Path) -> Dict[str, object]:
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise QaFailure("restart profile directory identity is unavailable") from error
+    if (
+        release_lifecycle.is_link_like(path, metadata)
+        or not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+    ):
+        raise QaFailure("restart profile directory is not private and physical")
+    return {
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "mode": stat.S_IMODE(metadata.st_mode),
+        "pathSha256": sha256_bytes(str(path).encode("utf-8")),
+    }
+
+
+def physical_tree_report_digest(seal: PhysicalTreeSeal) -> str:
+    records = [
+        seal_record(name, seal.files[name]) for name in sorted(seal.files)
+    ]
+    return sha256_bytes(
+        json.dumps(
+            records,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    )
+
+
 def _snapshot_file_paths(root: Path) -> Dict[str, Path]:
     try:
         metadata = root.lstat()
@@ -767,6 +800,273 @@ def process_cmdline(pid: int) -> List[str]:
     return [part.decode("utf-8", "replace") for part in raw.split(b"\0") if part]
 
 
+def process_stat_fields(pid: int) -> Tuple[str, int, int, int, int]:
+    try:
+        raw = (Path("/proc") / str(pid) / "stat").read_text()
+    except (OSError, UnicodeError) as error:
+        raise QaFailure("process stat identity is unavailable") from error
+    close = raw.rfind(")")
+    if close < 0:
+        raise QaFailure("process stat identity is malformed")
+    fields = raw[close + 2 :].split()
+    try:
+        state = fields[0]
+        parent_pid = int(fields[1])
+        process_group_id = int(fields[2])
+        session_id = int(fields[3])
+        start_time_ticks = int(fields[19])
+    except (IndexError, ValueError) as error:
+        raise QaFailure("process stat identity is malformed") from error
+    if (
+        len(state) != 1
+        or parent_pid < 0
+        or process_group_id <= 1
+        or session_id <= 1
+        or start_time_ticks <= 0
+    ):
+        raise QaFailure("process stat identity is outside its bounds")
+    return state, parent_pid, process_group_id, session_id, start_time_ticks
+
+
+def process_environment_binding(pid: int, expected: Mapping[str, str]) -> str:
+    try:
+        raw = (Path("/proc") / str(pid) / "environ").read_bytes()
+    except OSError as error:
+        raise QaFailure("process environment identity is unavailable") from error
+    values: Dict[str, str] = {}
+    for item in raw.split(b"\0"):
+        if not item or b"=" not in item:
+            continue
+        key_bytes, value_bytes = item.split(b"=", 1)
+        try:
+            key = key_bytes.decode("ascii")
+            value = value_bytes.decode("utf-8")
+        except UnicodeError:
+            continue
+        if key in expected:
+            values[key] = value
+    if values != dict(expected):
+        raise QaFailure("application process escaped the isolated environment")
+    return sha256_bytes(
+        json.dumps(values, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode(
+            "utf-8"
+        )
+    )
+
+
+def capture_process_identity(
+    pid: int,
+    role: str,
+    expected_environment: Mapping[str, str],
+    *,
+    expected_executable: Optional[Tuple[Path, PhysicalFileSeal]] = None,
+    executable_name: Optional[str] = None,
+    required_argument: Optional[str] = None,
+) -> Dict[str, object]:
+    state, parent_pid, process_group_id, session_id, start_time_ticks = (
+        process_stat_fields(pid)
+    )
+    if state == "Z":
+        raise QaFailure("cannot bind a zombie application process")
+    command = process_cmdline(pid)
+    if not command:
+        raise QaFailure("application process command line is unavailable")
+    if required_argument is not None and required_argument not in command:
+        raise QaFailure("application process is not bound to the isolated profile")
+    try:
+        executable_path = (Path("/proc") / str(pid) / "exe").resolve(strict=True)
+    except OSError as error:
+        raise QaFailure("application process executable is unavailable") from error
+    if executable_name is not None and executable_path.name != executable_name:
+        raise QaFailure("application process executable has the wrong identity")
+    executable_seal = capture_physical_file_seal(
+        executable_path,
+        "application process executable " + role,
+        require_posix_executable=True,
+    )
+    if expected_executable is not None:
+        expected_path, expected_seal = expected_executable
+        if executable_path != expected_path or _metadata_signature(
+            executable_seal.metadata
+        ) != _metadata_signature(expected_seal.metadata) or executable_seal.sha256 != expected_seal.sha256:
+            raise QaFailure("application process does not execute the sealed binary")
+    command_bytes = b"\0".join(part.encode("utf-8") for part in command)
+    return {
+        "role": role,
+        "pid": pid,
+        "parentPid": parent_pid,
+        "processGroupId": process_group_id,
+        "sessionId": session_id,
+        "startTimeTicks": start_time_ticks,
+        "commandSha256": sha256_bytes(command_bytes),
+        "environmentBindingSha256": process_environment_binding(
+            pid, expected_environment
+        ),
+        "isolatedEnvironmentBound": True,
+        "executablePath": str(executable_path),
+        "executableSeal": seal_record(role, executable_seal),
+    }
+
+
+def process_identity_alive(identity: Mapping[str, object]) -> bool:
+    pid = identity.get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
+        raise QaFailure("recorded process identity has an invalid PID")
+    try:
+        state, _parent, group, session, started = process_stat_fields(pid)
+    except QaFailure:
+        return False
+    if state == "Z":
+        return False
+    seal = identity.get("executableSeal")
+    if not isinstance(seal, dict):
+        raise QaFailure("recorded process identity omits its executable seal")
+    try:
+        opened = (Path("/proc") / str(pid) / "exe").stat()
+    except OSError:
+        return False
+    return (
+        started == identity.get("startTimeTicks")
+        and group == identity.get("processGroupId")
+        and session == identity.get("sessionId")
+        and opened.st_dev == seal.get("device")
+        and opened.st_ino == seal.get("inode")
+    )
+
+
+def capture_application_identities(
+    main_pid: int,
+    sublime_binary: Path,
+    sublime_seal: PhysicalFileSeal,
+    plugin_host: Path,
+    plugin_host_seal: PhysicalFileSeal,
+    profile: Path,
+    sidecar: Path,
+    sidecar_seal: PhysicalFileSeal,
+    expected_environment: Mapping[str, str],
+) -> List[Dict[str, object]]:
+    hosts = command_pids("plugin_host-3.8", str(profile))
+    sidecars = packaged_sidecar_pids(sidecar, sidecar_seal)
+    if len(hosts) != 1 or len(sidecars) != 1:
+        raise QaFailure("restart checkpoint requires one plugin host and one sidecar")
+    identities = [
+        capture_process_identity(
+            main_pid,
+            "sublime-main",
+            expected_environment,
+            expected_executable=(sublime_binary, sublime_seal),
+        ),
+        capture_process_identity(
+            hosts[0],
+            "plugin-host-3.8",
+            expected_environment,
+            expected_executable=(plugin_host, plugin_host_seal),
+            executable_name="plugin_host-3.8",
+            required_argument=str(profile),
+        ),
+        capture_process_identity(
+            sidecars[0],
+            "packaged-inexd",
+            expected_environment,
+            expected_executable=(sidecar, sidecar_seal),
+        ),
+    ]
+    sessions = {identity["sessionId"] for identity in identities}
+    if len(sessions) != 1:
+        raise QaFailure("application process identities do not share one launch session")
+    return identities
+
+
+def session_process_pids(session_id: int) -> List[int]:
+    matches: List[int] = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        try:
+            state, _parent, _group, observed_session, _started = process_stat_fields(pid)
+        except QaFailure:
+            continue
+        if state != "Z" and observed_session == session_id:
+            matches.append(pid)
+    return sorted(matches)
+
+
+def kill_verified_application_session(
+    identities: Sequence[Mapping[str, object]], launcher: subprocess.Popen
+) -> int:
+    if len(identities) != 3 or any(
+        not process_identity_alive(identity) for identity in identities
+    ):
+        raise QaFailure("application process identity changed before SIGKILL")
+    sessions = {identity.get("sessionId") for identity in identities}
+    if len(sessions) != 1:
+        raise QaFailure("application SIGKILL session is ambiguous")
+    session_id = next(iter(sessions))
+    if (
+        not isinstance(session_id, int)
+        or isinstance(session_id, bool)
+        or session_id <= 1
+        or session_id == os.getsid(0)
+        or launcher.poll() is not None
+        or os.getsid(launcher.pid) != session_id
+    ):
+        raise QaFailure("application launcher is outside the verified SIGKILL session")
+    pidfds: Dict[int, int] = {}
+    captured_starts: Dict[int, int] = {}
+    try:
+        for _attempt in range(20):
+            for descriptor in pidfds.values():
+                os.close(descriptor)
+            pidfds.clear()
+            captured_starts.clear()
+            before = session_process_pids(session_id)
+            if not before:
+                raise QaFailure("application session disappeared before SIGKILL")
+            try:
+                for pid in before:
+                    _state, _parent, _group, observed_session, started = (
+                        process_stat_fields(pid)
+                    )
+                    descriptor = os.pidfd_open(pid)
+                    pidfds[pid] = descriptor
+                    _state2, _parent2, _group2, session2, started2 = (
+                        process_stat_fields(pid)
+                    )
+                    if observed_session != session_id or session2 != session_id or started2 != started:
+                        raise ProcessLookupError
+                    captured_starts[pid] = started
+            except (OSError, QaFailure):
+                time.sleep(0.05)
+                continue
+            if session_process_pids(session_id) == before:
+                break
+            time.sleep(0.05)
+        else:
+            raise QaFailure("application session membership did not stabilize")
+        if not {int(identity["pid"]) for identity in identities}.issubset(pidfds):
+            raise QaFailure("verified application roles escaped the launch session")
+        if any(not process_identity_alive(identity) for identity in identities):
+            raise QaFailure("application process identity changed after pidfd capture")
+        for pid in sorted(pidfds, reverse=True):
+            signal.pidfd_send_signal(pidfds[pid], signal.SIGKILL)
+        wait_until(
+            "old application session to die",
+            lambda: not session_process_pids(session_id),
+            5,
+        )
+        if any(process_identity_alive(identity) for identity in identities):
+            raise QaFailure("old application role survived pidfd SIGKILL")
+        try:
+            launcher.wait(timeout=5)
+        except subprocess.TimeoutExpired as error:
+            raise QaFailure("SIGKILL launcher did not terminate") from error
+        return len(pidfds)
+    finally:
+        for descriptor in pidfds.values():
+            os.close(descriptor)
+
+
 def sublime_multiinstance_pids(binary: Path) -> List[int]:
     matches: List[int] = []
     for entry in Path("/proc").iterdir():
@@ -913,6 +1213,101 @@ def append_report(path: Path, value: Dict[str, object]) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def validate_restart_checkpoint_state(
+    path: Path,
+    helper_records: Sequence[Mapping[str, object]],
+    content_tokens: Sequence[str],
+) -> Dict[str, object]:
+    seal = capture_physical_file_seal(path, "restart checkpoint state")
+    if seal.metadata.st_size > 16 * 1024:
+        raise QaFailure("restart checkpoint state exceeds its size bound")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise QaFailure("restart checkpoint state is malformed") from error
+    expected_keys = {
+        "schema_version",
+        "phase",
+        "logical_path",
+        "opened_byte_count",
+        "opened_content_sha256",
+        "saved_byte_count",
+        "saved_content_sha256",
+        "token_fingerprints",
+    }
+    if not isinstance(value, dict) or set(value) != expected_keys:
+        raise QaFailure("restart checkpoint state has an invalid schema")
+    observations = {
+        record.get("event"): record
+        for record in helper_records
+        if record.get("event") in {"opened", "saved"}
+    }
+    opened = observations.get("opened")
+    saved = observations.get("saved")
+    canonical_bytes = (json.dumps(value, ensure_ascii=True, sort_keys=True) + "\n").encode(
+        "utf-8"
+    )
+    if path.read_bytes() != canonical_bytes or seal.sha256 != sha256_bytes(canonical_bytes):
+        raise QaFailure("restart checkpoint state is not canonical or seal-bound")
+    if (
+        value.get("schema_version") != 1
+        or value.get("phase") != "await_full_application_restart"
+        or value.get("logical_path") != "qa.md"
+        or not isinstance(opened, Mapping)
+        or not isinstance(saved, Mapping)
+        or value.get("opened_byte_count") != opened.get("byte_count")
+        or value.get("opened_content_sha256") != opened.get("content_sha256")
+        or value.get("saved_byte_count") != saved.get("byte_count")
+        or value.get("saved_content_sha256") != saved.get("content_sha256")
+    ):
+        raise QaFailure("restart checkpoint state is not bound to helper observations")
+    token_fingerprints = value.get("token_fingerprints")
+    expected_tokens = sorted(
+        (
+            len(token.encode("utf-8")),
+            sha256_bytes(token.encode("utf-8")),
+        )
+        for token in content_tokens
+    )
+    if (
+        not isinstance(token_fingerprints, list)
+        or len(token_fingerprints) != len(expected_tokens)
+    ):
+        raise QaFailure("restart checkpoint state omits token fingerprints")
+    observed_tokens: List[Tuple[int, str]] = []
+    for token in token_fingerprints:
+        if (
+            not isinstance(token, dict)
+            or set(token) != {"byte_count", "content_sha256"}
+            or not isinstance(token.get("byte_count"), int)
+            or isinstance(token.get("byte_count"), bool)
+            or token["byte_count"] <= 0
+            or not _valid_digest(token.get("content_sha256"))
+        ):
+            raise QaFailure("restart checkpoint state has an invalid token fingerprint")
+        observed_tokens.append((token["byte_count"], token["content_sha256"]))
+    if sorted(observed_tokens) != expected_tokens:
+        raise QaFailure("restart checkpoint token fingerprints are not exact")
+    return {
+        "schemaVersion": value["schema_version"],
+        "phase": value["phase"],
+        "logicalPath": value["logical_path"],
+        "opened": {
+            "byteCount": value["opened_byte_count"],
+            "contentSha256": value["opened_content_sha256"],
+        },
+        "saved": {
+            "byteCount": value["saved_byte_count"],
+            "contentSha256": value["saved_content_sha256"],
+        },
+        "tokenFingerprints": [
+            {"byteCount": byte_count, "contentSha256": digest}
+            for byte_count, digest in observed_tokens
+        ],
+        "plaintextFieldsAbsent": True,
+    }
 
 
 def encoded_needles(tokens: Iterable[str]) -> List[Tuple[str, bytes]]:
@@ -1243,7 +1638,16 @@ def normalize_helper_records(
             "time",
             "view_count",
             "managed_count",
+            "client_present",
             "session_active",
+            "vault_id_present",
+            "vault_path_present",
+            "unlock_in_progress",
+            "pending_plaintext_count",
+            "handoff_count",
+            "scrubbing_count",
+            "fixed_scrub_ack_count",
+            "orphan_scrub_blocked",
             "marker_count",
             "known_fingerprint_count",
             "token_window_match_count",
@@ -1416,7 +1820,16 @@ def normalize_helper_records(
             or by_event["restart_loaded"].get("issue_count") != 0
             or preunlock.get("clean") is not True
             or preunlock.get("managed_count") != 0
+            or preunlock.get("client_present") is not False
             or preunlock.get("session_active") is not False
+            or preunlock.get("vault_id_present") is not False
+            or preunlock.get("vault_path_present") is not False
+            or preunlock.get("unlock_in_progress") is not False
+            or preunlock.get("pending_plaintext_count") != 0
+            or preunlock.get("handoff_count") != 0
+            or preunlock.get("scrubbing_count") != 0
+            or preunlock.get("fixed_scrub_ack_count") != 0
+            or preunlock.get("orphan_scrub_blocked") is not False
             or preunlock.get("marker_count") != 0
             or preunlock.get("known_fingerprint_count") != 0
             or preunlock.get("token_window_match_count") != 0
@@ -1586,8 +1999,63 @@ def _validate_seal_record(value: object) -> None:
             raise QaFailure("artifact report has invalid physical metadata")
 
 
+def _validate_process_identity_record(value: object, role: str) -> None:
+    if not isinstance(value, dict) or set(value) != {
+        "role",
+        "pid",
+        "parentPid",
+        "processGroupId",
+        "sessionId",
+        "startTimeTicks",
+        "commandSha256",
+        "environmentBindingSha256",
+        "isolatedEnvironmentBound",
+        "executablePath",
+        "executableSeal",
+    }:
+        raise QaFailure("artifact report has an invalid process identity schema")
+    if (
+        value.get("role") != role
+        or value.get("isolatedEnvironmentBound") is not True
+        or not isinstance(value.get("executablePath"), str)
+        or not os.path.isabs(str(value["executablePath"]))
+        or not _valid_digest(value.get("commandSha256"))
+        or not _valid_digest(value.get("environmentBindingSha256"))
+    ):
+        raise QaFailure("artifact report has an invalid process identity binding")
+    for field, minimum in (
+        ("pid", 2),
+        ("parentPid", 0),
+        ("processGroupId", 2),
+        ("sessionId", 2),
+        ("startTimeTicks", 1),
+    ):
+        item = value.get(field)
+        if not isinstance(item, int) or isinstance(item, bool) or item < minimum:
+            raise QaFailure("artifact report has invalid process identity metadata")
+    _validate_seal_record(value.get("executableSeal"))
+    if value["executableSeal"].get("name") != role:
+        raise QaFailure("artifact report process executable seal has the wrong role")
+
+
+def _same_sealed_file(left: Mapping[str, object], right: Mapping[str, object]) -> bool:
+    return all(
+        left.get(field) == right.get(field)
+        for field in (
+            "device",
+            "inode",
+            "mode",
+            "linkCount",
+            "size",
+            "mtimeNs",
+            "ctimeNs",
+            "sha256",
+        )
+    )
+
+
 def validate_artifact_report(report: Dict[str, object]) -> None:
-    if set(report) != {
+    base_root_fields = {
         "schemaVersion",
         "reportType",
         "reportScope",
@@ -1616,15 +2084,29 @@ def validate_artifact_report(report: Dict[str, object]) -> None:
         "rootDeletionVerified",
         "notCovered",
         "trustAssumptions",
-    }:
-        raise QaFailure("artifact report has an invalid root schema")
+    }
+    schema_version = report.get("schemaVersion")
     scenario = report.get("scenario")
+    expected_root_fields = base_root_fields | (
+        {"restartLifecycle"}
+        if schema_version == 3 and scenario == "full-application-kill-restart"
+        else set()
+    )
+    if set(report) != expected_root_fields:
+        raise QaFailure("artifact report has an invalid root schema")
     result = report.get("scenarioResult")
+    fixed_schema_ok = (
+        schema_version == 2
+        and report.get("reportScope") == ARTIFACT_REPORT_SCOPE
+        and scenario in {"normal", "plugin-host-crash"}
+    ) or (
+        schema_version == 3
+        and report.get("reportScope") == RESTART_ARTIFACT_REPORT_SCOPE
+        and scenario == "full-application-kill-restart"
+    )
     if (
-        report.get("schemaVersion") != 2
+        not fixed_schema_ok
         or report.get("reportType") != "inex-sublime-build4200-evidence"
-        or report.get("reportScope") != ARTIFACT_REPORT_SCOPE
-        or scenario not in {"normal", "plugin-host-crash"}
         or report.get("nativePlatform") != "linux-x64"
         or not isinstance(result, dict)
         or report.get("reportProtection") != "create-new-posix-mode-0600"
@@ -2019,9 +2501,7 @@ def validate_artifact_report(report: Dict[str, object]) -> None:
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
-    expected_events = list(
-        NORMAL_EVENT_SEQUENCE if scenario == "normal" else CRASH_EVENT_SEQUENCE
-    )
+    expected_events = list(scenario_event_sequence(str(scenario)))
     expected_counts = {event: expected_events.count(event) for event in sorted(set(expected_events))}
     if (
         helper_report.get("recordCount") != len(normalized_observations)
@@ -2044,7 +2524,7 @@ def validate_artifact_report(report: Dict[str, object]) -> None:
     }:
         raise QaFailure("artifact report has an invalid residue scan claim")
 
-    if set(result) != {
+    v2_result_fields = {
         "scenario",
         "result",
         "events",
@@ -2058,7 +2538,29 @@ def validate_artifact_report(report: Dict[str, object]) -> None:
         "packagedSidecarObserved",
         "packagedSidecarMatchCount",
         "packagedSidecarExeSeal",
-    } or result.get("scenario") != scenario:
+    }
+    restart_result_fields = {
+        "scenario",
+        "result",
+        "events",
+        "rootScanHits",
+        "vaultEnvelope",
+        "packagedSidecarObserved",
+        "packagedSidecarMatchCount",
+        "packagedSidecarExeSeal",
+        "applicationRestarted",
+        "sameProfileAndInstalledPackage",
+        "oldProcessIdentitiesDead",
+        "preUnlockClean",
+        "reopenedFingerprintMatches",
+        "normalCloseComplete",
+    }
+    expected_result_fields = (
+        restart_result_fields
+        if scenario == "full-application-kill-restart"
+        else v2_result_fields
+    )
+    if set(result) != expected_result_fields or result.get("scenario") != scenario:
         raise QaFailure("artifact report has an invalid single-scenario result")
     _validate_seal_record(result.get("packagedSidecarExeSeal"))
     if (
@@ -2066,7 +2568,8 @@ def validate_artifact_report(report: Dict[str, object]) -> None:
         or result.get("rootScanHits") != 0
         or result.get("vaultEnvelope") != "EDRY"
         or result.get("packagedSidecarObserved") is not True
-        or result.get("packagedSidecarMatchCount") != 1
+        or result.get("packagedSidecarMatchCount")
+        != (2 if scenario == "full-application-kill-restart" else 1)
         or result.get("packagedSidecarExeSeal")
         != executable_map["inexd"].get("seal")
     ):
@@ -2086,7 +2589,7 @@ def validate_artifact_report(report: Dict[str, object]) -> None:
             )
         ):
             raise QaFailure("artifact report has an invalid normal result")
-    elif (
+    elif scenario == "plugin-host-crash" and (
         result_value != "PASS_WITH_DOCUMENTED_BOUNDARY"
         or result.get("crudComplete") is not False
         or result.get("pluginHostRestarted") is not False
@@ -2095,6 +2598,238 @@ def validate_artifact_report(report: Dict[str, object]) -> None:
         or result.get("hostDeadClipboardReadOk") is not True
     ):
         raise QaFailure("artifact report has an invalid crash-boundary result")
+    elif scenario == "full-application-kill-restart":
+        if (
+            result_value != "PASS"
+            or any(
+                result.get(field) is not True
+                for field in (
+                    "applicationRestarted",
+                    "sameProfileAndInstalledPackage",
+                    "oldProcessIdentitiesDead",
+                    "preUnlockClean",
+                    "reopenedFingerprintMatches",
+                    "normalCloseComplete",
+                )
+            )
+        ):
+            raise QaFailure("artifact report has an invalid full-restart result")
+        lifecycle = report.get("restartLifecycle")
+        if not isinstance(lifecycle, dict) or set(lifecycle) != {
+            "launchCount",
+            "sameProfilePath",
+            "sameInstalledPackageTree",
+            "signalDelivery",
+            "killSignal",
+            "killedSessionProcessCount",
+            "profileDirectoryBindings",
+            "installedPackageTreeSha256ByLaunch",
+            "pluginHostExecutable",
+            "firstLaunchProcessIdentities",
+            "oldProcessIdentitiesDead",
+            "checkpoint",
+            "secondLaunchProcessIdentities",
+            "secondLaunchIdentitiesDistinct",
+        }:
+            raise QaFailure("artifact report has an invalid restart lifecycle schema")
+        if (
+            lifecycle.get("launchCount") != 2
+            or lifecycle.get("sameProfilePath") is not True
+            or lifecycle.get("sameInstalledPackageTree") is not True
+            or lifecycle.get("signalDelivery")
+            != "pidfd-per-stable-launch-session-identity"
+            or lifecycle.get("killSignal") != "SIGKILL"
+            or not isinstance(lifecycle.get("killedSessionProcessCount"), int)
+            or isinstance(lifecycle.get("killedSessionProcessCount"), bool)
+            or lifecycle["killedSessionProcessCount"] < 3
+            or lifecycle.get("oldProcessIdentitiesDead") is not True
+            or lifecycle.get("secondLaunchIdentitiesDistinct") is not True
+        ):
+            raise QaFailure("artifact report has a false restart lifecycle claim")
+        roles = ["sublime-main", "plugin-host-3.8", "packaged-inexd"]
+        profile_bindings = lifecycle.get("profileDirectoryBindings")
+        if (
+            not isinstance(profile_bindings, list)
+            or len(profile_bindings) != 2
+            or profile_bindings[0] != profile_bindings[1]
+        ):
+            raise QaFailure("artifact report profile identity changed across restart")
+        for binding in profile_bindings:
+            if not isinstance(binding, dict) or set(binding) != {
+                "device",
+                "inode",
+                "mode",
+                "pathSha256",
+            }:
+                raise QaFailure("artifact report has an invalid profile identity")
+            for field in ("device", "inode", "mode"):
+                item = binding.get(field)
+                if not isinstance(item, int) or isinstance(item, bool) or item < 0:
+                    raise QaFailure("artifact report has invalid profile metadata")
+            if binding["mode"] & 0o022 or not _valid_digest(
+                binding.get("pathSha256")
+            ):
+                raise QaFailure("artifact report has an unsafe profile identity")
+        tree_digests = lifecycle.get("installedPackageTreeSha256ByLaunch")
+        if (
+            not isinstance(tree_digests, list)
+            or len(tree_digests) != 2
+            or tree_digests[0] != tree.get("treeSha256")
+            or tree_digests[1] != tree.get("treeSha256")
+        ):
+            raise QaFailure("artifact report package tree changed across restart")
+        plugin_host_executable = lifecycle.get("pluginHostExecutable")
+        if (
+            not isinstance(plugin_host_executable, dict)
+            or set(plugin_host_executable) != {"path", "seal"}
+            or not isinstance(plugin_host_executable.get("path"), str)
+            or not os.path.isabs(str(plugin_host_executable["path"]))
+            or Path(str(plugin_host_executable["path"])).name != "plugin_host-3.8"
+        ):
+            raise QaFailure("artifact report has an invalid presealed plugin host")
+        _validate_seal_record(plugin_host_executable.get("seal"))
+        if plugin_host_executable["seal"].get("name") != "plugin-host-3.8":
+            raise QaFailure("artifact report plugin-host seal has the wrong name")
+        first_identities = lifecycle.get("firstLaunchProcessIdentities")
+        second_identities = lifecycle.get("secondLaunchProcessIdentities")
+        if (
+            not isinstance(first_identities, list)
+            or not isinstance(second_identities, list)
+            or len(first_identities) != len(roles)
+            or len(second_identities) != len(roles)
+        ):
+            raise QaFailure("artifact report omits restart process identities")
+        for records in (first_identities, second_identities):
+            for record, role in zip(records, roles):
+                _validate_process_identity_record(record, role)
+            if len({record["sessionId"] for record in records}) != 1:
+                raise QaFailure("artifact report process roles escaped their launch session")
+        for first, second in zip(first_identities, second_identities):
+            if second["startTimeTicks"] <= first["startTimeTicks"]:
+                raise QaFailure("artifact report second process identity is not newer")
+        environment_bindings = {
+            record["environmentBindingSha256"]
+            for record in first_identities + second_identities
+        }
+        if len(environment_bindings) != 1:
+            raise QaFailure("artifact report process environments differ across launches")
+        build_seal = build.get("seal")
+        sidecar_seal = executable_map["inexd"].get("seal")
+        for records in (first_identities, second_identities):
+            if (
+                records[0].get("executablePath") != build.get("path")
+                or not _same_sealed_file(records[0]["executableSeal"], build_seal)
+                or Path(str(records[1].get("executablePath"))).name
+                != "plugin_host-3.8"
+                or records[1].get("executablePath")
+                != plugin_host_executable.get("path")
+                or not _same_sealed_file(
+                    records[1]["executableSeal"], plugin_host_executable["seal"]
+                )
+                or not _same_sealed_file(
+                    records[2]["executableSeal"], sidecar_seal
+                )
+            ):
+                raise QaFailure("artifact report process executable binding is invalid")
+        checkpoint = lifecycle.get("checkpoint")
+        if not isinstance(checkpoint, dict) or set(checkpoint) != {
+            "stateSeal",
+            "stateBinding",
+            "runtimeAndSocketsStopped",
+            "residueScan",
+        }:
+            raise QaFailure("artifact report has an invalid restart checkpoint")
+        _validate_seal_record(checkpoint.get("stateSeal"))
+        if (
+            checkpoint["stateSeal"].get("name") != "control/state.json"
+            or checkpoint["stateSeal"].get("mode") != 0o600
+            or checkpoint.get("runtimeAndSocketsStopped") is not True
+        ):
+            raise QaFailure("artifact report restart state seal is invalid")
+        checkpoint_scan = checkpoint.get("residueScan")
+        expected_checkpoint_scan = dict(residue)
+        expected_checkpoint_scan["roots"] = [
+            "isolated-root-after-sigkill-before-second-launch"
+        ]
+        if checkpoint_scan != expected_checkpoint_scan:
+            raise QaFailure("artifact report restart checkpoint scan is invalid")
+        state_binding = checkpoint.get("stateBinding")
+        if not isinstance(state_binding, dict) or set(state_binding) != {
+            "schemaVersion",
+            "phase",
+            "logicalPath",
+            "opened",
+            "saved",
+            "tokenFingerprints",
+            "plaintextFieldsAbsent",
+        }:
+            raise QaFailure("artifact report restart state binding is invalid")
+        observations_by_event = {
+            observation["event"]: observation
+            for observation in normalized_observations
+            if isinstance(observation, dict)
+        }
+        expected_opened = {
+            "byteCount": observations_by_event["opened"]["byte_count"],
+            "contentSha256": observations_by_event["opened"]["content_sha256"],
+        }
+        expected_saved = {
+            "byteCount": observations_by_event["saved"]["byte_count"],
+            "contentSha256": observations_by_event["saved"]["content_sha256"],
+        }
+        if (
+            state_binding.get("schemaVersion") != 1
+            or state_binding.get("phase") != "await_full_application_restart"
+            or state_binding.get("logicalPath") != "qa.md"
+            or state_binding.get("opened") != expected_opened
+            or state_binding.get("saved") != expected_saved
+            or state_binding.get("plaintextFieldsAbsent") is not True
+        ):
+            raise QaFailure("artifact report restart state is not observation-bound")
+        token_fingerprints = state_binding.get("tokenFingerprints")
+        if not isinstance(token_fingerprints, list) or len(token_fingerprints) != 2:
+            raise QaFailure("artifact report restart token bindings are incomplete")
+        for token in token_fingerprints:
+            if (
+                not isinstance(token, dict)
+                or set(token) != {"byteCount", "contentSha256"}
+                or not isinstance(token.get("byteCount"), int)
+                or isinstance(token.get("byteCount"), bool)
+                or token["byteCount"] <= 0
+                or not _valid_digest(token.get("contentSha256"))
+            ):
+                raise QaFailure("artifact report restart token binding is invalid")
+        token_pairs = [
+            (token["byteCount"], token["contentSha256"])
+            for token in token_fingerprints
+        ]
+        if token_pairs != sorted(set(token_pairs)):
+            raise QaFailure("artifact report restart token bindings are not canonical")
+        reconstructed_state = {
+            "schema_version": state_binding["schemaVersion"],
+            "phase": state_binding["phase"],
+            "logical_path": state_binding["logicalPath"],
+            "opened_byte_count": state_binding["opened"]["byteCount"],
+            "opened_content_sha256": state_binding["opened"]["contentSha256"],
+            "saved_byte_count": state_binding["saved"]["byteCount"],
+            "saved_content_sha256": state_binding["saved"]["contentSha256"],
+            "token_fingerprints": [
+                {
+                    "byte_count": token["byteCount"],
+                    "content_sha256": token["contentSha256"],
+                }
+                for token in token_fingerprints
+            ],
+        }
+        reconstructed_state_bytes = (
+            json.dumps(reconstructed_state, ensure_ascii=True, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        if (
+            checkpoint["stateSeal"].get("size") != len(reconstructed_state_bytes)
+            or checkpoint["stateSeal"].get("sha256")
+            != sha256_bytes(reconstructed_state_bytes)
+        ):
+            raise QaFailure("artifact report restart state seal is not canonical-bound")
 
 
 def encode_artifact_report(report: Dict[str, object]) -> bytes:
@@ -2106,6 +2841,11 @@ def encode_artifact_report(report: Dict[str, object]) -> bytes:
 
 def main() -> int:
     args = parse_arguments()
+    scenario = (
+        "full-application-kill-restart"
+        if args.full_application_kill_restart
+        else ("plugin-host-crash" if args.plugin_host_crash else "normal")
+    )
     artifact_mode = args.artifact_directory is not None
     if artifact_mode and args.keep:
         raise QaFailure("artifact evidence cannot retain the isolated root")
@@ -2162,6 +2902,15 @@ def main() -> int:
     version = bounded_tool_version(sublime_binary, ("--version",)) + "\n"
     if ("Build " + BUILD) not in version:
         raise QaFailure("Sublime Text Build 4200 is required")
+    restart_plugin_host_path: Optional[Path] = None
+    restart_plugin_host_seal: Optional[PhysicalFileSeal] = None
+    if args.full_application_kill_restart:
+        restart_plugin_host_path = sublime_binary.parent / "plugin_host-3.8"
+        restart_plugin_host_seal = capture_physical_file_seal(
+            restart_plugin_host_path,
+            "Sublime Text Build 4200 plugin host",
+            require_posix_executable=True,
+        )
 
     output_path: Optional[Path] = None
     harness_source: Dict[str, object] = {}
@@ -2495,6 +3244,18 @@ def main() -> int:
             "TEMP": str(isolated_tmp),
         }
     )
+    process_environment_binding_values = {
+        key: env[key]
+        for key in (
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_RUNTIME_DIR",
+            "TMPDIR",
+            "TMP",
+            "TEMP",
+        )
+    }
     display_number = 120 + (os.getpid() % 70)
     while Path("/tmp/.X11-unix/X%d" % display_number).exists():
         display_number += 1
@@ -2521,12 +3282,32 @@ def main() -> int:
     crud_markdown_deleted = False
     packaged_sidecar_observed = not artifact_mode
     packaged_sidecar_match_count = 0
+    restart_first_identities: List[Dict[str, object]] = []
+    restart_second_identities: List[Dict[str, object]] = []
+    restart_killed_session_process_count = 0
+    restart_checkpoint_state_seal: Optional[PhysicalFileSeal] = None
+    restart_checkpoint_state_binding: Dict[str, object] = {}
+    restart_checkpoint_scan_complete = False
+    restart_old_identities_dead = False
+    restart_application_restarted = False
+    restart_preunlock_clean = False
+    restart_reopened_fingerprint_matches = False
+    restart_normal_close_complete = False
+    restart_launch_count = 0
+    restart_profile_bindings: List[Dict[str, object]] = []
+    restart_installed_tree_digests: List[str] = []
     events: List[str] = []
     helper_records: List[Dict[str, object]] = []
     answered_password_windows: set = set()
     pending_artifact_report: Optional[bytes] = None
 
     try:
+        if args.full_application_kill_restart:
+            restart_profile_bindings.append(directory_binding(profile))
+            if installed_inex_seal is not None:
+                restart_installed_tree_digests.append(
+                    physical_tree_report_digest(installed_inex_seal)
+                )
         if artifact_mode:
             if artifact_snapshot is None or installed_inex_seal is None:
                 raise QaFailure("artifact binding inputs are unavailable before launch")
@@ -2601,32 +3382,47 @@ def main() -> int:
         if window_manager_process.poll() is not None:
             raise QaFailure("isolated metacity process failed to start")
 
-        preexisting_sublime = set(sublime_multiinstance_pids(sublime_binary))
-        sublime_process = subprocess.Popen(
-            [
-                str(sublime_binary),
-                "--new-window",
-                "--wait",
-                str(bootstrap),
-            ],
-            env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
+        def launch_sublime() -> Tuple[subprocess.Popen, int]:
+            preexisting_sublime = set(sublime_multiinstance_pids(sublime_binary))
+            launcher = subprocess.Popen(
+                [
+                    str(sublime_binary),
+                    "--new-window",
+                    "--wait",
+                    str(bootstrap),
+                ],
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
 
-        def find_sublime_main() -> Optional[int]:
-            # Build 4200 reparents the multiinstance process to PID 1 before
-            # the --wait launcher returns.  Bind discovery to the exact new
-            # PID set created after this isolated launch, never to an existing
-            # user process.
-            candidates = set(sublime_multiinstance_pids(sublime_binary)) - preexisting_sublime
-            return next(iter(candidates)) if len(candidates) == 1 else None
+            def find_sublime_main() -> Optional[int]:
+                # Build 4200 reparents the multiinstance process to PID 1 before
+                # the --wait launcher returns. Bind discovery to the exact new
+                # PID set created after this isolated launch.
+                candidates = (
+                    set(sublime_multiinstance_pids(sublime_binary))
+                    - preexisting_sublime
+                )
+                return next(iter(candidates)) if len(candidates) == 1 else None
 
-        wait_until("Sublime main process", lambda: find_sublime_main() is not None, 10)
-        sublime_main_pid = find_sublime_main()
-        if sublime_main_pid is None:
-            raise QaFailure("Sublime main process disappeared")
+            try:
+                wait_until(
+                    "Sublime main process", lambda: find_sublime_main() is not None, 10
+                )
+                main_pid = find_sublime_main()
+                if main_pid is None:
+                    raise QaFailure("Sublime main process disappeared")
+                if os.getsid(main_pid) != os.getsid(launcher.pid):
+                    raise QaFailure("Sublime main process escaped its launch session")
+                return launcher, main_pid
+            except Exception:
+                terminate_pid(launcher.pid, 0.2)
+                raise
+
+        sublime_process, sublime_main_pid = launch_sublime()
+        restart_launch_count = 1
         def isolated_window_ids() -> List[str]:
             # Build 4200 may create a separate initial untitled top-level in a
             # fresh profile. The Quick Panel belongs to the window holding the
@@ -2668,11 +3464,21 @@ def main() -> int:
             ]
 
         offset = 0
-        deadline = time.monotonic() + FLOW_TIMEOUT_SECONDS
+        deadline = time.monotonic() + FLOW_TIMEOUT_SECONDS * (
+            2 if args.full_application_kill_restart else 1
+        )
         while time.monotonic() < deadline:
             if sublime_process.poll() is not None:
                 raise QaFailure("Sublime launcher exited before QA completion")
             for password_window_id in password_window_ids():
+                if (
+                    args.full_application_kill_restart
+                    and restart_launch_count == 2
+                    and not restart_preunlock_clean
+                ):
+                    # The helper's stable all-view/no-session observation must
+                    # be consumed before the runner is allowed to unlock.
+                    break
                 if password_window_id in answered_password_windows:
                     continue
                 run_checked(
@@ -2769,6 +3575,7 @@ def main() -> int:
                 if event == "ui" and record.get("action") in (
                     "select_tree",
                     "select_tree_for_plugin_host_crash",
+                    "select_tree_after_restart",
                 ):
                     wait_until(
                         "isolated Sublime window",
@@ -2856,6 +3663,292 @@ def main() -> int:
                     if not args.plugin_host_crash and record.get("crud_complete") is not True:
                         raise QaFailure("normal completion omitted the CRUD scenario")
                     minimal_complete = True
+                if event == "full_application_restart_ready":
+                    if not args.full_application_kill_restart:
+                        raise QaFailure("unexpected full-application restart scenario")
+                    if (
+                        record.get("marker") is not True
+                        or record.get("state_written") is not True
+                        or record.get("logical_path") != "qa.md"
+                    ):
+                        raise QaFailure("full-application restart checkpoint is invalid")
+                    if sublime_main_pid is None or sublime_process is None:
+                        raise QaFailure("first Sublime launch identity is unavailable")
+                    restart_checkpoint_state_binding = validate_restart_checkpoint_state(
+                        state, helper_records, content_tokens
+                    )
+                    restart_checkpoint_state_seal = capture_physical_file_seal(
+                        state, "restart checkpoint state"
+                    )
+                    restart_first_identities = capture_application_identities(
+                        sublime_main_pid,
+                        sublime_binary,
+                        helper_seals["sublime-text"]
+                        if artifact_mode
+                        else capture_physical_file_seal(
+                            sublime_binary,
+                            "Sublime Text Build 4200",
+                            require_posix_executable=True,
+                        ),
+                        restart_plugin_host_path,
+                        restart_plugin_host_seal,
+                        profile,
+                        inexd,
+                        executable_seals["inexd"]
+                        if artifact_mode
+                        else capture_physical_file_seal(
+                            inexd,
+                            "developer sidecar",
+                            require_posix_executable=True,
+                        ),
+                        process_environment_binding_values,
+                    )
+                    restart_killed_session_process_count = (
+                        kill_verified_application_session(
+                            restart_first_identities, sublime_process
+                        )
+                    )
+                    restart_old_identities_dead = all(
+                        not process_identity_alive(identity)
+                        for identity in restart_first_identities
+                    )
+                    if not restart_old_identities_dead:
+                        raise QaFailure("old application identity survived verified SIGKILL")
+                    sublime_main_pid = None
+                    sublime_process = None
+                    if command_pids("plugin_host-3.8", str(profile)):
+                        raise QaFailure("old profile plugin host survived verified SIGKILL")
+                    if packaged_sidecar_pids(
+                        inexd,
+                        executable_seals["inexd"]
+                        if artifact_mode
+                        else capture_physical_file_seal(
+                            inexd,
+                            "developer sidecar",
+                            require_posix_executable=True,
+                        ),
+                    ):
+                        raise QaFailure("old packaged sidecar survived verified SIGKILL")
+
+                    if window_manager_process is not None:
+                        terminate_pid(window_manager_process.pid, 0.2)
+                        window_manager_process = None
+                    if xvfb_process is not None:
+                        terminate_pid(xvfb_process.pid, 0.2)
+                        xvfb_process = None
+                    terminate_pid(dbus_pid, 0.2)
+                    dbus_pid = None
+                    wait_until(
+                        "first-launch X11 socket removal",
+                        lambda: not Path(
+                            "/tmp/.X11-unix/X%d" % display_number
+                        ).exists(),
+                        5,
+                    )
+                    for generated_runtime_path in (
+                        xauthority,
+                        runtime / "dbus-session-bus",
+                    ):
+                        try:
+                            generated_runtime_path.unlink()
+                        except FileNotFoundError:
+                            pass
+                        except OSError as error:
+                            raise QaFailure(
+                                "restart checkpoint runtime cleanup failed"
+                            ) from error
+                    wait_until(
+                        "all first-launch root-bound processes to exit",
+                        lambda: not root_bound_pids(root),
+                        5,
+                    )
+                    if scan_for_tokens((root,), tokens):
+                        raise QaFailure("plaintext residue existed at restart checkpoint")
+                    restart_checkpoint_scan_complete = True
+                    if artifact_mode:
+                        if artifact_snapshot is None or installed_inex_seal is None:
+                            raise QaFailure("artifact binding disappeared at restart")
+                        verify_binding_inputs(
+                            artifact_snapshot,
+                            artifact_snapshot_seals,
+                            packages / "Inex",
+                            installed_inex_seal,
+                            {"inex": inex, "inexd": inexd},
+                            executable_seals,
+                            resolved_helpers,
+                            helper_seals,
+                            harness_source,
+                            harness_seals,
+                        )
+                        observed_installed_tree = capture_physical_tree_seal(
+                            packages / "Inex", "installed Inex package at restart"
+                        )
+                        restart_installed_tree_digests.append(
+                            physical_tree_report_digest(observed_installed_tree)
+                        )
+                        if restart_installed_tree_digests[0] != restart_installed_tree_digests[1]:
+                            raise QaFailure("installed package tree changed across restart")
+                    restart_profile_bindings.append(directory_binding(profile))
+                    if restart_profile_bindings[0] != restart_profile_bindings[1]:
+                        raise QaFailure("profile directory identity changed across restart")
+
+                    dbus = run_checked(
+                        [
+                            dbus_daemon,
+                            "--session",
+                            "--fork",
+                            "--address=unix:path="
+                            + str(runtime / "dbus-session-bus"),
+                            "--print-address=1",
+                            "--print-pid=1",
+                        ],
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    dbus_lines = [
+                        line.strip() for line in dbus.stdout.splitlines() if line.strip()
+                    ]
+                    if len(dbus_lines) < 2 or not dbus_lines[-1].isdigit():
+                        raise QaFailure("second D-Bus session did not return identity")
+                    env["DBUS_SESSION_BUS_ADDRESS"] = dbus_lines[0]
+                    dbus_pid = int(dbus_lines[-1])
+                    run_checked(
+                        [xauth, "-f", str(xauthority), "add", display, ".", x11_cookie],
+                        env=env,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=5,
+                    )
+                    xvfb_process = subprocess.Popen(
+                        [
+                            xvfb,
+                            display,
+                            "-screen",
+                            "0",
+                            "1280x800x24",
+                            "-nolisten",
+                            "tcp",
+                            "-auth",
+                            str(xauthority),
+                        ],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        start_new_session=True,
+                    )
+                    wait_until(
+                        "second Xvfb",
+                        lambda: Path(
+                            "/tmp/.X11-unix/X%d" % display_number
+                        ).exists(),
+                        5,
+                    )
+                    window_manager_process = subprocess.Popen(
+                        [window_manager, "--sm-disable", "--replace"],
+                        env=env,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        start_new_session=True,
+                    )
+                    time.sleep(0.5)
+                    if window_manager_process.poll() is not None:
+                        raise QaFailure("second metacity process failed to start")
+                    answered_password_windows.clear()
+                    qa_window_id = None
+                    sublime_process, sublime_main_pid = launch_sublime()
+                    restart_launch_count = 2
+                    restart_application_restarted = True
+                    continue
+                if event == "restart_preunlock_checked":
+                    if not args.full_application_kill_restart:
+                        raise QaFailure("unexpected restart pre-unlock checkpoint")
+                    if not (
+                        record.get("clean") is True
+                        and record.get("managed_count") == 0
+                        and record.get("client_present") is False
+                        and record.get("session_active") is False
+                        and record.get("vault_id_present") is False
+                        and record.get("vault_path_present") is False
+                        and record.get("unlock_in_progress") is False
+                        and record.get("pending_plaintext_count") == 0
+                        and record.get("handoff_count") == 0
+                        and record.get("scrubbing_count") == 0
+                        and record.get("fixed_scrub_ack_count") == 0
+                        and record.get("orphan_scrub_blocked") is False
+                        and record.get("marker_count") == 0
+                        and record.get("known_fingerprint_count") == 0
+                        and record.get("token_window_match_count") == 0
+                        and record.get("stable_duration_ms") == 2000
+                    ):
+                        raise QaFailure("restart pre-unlock checkpoint is not clean")
+                    sidecar_seal_for_check = (
+                        executable_seals["inexd"]
+                        if artifact_mode
+                        else capture_physical_file_seal(
+                            inexd,
+                            "developer sidecar",
+                            require_posix_executable=True,
+                        )
+                    )
+                    if packaged_sidecar_pids(inexd, sidecar_seal_for_check):
+                        raise QaFailure("sidecar existed before the second unlock")
+                    restart_preunlock_clean = True
+                if event == "restart_reopened":
+                    if not args.full_application_kill_restart:
+                        raise QaFailure("unexpected restart reopen observation")
+                    if (
+                        record.get("fingerprint_matches") is not True
+                        or record.get("logical_path_matches") is not True
+                    ):
+                        raise QaFailure("restart did not reopen the saved ciphertext")
+                    if sublime_main_pid is None:
+                        raise QaFailure("second Sublime launch identity is unavailable")
+                    restart_second_identities = capture_application_identities(
+                        sublime_main_pid,
+                        sublime_binary,
+                        helper_seals["sublime-text"]
+                        if artifact_mode
+                        else capture_physical_file_seal(
+                            sublime_binary,
+                            "Sublime Text Build 4200",
+                            require_posix_executable=True,
+                        ),
+                        restart_plugin_host_path,
+                        restart_plugin_host_seal,
+                        profile,
+                        inexd,
+                        executable_seals["inexd"]
+                        if artifact_mode
+                        else capture_physical_file_seal(
+                            inexd,
+                            "developer sidecar",
+                            require_posix_executable=True,
+                        ),
+                        process_environment_binding_values,
+                    )
+                    first_by_role = {
+                        identity["role"]: identity
+                        for identity in restart_first_identities
+                    }
+                    if any(
+                        identity["startTimeTicks"]
+                        <= first_by_role[identity["role"]]["startTimeTicks"]
+                        for identity in restart_second_identities
+                    ):
+                        raise QaFailure("second launch process identity is not newer")
+                    packaged_sidecar_match_count = 2
+                    restart_reopened_fingerprint_matches = True
+                if event == "restart_closed":
+                    if (
+                        not args.full_application_kill_restart
+                        or record.get("normal_close") is not True
+                        or record.get("managed_count") != 0
+                        or record.get("view_absent") is not True
+                    ):
+                        raise QaFailure("restart normal-close checkpoint is invalid")
+                    restart_normal_close_complete = True
                 if event == "plugin_host_crash_ready":
                     if not args.plugin_host_crash:
                         raise QaFailure("unexpected plugin-host crash scenario")
@@ -3096,9 +4189,9 @@ def main() -> int:
                             "plugin_host-3.8 restart did not scrub the marked orphan view"
                         )
                 if event == "complete":
-                    if not args.plugin_host_crash and not minimal_complete:
+                    if scenario == "normal" and not minimal_complete:
                         raise QaFailure("completion preceded the minimal-flow close")
-                    if not args.plugin_host_crash and not all(
+                    if scenario == "normal" and not all(
                         (
                             crud_folder_created,
                             crud_markdown_created,
@@ -3108,11 +4201,24 @@ def main() -> int:
                     ):
                         raise QaFailure("completion preceded the CRUD assertions")
                     if (
-                        args.plugin_host_crash
+                        scenario == "plugin-host-crash"
                         and not plugin_host_checked
                         and not plugin_host_restart_required
                     ):
                         raise QaFailure("completion preceded the plugin-host restart check")
+                    if scenario == "full-application-kill-restart" and not all(
+                        (
+                            restart_application_restarted,
+                            restart_checkpoint_scan_complete,
+                            restart_old_identities_dead,
+                            restart_preunlock_clean,
+                            restart_reopened_fingerprint_matches,
+                            restart_normal_close_complete,
+                            bool(restart_first_identities),
+                            bool(restart_second_identities),
+                        )
+                    ):
+                        raise QaFailure("completion preceded a restart lifecycle checkpoint")
                     flow_complete = True
                     break
             if flow_complete:
@@ -3148,7 +4254,6 @@ def main() -> int:
         helper_report_seal = capture_physical_file_seal(report, "QA helper report")
         if offset != helper_report_seal.metadata.st_size:
             raise QaFailure("QA helper report ended with an incomplete record")
-        scenario = "plugin-host-crash" if args.plugin_host_crash else "normal"
         normalized_helper_records = normalize_helper_records(helper_records, scenario)
         event_counts = {
             event: events.count(event) for event in sorted(set(events))
@@ -3161,7 +4266,9 @@ def main() -> int:
         ).encode("utf-8")
         summary = {
             "events": events,
+            "scenario": scenario,
             "plugin_host_crash": args.plugin_host_crash,
+            "full_application_kill_restart": args.full_application_kill_restart,
             "result": (
                 "PASS_WITH_DOCUMENTED_BOUNDARY"
                 if plugin_host_restart_required
@@ -3170,7 +4277,7 @@ def main() -> int:
             "root_scan_hits": 0,
             "vault_envelope": "EDRY",
             "crud_complete": (
-                not args.plugin_host_crash
+                scenario == "normal"
                 and crud_folder_created
                 and crud_markdown_created
                 and crud_markdown_renamed
@@ -3184,6 +4291,17 @@ def main() -> int:
                     "sublime_restart_required": plugin_host_restart_required,
                     "host_dead_plaintext_copyable": host_dead_plaintext_copyable,
                     "host_dead_clipboard_read_ok": host_dead_clipboard_read_ok,
+                }
+            )
+        if args.full_application_kill_restart:
+            summary.update(
+                {
+                    "application_restarted": restart_application_restarted,
+                    "old_process_identities_dead": restart_old_identities_dead,
+                    "preunlock_clean": restart_preunlock_clean,
+                    "reopened_fingerprint_matches": restart_reopened_fingerprint_matches,
+                    "normal_close_complete": restart_normal_close_complete,
+                    "launch_count": restart_launch_count,
                 }
             )
         write_json(control / "final-result.json", summary)
@@ -3228,48 +4346,85 @@ def main() -> int:
                     sort_keys=True,
                 ).encode("utf-8")
             )
-            scenario_result = {
-                "scenario": scenario,
-                "result": summary["result"],
-                "events": events,
-                "rootScanHits": 0,
-                "vaultEnvelope": "EDRY",
-                "crudComplete": summary["crud_complete"],
-                "pluginHostRestarted": (
-                    summary.get("plugin_host_restarted")
-                    if args.plugin_host_crash
-                    else None
-                ),
-                "sublimeRestartRequired": (
-                    summary.get("sublime_restart_required")
-                    if args.plugin_host_crash
-                    else None
-                ),
-                "hostDeadPlaintextCopyable": (
-                    summary.get("host_dead_plaintext_copyable")
-                    if args.plugin_host_crash
-                    else None
-                ),
-                "hostDeadClipboardReadOk": (
-                    summary.get("host_dead_clipboard_read_ok")
-                    if args.plugin_host_crash
-                    else None
-                ),
-                "packagedSidecarObserved": packaged_sidecar_observed,
-                "packagedSidecarMatchCount": packaged_sidecar_match_count,
-                "packagedSidecarExeSeal": seal_record(
-                    "inexd", executable_seals["inexd"]
-                ),
-            }
+            if args.full_application_kill_restart:
+                if restart_checkpoint_state_seal is None:
+                    raise QaFailure("restart checkpoint state seal is unavailable")
+                verify_physical_file_seal(
+                    state,
+                    restart_checkpoint_state_seal,
+                    "restart checkpoint state",
+                )
+                verify_physical_file_seal(
+                    restart_plugin_host_path,
+                    restart_plugin_host_seal,
+                    "Sublime Text Build 4200 plugin host",
+                    require_posix_executable=True,
+                )
+                scenario_result = {
+                    "scenario": scenario,
+                    "result": summary["result"],
+                    "events": events,
+                    "rootScanHits": 0,
+                    "vaultEnvelope": "EDRY",
+                    "packagedSidecarObserved": packaged_sidecar_observed,
+                    "packagedSidecarMatchCount": packaged_sidecar_match_count,
+                    "packagedSidecarExeSeal": seal_record(
+                        "inexd", executable_seals["inexd"]
+                    ),
+                    "applicationRestarted": restart_application_restarted,
+                    "sameProfileAndInstalledPackage": True,
+                    "oldProcessIdentitiesDead": restart_old_identities_dead,
+                    "preUnlockClean": restart_preunlock_clean,
+                    "reopenedFingerprintMatches": restart_reopened_fingerprint_matches,
+                    "normalCloseComplete": restart_normal_close_complete,
+                }
+            else:
+                scenario_result = {
+                    "scenario": scenario,
+                    "result": summary["result"],
+                    "events": events,
+                    "rootScanHits": 0,
+                    "vaultEnvelope": "EDRY",
+                    "crudComplete": summary["crud_complete"],
+                    "pluginHostRestarted": (
+                        summary.get("plugin_host_restarted")
+                        if args.plugin_host_crash
+                        else None
+                    ),
+                    "sublimeRestartRequired": (
+                        summary.get("sublime_restart_required")
+                        if args.plugin_host_crash
+                        else None
+                    ),
+                    "hostDeadPlaintextCopyable": (
+                        summary.get("host_dead_plaintext_copyable")
+                        if args.plugin_host_crash
+                        else None
+                    ),
+                    "hostDeadClipboardReadOk": (
+                        summary.get("host_dead_clipboard_read_ok")
+                        if args.plugin_host_crash
+                        else None
+                    ),
+                    "packagedSidecarObserved": packaged_sidecar_observed,
+                    "packagedSidecarMatchCount": packaged_sidecar_match_count,
+                    "packagedSidecarExeSeal": seal_record(
+                        "inexd", executable_seals["inexd"]
+                    ),
+                }
             cli_member = next(
                 record["memberName"]
                 for record in materialized_members
                 if record["archiveKind"] == "rust"
             )
             artifact_report: Dict[str, object] = {
-                "schemaVersion": 2,
+                "schemaVersion": 3 if args.full_application_kill_restart else 2,
                 "reportType": "inex-sublime-build4200-evidence",
-                "reportScope": ARTIFACT_REPORT_SCOPE,
+                "reportScope": (
+                    RESTART_ARTIFACT_REPORT_SCOPE
+                    if args.full_application_kill_restart
+                    else ARTIFACT_REPORT_SCOPE
+                ),
                 "artifactSource": artifact_source,
                 "harnessSource": harness_source,
                 "harnessFiles": [
@@ -3377,6 +4532,45 @@ def main() -> int:
                 ),
                 "trustAssumptions": list(REPORT_TRUST_ASSUMPTIONS),
             }
+            if args.full_application_kill_restart:
+                artifact_report["restartLifecycle"] = {
+                    "launchCount": restart_launch_count,
+                    "sameProfilePath": True,
+                    "sameInstalledPackageTree": True,
+                    "signalDelivery": "pidfd-per-stable-launch-session-identity",
+                    "killSignal": "SIGKILL",
+                    "killedSessionProcessCount": restart_killed_session_process_count,
+                    "profileDirectoryBindings": restart_profile_bindings,
+                    "installedPackageTreeSha256ByLaunch": restart_installed_tree_digests,
+                    "pluginHostExecutable": {
+                        "path": str(restart_plugin_host_path),
+                        "seal": seal_record(
+                            "plugin-host-3.8", restart_plugin_host_seal
+                        ),
+                    },
+                    "firstLaunchProcessIdentities": restart_first_identities,
+                    "oldProcessIdentitiesDead": restart_old_identities_dead,
+                    "checkpoint": {
+                        "stateSeal": seal_record(
+                            "control/state.json", restart_checkpoint_state_seal
+                        ),
+                        "stateBinding": restart_checkpoint_state_binding,
+                        "runtimeAndSocketsStopped": True,
+                        "residueScan": {
+                            "roots": ["isolated-root-after-sigkill-before-second-launch"],
+                            "excludedRoots": [],
+                            "pathScope": "all-relative-path-components",
+                            "contentScope": "all-nonlink-regular-files-fail-closed",
+                            "encodings": list(SCAN_ENCODINGS),
+                            "randomFilenameCanaryScanned": True,
+                            "entropyFragmentsScanned": True,
+                            "entropyFragmentMinimumCharacters": 16,
+                            "hits": 0,
+                        },
+                    },
+                    "secondLaunchProcessIdentities": restart_second_identities,
+                    "secondLaunchIdentitiesDistinct": True,
+                }
             pending_artifact_report = encode_artifact_report(artifact_report)
         print(json.dumps(summary, sort_keys=True), flush=True)
         final_success = True

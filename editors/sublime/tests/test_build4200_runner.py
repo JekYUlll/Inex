@@ -117,7 +117,16 @@ def _helper_observations(scenario: str) -> list[dict]:
                 "event": "restart_preunlock_checked",
                 "view_count": 0,
                 "managed_count": 0,
+                "client_present": False,
                 "session_active": False,
+                "vault_id_present": False,
+                "vault_path_present": False,
+                "unlock_in_progress": False,
+                "pending_plaintext_count": 0,
+                "handoff_count": 0,
+                "scrubbing_count": 0,
+                "fixed_scrub_ack_count": 0,
+                "orphan_scrub_blocked": False,
                 "marker_count": 0,
                 "known_fingerprint_count": 0,
                 "token_window_match_count": 0,
@@ -323,7 +332,11 @@ def _valid_report(scenario: str = "normal") -> dict:
     ).encode("utf-8")
     events = [record["event"] for record in normalized]
     event_counts = {event: events.count(event) for event in sorted(set(events))}
-    result_value = "PASS" if scenario == "normal" else "PASS_WITH_DOCUMENTED_BOUNDARY"
+    result_value = (
+        "PASS_WITH_DOCUMENTED_BOUNDARY"
+        if scenario == "plugin-host-crash"
+        else "PASS"
+    )
     tool_names = sorted(
         {"sublime-text", "zenity", "xdotool", "Xvfb", "dbus-daemon", "metacity", "xauth"}
         | ({"xclip"} if scenario == "plugin-host-crash" else set())
@@ -463,6 +476,164 @@ def _valid_report(scenario: str = "normal") -> dict:
         "notCovered": runner.report_not_covered(scenario, result_value),
         "trustAssumptions": list(runner.REPORT_TRUST_ASSUMPTIONS),
     }
+    if scenario == "full-application-kill-restart":
+        main_seal = copy.deepcopy(report["build4200"]["seal"])
+        main_seal["name"] = "sublime-main"
+        first_sidecar_seal = copy.deepcopy(sidecar_seal)
+        first_sidecar_seal["name"] = "packaged-inexd"
+        plugin_seal = _seal(
+            "plugin-host-3.8", _digest("7"), size=7, mode=0o755
+        )
+
+        def identity(
+            role: str,
+            pid: int,
+            session_id: int,
+            executable_path: str,
+            executable_seal: dict,
+        ) -> dict:
+            return {
+                "role": role,
+                "pid": pid,
+                "parentPid": 1,
+                "processGroupId": session_id,
+                "sessionId": session_id,
+                "startTimeTicks": pid * 10,
+                "commandSha256": _digest("6"),
+                "environmentBindingSha256": _digest("9"),
+                "isolatedEnvironmentBound": True,
+                "executablePath": executable_path,
+                "executableSeal": copy.deepcopy(executable_seal),
+            }
+
+        first_identities = [
+            identity(
+                "sublime-main",
+                101,
+                100,
+                "/opt/sublime_text/sublime_text",
+                main_seal,
+            ),
+            identity(
+                "plugin-host-3.8",
+                102,
+                100,
+                "/opt/sublime_text/plugin_host-3.8",
+                plugin_seal,
+            ),
+            identity(
+                "packaged-inexd",
+                103,
+                100,
+                "/private/Packages/Inex/bin/inexd",
+                first_sidecar_seal,
+            ),
+        ]
+        second_identities = copy.deepcopy(first_identities)
+        for offset, record in enumerate(second_identities, start=1):
+            record["pid"] = 200 + offset
+            record["processGroupId"] = 200
+            record["sessionId"] = 200
+            record["startTimeTicks"] = (200 + offset) * 10
+        state_binding = {
+            "schemaVersion": 1,
+            "phase": "await_full_application_restart",
+            "logicalPath": "qa.md",
+            "opened": {"byteCount": 10, "contentSha256": _digest("a")},
+            "saved": {"byteCount": 20, "contentSha256": _digest("b")},
+            "tokenFingerprints": [
+                {"byteCount": 47, "contentSha256": _digest("1")},
+                {"byteCount": 50, "contentSha256": _digest("2")},
+            ],
+            "plaintextFieldsAbsent": True,
+        }
+        state_value = {
+            "schema_version": 1,
+            "phase": "await_full_application_restart",
+            "logical_path": "qa.md",
+            "opened_byte_count": 10,
+            "opened_content_sha256": _digest("a"),
+            "saved_byte_count": 20,
+            "saved_content_sha256": _digest("b"),
+            "token_fingerprints": [
+                {"byte_count": 47, "content_sha256": _digest("1")},
+                {"byte_count": 50, "content_sha256": _digest("2")},
+            ],
+        }
+        state_bytes = (
+            json.dumps(state_value, ensure_ascii=True, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        checkpoint_scan = copy.deepcopy(report["residueScan"])
+        checkpoint_scan["roots"] = [
+            "isolated-root-after-sigkill-before-second-launch"
+        ]
+        report.update(
+            {
+                "schemaVersion": 3,
+                "reportScope": runner.RESTART_ARTIFACT_REPORT_SCOPE,
+                "scenarioResult": {
+                    "scenario": scenario,
+                    "result": "PASS",
+                    "events": events,
+                    "rootScanHits": 0,
+                    "vaultEnvelope": "EDRY",
+                    "packagedSidecarObserved": True,
+                    "packagedSidecarMatchCount": 2,
+                    "packagedSidecarExeSeal": sidecar_seal,
+                    "applicationRestarted": True,
+                    "sameProfileAndInstalledPackage": True,
+                    "oldProcessIdentitiesDead": True,
+                    "preUnlockClean": True,
+                    "reopenedFingerprintMatches": True,
+                    "normalCloseComplete": True,
+                },
+                "restartLifecycle": {
+                    "launchCount": 2,
+                    "sameProfilePath": True,
+                    "sameInstalledPackageTree": True,
+                    "signalDelivery": "pidfd-per-stable-launch-session-identity",
+                    "killSignal": "SIGKILL",
+                    "killedSessionProcessCount": 4,
+                    "profileDirectoryBindings": [
+                        {
+                            "device": 1,
+                            "inode": 99,
+                            "mode": 0o700,
+                            "pathSha256": _digest("4"),
+                        },
+                        {
+                            "device": 1,
+                            "inode": 99,
+                            "mode": 0o700,
+                            "pathSha256": _digest("4"),
+                        },
+                    ],
+                    "installedPackageTreeSha256ByLaunch": [
+                        tree_digest,
+                        tree_digest,
+                    ],
+                    "pluginHostExecutable": {
+                        "path": "/opt/sublime_text/plugin_host-3.8",
+                        "seal": plugin_seal,
+                    },
+                    "firstLaunchProcessIdentities": first_identities,
+                    "oldProcessIdentitiesDead": True,
+                    "checkpoint": {
+                        "stateSeal": _seal(
+                            "control/state.json",
+                            runner.sha256_bytes(state_bytes),
+                            size=len(state_bytes),
+                            mode=0o600,
+                        ),
+                        "stateBinding": state_binding,
+                        "runtimeAndSocketsStopped": True,
+                        "residueScan": checkpoint_scan,
+                    },
+                    "secondLaunchProcessIdentities": second_identities,
+                    "secondLaunchIdentitiesDistinct": True,
+                },
+            }
+        )
     return report
 
 
@@ -504,6 +675,7 @@ class Build4200RunnerFoundationTests(unittest.TestCase):
         )
         for field, value in (
             ("clean", False),
+            ("client_present", True),
             ("marker_count", 1),
             ("known_fingerprint_count", 1),
             ("token_window_match_count", 1),
@@ -520,6 +692,114 @@ class Build4200RunnerFoundationTests(unittest.TestCase):
                     runner.normalize_helper_records(
                         candidate, "full-application-kill-restart"
                     )
+
+    def test_restart_checkpoint_state_is_canonical_and_observation_bound(self) -> None:
+        content_tokens = ["INEXQA_INITIAL_" + "1" * 32, "INEXQA_EDIT_" + "2" * 32]
+        observations = _helper_observations("full-application-kill-restart")
+        state = {
+            "schema_version": 1,
+            "phase": "await_full_application_restart",
+            "logical_path": "qa.md",
+            "opened_byte_count": 10,
+            "opened_content_sha256": _digest("a"),
+            "saved_byte_count": 20,
+            "saved_content_sha256": _digest("b"),
+            "token_fingerprints": [
+                {
+                    "byte_count": len(token.encode("utf-8")),
+                    "content_sha256": runner.sha256_bytes(token.encode("utf-8")),
+                }
+                for token in content_tokens
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state.json"
+            path.write_text(
+                json.dumps(state, ensure_ascii=True, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            binding = runner.validate_restart_checkpoint_state(
+                path, observations, content_tokens
+            )
+            self.assertEqual(binding["schemaVersion"], 1)
+            self.assertTrue(binding["plaintextFieldsAbsent"])
+
+            path.write_text(
+                json.dumps(state, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(runner.QaFailure, "canonical"):
+                runner.validate_restart_checkpoint_state(
+                    path, observations, content_tokens
+                )
+
+    def test_report_validator_rejects_restart_lifecycle_mutations(self) -> None:
+        baseline = _valid_report("full-application-kill-restart")
+        runner.validate_artifact_report(baseline)
+
+        def legacy_schema(report: dict) -> None:
+            report["schemaVersion"] = 2
+
+        def weaker_signal_delivery(report: dict) -> None:
+            report["restartLifecycle"]["signalDelivery"] = "killpg"
+
+        def profile_rebound(report: dict) -> None:
+            report["restartLifecycle"]["profileDirectoryBindings"][1]["inode"] += 1
+
+        def package_tree_changed(report: dict) -> None:
+            report["restartLifecycle"]["installedPackageTreeSha256ByLaunch"][1] = _digest("0")
+
+        def plugin_host_rebound(report: dict) -> None:
+            report["restartLifecycle"]["secondLaunchProcessIdentities"][1][
+                "executableSeal"
+            ]["inode"] += 1
+
+        def non_newer_second_launch(report: dict) -> None:
+            first = report["restartLifecycle"]["firstLaunchProcessIdentities"][0]
+            second = report["restartLifecycle"]["secondLaunchProcessIdentities"][0]
+            second["startTimeTicks"] = first["startTimeTicks"]
+
+        def second_role_escaped_session(report: dict) -> None:
+            report["restartLifecycle"]["secondLaunchProcessIdentities"][2][
+                "sessionId"
+            ] += 1
+
+        def forged_state_binding(report: dict) -> None:
+            report["restartLifecycle"]["checkpoint"]["stateBinding"]["saved"][
+                "contentSha256"
+            ] = _digest("0")
+
+        def forged_state_seal(report: dict) -> None:
+            report["restartLifecycle"]["checkpoint"]["stateSeal"]["size"] += 1
+
+        def checkpoint_residue(report: dict) -> None:
+            report["restartLifecycle"]["checkpoint"]["residueScan"]["hits"] = 1
+
+        def false_preunlock_result(report: dict) -> None:
+            report["scenarioResult"]["preUnlockClean"] = False
+
+        def only_one_sidecar_observation(report: dict) -> None:
+            report["scenarioResult"]["packagedSidecarMatchCount"] = 1
+
+        for mutation in (
+            legacy_schema,
+            weaker_signal_delivery,
+            profile_rebound,
+            package_tree_changed,
+            plugin_host_rebound,
+            non_newer_second_launch,
+            second_role_escaped_session,
+            forged_state_binding,
+            forged_state_seal,
+            checkpoint_residue,
+            false_preunlock_result,
+            only_one_sidecar_observation,
+        ):
+            with self.subTest(mutation=mutation.__name__):
+                candidate = copy.deepcopy(baseline)
+                mutation(candidate)
+                with self.assertRaises(runner.QaFailure):
+                    runner.validate_artifact_report(candidate)
 
     def test_physical_seal_rejects_mutation_rebind_and_hardlink(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -669,8 +949,12 @@ class Build4200RunnerFoundationTests(unittest.TestCase):
             with self.assertRaisesRegex(runner.QaFailure, "non-regular|link-like"):
                 runner.scan_for_tokens((root,), [token])
 
-    def test_report_validator_accepts_distinct_clean_sources_and_both_scenarios(self) -> None:
-        for scenario in ("normal", "plugin-host-crash"):
+    def test_report_validator_accepts_distinct_clean_sources_and_all_scenarios(self) -> None:
+        for scenario in (
+            "normal",
+            "plugin-host-crash",
+            "full-application-kill-restart",
+        ):
             with self.subTest(scenario=scenario):
                 report = _valid_report(scenario)
                 self.assertNotEqual(

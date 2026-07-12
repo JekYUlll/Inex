@@ -484,8 +484,14 @@ def _full_application_restart_ready() -> None:
                 "content_sha256": hashlib.sha256(token_bytes).hexdigest(),
             }
         )
+    token_fingerprints.sort(
+        key=lambda fingerprint: (
+            fingerprint["byte_count"], fingerprint["content_sha256"]
+        )
+    )
     saved_fingerprint = (len(encoded), hashlib.sha256(encoded).hexdigest())
     state = {
+        "schema_version": 1,
         "phase": "await_full_application_restart",
         "logical_path": "qa.md",
         "opened_byte_count": _opened_fingerprint[0],
@@ -528,6 +534,7 @@ def _valid_state_fingerprint(
 def _restart_state() -> Optional[Dict[str, Any]]:
     state = _read_state()
     if set(state) != {
+        "schema_version",
         "phase",
         "logical_path",
         "opened_byte_count",
@@ -538,7 +545,8 @@ def _restart_state() -> Optional[Dict[str, Any]]:
     }:
         return None
     if (
-        state.get("phase") != "await_full_application_restart"
+        state.get("schema_version") != 1
+        or state.get("phase") != "await_full_application_restart"
         or state.get("logical_path") != "qa.md"
         or _valid_state_fingerprint(
             state, "opened_byte_count", "opened_content_sha256"
@@ -581,10 +589,28 @@ def _contains_hashed_window(encoded: bytes, byte_count: int, digest: str) -> boo
 def _preunlock_observation(state: Dict[str, Any]) -> Dict[str, Any]:
     module = _inex_module()
     managed_count = len(module._registry.values()) if module is not None else -1
+    client_present = False
     session_active = False
+    vault_id_present = False
+    vault_path_present = False
+    unlock_in_progress = False
+    pending_plaintext_count = -1
+    handoff_count = -1
+    scrubbing_count = -1
+    fixed_scrub_ack_count = -1
+    orphan_scrub_blocked = True
     if module is not None:
-        client, _vault, _generation = module._runtime_snapshot()
+        client, vault_id, _generation = module._runtime_snapshot()
+        client_present = client is not None
         session_active = client is not None and client.has_session
+        vault_id_present = vault_id is not None
+        vault_path_present = getattr(module, "_vault_path", None) is not None
+        unlock_in_progress = getattr(module, "_unlock_in_progress", True) is True
+        pending_plaintext_count = len(module._pending_plaintext)
+        handoff_count = len(module._handoffs)
+        scrubbing_count = len(module._scrubbing_views)
+        fixed_scrub_ack_count = len(module._fixed_scrub_acks)
+        orphan_scrub_blocked = getattr(module, "_orphan_scrub_blocked", True) is True
     known_fingerprints = {
         _valid_state_fingerprint(state, "opened_byte_count", "opened_content_sha256"),
         _valid_state_fingerprint(state, "saved_byte_count", "saved_content_sha256"),
@@ -612,7 +638,16 @@ def _preunlock_observation(state: Dict[str, Any]) -> Dict[str, Any]:
             )
     clean = (
         managed_count == 0
+        and not client_present
         and not session_active
+        and not vault_id_present
+        and not vault_path_present
+        and not unlock_in_progress
+        and pending_plaintext_count == 0
+        and handoff_count == 0
+        and scrubbing_count == 0
+        and fixed_scrub_ack_count == 0
+        and not orphan_scrub_blocked
         and marker_count == 0
         and known_fingerprint_count == 0
         and token_window_match_count == 0
@@ -620,7 +655,16 @@ def _preunlock_observation(state: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "view_count": view_count,
         "managed_count": managed_count,
+        "client_present": client_present,
         "session_active": session_active,
+        "vault_id_present": vault_id_present,
+        "vault_path_present": vault_path_present,
+        "unlock_in_progress": unlock_in_progress,
+        "pending_plaintext_count": pending_plaintext_count,
+        "handoff_count": handoff_count,
+        "scrubbing_count": scrubbing_count,
+        "fixed_scrub_ack_count": fixed_scrub_ack_count,
+        "orphan_scrub_blocked": orphan_scrub_blocked,
         "marker_count": marker_count,
         "known_fingerprint_count": known_fingerprint_count,
         "token_window_match_count": token_window_match_count,

@@ -51,6 +51,12 @@ PYTHONDONTWRITEBYTECODE=1 timeout --signal=TERM --kill-after=5s 90s \
   --artifact-directory /absolute/linux-x64-four-file-artifact \
   --output /absolute/private-evidence/sublime-plugin-host-crash.json \
   --plugin-host-crash
+
+PYTHONDONTWRITEBYTECODE=1 timeout --signal=TERM --kill-after=5s 180s \
+  python3.13 editors/sublime/test/build4200/run_build4200.py \
+  --artifact-directory /absolute/linux-x64-four-file-artifact \
+  --output /absolute/private-evidence/sublime-full-application-restart.json \
+  --full-application-kill-restart
 ```
 
 Artifact mode snapshots and strictly audits all four files, materializes the
@@ -62,12 +68,35 @@ isolated root, and only then creates the external canonical report as mode
 0600. The artifact and clean harness commits are recorded separately and need
 not be the same commit.
 
-These two single-scenario reports establish an exact-packaged Linux baseline.
-They do not close the persistent-profile matrix: same-profile application
-restart, keyboard/menu Save variants, export/clipboard/macro surfaces,
+The normal and plugin-host-crash reports retain the strict outer schema v2.
+The full-application-kill-restart scenario uses outer schema v3. It keeps the
+same isolated profile and installed package for two launches. After the first
+encrypted save, the helper writes only canonical length/SHA-256 fingerprints
+to a mode-0600 state file. The runner pre-seals and captures the exact main,
+Python plugin-host, and packaged-sidecar process identities, opens pidfds for
+every stable member of the launch session, and delivers SIGKILL through those
+pidfds. It then stops the isolated desktop, X11 socket, and D-Bus session,
+requires no profile-bound survivor, and performs an intermediate zero-hit
+residue scan before starting the second desktop and application launch.
+
+Before the runner may answer the second password prompt, the restarted helper
+must observe every window and view continuously for two seconds with no Inex
+client, session, vault identity/path, unlock operation, registry entry,
+plaintext handoff, pending plaintext owner, scrub/ack state, product marker,
+known full-content fingerprint, or sliding-window random-token fingerprint.
+Zero restored views is valid. The second launch then unlocks the same vault,
+reopens `qa.md`, requires its length/SHA-256 to equal the first encrypted-save
+checkpoint, and closes it through the normal Inex command. The v3 report binds
+both launch identity sets, the unchanged profile directory and installed tree,
+the canonical state seal, and both the checkpoint and final residue scans.
+
+These three single-scenario reports establish an exact-packaged Linux
+baseline. They do not close the remaining persistent-profile matrix:
+keyboard/menu Save variants, export/clipboard/macro surfaces,
 matching/stale/corrupt drafts, project/non-project windows, idle/daemon/full
-application kills, all CRUD negative paths, other native platforms, and
-signing/publication remain explicitly outside this increment.
+application kill variants beyond this one path, all CRUD negative paths,
+other native platforms, and signing/publication remain explicitly outside
+this increment.
 
 After the minimal flow passes, probe abrupt Python plugin-host loss with:
 
