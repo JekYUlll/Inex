@@ -489,6 +489,15 @@ def _full_application_restart_ready() -> None:
             fingerprint["byte_count"], fingerprint["content_sha256"]
         )
     )
+    token_fingerprint_bytes = json.dumps(
+        token_fingerprints,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    token_fingerprint_set_sha256 = hashlib.sha256(
+        token_fingerprint_bytes
+    ).hexdigest()
     saved_fingerprint = (len(encoded), hashlib.sha256(encoded).hexdigest())
     state = {
         "schema_version": 1,
@@ -512,6 +521,7 @@ def _full_application_restart_ready() -> None:
         marker=marker,
         state_written=True,
         token_fingerprint_count=len(token_fingerprints),
+        token_fingerprint_set_sha256=token_fingerprint_set_sha256,
     )
 
 

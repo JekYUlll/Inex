@@ -69,15 +69,29 @@ isolated root, and only then creates the external canonical report as mode
 not be the same commit.
 
 The normal and plugin-host-crash reports retain the strict outer schema v2.
-The full-application-kill-restart scenario uses outer schema v3. It keeps the
+The successor full-application-kill-restart scenario uses outer schema v4;
+the current validator deliberately rejects the predecessor v3 report as a
+successor. It keeps the
 same isolated profile and installed package for two launches. After the first
 encrypted save, the helper writes only canonical length/SHA-256 fingerprints
-to a mode-0600 state file. The runner pre-seals and captures the exact main,
-Python plugin-host, and packaged-sidecar process identities, opens pidfds for
-every stable member of the launch session, and delivers SIGKILL through those
-pidfds. It then stops the isolated desktop, X11 socket, and D-Bus session,
-requires no profile-bound survivor, and performs an intermediate zero-hit
-residue scan before starting the second desktop and application launch.
+to a mode-0600 state file. Before launch, the runner enables and reads back the
+Linux child-subreaper setting. It pre-seals and captures the exact main, Python
+plugin-host, and packaged-sidecar identities, stabilizes the complete launch
+session plus descendant closure, opens pidfds only after PID/start-time/
+session/parent identity rechecks, and delivers SIGKILL through those pidfds.
+Any descendant which used `setsid` or daemonized is either already in that
+closure or is adopted by the confirmed subreaper and drained through a newly
+verified pidfd.
+
+The checkpoint then stops the isolated desktop, X11 socket, and D-Bus session
+and performs two stable procfs censuses. A process is root-bound only through
+an exact isolated HOME/XDG/TMP environment value or an executable, cwd,
+process-root, or open-fd target within the private root; an argv mention alone
+is not a binding and is never a reason to signal an unrelated process.
+Unreadable procfs state for a verified closure/adopted candidate fails closed.
+Any remaining root-bound process also fails the scenario instead of being
+blindly killed. Only after the zero-survivor census does the runner perform the
+intermediate zero-hit residue scan and start the second launch.
 
 Before the runner may answer the second password prompt, the restarted helper
 must observe every window and view continuously for two seconds with no Inex
@@ -86,12 +100,16 @@ plaintext handoff, pending plaintext owner, scrub/ack state, product marker,
 known full-content fingerprint, or sliding-window random-token fingerprint.
 Zero restored views is valid. The second launch then unlocks the same vault,
 reopens `qa.md`, requires its length/SHA-256 to equal the first encrypted-save
-checkpoint, and closes it through the normal Inex command. The v3 report binds
-both launch identity sets, the unchanged profile directory and installed tree,
-the canonical state seal, and both the checkpoint and final residue scans.
+checkpoint, and closes it through the normal Inex command. The v4 report binds
+both launch identity sets, a reconstructable isolated environment, the exact
+profile and package-owned sidecar paths, the unchanged installed tree, and the
+canonical state seal. The random-token fingerprint-set digest is independently
+cross-bound through the helper event, state binding, and lifecycle record.
+Both the checkpoint and final residue scans remain mandatory.
 
-These three single-scenario reports establish an exact-packaged Linux
-baseline. They do not close the remaining persistent-profile matrix:
+When all three successor runs pass, their single-scenario reports establish an
+exact-packaged Linux baseline. They do not close the remaining
+persistent-profile matrix:
 keyboard/menu Save variants, export/clipboard/macro surfaces,
 matching/stale/corrupt drafts, project/non-project windows, idle/daemon/full
 application kill variants beyond this one path, all CRUD negative paths,

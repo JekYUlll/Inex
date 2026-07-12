@@ -46,6 +46,20 @@ def _seal(name: str, digest: str, *, size: int, mode: int) -> dict:
     }
 
 
+def _restart_token_fingerprints() -> list[dict]:
+    return [
+        {"byteCount": 47, "contentSha256": _digest("1")},
+        {"byteCount": 50, "contentSha256": _digest("2")},
+    ]
+
+
+def _restart_token_fingerprint_digest() -> str:
+    return runner.token_fingerprint_set_digest(
+        (item["byteCount"], item["contentSha256"])
+        for item in _restart_token_fingerprints()
+    )
+
+
 def _helper_observations(scenario: str) -> list[dict]:
     common = [
         {"event": "loaded", "build": "4200", "gate_ok": True, "issue_count": 0},
@@ -108,6 +122,7 @@ def _helper_observations(scenario: str) -> list[dict]:
                 "marker": True,
                 "state_written": True,
                 "token_fingerprint_count": 2,
+                "token_fingerprint_set_sha256": _restart_token_fingerprint_digest(),
             },
             {
                 "event": "restart_loaded",
@@ -479,6 +494,17 @@ def _valid_report(scenario: str = "normal") -> dict:
         "trustAssumptions": list(runner.REPORT_TRUST_ASSUMPTIONS),
     }
     if scenario == "full-application-kill-restart":
+        isolated_environment = runner.expected_root_environment(Path("/private"))
+        environment_digest = runner.sha256_bytes(
+            json.dumps(
+                isolated_environment,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        )
+        profile_path = "/private/config/sublime-text"
+        sidecar_path = profile_path + "/Packages/Inex/bin/inexd"
         main_seal = copy.deepcopy(report["build4200"]["seal"])
         main_seal["name"] = "sublime-main"
         first_sidecar_seal = copy.deepcopy(sidecar_seal)
@@ -502,7 +528,7 @@ def _valid_report(scenario: str = "normal") -> dict:
                 "sessionId": session_id,
                 "startTimeTicks": pid * 10,
                 "commandSha256": _digest("6"),
-                "environmentBindingSha256": _digest("9"),
+                "environmentBindingSha256": environment_digest,
                 "isolatedEnvironmentBound": True,
                 "executablePath": executable_path,
                 "executableSeal": copy.deepcopy(executable_seal),
@@ -527,7 +553,7 @@ def _valid_report(scenario: str = "normal") -> dict:
                 "packaged-inexd",
                 103,
                 100,
-                "/private/Packages/Inex/bin/inexd",
+                sidecar_path,
                 first_sidecar_seal,
             ),
         ]
@@ -543,10 +569,8 @@ def _valid_report(scenario: str = "normal") -> dict:
             "logicalPath": "qa.md",
             "opened": {"byteCount": 10, "contentSha256": _digest("a")},
             "saved": {"byteCount": 20, "contentSha256": _digest("b")},
-            "tokenFingerprints": [
-                {"byteCount": 47, "contentSha256": _digest("1")},
-                {"byteCount": 50, "contentSha256": _digest("2")},
-            ],
+            "tokenFingerprints": _restart_token_fingerprints(),
+            "tokenFingerprintSetSha256": _restart_token_fingerprint_digest(),
             "plaintextFieldsAbsent": True,
         }
         state_value = {
@@ -571,7 +595,7 @@ def _valid_report(scenario: str = "normal") -> dict:
         ]
         report.update(
             {
-                "schemaVersion": 3,
+                "schemaVersion": 4,
                 "reportScope": runner.RESTART_ARTIFACT_REPORT_SCOPE,
                 "scenarioResult": {
                     "scenario": scenario,
@@ -593,27 +617,50 @@ def _valid_report(scenario: str = "normal") -> dict:
                     "launchCount": 2,
                     "sameProfilePath": True,
                     "sameInstalledPackageTree": True,
-                    "signalDelivery": "pidfd-per-stable-launch-session-identity",
+                    "childSubreaperConfirmed": True,
+                    "processClosurePolicy": {
+                        "stablePidfdIdentity": True,
+                        "sessionAndDescendantClosure": True,
+                        "subreaperAdoptionSweep": True,
+                        "rootBindingSources": [
+                            "cwd",
+                            "environment",
+                            "exe",
+                            "fd",
+                            "root",
+                        ],
+                        "argvOnlyIsNotBinding": True,
+                        "unverifiedRootBoundSurvivors": 0,
+                    },
+                    "signalDelivery": "pidfd-per-stable-session-descendant-closure",
                     "killSignal": "SIGKILL",
-                    "killedSessionProcessCount": 4,
+                    "killedProcessClosureCount": 4,
+                    "isolatedEnvironment": isolated_environment,
                     "profileDirectoryBindings": [
                         {
                             "device": 1,
                             "inode": 99,
                             "mode": 0o700,
-                            "pathSha256": _digest("4"),
+                            "path": profile_path,
+                            "pathSha256": runner.sha256_bytes(
+                                profile_path.encode("utf-8")
+                            ),
                         },
                         {
                             "device": 1,
                             "inode": 99,
                             "mode": 0o700,
-                            "pathSha256": _digest("4"),
+                            "path": profile_path,
+                            "pathSha256": runner.sha256_bytes(
+                                profile_path.encode("utf-8")
+                            ),
                         },
                     ],
                     "installedPackageTreeSha256ByLaunch": [
                         tree_digest,
                         tree_digest,
                     ],
+                    "canaryFingerprintSetSha256": _restart_token_fingerprint_digest(),
                     "pluginHostExecutable": {
                         "path": "/opt/sublime_text/plugin_host-3.8",
                         "seal": plugin_seal,
@@ -931,6 +978,20 @@ time.sleep(60)
     def test_restart_checkpoint_state_is_canonical_and_observation_bound(self) -> None:
         content_tokens = ["INEXQA_INITIAL_" + "1" * 32, "INEXQA_EDIT_" + "2" * 32]
         observations = _helper_observations("full-application-kill-restart")
+        token_pairs = sorted(
+            (
+                len(token.encode("utf-8")),
+                runner.sha256_bytes(token.encode("utf-8")),
+            )
+            for token in content_tokens
+        )
+        next(
+            record
+            for record in observations
+            if record["event"] == "full_application_restart_ready"
+        )["token_fingerprint_set_sha256"] = runner.token_fingerprint_set_digest(
+            token_pairs
+        )
         state = {
             "schema_version": 1,
             "phase": "await_full_application_restart",
@@ -941,10 +1002,10 @@ time.sleep(60)
             "saved_content_sha256": _digest("b"),
             "token_fingerprints": [
                 {
-                    "byte_count": len(token.encode("utf-8")),
-                    "content_sha256": runner.sha256_bytes(token.encode("utf-8")),
+                    "byte_count": byte_count,
+                    "content_sha256": digest,
                 }
-                for token in content_tokens
+                for byte_count, digest in token_pairs
             ],
         }
         with tempfile.TemporaryDirectory() as temporary:
@@ -972,14 +1033,23 @@ time.sleep(60)
         baseline = _valid_report("full-application-kill-restart")
         runner.validate_artifact_report(baseline)
 
-        def legacy_schema(report: dict) -> None:
-            report["schemaVersion"] = 2
+        def predecessor_v3_schema(report: dict) -> None:
+            report["schemaVersion"] = 3
 
         def weaker_signal_delivery(report: dict) -> None:
             report["restartLifecycle"]["signalDelivery"] = "killpg"
 
         def profile_rebound(report: dict) -> None:
             report["restartLifecycle"]["profileDirectoryBindings"][1]["inode"] += 1
+
+        def jointly_forged_profile_bindings(report: dict) -> None:
+            for binding in report["restartLifecycle"]["profileDirectoryBindings"]:
+                binding["device"] = 999
+                binding["inode"] = 999
+                binding["path"] = "/forged/profile"
+                binding["pathSha256"] = runner.sha256_bytes(
+                    binding["path"].encode("utf-8")
+                )
 
         def package_tree_changed(report: dict) -> None:
             report["restartLifecycle"]["installedPackageTreeSha256ByLaunch"][1] = _digest("0")
@@ -999,6 +1069,13 @@ time.sleep(60)
                 "sessionId"
             ] += 1
 
+        def jointly_forged_sidecar_paths(report: dict) -> None:
+            for identities in (
+                report["restartLifecycle"]["firstLaunchProcessIdentities"],
+                report["restartLifecycle"]["secondLaunchProcessIdentities"],
+            ):
+                identities[2]["executablePath"] = "/unrelated/forged/inexd"
+
         def forged_state_binding(report: dict) -> None:
             report["restartLifecycle"]["checkpoint"]["stateBinding"]["saved"][
                 "contentSha256"
@@ -1006,6 +1083,43 @@ time.sleep(60)
 
         def forged_state_seal(report: dict) -> None:
             report["restartLifecycle"]["checkpoint"]["stateSeal"]["size"] += 1
+
+        def jointly_forged_tokens_and_state_seal(report: dict) -> None:
+            lifecycle = report["restartLifecycle"]
+            binding = lifecycle["checkpoint"]["stateBinding"]
+            binding["tokenFingerprints"] = [
+                {"byteCount": 1, "contentSha256": _digest("3")},
+                {"byteCount": 2, "contentSha256": _digest("4")},
+            ]
+            forged_digest = runner.token_fingerprint_set_digest(
+                (token["byteCount"], token["contentSha256"])
+                for token in binding["tokenFingerprints"]
+            )
+            binding["tokenFingerprintSetSha256"] = forged_digest
+            lifecycle["canaryFingerprintSetSha256"] = forged_digest
+            state_value = {
+                "schema_version": binding["schemaVersion"],
+                "phase": binding["phase"],
+                "logical_path": binding["logicalPath"],
+                "opened_byte_count": binding["opened"]["byteCount"],
+                "opened_content_sha256": binding["opened"]["contentSha256"],
+                "saved_byte_count": binding["saved"]["byteCount"],
+                "saved_content_sha256": binding["saved"]["contentSha256"],
+                "token_fingerprints": [
+                    {
+                        "byte_count": token["byteCount"],
+                        "content_sha256": token["contentSha256"],
+                    }
+                    for token in binding["tokenFingerprints"]
+                ],
+            }
+            encoded = (
+                json.dumps(state_value, ensure_ascii=True, sort_keys=True) + "\n"
+            ).encode("utf-8")
+            lifecycle["checkpoint"]["stateSeal"]["size"] = len(encoded)
+            lifecycle["checkpoint"]["stateSeal"]["sha256"] = (
+                runner.sha256_bytes(encoded)
+            )
 
         def checkpoint_residue(report: dict) -> None:
             report["restartLifecycle"]["checkpoint"]["residueScan"]["hits"] = 1
@@ -1017,15 +1131,18 @@ time.sleep(60)
             report["scenarioResult"]["packagedSidecarMatchCount"] = 1
 
         for mutation in (
-            legacy_schema,
+            predecessor_v3_schema,
             weaker_signal_delivery,
             profile_rebound,
+            jointly_forged_profile_bindings,
             package_tree_changed,
             plugin_host_rebound,
             non_newer_second_launch,
             second_role_escaped_session,
+            jointly_forged_sidecar_paths,
             forged_state_binding,
             forged_state_seal,
+            jointly_forged_tokens_and_state_seal,
             checkpoint_residue,
             false_preunlock_result,
             only_one_sidecar_observation,

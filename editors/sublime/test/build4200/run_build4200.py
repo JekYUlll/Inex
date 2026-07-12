@@ -50,7 +50,7 @@ ARTIFACT_REPORT_SCOPE = (
     "exact-packaged-sublime-build4200-single-scenario-evidence-non-release-approval"
 )
 RESTART_ARTIFACT_REPORT_SCOPE = (
-    "exact-packaged-sublime-build4200-full-application-kill-restart-evidence-"
+    "exact-packaged-sublime-build4200-full-application-kill-restart-v4-evidence-"
     "non-release-approval"
 )
 ARTIFACT_HARNESS_FILES = (
@@ -446,8 +446,26 @@ def directory_binding(path: Path) -> Dict[str, object]:
         "device": metadata.st_dev,
         "inode": metadata.st_ino,
         "mode": stat.S_IMODE(metadata.st_mode),
+        "path": str(path),
         "pathSha256": sha256_bytes(str(path).encode("utf-8")),
     }
+
+
+def token_fingerprint_set_digest(
+    fingerprints: Iterable[Tuple[int, str]]
+) -> str:
+    records = [
+        {"byte_count": byte_count, "content_sha256": digest}
+        for byte_count, digest in sorted(fingerprints)
+    ]
+    return sha256_bytes(
+        json.dumps(
+            records,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    )
 
 
 def physical_tree_report_digest(seal: PhysicalTreeSeal) -> str:
@@ -1856,10 +1874,12 @@ def validate_restart_checkpoint_state(
     observations = {
         record.get("event"): record
         for record in helper_records
-        if record.get("event") in {"opened", "saved"}
+        if record.get("event")
+        in {"opened", "saved", "full_application_restart_ready"}
     }
     opened = observations.get("opened")
     saved = observations.get("saved")
+    ready = observations.get("full_application_restart_ready")
     canonical_bytes = (json.dumps(value, ensure_ascii=True, sort_keys=True) + "\n").encode(
         "utf-8"
     )
@@ -1871,6 +1891,7 @@ def validate_restart_checkpoint_state(
         or value.get("logical_path") != "qa.md"
         or not isinstance(opened, Mapping)
         or not isinstance(saved, Mapping)
+        or not isinstance(ready, Mapping)
         or value.get("opened_byte_count") != opened.get("byte_count")
         or value.get("opened_content_sha256") != opened.get("content_sha256")
         or value.get("saved_byte_count") != saved.get("byte_count")
@@ -1902,8 +1923,15 @@ def validate_restart_checkpoint_state(
         ):
             raise QaFailure("restart checkpoint state has an invalid token fingerprint")
         observed_tokens.append((token["byte_count"], token["content_sha256"]))
-    if sorted(observed_tokens) != expected_tokens:
+    if observed_tokens != expected_tokens:
         raise QaFailure("restart checkpoint token fingerprints are not exact")
+    token_fingerprint_set_sha256 = token_fingerprint_set_digest(observed_tokens)
+    if (
+        ready.get("token_fingerprint_count") != len(observed_tokens)
+        or ready.get("token_fingerprint_set_sha256")
+        != token_fingerprint_set_sha256
+    ):
+        raise QaFailure("restart checkpoint token fingerprints are not helper-bound")
     return {
         "schemaVersion": value["schema_version"],
         "phase": value["phase"],
@@ -1920,6 +1948,7 @@ def validate_restart_checkpoint_state(
             {"byteCount": byte_count, "contentSha256": digest}
             for byte_count, digest in observed_tokens
         ],
+        "tokenFingerprintSetSha256": token_fingerprint_set_sha256,
         "plaintextFieldsAbsent": True,
     }
 
@@ -2245,6 +2274,7 @@ def normalize_helper_records(
             "marker",
             "state_written",
             "token_fingerprint_count",
+            "token_fingerprint_set_sha256",
         },
         "restart_loaded": {"event", "time", "build", "gate_ok", "issue_count"},
         "restart_preunlock_checked": {
@@ -2421,6 +2451,7 @@ def normalize_helper_records(
             or ready.get("state_written") is not True
             or ready.get("logical_path") != "qa.md"
             or ready.get("token_fingerprint_count") != 2
+            or not _valid_digest(ready.get("token_fingerprint_set_sha256"))
             or not isinstance(ready.get("view_id"), int)
             or isinstance(ready.get("view_id"), bool)
             or ready["view_id"] <= 0
@@ -2703,7 +2734,7 @@ def validate_artifact_report(report: Dict[str, object]) -> None:
     scenario = report.get("scenario")
     expected_root_fields = base_root_fields | (
         {"restartLifecycle"}
-        if schema_version == 3 and scenario == "full-application-kill-restart"
+        if schema_version == 4 and scenario == "full-application-kill-restart"
         else set()
     )
     if set(report) != expected_root_fields:
@@ -2714,7 +2745,7 @@ def validate_artifact_report(report: Dict[str, object]) -> None:
         and report.get("reportScope") == ARTIFACT_REPORT_SCOPE
         and scenario in {"normal", "plugin-host-crash"}
     ) or (
-        schema_version == 3
+        schema_version == 4
         and report.get("reportScope") == RESTART_ARTIFACT_REPORT_SCOPE
         and scenario == "full-application-kill-restart"
     )
@@ -3233,11 +3264,15 @@ def validate_artifact_report(report: Dict[str, object]) -> None:
             "launchCount",
             "sameProfilePath",
             "sameInstalledPackageTree",
+            "childSubreaperConfirmed",
+            "processClosurePolicy",
             "signalDelivery",
             "killSignal",
-            "killedSessionProcessCount",
+            "killedProcessClosureCount",
+            "isolatedEnvironment",
             "profileDirectoryBindings",
             "installedPackageTreeSha256ByLaunch",
+            "canaryFingerprintSetSha256",
             "pluginHostExecutable",
             "firstLaunchProcessIdentities",
             "oldProcessIdentitiesDead",
@@ -3250,17 +3285,56 @@ def validate_artifact_report(report: Dict[str, object]) -> None:
             lifecycle.get("launchCount") != 2
             or lifecycle.get("sameProfilePath") is not True
             or lifecycle.get("sameInstalledPackageTree") is not True
+            or lifecycle.get("childSubreaperConfirmed") is not True
             or lifecycle.get("signalDelivery")
-            != "pidfd-per-stable-launch-session-identity"
+            != "pidfd-per-stable-session-descendant-closure"
             or lifecycle.get("killSignal") != "SIGKILL"
-            or not isinstance(lifecycle.get("killedSessionProcessCount"), int)
-            or isinstance(lifecycle.get("killedSessionProcessCount"), bool)
-            or lifecycle["killedSessionProcessCount"] < 3
+            or not isinstance(lifecycle.get("killedProcessClosureCount"), int)
+            or isinstance(lifecycle.get("killedProcessClosureCount"), bool)
+            or lifecycle["killedProcessClosureCount"] < 4
             or lifecycle.get("oldProcessIdentitiesDead") is not True
             or lifecycle.get("secondLaunchIdentitiesDistinct") is not True
         ):
             raise QaFailure("artifact report has a false restart lifecycle claim")
+        if lifecycle.get("processClosurePolicy") != {
+            "stablePidfdIdentity": True,
+            "sessionAndDescendantClosure": True,
+            "subreaperAdoptionSweep": True,
+            "rootBindingSources": ["cwd", "environment", "exe", "fd", "root"],
+            "argvOnlyIsNotBinding": True,
+            "unverifiedRootBoundSurvivors": 0,
+        }:
+            raise QaFailure("artifact report has an invalid process closure policy")
         roles = ["sublime-main", "plugin-host-3.8", "packaged-inexd"]
+        isolated_environment = lifecycle.get("isolatedEnvironment")
+        if (
+            not isinstance(isolated_environment, dict)
+            or set(isolated_environment) != set(ROOT_ENVIRONMENT_KEYS)
+            or any(
+                not isinstance(value, str)
+                or not os.path.isabs(value)
+                or os.path.normpath(value) != value
+                for value in isolated_environment.values()
+            )
+        ):
+            raise QaFailure("artifact report has an invalid isolated environment")
+        isolated_root = Path(str(isolated_environment["HOME"])).parent
+        if isolated_environment != expected_root_environment(isolated_root):
+            raise QaFailure("artifact report environment paths do not share one root")
+        expected_environment_digest = sha256_bytes(
+            json.dumps(
+                isolated_environment,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        )
+        expected_profile_path = Path(
+            str(isolated_environment["XDG_CONFIG_HOME"])
+        ) / "sublime-text"
+        expected_sidecar_path = (
+            expected_profile_path / "Packages" / "Inex" / "bin" / "inexd"
+        )
         profile_bindings = lifecycle.get("profileDirectoryBindings")
         if (
             not isinstance(profile_bindings, list)
@@ -3273,6 +3347,7 @@ def validate_artifact_report(report: Dict[str, object]) -> None:
                 "device",
                 "inode",
                 "mode",
+                "path",
                 "pathSha256",
             }:
                 raise QaFailure("artifact report has an invalid profile identity")
@@ -3280,8 +3355,11 @@ def validate_artifact_report(report: Dict[str, object]) -> None:
                 item = binding.get(field)
                 if not isinstance(item, int) or isinstance(item, bool) or item < 0:
                     raise QaFailure("artifact report has invalid profile metadata")
-            if binding["mode"] & 0o700 != 0o700 or not _valid_digest(
-                binding.get("pathSha256")
+            if (
+                binding["mode"] & 0o700 != 0o700
+                or binding.get("path") != str(expected_profile_path)
+                or binding.get("pathSha256")
+                != sha256_bytes(str(expected_profile_path).encode("utf-8"))
             ):
                 raise QaFailure("artifact report has an unsafe profile identity")
         tree_digests = lifecycle.get("installedPackageTreeSha256ByLaunch")
@@ -3325,7 +3403,7 @@ def validate_artifact_report(report: Dict[str, object]) -> None:
             record["environmentBindingSha256"]
             for record in first_identities + second_identities
         }
-        if len(environment_bindings) != 1:
+        if environment_bindings != {expected_environment_digest}:
             raise QaFailure("artifact report process environments differ across launches")
         build_seal = build.get("seal")
         sidecar_seal = executable_map["inexd"].get("seal")
@@ -3343,6 +3421,7 @@ def validate_artifact_report(report: Dict[str, object]) -> None:
                 or not _same_sealed_file(
                     records[2]["executableSeal"], sidecar_seal
                 )
+                or records[2].get("executablePath") != str(expected_sidecar_path)
             ):
                 raise QaFailure("artifact report process executable binding is invalid")
         checkpoint = lifecycle.get("checkpoint")
@@ -3375,6 +3454,7 @@ def validate_artifact_report(report: Dict[str, object]) -> None:
             "opened",
             "saved",
             "tokenFingerprints",
+            "tokenFingerprintSetSha256",
             "plaintextFieldsAbsent",
         }:
             raise QaFailure("artifact report restart state binding is invalid")
@@ -3419,6 +3499,20 @@ def validate_artifact_report(report: Dict[str, object]) -> None:
         ]
         if token_pairs != sorted(set(token_pairs)):
             raise QaFailure("artifact report restart token bindings are not canonical")
+        token_fingerprint_set_sha256 = token_fingerprint_set_digest(token_pairs)
+        ready_observation = observations_by_event.get(
+            "full_application_restart_ready"
+        )
+        if (
+            state_binding.get("tokenFingerprintSetSha256")
+            != token_fingerprint_set_sha256
+            or lifecycle.get("canaryFingerprintSetSha256")
+            != token_fingerprint_set_sha256
+            or not isinstance(ready_observation, dict)
+            or ready_observation.get("token_fingerprint_set_sha256")
+            != token_fingerprint_set_sha256
+        ):
+            raise QaFailure("artifact report restart token bindings are self-attested")
         reconstructed_state = {
             "schema_version": state_binding["schemaVersion"],
             "phase": state_binding["phase"],
@@ -5083,7 +5177,7 @@ def main() -> int:
                 if record["archiveKind"] == "rust"
             )
             artifact_report: Dict[str, object] = {
-                "schemaVersion": 3 if args.full_application_kill_restart else 2,
+                "schemaVersion": 4 if args.full_application_kill_restart else 2,
                 "reportType": "inex-sublime-build4200-evidence",
                 "reportScope": (
                     RESTART_ARTIFACT_REPORT_SCOPE
@@ -5202,11 +5296,30 @@ def main() -> int:
                     "launchCount": restart_launch_count,
                     "sameProfilePath": True,
                     "sameInstalledPackageTree": True,
-                    "signalDelivery": "pidfd-per-stable-launch-session-identity",
+                    "childSubreaperConfirmed": child_subreaper_confirmed,
+                    "processClosurePolicy": {
+                        "stablePidfdIdentity": True,
+                        "sessionAndDescendantClosure": True,
+                        "subreaperAdoptionSweep": True,
+                        "rootBindingSources": [
+                            "cwd",
+                            "environment",
+                            "exe",
+                            "fd",
+                            "root",
+                        ],
+                        "argvOnlyIsNotBinding": True,
+                        "unverifiedRootBoundSurvivors": 0,
+                    },
+                    "signalDelivery": "pidfd-per-stable-session-descendant-closure",
                     "killSignal": "SIGKILL",
-                    "killedSessionProcessCount": restart_killed_session_process_count,
+                    "killedProcessClosureCount": restart_killed_session_process_count,
+                    "isolatedEnvironment": process_environment_binding_values,
                     "profileDirectoryBindings": restart_profile_bindings,
                     "installedPackageTreeSha256ByLaunch": restart_installed_tree_digests,
+                    "canaryFingerprintSetSha256": restart_checkpoint_state_binding[
+                        "tokenFingerprintSetSha256"
+                    ],
                     "pluginHostExecutable": {
                         "path": str(restart_plugin_host_path),
                         "seal": seal_record(
