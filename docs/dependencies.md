@@ -37,9 +37,14 @@ health warning under the documented social threat model; strict mode may fail.
 ## Argon2id policy
 
 Libsodium's explicit Argon2id13 API is used, never `ALG_DEFAULT`. Its current
-parallelism is fixed at one; v1 calibrates only memory and operations, and the
-JSON does not promise configurable lanes. New vaults use at least 64 MiB and
-operations limit 3. Readers validate a resource ceiling before calling sodium.
+parallelism is fixed at one and the JSON does not promise configurable lanes.
+Normal CLI/core creation currently uses the fixed floor of 64 MiB and
+operations limit 3. An explicit RPC `kdf` still shares the broader reader
+ceiling of 20 operations and 1 GiB, and CLI password add/change currently
+returns to the fixed default even when the authenticated slot is stronger.
+Bounded creation-time ops calibration toward 250–750 ms, an independent RPC
+creation cap, and no-downgrade rewrap selection remain explicit pre-alpha
+release gates. Readers validate a resource ceiling before calling sodium.
 
 ## Build and supply-chain checks
 

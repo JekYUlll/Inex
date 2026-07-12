@@ -9,7 +9,7 @@ required native/editor/package black-box result.
 
 > **NO-GO for GA, supported VS Code MVP, or supported Sublime release.**
 
-The 2026-07-11 source checkpoint has strong Linux and cross-platform
+The 2026-07-12 source checkpoint has strong Linux and cross-platform
 development evidence, but the release gates below are intentionally incomplete.
 The project must keep its pre-alpha warning and must not present any generated
 archive as a supported install.
@@ -27,13 +27,14 @@ Status terms in this document mean:
 
 | Area | Status | Evidence and exact boundary |
 |------|--------|-----------------------------|
-| Linux Rust workspace | verified source checkpoint | 287/287 workspace tests pass with index-CAS v4 and exact runtime-info regressions, plus rustfmt, all-target/all-feature pedantic Clippy with warnings denied, rustdoc warnings denied, and whitespace checks |
+| Linux Rust workspace | verified source checkpoint | 307/307 workspace tests pass with index-CAS v4, native force-kill atomic-write, pre-lock ownership, and exact runtime-info regressions, plus rustfmt, all-target/all-feature pedantic Clippy with warnings denied, rustdoc warnings denied, and whitespace checks |
 | EDRY/vault compatibility | checkpoint | Frozen v1 fixture rebuild/unlock/decrypt and broad format/path/tamper tests pass on Linux; Windows GNU compiles and earlier Wine suites pass, but this is not native Windows evidence |
-| Import | verified checkpoint | Copy-only absent-destination staging, re-open/seal/allowlist/publication, source-preservation, and failure-class tests pass. The final clean Linux x64 artifact also imports a five-document synthetic tree including exact 16 MiB content, preserves every source hash, and produces no plaintext Markdown in the vault; publication ambiguity and native-platform fault cases remain pending |
-| Git | verified Linux source checkpoint | Locked-safe driver, local installer, encrypted diff3, fixed tree provenance, full-width SHA-1/SHA-256, detected/split rename/modify, and legacy v1/v2/v3 recovery pass. New v4 transactions bind an alternate candidate to the old index and hold the real `.git/index.lock`; Linux real-repository regressions cover pre-lock winner, lock-held Git failure, marker/candidate/published recovery, target drift, and foreign-lock preservation. Native Windows abrupt-kill/power-loss, ref-only concurrency, and legacy recovery CAS remain pending |
+| Import | verified checkpoint | Copy-only absent-destination staging, re-open/seal/allowlist/publication, source-preservation, and failure-class tests pass. The historical strict-v1 artifact from `40ff728` also imports a five-document synthetic tree including exact 16 MiB content, preserves every source hash, and produces no plaintext Markdown in the vault; it predates later core/Git changes, while publication ambiguity and native-platform fault cases remain pending |
+| Argon2id creation policy | incomplete | Normal CLI/core creation is still fixed at 3 operations and 64 MiB rather than calibrated toward 250–750 ms. Explicit RPC creation shares the broader reader ceiling, and CLI password add/change can select weaker parameters than a stronger authenticated slot. Bounded calibration, a separate creation cap, and no-downgrade rewrap remain release gates |
+| Git | verified Linux fail-closed source checkpoint | Locked-safe driver, local installer, encrypted diff3, fixed tree provenance, full-width SHA-1/SHA-256, detected/split rename/modify, and legacy v1/v2/v3 recovery pass. New v4 transactions publish a canonical pre-lock reservation plus initial/final ownership receipts before holding the real `.git/index.lock`; Linux regressions cover orphan/partial/wrong-case/link/foreign state, pre-lock winner, lock-held Git failure, marker/candidate/published recovery, target drift, and foreign-lock preservation. A kill between candidate mutation and its matching receipt is detected and preserved as `RecoveryConflict`, not automatically recovered. Native Windows abrupt-kill/power-loss, ref-only concurrency, and legacy recovery CAS remain pending |
 | VS Code unit/bundle | verified checkpoint | Strict TypeScript, 23/23 Node tests, production bundle, and integration bundle pass |
 | VS Code Extension Host | partial | The current local build and 1.125.0 directly drive the production create/folder-create/file-rename/file-delete actions plus encrypted backup/recovery against the daemon/custom editor. Close refusal, rename collision, Unix delete-I/O failure recovery, command registration, and isolated-root residue pass. InputBox/QuickPick mouse interaction is not automated, and test-mode workbench storage is in-memory, so persistent cross-process restore/Local History is unproven |
-| Sublime current source | partial | Pure-Python tests pass 61/61. An exact Build 4200 normal E2E drives unlock/open/edit/save/close and real-panel New Folder/New Markdown/rename/etag-delete through registered commands. Authenticated tree checks pass after each mutation; `folder_created`, `markdown_created`, `renamed`, and `deleted` are present, `crud_complete=true`, `vault_envelope=EDRY`, and `root_scan_hits=0`. The plugin-host SIGKILL probe remains `PASS_WITH_DOCUMENTED_BOUNDARY`: the visible buffer is copyable, the host does not restart in-process, a full Sublime restart is required, `vault_envelope=EDRY`, and roots scanned after application exit remain clean. Its `crud_complete=false` is intentional because the crash branch kills after open/edit/save; this is not crash-time plaintext erasure. The full packaged matrix is pending |
+| Sublime current source | partial | Pure-Python tests pass 61/61. An exact Build 4200 normal E2E drives unlock/open/edit/save/close and real-panel New Folder/New Markdown/rename/etag-delete through registered commands. `xdotool type --file -` reads the random password from its stdin and injects X11 keyboard events into the real absolute zenity masked entry; that password then joins the encoded full-root residue scan. Authenticated tree checks pass after each mutation; `folder_created`, `markdown_created`, `renamed`, and `deleted` are present, `crud_complete=true`, `vault_envelope=EDRY`, and `root_scan_hits=0`. The plugin-host SIGKILL probe remains `PASS_WITH_DOCUMENTED_BOUNDARY`: the visible buffer is copyable, the host does not restart in-process, a full Sublime restart is required, `vault_envelope=EDRY`, and roots scanned after application exit remain clean. Its `crud_complete=false` is intentional because the crash branch kills after open/edit/save; this is not crash-time plaintext erasure. The full packaged matrix is pending |
 | Linux x64 packaging | verified strict-v1 local checkpoint | Artifact source `40ff7288879b27cc2e3b956b029fdb10e99ab25c` is clean. Two independent system-GCC release builds produce identical binaries and identical Rust ZIP, VSIX, Sublime ZIP, and SHA256SUMS. Both pass strict release-set/native audit and VS Code 1.125.0 install/bundled-sidecar smoke; runtime reports GNU x64, release profile, libsodium 1.0.22/ABI 26.4/non-minimal |
 | Linux x64 artifact lifecycle | verified independent clean-clone checkpoint | An independent `git clone --no-hardlinks` at clean harness `d44ead9bff35252577118441f8f575ed7e7b8d12` re-audits artifact source `40ff728`. SHA-256: Rust ZIP `b6b69bd9a9827e7d5915a64714f3d41faddc6d38552dfa5559b8be6c213a3775`; Sublime ZIP `aaf2cd8f652a5eca66dea429d30080cebadd17edbe4135820925aec6d51aa321`; VSIX `468886d49250b0f04e408d5f1c23a0dc4a47c2c28ded7adb101661d1e7b1b93d`. Five expected bodies including exact 16 MiB content authenticate after import, password rewrap, single-ref/single-commit Git bundle and clean tree-copy restores. CLI wrong-password, RPC auth-failure, locked merge-driver, driver relocation, frozen-v1, physical allowlist and descendant cleanup pass; outside-source sensitive hits are zero. Scope remains lifecycle-only, not release approval or native/fault-state/two-version evidence |
 | License collection | verified Linux engineering checkpoint | All three strict-v1 packages share inventory SHA-256 `228bfeb70f96146623ab31146c58bcd5c51434cbb14f4e35ce04525d12dbfc89`, 77 target-bound Cargo components, 147 hashed license/NOTICE texts, and sidecar SHA-256 `5bacbda459d7a3627377271bc2b03d20c8456076b7ccc347fab577216a66149e`. Independent all-native artifact runs, legal review, and license-choice/signature policy remain pending |
@@ -55,30 +56,36 @@ These are not documentation polish items; each changes the release decision:
    on every advertised OS.
 4. Close the remaining GA Git transaction boundary. New v4 index updates have
    a held-lock expected-old CAS on Linux, but native Windows NTFS/ReFS
-   abrupt-kill/power-loss remains unproven; legacy v1/v2/v3 recovery and
-   concurrent ref-only mutation are not covered by the v4 index lock. Keep the
-   supported operational rule that other Git is stopped until those cases have
-   binding evidence.
-5. Build and smoke all four intended platform artifacts on their native target:
+   abrupt-kill/power-loss remains unproven. Candidate/initial/final receipt-gap
+   exits are visible and preserved as `RecoveryConflict` but still require
+   manual investigation; legacy v1/v2/v3 recovery and concurrent ref-only
+   mutation are not covered by the v4 index lock. Keep the supported
+   operational rule that other Git is stopped until those cases have binding
+   evidence.
+5. Implement bounded creation-time Argon2id calibration toward 250–750 ms with
+   the v1 memory/parallelism contract, cap explicit RPC creation independently
+   from the reader ceiling, and ensure password add/change never silently
+   downgrades the authenticated slot's work factors.
+6. Build and smoke all four intended platform artifacts on their native target:
    Linux x64/arm64 and Windows x64/arm64. Verify executable architecture and
    dynamic/static native-library expectations, not only archive names.
-6. Repeat the verified Linux x64 normal-path lifecycle on every native final
+7. Repeat the verified Linux x64 normal-path lifecycle on every native final
    artifact, then add
    publication/recovery fault-state preservation and a true two-version
    upgrade/rollback drill. A frozen-v1 read is compatibility evidence, not a
    substitute for two released program versions.
-7. Complete independent legal review of the collected 77-component inventory,
+8. Complete independent legal review of the collected 77-component inventory,
    147 license/NOTICE texts, license-expression choices, and distribution
    obligations; collection is implemented but is not legal approval.
-8. Push the exact clean source and pass the configured four-platform CI/package
+9. Push the exact clean source and pass the configured four-platform CI/package
    matrices. The local byte-identical Linux x64 pair establishes that checkpoint
    only; it does not establish hosted-runner availability or a native
    multi-platform release matrix.
-9. Keep password-slot documentation explicit that rewrapping does not revoke
+10. Keep password-slot documentation explicit that rewrapping does not revoke
     an old password held with historical `vault.json`; master-key rotation is a
     separate unimplemented migration, not a hidden property of `password
     change`.
-10. Establish a private vulnerability-reporting channel, supported-version
+11. Establish a private vulnerability-reporting channel, supported-version
     policy, release signing keys, and a separately authenticated checksum/
     signature publication path.
 
@@ -320,7 +327,7 @@ workspace/tag parsing, canonical provenance, and PE32+ structure/import ranges;
 the original malformed-VSIX and ZIP bypass samples are rejected. Independent
 release-tool code review is GO. The same helper rejects the xlings-default ELF
 because its interpreter/RUNPATH refers to the build user's xlings home. This is
-valuable local evidence, not a clean-tree, signed, native multi-platform
+valuable local evidence, not a signed, current-source, native multi-platform
 release.
 
 - [ ] The helper scripts and pinned `@vscode/vsce` lockfile are committed,

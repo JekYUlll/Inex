@@ -24,15 +24,16 @@ In particular:
   plugin host still leaves the visible buffer actively copyable and requires a
   full Sublime restart; the client therefore remains experimental until the
   complete package canary matrix passes; and
-- release-tool tests pass 49/49, `actionlint` and pedantic/all-features Clippy
+- release-tool tests pass 59/59, `actionlint` and pedantic/all-features Clippy
   pass, and independent release-tool code review is GO. A system-GCC Linux x64
-  clean-source double build is byte-identical and passes strict
+  double build from historical artifact source `40ff728` is byte-identical and passes strict
   archive/native-dependency audit plus VS Code 1.125.0 CLI
   install/bundled-sidecar smoke. A standalone clean-checkout lifecycle run at
-  harness commit `1e01842` also passes authenticated import/password/restore,
+  harness commit `d44ead9` also passes authenticated import/password/restore,
   Git bundle, frozen-v1 compatibility, exact body and bounded residue checks.
-  This local result is not native Windows/arm64, persistent-profile, signed, or
-  independent release evidence.
+  These packages predate later core/Git source changes and must be rebuilt from
+  the eventual final feature commit. This local result is not native
+  Windows/arm64, persistent-profile, signed, or independent release evidence.
 
 The current evidence and blockers are maintained in
 [`docs/release-checklist.md`](docs/release-checklist.md). Do not use Inex as the
@@ -118,8 +119,14 @@ Stop every editor-integrated or command-line Git operation before running
 transactions now generate and verify an alternate index, install an
 Inex-owned marker at the real `.git/index.lock`, bind old/candidate index
 digests in journal v4, and publish the candidate only after the locked
-worktree/owner/provenance recheck. A normal Git index writer either wins before
-that lock or fails while it is held. This does not serialize ref-only commands,
+worktree/owner/provenance recheck. Before the alternate candidate is created, a
+durable create-only pre-lock reservation binds its random private name and the
+old index digest; a fresh process can therefore classify a pre-lock abrupt exit
+without relying on destructors. Create-only initial/final ownership receipts
+then bind candidate bytes before mutation and before real-lock publication;
+ambiguous receipt gaps preserve all state and require investigation instead of
+guessing ownership. A normal Git index writer either wins before the real lock
+or fails while it is held. This does not serialize ref-only commands,
 legacy v1/v2/v3 journal recovery, or a same-OS-user process that directly
 unlinks or rewrites transaction files. Native Windows abrupt-kill and
 power-loss behavior is also not yet binding evidence, so deliberate concurrent
@@ -167,6 +174,13 @@ survive an abrupt exit.
   128-bit random file identifier.
 - Authentication: the canonical EDRY header, including vault identity and
   normalized logical path, is associated data.
+
+The current normal creation path still uses fixed `opsLimit=3` and 64 MiB
+rather than host calibration toward 250–750 ms. RPC callers can currently
+request creation parameters up to the broader reader ceiling, and CLI password
+add/change returns to the fixed default even when the authenticated slot is
+stronger. Bounded creation calibration, an independent RPC creation cap, and
+no-downgrade rewrap selection remain pre-alpha release gates.
 
 Changing a password rewraps the stable master key and does not rewrite journal
 files. Master-key rotation is represented by a key epoch and is a distinct,
