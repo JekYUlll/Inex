@@ -6,7 +6,8 @@ from __future__ import annotations
 import argparse
 import atexit
 import base64
-from dataclasses import dataclass
+import ctypes
+from dataclasses import dataclass, field
 import hashlib
 import json
 import os
@@ -14,6 +15,7 @@ from pathlib import Path, PurePosixPath
 import platform as host_platform
 import re
 import secrets
+import select
 import shutil
 import signal
 import stat
@@ -126,6 +128,17 @@ RESTART_EVENT_SEQUENCE = (
     "restart_closed",
     "complete",
 )
+ROOT_ENVIRONMENT_KEYS = (
+    "HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_RUNTIME_DIR",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+)
+PR_SET_CHILD_SUBREAPER = 36
+PR_GET_CHILD_SUBREAPER = 37
 
 
 class QaFailure(RuntimeError):
@@ -157,8 +170,8 @@ def cleanup_active_artifact_root() -> None:
         or stat.S_IMODE(observed.st_mode) != 0o700
     ):
         raise QaFailure("artifact evidence root changed physical identity")
-    for pid in root_bound_pids(root):
-        terminate_pid(pid, 0.2)
+    if stable_root_binding_census(root, expected_root_environment(root)):
+        raise QaFailure("artifact evidence root retains a live process binding")
     shutil.rmtree(root)
     if os.path.lexists(root):
         raise QaFailure("artifact evidence root deletion was not verified")
@@ -186,6 +199,30 @@ class PhysicalTreeSeal:
     root: os.stat_result
     directories: Mapping[str, os.stat_result]
     files: Mapping[str, PhysicalFileSeal]
+
+
+@dataclass(frozen=True)
+class ProcessSnapshot:
+    pid: int
+    state: str = field(compare=False)
+    parent_pid: int
+    process_group_id: int
+    session_id: int
+    start_time_ticks: int
+
+
+@dataclass
+class StableProcessHandle:
+    snapshot: ProcessSnapshot
+    pidfd: int
+
+
+@dataclass(frozen=True)
+class RootBindingObservation:
+    snapshot: ProcessSnapshot
+    sources: Tuple[str, ...]
+    environment_keys: Tuple[str, ...]
+    argv_mentions_root: bool
 
 
 def _metadata_signature(metadata: os.stat_result) -> Tuple[int, ...]:
@@ -800,7 +837,7 @@ def process_cmdline(pid: int) -> List[str]:
     return [part.decode("utf-8", "replace") for part in raw.split(b"\0") if part]
 
 
-def process_stat_fields(pid: int) -> Tuple[str, int, int, int, int]:
+def process_snapshot(pid: int) -> ProcessSnapshot:
     try:
         raw = (Path("/proc") / str(pid) / "stat").read_text()
     except (OSError, UnicodeError) as error:
@@ -825,7 +862,124 @@ def process_stat_fields(pid: int) -> Tuple[str, int, int, int, int]:
         or start_time_ticks <= 0
     ):
         raise QaFailure("process stat identity is outside its bounds")
-    return state, parent_pid, process_group_id, session_id, start_time_ticks
+    return ProcessSnapshot(
+        pid=pid,
+        state=state,
+        parent_pid=parent_pid,
+        process_group_id=process_group_id,
+        session_id=session_id,
+        start_time_ticks=start_time_ticks,
+    )
+
+
+def process_stat_fields(pid: int) -> Tuple[str, int, int, int, int]:
+    observed = process_snapshot(pid)
+    return (
+        observed.state,
+        observed.parent_pid,
+        observed.process_group_id,
+        observed.session_id,
+        observed.start_time_ticks,
+    )
+
+
+def enable_and_verify_child_subreaper() -> None:
+    if sys.platform != "linux":
+        raise QaFailure("full application restart evidence requires Linux subreaper support")
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        prctl = libc.prctl
+    except (AttributeError, OSError) as error:
+        raise QaFailure("Linux child subreaper control is unavailable") from error
+    result = prctl(
+        ctypes.c_int(PR_SET_CHILD_SUBREAPER),
+        ctypes.c_ulong(1),
+        ctypes.c_ulong(0),
+        ctypes.c_ulong(0),
+        ctypes.c_ulong(0),
+    )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise QaFailure(
+            "Linux child subreaper activation failed: " + os.strerror(error_number)
+        )
+    observed = ctypes.c_int(0)
+    result = prctl(
+        ctypes.c_int(PR_GET_CHILD_SUBREAPER),
+        ctypes.byref(observed),
+        ctypes.c_ulong(0),
+        ctypes.c_ulong(0),
+        ctypes.c_ulong(0),
+    )
+    if result != 0 or observed.value != 1:
+        raise QaFailure("Linux child subreaper activation was not confirmed")
+
+
+def open_stable_process(
+    pid: int, expected: Optional[ProcessSnapshot] = None
+) -> StableProcessHandle:
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        raise QaFailure("stable process control requires Linux pidfd support")
+    before = process_snapshot(pid)
+    if before.state == "Z" or (expected is not None and before != expected):
+        raise QaFailure("process identity changed before pidfd capture")
+    descriptor = -1
+    try:
+        descriptor = os.pidfd_open(pid)
+        after = process_snapshot(pid)
+        if after != before or after.state == "Z":
+            raise QaFailure("process identity changed during pidfd capture")
+        return StableProcessHandle(snapshot=after, pidfd=descriptor)
+    except OSError as error:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise QaFailure("stable process pidfd capture failed") from error
+    except Exception:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+
+
+def close_process_handles(handles: Iterable[StableProcessHandle]) -> None:
+    for handle in handles:
+        try:
+            os.close(handle.pidfd)
+        except OSError:
+            pass
+
+
+def stable_process_alive(handle: StableProcessHandle) -> bool:
+    poller = select.poll()
+    poller.register(handle.pidfd, select.POLLIN | select.POLLHUP | select.POLLERR)
+    if poller.poll(0):
+        return False
+    try:
+        return process_snapshot(handle.snapshot.pid) == handle.snapshot
+    except QaFailure:
+        return False
+
+
+def signal_stable_process(handle: StableProcessHandle, signum: int) -> None:
+    if not stable_process_alive(handle):
+        return
+    try:
+        signal.pidfd_send_signal(handle.pidfd, signum)
+    except ProcessLookupError:
+        return
+    except OSError as error:
+        raise QaFailure("pidfd signal delivery failed") from error
+
+
+def wait_for_stable_processes(
+    handles: Sequence[StableProcessHandle], label: str, timeout: float
+) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not any(stable_process_alive(handle) for handle in handles):
+            return
+        time.sleep(0.02)
+    if any(stable_process_alive(handle) for handle in handles):
+        raise QaFailure("timed out waiting for " + label)
 
 
 def process_environment_binding(pid: int, expected: Mapping[str, str]) -> str:
@@ -852,6 +1006,172 @@ def process_environment_binding(pid: int, expected: Mapping[str, str]) -> str:
             "utf-8"
         )
     )
+
+
+def expected_root_environment(root: Path) -> Dict[str, str]:
+    return {
+        "HOME": str(root / "home"),
+        "XDG_CONFIG_HOME": str(root / "config"),
+        "XDG_CACHE_HOME": str(root / "cache"),
+        "XDG_RUNTIME_DIR": str(root / "runtime"),
+        "TMPDIR": str(root / "tmp"),
+        "TMP": str(root / "tmp"),
+        "TEMP": str(root / "tmp"),
+    }
+
+
+def _path_target_within_root(target: str, root: Path) -> bool:
+    deleted_suffix = " (deleted)"
+    if target.endswith(deleted_suffix):
+        target = target[: -len(deleted_suffix)]
+    if not target.startswith(os.sep):
+        return False
+    try:
+        return os.path.commonpath((target, str(root))) == str(root)
+    except ValueError:
+        return False
+
+
+def _read_proc_link(pid: int, name: str) -> str:
+    try:
+        return os.readlink(Path("/proc") / str(pid) / name)
+    except (FileNotFoundError, PermissionError) as error:
+        raise ProcessLookupError(pid) from error
+    except OSError as error:
+        raise QaFailure("procfs process path binding is unavailable") from error
+
+
+def _process_environment_root_keys(
+    pid: int, expected_environment: Mapping[str, str]
+) -> Tuple[str, ...]:
+    try:
+        raw = (Path("/proc") / str(pid) / "environ").read_bytes()
+    except (FileNotFoundError, PermissionError) as error:
+        raise ProcessLookupError(pid) from error
+    except OSError as error:
+        raise QaFailure("procfs process environment census is unavailable") from error
+    matches = set()
+    encoded_expected = {
+        key.encode("ascii"): value.encode("utf-8")
+        for key, value in expected_environment.items()
+    }
+    for item in raw.split(b"\0"):
+        if b"=" not in item:
+            continue
+        key, value = item.split(b"=", 1)
+        if encoded_expected.get(key) == value:
+            matches.add(key.decode("ascii"))
+    return tuple(sorted(matches))
+
+
+def _process_fd_targets(pid: int) -> Tuple[str, ...]:
+    directory = Path("/proc") / str(pid) / "fd"
+    try:
+        before = sorted(entry.name for entry in directory.iterdir())
+    except (FileNotFoundError, PermissionError) as error:
+        raise ProcessLookupError(pid) from error
+    except OSError as error:
+        raise QaFailure("procfs process descriptor census is unavailable") from error
+    targets = []
+    for descriptor_name in before:
+        try:
+            targets.append(os.readlink(directory / descriptor_name))
+        except (FileNotFoundError, PermissionError):
+            # A descriptor closed during the walk is no longer a surviving
+            # binding. Two complete process censuses below still have to
+            # agree before the result is accepted.
+            continue
+        except OSError as error:
+            raise QaFailure("procfs process descriptor binding is unavailable") from error
+    return tuple(targets)
+
+
+def capture_root_binding_observation(
+    pid: int, root: Path, expected_environment: Mapping[str, str]
+) -> Optional[RootBindingObservation]:
+    try:
+        owner = (Path("/proc") / str(pid)).stat().st_uid
+    except FileNotFoundError as error:
+        raise ProcessLookupError(pid) from error
+    except OSError as error:
+        raise QaFailure("procfs process ownership is unavailable") from error
+    if owner != os.geteuid():
+        return None
+    before = process_snapshot(pid)
+    if before.state == "Z":
+        return None
+    sources = set()
+    for name in ("exe", "cwd", "root"):
+        target = _read_proc_link(pid, name)
+        if _path_target_within_root(target, root):
+            sources.add(name)
+    if any(
+        _path_target_within_root(target, root)
+        for target in _process_fd_targets(pid)
+    ):
+        sources.add("fd")
+    environment_keys = _process_environment_root_keys(pid, expected_environment)
+    if environment_keys:
+        sources.add("environment")
+    argv_mentions_root = any(
+        str(root) in argument for argument in process_cmdline(pid)
+    )
+    after = process_snapshot(pid)
+    if after != before:
+        raise ProcessLookupError(pid)
+    if not sources:
+        return None
+    return RootBindingObservation(
+        snapshot=after,
+        sources=tuple(sorted(sources)),
+        environment_keys=environment_keys,
+        argv_mentions_root=argv_mentions_root,
+    )
+
+
+def _root_binding_census_once(
+    root: Path,
+    expected_environment: Mapping[str, str],
+    excluded_pids: Iterable[int],
+) -> Tuple[RootBindingObservation, ...]:
+    excluded = set(excluded_pids)
+    observations = []
+    try:
+        entries = sorted(
+            (entry for entry in Path("/proc").iterdir() if entry.name.isdigit()),
+            key=lambda entry: int(entry.name),
+        )
+    except OSError as error:
+        raise QaFailure("procfs root-binding census is unavailable") from error
+    for entry in entries:
+        pid = int(entry.name)
+        if pid in excluded:
+            continue
+        try:
+            observation = capture_root_binding_observation(
+                pid, root, expected_environment
+            )
+        except ProcessLookupError:
+            continue
+        if observation is not None:
+            observations.append(observation)
+    return tuple(observations)
+
+
+def stable_root_binding_census(
+    root: Path,
+    expected_environment: Mapping[str, str],
+    *,
+    excluded_pids: Iterable[int] = (),
+) -> Tuple[RootBindingObservation, ...]:
+    excluded = {os.getpid(), *ancestor_pids(os.getpid()), *excluded_pids}
+    for _attempt in range(20):
+        first = _root_binding_census_once(root, expected_environment, excluded)
+        time.sleep(0.01)
+        second = _root_binding_census_once(root, expected_environment, excluded)
+        if first == second:
+            return second
+    raise QaFailure("procfs root-binding census did not stabilize")
 
 
 def capture_process_identity(
@@ -992,16 +1312,90 @@ def session_process_pids(session_id: int) -> List[int]:
     return sorted(matches)
 
 
-def kill_verified_application_session(
-    identities: Sequence[Mapping[str, object]], launcher: subprocess.Popen
-) -> int:
+def process_table() -> Dict[int, ProcessSnapshot]:
+    observed: Dict[int, ProcessSnapshot] = {}
+    try:
+        entries = list(Path("/proc").iterdir())
+    except OSError as error:
+        raise QaFailure("procfs process table is unavailable") from error
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        try:
+            snapshot = process_snapshot(pid)
+        except QaFailure:
+            continue
+        if snapshot.state != "Z":
+            observed[pid] = snapshot
+    return observed
+
+
+def _identity_snapshot(identity: Mapping[str, object]) -> ProcessSnapshot:
+    values = {
+        "pid": identity.get("pid"),
+        "parent_pid": identity.get("parentPid"),
+        "process_group_id": identity.get("processGroupId"),
+        "session_id": identity.get("sessionId"),
+        "start_time_ticks": identity.get("startTimeTicks"),
+    }
+    if any(
+        not isinstance(value, int) or isinstance(value, bool)
+        for value in values.values()
+    ):
+        raise QaFailure("recorded application identity is incomplete")
+    return ProcessSnapshot(
+        pid=values["pid"],
+        state=process_snapshot(values["pid"]).state,
+        parent_pid=values["parent_pid"],
+        process_group_id=values["process_group_id"],
+        session_id=values["session_id"],
+        start_time_ticks=values["start_time_ticks"],
+    )
+
+
+def _descendant_closure(
+    table: Mapping[int, ProcessSnapshot], seeds: Iterable[int]
+) -> set:
+    closure = set(seeds)
+    while True:
+        added = {
+            pid
+            for pid, snapshot in table.items()
+            if snapshot.parent_pid in closure and pid not in closure
+        }
+        if not added:
+            return closure
+        closure.update(added)
+
+
+def _launch_closure_snapshots(
+    table: Mapping[int, ProcessSnapshot],
+    session_id: int,
+    adopted_root_bound_pids: Iterable[int],
+) -> Dict[int, ProcessSnapshot]:
+    seeds = {
+        pid for pid, snapshot in table.items() if snapshot.session_id == session_id
+    }
+    seeds.update(pid for pid in adopted_root_bound_pids if pid in table)
+    closure = _descendant_closure(table, seeds)
+    return {pid: table[pid] for pid in sorted(closure) if pid in table}
+
+
+def capture_stable_launch_closure(
+    identities: Sequence[Mapping[str, object]],
+    launcher: subprocess.Popen,
+    root: Path,
+    expected_environment: Mapping[str, str],
+    excluded_infrastructure_pids: Iterable[int],
+) -> Tuple[List[StableProcessHandle], ProcessSnapshot]:
     if len(identities) != 3 or any(
         not process_identity_alive(identity) for identity in identities
     ):
-        raise QaFailure("application process identity changed before SIGKILL")
+        raise QaFailure("application process identity changed before closure capture")
     sessions = {identity.get("sessionId") for identity in identities}
     if len(sessions) != 1:
-        raise QaFailure("application SIGKILL session is ambiguous")
+        raise QaFailure("application process closure session is ambiguous")
     session_id = next(iter(sessions))
     if (
         not isinstance(session_id, int)
@@ -1009,62 +1403,146 @@ def kill_verified_application_session(
         or session_id <= 1
         or session_id == os.getsid(0)
         or launcher.poll() is not None
-        or os.getsid(launcher.pid) != session_id
     ):
-        raise QaFailure("application launcher is outside the verified SIGKILL session")
-    pidfds: Dict[int, int] = {}
-    captured_starts: Dict[int, int] = {}
-    try:
-        for _attempt in range(20):
-            for descriptor in pidfds.values():
-                os.close(descriptor)
-            pidfds.clear()
-            captured_starts.clear()
-            before = session_process_pids(session_id)
-            if not before:
-                raise QaFailure("application session disappeared before SIGKILL")
-            try:
-                for pid in before:
-                    _state, _parent, _group, observed_session, started = (
-                        process_stat_fields(pid)
-                    )
-                    descriptor = os.pidfd_open(pid)
-                    pidfds[pid] = descriptor
-                    _state2, _parent2, _group2, session2, started2 = (
-                        process_stat_fields(pid)
-                    )
-                    if observed_session != session_id or session2 != session_id or started2 != started:
-                        raise ProcessLookupError
-                    captured_starts[pid] = started
-            except (OSError, QaFailure):
-                time.sleep(0.05)
-                continue
-            if session_process_pids(session_id) == before:
-                break
-            time.sleep(0.05)
-        else:
-            raise QaFailure("application session membership did not stabilize")
-        if not {int(identity["pid"]) for identity in identities}.issubset(pidfds):
-            raise QaFailure("verified application roles escaped the launch session")
-        if any(not process_identity_alive(identity) for identity in identities):
-            raise QaFailure("application process identity changed after pidfd capture")
-        for pid in sorted(pidfds, reverse=True):
-            signal.pidfd_send_signal(pidfds[pid], signal.SIGKILL)
-        wait_until(
-            "old application session to die",
-            lambda: not session_process_pids(session_id),
-            5,
+        raise QaFailure("application launcher is outside the verified closure")
+    launcher_snapshot = process_snapshot(launcher.pid)
+    if launcher_snapshot.session_id != session_id:
+        raise QaFailure("application launcher escaped its verified session")
+    required = {
+        snapshot.pid: snapshot for snapshot in map(_identity_snapshot, identities)
+    }
+    required[launcher_snapshot.pid] = launcher_snapshot
+    infrastructure = set(excluded_infrastructure_pids)
+    for _attempt in range(20):
+        first_table = process_table()
+        first_bindings = stable_root_binding_census(
+            root,
+            expected_environment,
+            excluded_pids=infrastructure,
         )
+        adopted = {
+            observation.snapshot.pid
+            for observation in first_bindings
+            if observation.snapshot.parent_pid == os.getpid()
+            and observation.snapshot.start_time_ticks
+            >= launcher_snapshot.start_time_ticks
+        }
+        first = _launch_closure_snapshots(first_table, session_id, adopted)
+        if any(first.get(pid) != snapshot for pid, snapshot in required.items()):
+            raise QaFailure("required application role escaped the launch closure")
+        handles: List[StableProcessHandle] = []
+        try:
+            handles = [
+                open_stable_process(pid, snapshot)
+                for pid, snapshot in sorted(first.items())
+            ]
+            second_table = process_table()
+            second_bindings = stable_root_binding_census(
+                root,
+                expected_environment,
+                excluded_pids=infrastructure,
+            )
+            adopted_second = {
+                observation.snapshot.pid
+                for observation in second_bindings
+                if observation.snapshot.parent_pid == os.getpid()
+                and observation.snapshot.start_time_ticks
+                >= launcher_snapshot.start_time_ticks
+            }
+            second = _launch_closure_snapshots(
+                second_table, session_id, adopted_second
+            )
+            if first == second and all(stable_process_alive(handle) for handle in handles):
+                return handles, launcher_snapshot
+        except QaFailure:
+            pass
+        close_process_handles(handles)
+        time.sleep(0.05)
+    raise QaFailure("application launch closure did not stabilize")
+
+
+def _reap_known_subreaper_children(
+    handles: Sequence[StableProcessHandle], launcher_pid: int
+) -> None:
+    for handle in handles:
+        if handle.snapshot.pid == launcher_pid:
+            continue
+        try:
+            os.waitpid(handle.snapshot.pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
+
+
+def kill_verified_application_session(
+    identities: Sequence[Mapping[str, object]],
+    launcher: subprocess.Popen,
+    root: Path,
+    expected_environment: Mapping[str, str],
+    excluded_infrastructure_pids: Iterable[int],
+) -> int:
+    handles, launcher_snapshot = capture_stable_launch_closure(
+        identities,
+        launcher,
+        root,
+        expected_environment,
+        excluded_infrastructure_pids,
+    )
+    all_handles = list(handles)
+    infrastructure = set(excluded_infrastructure_pids)
+    try:
+        for handle in sorted(
+            handles, key=lambda item: item.snapshot.pid, reverse=True
+        ):
+            signal_stable_process(handle, signal.SIGKILL)
+        wait_for_stable_processes(handles, "old application closure to die", 5)
         if any(process_identity_alive(identity) for identity in identities):
             raise QaFailure("old application role survived pidfd SIGKILL")
         try:
             launcher.wait(timeout=5)
         except subprocess.TimeoutExpired as error:
             raise QaFailure("SIGKILL launcher did not terminate") from error
-        return len(pidfds)
+        _reap_known_subreaper_children(handles, launcher_snapshot.pid)
+
+        # A process which daemonized while the first closure was being killed
+        # is reparented to this confirmed subreaper. Capture and kill only that
+        # parent-bound identity; an unrelated root-bound process is never
+        # signalled and instead makes the evidence fail closed below.
+        for _attempt in range(20):
+            table = process_table()
+            adopted = [
+                snapshot
+                for snapshot in table.values()
+                if snapshot.parent_pid == os.getpid()
+                and snapshot.start_time_ticks >= launcher_snapshot.start_time_ticks
+                and snapshot.pid not in infrastructure
+                and snapshot.pid != os.getpid()
+            ]
+            if not adopted:
+                break
+            sweep_handles = [
+                open_stable_process(snapshot.pid, snapshot)
+                for snapshot in sorted(adopted, key=lambda item: item.pid)
+            ]
+            all_handles.extend(sweep_handles)
+            for handle in sweep_handles:
+                signal_stable_process(handle, signal.SIGKILL)
+            wait_for_stable_processes(
+                sweep_handles, "subreaper-adopted application descendants", 5
+            )
+            _reap_known_subreaper_children(sweep_handles, launcher_snapshot.pid)
+        else:
+            raise QaFailure("subreaper-adopted application descendants did not drain")
+
+        survivors = stable_root_binding_census(
+            root,
+            expected_environment,
+            excluded_pids=infrastructure,
+        )
+        if survivors:
+            raise QaFailure("unverified root-bound process survived application SIGKILL")
+        return len(all_handles)
     finally:
-        for descriptor in pidfds.values():
-            os.close(descriptor)
+        close_process_handles(all_handles)
 
 
 def sublime_multiinstance_pids(binary: Path) -> List[int]:
@@ -1109,58 +1587,117 @@ def ancestor_pids(pid: int) -> List[int]:
     return ancestors
 
 
-def root_bound_pids(root: Path) -> List[int]:
-    fragment = str(root)
-    excluded = {os.getpid(), *ancestor_pids(os.getpid())}
-    matches: List[int] = []
-    for entry in Path("/proc").iterdir():
-        if not entry.name.isdigit():
-            continue
-        pid = int(entry.name)
-        if pid in excluded:
-            continue
-        command = process_cmdline(pid)
-        if any(fragment in argument for argument in command):
-            matches.append(pid)
-    return matches
+def terminate_process_snapshot(
+    expected: ProcessSnapshot, grace: float = 2.0
+) -> None:
+    handle: Optional[StableProcessHandle] = None
+    try:
+        try:
+            handle = open_stable_process(expected.pid, expected)
+        except QaFailure:
+            if not (Path("/proc") / str(expected.pid)).exists():
+                return
+            raise
+        signal_stable_process(handle, signal.SIGTERM)
+        try:
+            wait_for_stable_processes([handle], "process SIGTERM", grace)
+            return
+        except QaFailure:
+            pass
+        signal_stable_process(handle, signal.SIGKILL)
+        wait_for_stable_processes([handle], "process SIGKILL", 5)
+    finally:
+        if handle is not None:
+            close_process_handles([handle])
 
 
 def terminate_pid(pid: Optional[int], grace: float = 2.0) -> None:
     if pid is None:
         return
     try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
+        snapshot = process_snapshot(pid)
+    except QaFailure:
         return
-    deadline = time.monotonic() + grace
-    while time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return
-        time.sleep(0.05)
+    terminate_process_snapshot(snapshot, grace)
+
+
+def reap_subreaper_process(expected: ProcessSnapshot) -> None:
     try:
-        os.kill(pid, signal.SIGKILL)
-    except ProcessLookupError:
+        os.waitpid(expected.pid, os.WNOHANG)
+    except ChildProcessError:
         pass
+
+
+def _capture_cleanup_closure(
+    main_pid: Optional[int], launcher: Optional[subprocess.Popen], root: Path
+) -> List[StableProcessHandle]:
+    expected_environment = expected_root_environment(root)
+    for _attempt in range(20):
+        table = process_table()
+        seeds = set()
+        if launcher is not None and launcher.poll() is None:
+            launcher_snapshot = table.get(launcher.pid)
+            if launcher_snapshot is None:
+                time.sleep(0.02)
+                continue
+            seeds.update(
+                pid
+                for pid, snapshot in table.items()
+                if snapshot.session_id == launcher_snapshot.session_id
+            )
+        if main_pid is not None and main_pid in table:
+            try:
+                binding = capture_root_binding_observation(
+                    main_pid, root, expected_environment
+                )
+            except ProcessLookupError:
+                time.sleep(0.02)
+                continue
+            if binding is None:
+                raise QaFailure("cleanup main PID is not bound to the isolated root")
+            seeds.add(main_pid)
+        if not seeds:
+            return []
+        closure = _descendant_closure(table, seeds)
+        snapshots = {pid: table[pid] for pid in closure if pid in table}
+        handles: List[StableProcessHandle] = []
+        try:
+            handles = [
+                open_stable_process(pid, snapshot)
+                for pid, snapshot in sorted(snapshots.items())
+            ]
+            table_after = process_table()
+            if all(table_after.get(pid) == snapshot for pid, snapshot in snapshots.items()):
+                return handles
+        except QaFailure:
+            pass
+        close_process_handles(handles)
+        time.sleep(0.02)
+    raise QaFailure("cleanup application process closure did not stabilize")
 
 
 def terminate_sublime_tree(
     main_pid: Optional[int], launcher: Optional[subprocess.Popen], root: Path
 ) -> None:
-    descendants = child_pids(main_pid) if main_pid is not None else []
-    terminate_pid(main_pid, 0.5)
-    for pid in reversed(descendants):
-        terminate_pid(pid, 0.2)
+    handles = _capture_cleanup_closure(main_pid, launcher, root)
+    try:
+        for handle in sorted(
+            handles, key=lambda item: item.snapshot.pid, reverse=True
+        ):
+            signal_stable_process(handle, signal.SIGTERM)
+        try:
+            wait_for_stable_processes(handles, "isolated Sublime SIGTERM", 0.5)
+        except QaFailure:
+            for handle in handles:
+                signal_stable_process(handle, signal.SIGKILL)
+            wait_for_stable_processes(handles, "isolated Sublime SIGKILL", 5)
+    finally:
+        close_process_handles(handles)
     if launcher is not None:
-        terminate_pid(launcher.pid, 0.2)
-    for pid in root_bound_pids(root):
-        terminate_pid(pid, 0.2)
-    wait_until(
-        "isolated Sublime process-tree cleanup",
-        lambda: not root_bound_pids(root),
-        5,
-    )
+        try:
+            launcher.wait(timeout=5)
+        except subprocess.TimeoutExpired as error:
+            raise QaFailure("isolated Sublime launcher did not terminate") from error
 
 
 def read_new_reports(path: Path, offset: int) -> Tuple[int, List[Dict[str, object]]]:
@@ -2847,6 +3384,10 @@ def main() -> int:
         else ("plugin-host-crash" if args.plugin_host_crash else "normal")
     )
     artifact_mode = args.artifact_directory is not None
+    child_subreaper_confirmed = False
+    if args.full_application_kill_restart:
+        enable_and_verify_child_subreaper()
+        child_subreaper_confirmed = True
     if artifact_mode and args.keep:
         raise QaFailure("artifact evidence cannot retain the isolated root")
     if artifact_mode and (
@@ -3263,9 +3804,12 @@ def main() -> int:
     xauthority = control / "Xauthority"
     x11_cookie = secrets.token_hex(16)
     xvfb_process: Optional[subprocess.Popen] = None
+    xvfb_snapshot: Optional[ProcessSnapshot] = None
     window_manager_process: Optional[subprocess.Popen] = None
+    window_manager_snapshot: Optional[ProcessSnapshot] = None
     sublime_process: Optional[subprocess.Popen] = None
     dbus_pid: Optional[int] = None
+    dbus_snapshot: Optional[ProcessSnapshot] = None
     sublime_main_pid: Optional[int] = None
     final_success = False
     flow_complete = False
@@ -3342,6 +3886,7 @@ def main() -> int:
             raise QaFailure("dbus-daemon did not return address and pid")
         env["DBUS_SESSION_BUS_ADDRESS"] = dbus_lines[0]
         dbus_pid = int(dbus_lines[-1])
+        dbus_snapshot = process_snapshot(dbus_pid)
 
         run_checked(
             [xauth, "-f", str(xauthority), "add", display, ".", x11_cookie],
@@ -3369,6 +3914,7 @@ def main() -> int:
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
+        xvfb_snapshot = process_snapshot(xvfb_process.pid)
         env["DISPLAY"] = display
         wait_until("Xvfb", lambda: Path("/tmp/.X11-unix/X%d" % display_number).exists(), 5)
         window_manager_process = subprocess.Popen(
@@ -3378,6 +3924,7 @@ def main() -> int:
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
+        window_manager_snapshot = process_snapshot(window_manager_process.pid)
         time.sleep(0.5)
         if window_manager_process.poll() is not None:
             raise QaFailure("isolated metacity process failed to start")
@@ -3705,7 +4252,21 @@ def main() -> int:
                     )
                     restart_killed_session_process_count = (
                         kill_verified_application_session(
-                            restart_first_identities, sublime_process
+                            restart_first_identities,
+                            sublime_process,
+                            root,
+                            process_environment_binding_values,
+                            tuple(
+                                pid
+                                for pid in (
+                                    window_manager_process.pid
+                                    if window_manager_process is not None
+                                    else None,
+                                    xvfb_process.pid if xvfb_process is not None else None,
+                                    dbus_pid,
+                                )
+                                if pid is not None
+                            ),
                         )
                     )
                     restart_old_identities_dead = all(
@@ -3731,13 +4292,22 @@ def main() -> int:
                         raise QaFailure("old packaged sidecar survived verified SIGKILL")
 
                     if window_manager_process is not None:
-                        terminate_pid(window_manager_process.pid, 0.2)
+                        if window_manager_snapshot is None:
+                            raise QaFailure("window manager identity is unavailable")
+                        terminate_process_snapshot(window_manager_snapshot, 0.2)
                         window_manager_process = None
+                        window_manager_snapshot = None
                     if xvfb_process is not None:
-                        terminate_pid(xvfb_process.pid, 0.2)
+                        if xvfb_snapshot is None:
+                            raise QaFailure("Xvfb identity is unavailable")
+                        terminate_process_snapshot(xvfb_snapshot, 0.2)
                         xvfb_process = None
-                    terminate_pid(dbus_pid, 0.2)
+                        xvfb_snapshot = None
+                    if dbus_snapshot is not None:
+                        terminate_process_snapshot(dbus_snapshot, 0.2)
+                        reap_subreaper_process(dbus_snapshot)
                     dbus_pid = None
+                    dbus_snapshot = None
                     wait_until(
                         "first-launch X11 socket removal",
                         lambda: not Path(
@@ -3757,11 +4327,13 @@ def main() -> int:
                             raise QaFailure(
                                 "restart checkpoint runtime cleanup failed"
                             ) from error
-                    wait_until(
-                        "all first-launch root-bound processes to exit",
-                        lambda: not root_bound_pids(root),
-                        5,
+                    checkpoint_survivors = stable_root_binding_census(
+                        root, process_environment_binding_values
                     )
+                    if checkpoint_survivors:
+                        raise QaFailure(
+                            "root-bound process survived the full restart checkpoint"
+                        )
                     if scan_for_tokens((root,), tokens):
                         raise QaFailure("plaintext residue existed at restart checkpoint")
                     restart_checkpoint_scan_complete = True
@@ -3814,6 +4386,7 @@ def main() -> int:
                         raise QaFailure("second D-Bus session did not return identity")
                     env["DBUS_SESSION_BUS_ADDRESS"] = dbus_lines[0]
                     dbus_pid = int(dbus_lines[-1])
+                    dbus_snapshot = process_snapshot(dbus_pid)
                     run_checked(
                         [xauth, "-f", str(xauthority), "add", display, ".", x11_cookie],
                         env=env,
@@ -3838,6 +4411,7 @@ def main() -> int:
                         stderr=subprocess.DEVNULL,
                         start_new_session=True,
                     )
+                    xvfb_snapshot = process_snapshot(xvfb_process.pid)
                     wait_until(
                         "second Xvfb",
                         lambda: Path(
@@ -3851,6 +4425,9 @@ def main() -> int:
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
                         start_new_session=True,
+                    )
+                    window_manager_snapshot = process_snapshot(
+                        window_manager_process.pid
                     )
                     time.sleep(0.5)
                     if window_manager_process.poll() is not None:
@@ -4232,13 +4809,22 @@ def main() -> int:
         sublime_main_pid = None
         sublime_process = None
         if window_manager_process is not None:
-            terminate_pid(window_manager_process.pid, 0.2)
+            if window_manager_snapshot is None:
+                raise QaFailure("window manager identity is unavailable")
+            terminate_process_snapshot(window_manager_snapshot, 0.2)
             window_manager_process = None
+            window_manager_snapshot = None
         if xvfb_process is not None:
-            terminate_pid(xvfb_process.pid, 0.2)
+            if xvfb_snapshot is None:
+                raise QaFailure("Xvfb identity is unavailable")
+            terminate_process_snapshot(xvfb_snapshot, 0.2)
             xvfb_process = None
-        terminate_pid(dbus_pid, 0.2)
+            xvfb_snapshot = None
+        if dbus_snapshot is not None:
+            terminate_process_snapshot(dbus_snapshot, 0.2)
+            reap_subreaper_process(dbus_snapshot)
         dbus_pid = None
+        dbus_snapshot = None
         for generated_runtime_path in (xauthority, runtime / "dbus-session-bus"):
             try:
                 generated_runtime_path.unlink()
@@ -4246,6 +4832,8 @@ def main() -> int:
                 pass
             except OSError as error:
                 raise QaFailure("isolated display or D-Bus residue cleanup failed") from error
+        if stable_root_binding_census(root, process_environment_binding_values):
+            raise QaFailure("isolated root retains a live process binding")
         offset, final_records = read_new_reports(report, offset)
         helper_records.extend(final_records)
         events.extend(str(record["event"]) for record in final_records)
@@ -4576,16 +5164,32 @@ def main() -> int:
         final_success = True
         return 0
     finally:
+        cleanup_failure: Optional[QaFailure] = None
         try:
             terminate_sublime_tree(sublime_main_pid, sublime_process, root)
-        except QaFailure:
-            for pid in root_bound_pids(root):
-                terminate_pid(pid, 0.2)
+        except QaFailure as error:
+            cleanup_failure = error
         if window_manager_process is not None:
-            terminate_pid(window_manager_process.pid, 0.2)
+            if window_manager_snapshot is None:
+                cleanup_failure = QaFailure("window manager identity is unavailable")
+            else:
+                terminate_process_snapshot(window_manager_snapshot, 0.2)
         if xvfb_process is not None:
-            terminate_pid(xvfb_process.pid, 0.2)
-        terminate_pid(dbus_pid, 0.2)
+            if xvfb_snapshot is None:
+                cleanup_failure = QaFailure("Xvfb identity is unavailable")
+            else:
+                terminate_process_snapshot(xvfb_snapshot, 0.2)
+        if dbus_snapshot is not None:
+            terminate_process_snapshot(dbus_snapshot, 0.2)
+            reap_subreaper_process(dbus_snapshot)
+        if cleanup_failure is None and stable_root_binding_census(
+            root, process_environment_binding_values
+        ):
+            cleanup_failure = QaFailure(
+                "isolated root retains a live process binding during cleanup"
+            )
+        if cleanup_failure is not None:
+            raise cleanup_failure
         if artifact_mode:
             cleanup_active_artifact_root()
             if final_success:

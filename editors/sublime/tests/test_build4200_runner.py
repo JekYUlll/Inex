@@ -6,8 +6,10 @@ import json
 import os
 from pathlib import Path
 import stat
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -638,6 +640,225 @@ def _valid_report(scenario: str = "normal") -> dict:
 
 
 class Build4200RunnerFoundationTests(unittest.TestCase):
+    @unittest.skipUnless(
+        sys.platform == "linux" and hasattr(os, "pidfd_open"),
+        "Linux subreaper and pidfd regression",
+    )
+    def test_verified_closure_kills_real_setsid_daemon_escape(self) -> None:
+        runner.enable_and_verify_child_subreaper()
+        daemon_pid = None
+        launcher = None
+        observed = {}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            expected_environment = runner.expected_root_environment(root)
+            for value in expected_environment.values():
+                Path(value).mkdir(parents=True, exist_ok=True)
+            environment = {
+                "PATH": "/usr/bin:/bin",
+                "LANG": "C.UTF-8",
+                "LC_ALL": "C.UTF-8",
+                **expected_environment,
+            }
+            script = """
+import os
+import signal
+import time
+
+signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+normal = []
+for _index in range(2):
+    pid = os.fork()
+    if pid == 0:
+        time.sleep(60)
+        os._exit(0)
+    normal.append(pid)
+daemonizer = os.fork()
+if daemonizer == 0:
+    os.setsid()
+    daemon = os.fork()
+    if daemon > 0:
+        os._exit(0)
+    print("daemon:%d" % os.getpid(), flush=True)
+    time.sleep(60)
+    os._exit(0)
+for pid in normal:
+    print("normal:%d" % pid, flush=True)
+time.sleep(60)
+"""
+            launcher = subprocess.Popen(
+                [sys.executable, "-u", "-c", script],
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            try:
+                deadline = time.monotonic() + 5
+                while len(observed.get("normal", [])) < 2 or "daemon" not in observed:
+                    if time.monotonic() >= deadline:
+                        self.fail("setsid regression children did not start")
+                    line = launcher.stdout.readline().strip()
+                    if not line:
+                        continue
+                    kind, raw_pid = line.split(":", 1)
+                    if kind == "normal":
+                        observed.setdefault(kind, []).append(int(raw_pid))
+                    else:
+                        observed[kind] = int(raw_pid)
+                daemon_pid = observed["daemon"]
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    try:
+                        if runner.process_snapshot(daemon_pid).parent_pid == os.getpid():
+                            break
+                    except runner.QaFailure:
+                        pass
+                    time.sleep(0.02)
+                else:
+                    self.fail("setsid daemon was not adopted by the test subreaper")
+
+                role_pids = [launcher.pid, *observed["normal"]]
+                identities = []
+                for index, pid in enumerate(role_pids):
+                    snapshot = runner.process_snapshot(pid)
+                    executable = (Path("/proc") / str(pid) / "exe").stat()
+                    identities.append(
+                        {
+                            "role": "test-%d" % index,
+                            "pid": pid,
+                            "parentPid": snapshot.parent_pid,
+                            "processGroupId": snapshot.process_group_id,
+                            "sessionId": snapshot.session_id,
+                            "startTimeTicks": snapshot.start_time_ticks,
+                            "executableSeal": {
+                                "device": executable.st_dev,
+                                "inode": executable.st_ino,
+                            },
+                        }
+                    )
+                killed = runner.kill_verified_application_session(
+                    identities,
+                    launcher,
+                    root,
+                    expected_environment,
+                    (),
+                )
+                self.assertGreaterEqual(killed, 4)
+                self.assertFalse((Path("/proc") / str(daemon_pid)).exists())
+                self.assertEqual(
+                    runner.stable_root_binding_census(
+                        root, expected_environment
+                    ),
+                    (),
+                )
+            finally:
+                if launcher.poll() is None:
+                    launcher.kill()
+                    launcher.wait(timeout=5)
+                spawned_pids = list(observed.get("normal", []))
+                if daemon_pid is not None:
+                    spawned_pids.append(daemon_pid)
+                for spawned_pid in spawned_pids:
+                    try:
+                        snapshot = runner.process_snapshot(spawned_pid)
+                    except runner.QaFailure:
+                        pass
+                    else:
+                        runner.terminate_process_snapshot(snapshot, 0.1)
+                        try:
+                            os.waitpid(spawned_pid, os.WNOHANG)
+                        except ChildProcessError:
+                            pass
+                launcher.communicate(timeout=5)
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux procfs regression")
+    def test_argv_root_mention_is_not_a_process_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            expected_environment = runner.expected_root_environment(root)
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    "import time; time.sleep(30)",
+                    str(root / "mentioned-only"),
+                ],
+                env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            try:
+                time.sleep(0.05)
+                observations = runner.stable_root_binding_census(
+                    root, expected_environment
+                )
+                self.assertNotIn(
+                    process.pid,
+                    {observation.snapshot.pid for observation in observations},
+                )
+                self.assertIn(str(root), "\0".join(runner.process_cmdline(process.pid)))
+            finally:
+                process.terminate()
+                process.wait(timeout=5)
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux procfs regression")
+    def test_procfs_census_binds_environment_cwd_and_open_fd(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            expected_environment = runner.expected_root_environment(root)
+            for value in expected_environment.values():
+                Path(value).mkdir(parents=True, exist_ok=True)
+            held_file = root / "held.bin"
+            held_file.write_bytes(b"public")
+            script = (
+                "import os,sys,time; "
+                "os.chdir(sys.argv[1]); "
+                "handle=open(sys.argv[2], 'rb'); "
+                "time.sleep(30)"
+            )
+            process = subprocess.Popen(
+                [sys.executable, "-c", script, str(root), str(held_file)],
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "LANG": "C.UTF-8",
+                    **expected_environment,
+                },
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            try:
+                deadline = time.monotonic() + 5
+                observation = None
+                while time.monotonic() < deadline:
+                    observation = next(
+                        (
+                            item
+                            for item in runner.stable_root_binding_census(
+                                root, expected_environment
+                            )
+                            if item.snapshot.pid == process.pid
+                        ),
+                        None,
+                    )
+                    if observation is not None:
+                        break
+                    time.sleep(0.02)
+                self.assertIsNotNone(observation)
+                self.assertTrue(
+                    {"cwd", "environment", "fd"}.issubset(observation.sources)
+                )
+                self.assertEqual(
+                    observation.environment_keys,
+                    tuple(sorted(expected_environment)),
+                )
+            finally:
+                process.terminate()
+                process.wait(timeout=5)
+
     def test_artifact_directory_and_output_are_required_together(self) -> None:
         self.assertIsNone(runner.parse_arguments([]).artifact_directory)
         paired = runner.parse_arguments(
