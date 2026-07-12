@@ -55,16 +55,16 @@ operations limit 3. Readers validate a resource ceiling before calling sodium.
   before GA. Format fixtures must be byte-identical on every target.
 - The current strict release-tool source suite passes 59/59; `actionlint`,
   pedantic/all-features Clippy, warnings-as-errors rustdoc, and the Windows GNU
-  cross-check pass. A previous local system-GCC Linux x64 clean-source double
-  build is byte-identical and passes the then-current strict
-  ELF/archive/native-dependency audit plus executable/VSIX sidecar smoke with
-  `dirtySourceTree=false`, but those artifacts predate strict release-set
-  evidence v1 and are historical only. The xlings-default local ELF embeds its
-  build-home interpreter/RUNPATH and is correctly rejected as non-portable.
-- A clean standalone lifecycle run at harness commit `1e01842` re-audits the
-  final Linux x64 packages, authenticates five imported/restored bodies and
-  reports zero sensitive-residue hits outside the designated plaintext source.
-  This does not attest generated inputs or replace native/signing/legal gates.
+  cross-check pass. Two local system-GCC Linux x64 clean-source builds from
+  `40ff728` are byte-identical and pass strict release-set/ELF/native-dependency
+  audit plus executable/VSIX sidecar smoke with `dirtySourceTree=false`. The
+  xlings-default local ELF embeds its build-home interpreter/RUNPATH and is
+  correctly rejected as non-portable.
+- A clean standalone lifecycle run at harness commit `7f83dd6` re-audits those
+  packages, authenticates five imported/restored bodies, exercises CLI/RPC/Git
+  failure nondisclosure, and reports zero sensitive-residue hits outside the
+  designated plaintext source. This does not attest generated inputs or replace
+  native/signing/legal gates.
 
 ## License inventory and distribution obligations
 

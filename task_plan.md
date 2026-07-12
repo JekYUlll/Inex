@@ -85,7 +85,7 @@ Phase 7 — 跨平台验证、打包与发布准备
 - [ ] 审计磁盘明文残留、日志秘密、依赖许可与发布清单
   - [x] 将 target-bound Cargo graph、固定四 workspace member、精确许可策略/checksum、许可文本摘要与 libsodium 声明绑定到严格 `THIRD_PARTY_LICENSES.json`
   - [x] 严格验证三包共享 inventory/sidecar，并为 package/lifecycle evidence 定义 canonical report v1 与动态秘密自扫描
-  - [ ] 从新 clean HEAD 重建 Linux x64 三包，复验 audit/smoke/lifecycle 并另做 RPC/CLI/Git 负路径秘密 drill
+  - [x] 从新 clean HEAD 重建 Linux x64 三包，复验 audit/smoke/lifecycle 并另做 RPC/CLI/Git 负路径秘密 drill
   - [ ] 在所有原生目标重复许可/残留证据并完成独立法务、签名与发布渠道审查
 - [x] 在最终 clean commit 上用 system GCC 完成两次逐字节一致的 Linux x64 package/audit/native-dependency/VSIX-install smoke
 - [x] 从独立 standalone clean clone 对最终 Linux x64 artifact 完成 import/password/Git-bundle/tree-copy restore/frozen-v1/residue lifecycle drill

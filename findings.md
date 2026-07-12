@@ -172,6 +172,7 @@
 - `windows-x64` 发布许可图固定为 MSVC triple，单凭 PE machine 不能区分 GNU/MSVC。`runtime-info` 必须同时报告编译 target、debug assertions 与 libsodium runtime；release smoke 固定要求 MSVC triple 和 `rust-debug-assertions: false`，因此 GNU/debug 产物不能被错标。
 - 生命周期报告的秘密自扫描必须覆盖 JSON `ensure_ascii` 转义后的 Unicode/引号/反斜杠形态，并将已扫描的同一序列化 bytes 直接写到 stdout；重新序列化一份逻辑等价对象会削弱证据链。
 - 严格离线许可测试读取 Linux/Windows target metadata 与 registry license texts；独立 CI job 必须先安装固定 Rust 并 `cargo fetch --locked`，否则空 Cargo cache 会在测试收集后因 offline metadata 缺包失败。
+- 最终负路径证据不能只依赖单元测试中的 redacted error：CLI wrong-password+secret-query、RPC `AUTH_FAILED` 和 locked merge-driver 必须用最终 packaged binaries 执行，输出用完整动态 variants 扫描，merge input 前后绑定 bytes/identity/stat，最后再扫隔离根与 serialized report。
 
 ## Issues Encountered
 
