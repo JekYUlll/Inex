@@ -508,6 +508,317 @@ pub fn atomic_write_ciphertext(
     atomic_write_ciphertext_with_faults(vault_root, target, ciphertext, condition, &NoFaults)
 }
 
+/// Move one verified directory to a previously absent sibling name.
+///
+/// Both paths must be distinct absolute direct children of one canonical,
+/// link-free parent on a supported local filesystem. The source identity is
+/// captured before `critical_audit` and verified again immediately before the
+/// strictly no-replace namespace operation. Linux binds both names to a held
+/// parent descriptor for `renameat2(RENAME_NOREPLACE)`; Windows uses
+/// `MoveFileExW(MOVEFILE_WRITE_THROUGH)` without the replace flag.
+///
+/// This primitive deliberately knows nothing about import staging names,
+/// vault-private directories, or publication markers. Callers that require a
+/// stronger tree-content invariant must enforce it in `critical_audit` and
+/// hold their own mutation exclusion for the duration of the call.
+/// Callers must also exclude a non-cooperating process running as the same OS
+/// user from rebinding either child name between the final identity check and
+/// the namespace operation; post-state reconciliation detects but cannot
+/// prevent that path-based race.
+///
+/// # Errors
+///
+/// Returns [`AtomicDirectoryPublishError::DestinationExists`] when an
+/// unrelated destination is present, [`AtomicDirectoryPublishError::NotMoved`]
+/// when an errored namespace operation provably left the exact source in
+/// place, and [`AtomicDirectoryPublishError::Indeterminate`] when physical
+/// identities do not prove one complete outcome.
+pub(crate) fn atomic_move_verified_directory_no_replace_checked<F>(
+    source: &Path,
+    destination: &Path,
+    critical_audit: F,
+) -> Result<AtomicDirectoryPublishOutcome, AtomicDirectoryPublishError>
+where
+    F: FnOnce(&Path) -> Result<(), AtomicDirectoryPublishError>,
+{
+    atomic_move_verified_directory_no_replace_checked_with_faults(
+        source,
+        destination,
+        critical_audit,
+        DirectoryMoveFault::None,
+    )
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum DirectoryMoveFault {
+    #[default]
+    None,
+    BeforeMove,
+    AfterMove,
+    DirectorySync,
+    ParentSync,
+}
+
+fn atomic_move_verified_directory_no_replace_checked_with_faults<F>(
+    source: &Path,
+    destination: &Path,
+    critical_audit: F,
+    fault: DirectoryMoveFault,
+) -> Result<AtomicDirectoryPublishOutcome, AtomicDirectoryPublishError>
+where
+    F: FnOnce(&Path) -> Result<(), AtomicDirectoryPublishError>,
+{
+    let paths = VerifiedDirectoryMovePaths::resolve(source, destination)?;
+    critical_audit(&paths.source)?;
+    if !paths.parent_and_source_match() {
+        return Err(AtomicDirectoryPublishError::Indeterminate);
+    }
+    match inspect_directory_state(&paths.destination) {
+        Ok(DirectoryState::Absent) => {}
+        Ok(DirectoryState::Directory(_) | DirectoryState::Other) => {
+            return Err(AtomicDirectoryPublishError::DestinationExists);
+        }
+        Err(_) => return Err(AtomicDirectoryPublishError::Indeterminate),
+    }
+
+    #[cfg(target_os = "linux")]
+    let mut move_result = if fault == DirectoryMoveFault::BeforeMove {
+        Err(io::Error::other("injected error before directory move"))
+    } else {
+        platform::namespace_move_no_replace_in_directory(
+            &paths.parent_handle,
+            &paths.source_name,
+            &paths.destination_name,
+        )
+    };
+    #[cfg(not(target_os = "linux"))]
+    let mut move_result = if fault == DirectoryMoveFault::BeforeMove {
+        Err(io::Error::other("injected error before directory move"))
+    } else {
+        namespace_move(&paths.source, &paths.destination, false)
+    };
+    if fault == DirectoryMoveFault::AfterMove && move_result.is_ok() {
+        move_result = Err(io::Error::other("injected error after directory move"));
+    }
+
+    let source_state = inspect_directory_state(&paths.source);
+    let destination_state = inspect_directory_state(&paths.destination);
+    let parent_unchanged = paths.parent_matches();
+    let held_source_unchanged = paths.held_source_matches();
+    let exact_moved = parent_unchanged
+        && held_source_unchanged
+        && matches!(source_state, Ok(DirectoryState::Absent))
+        && matches!(
+            destination_state,
+            Ok(DirectoryState::Directory(ref identity)) if *identity == paths.source_identity
+        );
+    if !exact_moved {
+        let exact_not_moved = parent_unchanged
+            && held_source_unchanged
+            && matches!(
+                source_state,
+                Ok(DirectoryState::Directory(ref identity)) if *identity == paths.source_identity
+            )
+            && matches!(destination_state, Ok(DirectoryState::Absent));
+        if exact_not_moved && move_result.is_err() {
+            return Err(AtomicDirectoryPublishError::NotMoved);
+        }
+        let source_is_exact = matches!(
+            source_state,
+            Ok(DirectoryState::Directory(ref identity)) if *identity == paths.source_identity
+        );
+        let destination_is_foreign = !matches!(destination_state, Ok(DirectoryState::Absent))
+            && !matches!(
+                destination_state,
+                Ok(DirectoryState::Directory(ref identity)) if *identity == paths.source_identity
+            );
+        if parent_unchanged && held_source_unchanged && source_is_exact && destination_is_foreign {
+            return Err(AtomicDirectoryPublishError::DestinationExists);
+        }
+        return Err(AtomicDirectoryPublishError::Indeterminate);
+    }
+
+    let directory_synced = fault != DirectoryMoveFault::DirectorySync
+        && platform::sync_directory(&paths.destination).is_ok();
+    let parent_synced =
+        fault != DirectoryMoveFault::ParentSync && sync_namespace_parent(&paths.parent).is_ok();
+    if !paths.exact_moved_state() {
+        return Err(AtomicDirectoryPublishError::Indeterminate);
+    }
+    Ok(AtomicDirectoryPublishOutcome {
+        parent_sync: if directory_synced && parent_synced {
+            ParentSyncStatus::Synced
+        } else {
+            ParentSyncStatus::NotSynced
+        },
+    })
+}
+
+#[derive(Debug)]
+struct VerifiedDirectoryMovePaths {
+    source: PathBuf,
+    destination: PathBuf,
+    parent: PathBuf,
+    #[cfg(target_os = "linux")]
+    source_name: std::ffi::OsString,
+    #[cfg(target_os = "linux")]
+    destination_name: std::ffi::OsString,
+    parent_identity: FilesystemDirectoryIdentity,
+    source_identity: FilesystemDirectoryIdentity,
+    #[cfg(target_os = "linux")]
+    parent_handle: File,
+    #[cfg(target_os = "linux")]
+    source_handle: File,
+}
+
+impl VerifiedDirectoryMovePaths {
+    fn resolve(source: &Path, destination: &Path) -> Result<Self, AtomicDirectoryPublishError> {
+        if !source.is_absolute()
+            || !destination.is_absolute()
+            || source == destination
+            || !path_is_lexically_normal(source)
+            || !path_is_lexically_normal(destination)
+        {
+            return Err(AtomicDirectoryPublishError::InvalidPaths);
+        }
+        let source_parent = source
+            .parent()
+            .ok_or(AtomicDirectoryPublishError::InvalidPaths)?;
+        let destination_parent = destination
+            .parent()
+            .ok_or(AtomicDirectoryPublishError::InvalidPaths)?;
+        let source_name = source
+            .file_name()
+            .ok_or(AtomicDirectoryPublishError::InvalidPaths)?
+            .to_os_string();
+        let destination_name = destination
+            .file_name()
+            .ok_or(AtomicDirectoryPublishError::InvalidPaths)?
+            .to_os_string();
+        if !path_ancestors_are_non_link_directories(source_parent)
+            .map_err(AtomicDirectoryPublishError::io)?
+            || !path_ancestors_are_non_link_directories(destination_parent)
+                .map_err(AtomicDirectoryPublishError::io)?
+        {
+            return Err(AtomicDirectoryPublishError::InvalidPaths);
+        }
+        let source_parent_input_identity = filesystem_directory_identity(source_parent)
+            .map_err(AtomicDirectoryPublishError::io)?;
+        let destination_parent_input_identity = filesystem_directory_identity(destination_parent)
+            .map_err(AtomicDirectoryPublishError::io)?;
+        let parent = fs::canonicalize(source_parent).map_err(AtomicDirectoryPublishError::io)?;
+        let destination_parent =
+            fs::canonicalize(destination_parent).map_err(AtomicDirectoryPublishError::io)?;
+        if parent != destination_parent {
+            return Err(AtomicDirectoryPublishError::InvalidPaths);
+        }
+        let parent_identity =
+            filesystem_directory_identity(&parent).map_err(AtomicDirectoryPublishError::io)?;
+        if source_parent_input_identity != parent_identity
+            || destination_parent_input_identity != parent_identity
+        {
+            return Err(AtomicDirectoryPublishError::InvalidPaths);
+        }
+        let source = parent.join(&source_name);
+        let destination = parent.join(&destination_name);
+        if source == destination
+            || !path_is_supported_local_filesystem(&parent)
+                .map_err(AtomicDirectoryPublishError::io)?
+            || !path_is_supported_local_filesystem(&source)
+                .map_err(AtomicDirectoryPublishError::io)?
+            || !paths_share_mount(&parent, &source).map_err(AtomicDirectoryPublishError::io)?
+        {
+            return Err(AtomicDirectoryPublishError::InvalidPaths);
+        }
+        let source_identity =
+            match inspect_directory_state(&source).map_err(AtomicDirectoryPublishError::io)? {
+                DirectoryState::Directory(identity) => identity,
+                DirectoryState::Absent => {
+                    return Err(AtomicDirectoryPublishError::io(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "verified directory-move source is absent",
+                    )));
+                }
+                DirectoryState::Other => return Err(AtomicDirectoryPublishError::InvalidPaths),
+            };
+        match inspect_directory_state(&destination).map_err(AtomicDirectoryPublishError::io)? {
+            DirectoryState::Absent => {}
+            DirectoryState::Directory(_) | DirectoryState::Other => {
+                return Err(AtomicDirectoryPublishError::DestinationExists);
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        let parent_handle = platform::open_source_directory_path(&parent)
+            .map_err(AtomicDirectoryPublishError::io)?;
+        #[cfg(target_os = "linux")]
+        let source_handle = platform::open_source_directory_path(&source)
+            .map_err(AtomicDirectoryPublishError::io)?;
+        let paths = Self {
+            source,
+            destination,
+            parent,
+            #[cfg(target_os = "linux")]
+            source_name,
+            #[cfg(target_os = "linux")]
+            destination_name,
+            parent_identity,
+            source_identity,
+            #[cfg(target_os = "linux")]
+            parent_handle,
+            #[cfg(target_os = "linux")]
+            source_handle,
+        };
+        if !paths.parent_and_source_match() {
+            return Err(AtomicDirectoryPublishError::Indeterminate);
+        }
+        Ok(paths)
+    }
+
+    fn parent_matches(&self) -> bool {
+        let path_matches = filesystem_directory_identity(&self.parent)
+            .is_ok_and(|identity| identity == self.parent_identity);
+        #[cfg(target_os = "linux")]
+        let handle_matches = linux_directory_identity_from_file(&self.parent_handle)
+            .is_ok_and(|identity| identity == self.parent_identity);
+        #[cfg(not(target_os = "linux"))]
+        let handle_matches = true;
+        path_matches && handle_matches
+    }
+
+    fn held_source_matches(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            linux_directory_identity_from_file(&self.source_handle)
+                .is_ok_and(|identity| identity == self.source_identity)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.parent_identity.volume == self.source_identity.volume
+        }
+    }
+
+    fn parent_and_source_match(&self) -> bool {
+        self.parent_matches()
+            && self.held_source_matches()
+            && filesystem_directory_identity(&self.source)
+                .is_ok_and(|identity| identity == self.source_identity)
+    }
+
+    fn exact_moved_state(&self) -> bool {
+        self.parent_matches()
+            && self.held_source_matches()
+            && matches!(
+                inspect_directory_state(&self.source),
+                Ok(DirectoryState::Absent)
+            )
+            && matches!(
+                inspect_directory_state(&self.destination),
+                Ok(DirectoryState::Directory(ref identity)) if *identity == self.source_identity
+            )
+    }
+}
+
 /// Publish a complete encrypted staging vault as a previously absent vault.
 ///
 /// Both paths must be distinct direct children of the same resolved local
@@ -583,7 +894,6 @@ where
     let staging_name = staging
         .file_name()
         .ok_or(AtomicDirectoryPublishError::InvalidPaths)?;
-    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
     let destination_name = destination
         .file_name()
         .ok_or(AtomicDirectoryPublishError::InvalidPaths)?;
@@ -602,6 +912,8 @@ where
     if resolved_parent != resolved_destination_parent {
         return Err(AtomicDirectoryPublishError::InvalidPaths);
     }
+    let resolved_staging = resolved_parent.join(staging_name);
+    let resolved_destination = resolved_parent.join(destination_name);
     if !path_is_supported_local_filesystem(&resolved_parent)
         .map_err(AtomicDirectoryPublishError::io)?
         || !paths_share_mount(&resolved_parent, staging).map_err(AtomicDirectoryPublishError::io)?
@@ -679,100 +991,97 @@ where
         AtomicWriteError::Io { source, .. } => AtomicDirectoryPublishError::io(source),
         _ => AtomicDirectoryPublishError::Indeterminate,
     })?;
-    critical_audit(staging).map_err(AtomicDirectoryPublishError::io)?;
-    if filesystem_directory_identity(&resolved_parent)
-        .ok()
-        .as_ref()
-        != Some(&parent_identity)
-        || filesystem_directory_identity(staging).ok().as_ref() != Some(&staging_identity)
-        || filesystem_directory_identity(&local).ok().as_ref() != Some(&local_identity)
-        || !marker_matches_open_file(&marker, &marker_file, marker_bytes.len())
-        || !publish_handles_match()
-    {
-        return Err(AtomicDirectoryPublishError::Indeterminate);
-    }
-    match inspect_directory_state(destination).map_err(AtomicDirectoryPublishError::io)? {
-        DirectoryState::Absent => {}
-        DirectoryState::Directory(_) | DirectoryState::Other => {
-            return Err(AtomicDirectoryPublishError::DestinationExists);
+    let import_audit = |current: &Path| {
+        critical_audit(staging).map_err(AtomicDirectoryPublishError::io)?;
+        if filesystem_directory_identity(&resolved_parent)
+            .ok()
+            .as_ref()
+            != Some(&parent_identity)
+            || current != resolved_staging
+            || filesystem_directory_identity(current).ok().as_ref() != Some(&staging_identity)
+            || filesystem_directory_identity(&local).ok().as_ref() != Some(&local_identity)
+            || !marker_matches_open_file(&marker, &marker_file, marker_bytes.len())
+            || !publish_handles_match()
+        {
+            return Err(AtomicDirectoryPublishError::Indeterminate);
         }
-    }
-
-    #[cfg(target_os = "linux")]
-    let mut move_result = if skip_move {
-        Err(io::Error::other("injected skipped namespace move"))
+        Ok(())
+    };
+    let move_fault = if skip_move {
+        DirectoryMoveFault::BeforeMove
+    } else if inject_error_after_move {
+        DirectoryMoveFault::AfterMove
     } else {
-        platform::namespace_move_no_replace_in_directory(
-            &parent_handle,
-            staging_name,
-            destination_name,
+        DirectoryMoveFault::None
+    };
+    let directory_move_result = if skip_move || inject_error_after_move {
+        atomic_move_verified_directory_no_replace_checked_with_faults(
+            &resolved_staging,
+            &resolved_destination,
+            import_audit,
+            move_fault,
+        )
+    } else {
+        atomic_move_verified_directory_no_replace_checked(
+            &resolved_staging,
+            &resolved_destination,
+            import_audit,
         )
     };
-    #[cfg(not(target_os = "linux"))]
-    let mut move_result = if skip_move {
-        Err(io::Error::other("injected skipped namespace move"))
-    } else {
-        namespace_move(staging, destination, false)
-    };
-    if inject_error_after_move && move_result.is_ok() {
-        move_result = Err(io::Error::other(
-            "injected return error after complete move",
-        ));
-    }
-
-    let parent_unchanged = filesystem_directory_identity(&resolved_parent)
-        .is_ok_and(|identity| identity == parent_identity);
-    let stage_state = inspect_directory_state(staging);
-    let destination_state = inspect_directory_state(destination);
-
-    let exact_published = parent_unchanged
-        && publish_handles_match()
-        && matches!(stage_state, Ok(DirectoryState::Absent))
-        && matches!(
-            destination_state,
-            Ok(DirectoryState::Directory(ref identity)) if *identity == staging_identity
-        )
-        && filesystem_directory_identity(&destination.join(VAULT_LOCAL_DIRECTORY))
-            .is_ok_and(|identity| identity == local_identity)
-        && marker_matches_open_file(
-            &destination
-                .join(VAULT_LOCAL_DIRECTORY)
-                .join(IMPORT_PUBLISH_MARKER),
-            &marker_file,
-            marker_bytes.len(),
-        );
-    if !exact_published {
-        let exact_not_moved = parent_unchanged
-            && matches!(
-                stage_state,
-                Ok(DirectoryState::Directory(ref identity)) if *identity == staging_identity
-            )
-            && matches!(destination_state, Ok(DirectoryState::Absent))
+    let exact_import_source = || {
+        filesystem_directory_identity(&resolved_parent)
+            .is_ok_and(|identity| identity == parent_identity)
+            && filesystem_directory_identity(staging)
+                .is_ok_and(|identity| identity == staging_identity)
             && filesystem_directory_identity(&local)
                 .is_ok_and(|identity| identity == local_identity)
-            && marker_matches_open_file(&marker, &marker_file, marker_bytes.len());
-        if exact_not_moved {
-            return Err(AtomicDirectoryPublishError::NotMoved);
+            && marker_matches_open_file(&marker, &marker_file, marker_bytes.len())
+            && publish_handles_match()
+    };
+    match directory_move_result {
+        Ok(_) => {}
+        Err(error @ AtomicDirectoryPublishError::NotMoved) => {
+            if exact_import_source()
+                && matches!(
+                    inspect_directory_state(destination),
+                    Ok(DirectoryState::Absent)
+                )
+            {
+                return Err(error);
+            }
+            return Err(AtomicDirectoryPublishError::Indeterminate);
         }
-        let stage_is_exact = matches!(
-            stage_state,
-            Ok(DirectoryState::Directory(ref identity)) if *identity == staging_identity
-        );
-        let final_is_unrelated = !matches!(destination_state, Ok(DirectoryState::Absent))
-            && !matches!(
-                destination_state,
-                Ok(DirectoryState::Directory(ref identity)) if *identity == staging_identity
-            );
-        if parent_unchanged && stage_is_exact && final_is_unrelated {
-            return Err(AtomicDirectoryPublishError::DestinationExists);
+        Err(error @ AtomicDirectoryPublishError::DestinationExists) => {
+            let destination_state = inspect_directory_state(destination);
+            let destination_is_foreign = !matches!(destination_state, Ok(DirectoryState::Absent))
+                && !matches!(
+                    destination_state,
+                    Ok(DirectoryState::Directory(ref identity)) if *identity == staging_identity
+                );
+            if exact_import_source() && destination_is_foreign {
+                return Err(error);
+            }
+            return Err(AtomicDirectoryPublishError::Indeterminate);
         }
-        let _ = move_result;
-        return Err(AtomicDirectoryPublishError::Indeterminate);
+        Err(error) => return Err(error),
     }
 
     let published_marker = destination
         .join(VAULT_LOCAL_DIRECTORY)
         .join(IMPORT_PUBLISH_MARKER);
+    let exact_published_with_marker = || {
+        filesystem_directory_identity(&resolved_parent)
+            .is_ok_and(|identity| identity == parent_identity)
+            && filesystem_directory_identity(destination)
+                .is_ok_and(|identity| identity == staging_identity)
+            && filesystem_directory_identity(&destination.join(VAULT_LOCAL_DIRECTORY))
+                .is_ok_and(|identity| identity == local_identity)
+            && marker_matches_open_file(&published_marker, &marker_file, marker_bytes.len())
+            && publish_handles_match()
+    };
+    if !exact_published_with_marker() {
+        return Err(AtomicDirectoryPublishError::Indeterminate);
+    }
     let marker_cleanup = if inject_marker_cleanup_failure {
         Err(io::Error::other(
             "injected publication-marker cleanup failure",
@@ -781,15 +1090,7 @@ where
         fs::remove_file(&published_marker)
     };
     if marker_cleanup.is_err() {
-        let exact_published_with_marker = filesystem_directory_identity(&resolved_parent)
-            .is_ok_and(|identity| identity == parent_identity)
-            && filesystem_directory_identity(destination)
-                .is_ok_and(|identity| identity == staging_identity)
-            && filesystem_directory_identity(&destination.join(VAULT_LOCAL_DIRECTORY))
-                .is_ok_and(|identity| identity == local_identity)
-            && marker_matches_open_file(&published_marker, &marker_file, marker_bytes.len())
-            && publish_handles_match();
-        return Err(if exact_published_with_marker {
+        return Err(if exact_published_with_marker() {
             AtomicDirectoryPublishError::PublishedCleanupFailed
         } else {
             AtomicDirectoryPublishError::Indeterminate
@@ -3522,6 +3823,199 @@ mod tests {
 
         assert!(super::open_secure_source_root(&alias.join("source")).is_err());
         assert!(super::open_secure_source_root(&source).is_ok());
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn verified_directory_move_is_independent_of_import_layout() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        let source = fixture.root().join("candidate-bundle");
+        let destination = fixture.root().join("stable-bundle");
+        fs::create_dir(&source)?;
+        fs::write(source.join("manifest"), b"complete")?;
+
+        let outcome = super::atomic_move_verified_directory_no_replace_checked(
+            &source,
+            &destination,
+            |current| {
+                assert_eq!(current, source);
+                assert!(!current.join(VAULT_LOCAL_DIRECTORY).exists());
+                Ok(())
+            },
+        )
+        .map_err(io::Error::other)?;
+
+        assert!(!source.exists());
+        assert_eq!(fs::read(destination.join("manifest"))?, b"complete");
+        assert!(matches!(
+            outcome.parent_sync,
+            ParentSyncStatus::Synced | ParentSyncStatus::NotSynced
+        ));
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn verified_directory_move_rejects_existing_destination() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        let source = fixture.root().join("candidate");
+        let destination = fixture.root().join("stable");
+        fs::create_dir(&source)?;
+        fs::create_dir(&destination)?;
+        fs::write(source.join("identity"), b"source")?;
+        fs::write(destination.join("identity"), b"foreign")?;
+
+        assert!(matches!(
+            super::atomic_move_verified_directory_no_replace_checked(
+                &source,
+                &destination,
+                |_| Ok(())
+            ),
+            Err(AtomicDirectoryPublishError::DestinationExists)
+        ));
+        assert_eq!(fs::read(source.join("identity"))?, b"source");
+        assert_eq!(fs::read(destination.join("identity"))?, b"foreign");
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn verified_directory_move_classifies_foreign_destination_after_audit() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        let source = fixture.root().join("candidate");
+        let destination = fixture.root().join("stable");
+        fs::create_dir(&source)?;
+
+        assert!(matches!(
+            super::atomic_move_verified_directory_no_replace_checked(&source, &destination, |_| {
+                fs::create_dir(&destination).map_err(AtomicDirectoryPublishError::io)?;
+                Ok(())
+            }),
+            Err(AtomicDirectoryPublishError::DestinationExists)
+        ));
+        assert!(source.is_dir());
+        assert!(destination.is_dir());
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn verified_directory_move_rejects_source_identity_swap_after_audit() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        let source = fixture.root().join("candidate");
+        let destination = fixture.root().join("stable");
+        let retired = fixture.root().join("retired-candidate");
+        fs::create_dir(&source)?;
+
+        assert!(matches!(
+            super::atomic_move_verified_directory_no_replace_checked(
+                &source,
+                &destination,
+                |current| {
+                    fs::rename(current, &retired)
+                        .and_then(|()| fs::create_dir(current))
+                        .map_err(AtomicDirectoryPublishError::io)?;
+                    Ok(())
+                }
+            ),
+            Err(AtomicDirectoryPublishError::Indeterminate)
+        ));
+        assert!(source.is_dir());
+        assert!(retired.is_dir());
+        assert!(!destination.exists());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_directory_move_rejects_parent_identity_swap_after_audit() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        let parent = fixture.root().join("bundle-parent");
+        let source = parent.join("candidate");
+        let destination = parent.join("stable");
+        let retired = fixture.root().join("retired-bundle-parent");
+        fs::create_dir_all(&source)?;
+
+        assert!(matches!(
+            super::atomic_move_verified_directory_no_replace_checked(&source, &destination, |_| {
+                fs::rename(&parent, &retired)
+                    .and_then(|()| fs::create_dir(&parent))
+                    .map_err(AtomicDirectoryPublishError::io)?;
+                Ok(())
+            }),
+            Err(AtomicDirectoryPublishError::Indeterminate)
+        ));
+        assert!(retired.join("candidate").is_dir());
+        assert!(!destination.exists());
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn verified_directory_move_classifies_error_before_move_as_not_moved() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        let source = fixture.root().join("candidate");
+        let destination = fixture.root().join("stable");
+        fs::create_dir(&source)?;
+
+        assert!(matches!(
+            super::atomic_move_verified_directory_no_replace_checked_with_faults(
+                &source,
+                &destination,
+                |_| Ok(()),
+                super::DirectoryMoveFault::BeforeMove
+            ),
+            Err(AtomicDirectoryPublishError::NotMoved)
+        ));
+        assert!(source.is_dir());
+        assert!(!destination.exists());
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn verified_directory_move_reconciles_error_after_move() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        let source = fixture.root().join("candidate");
+        let destination = fixture.root().join("stable");
+        fs::create_dir(&source)?;
+        fs::write(source.join("manifest"), b"complete")?;
+
+        super::atomic_move_verified_directory_no_replace_checked_with_faults(
+            &source,
+            &destination,
+            |_| Ok(()),
+            super::DirectoryMoveFault::AfterMove,
+        )
+        .map_err(io::Error::other)?;
+        assert!(!source.exists());
+        assert_eq!(fs::read(destination.join("manifest"))?, b"complete");
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn verified_directory_move_reports_unconfirmed_directory_or_parent_sync() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        for (suffix, fault) in [
+            ("directory", super::DirectoryMoveFault::DirectorySync),
+            ("parent", super::DirectoryMoveFault::ParentSync),
+        ] {
+            let source = fixture.root().join(format!("candidate-{suffix}"));
+            let destination = fixture.root().join(format!("stable-{suffix}"));
+            fs::create_dir(&source)?;
+            let outcome = super::atomic_move_verified_directory_no_replace_checked_with_faults(
+                &source,
+                &destination,
+                |_| Ok(()),
+                fault,
+            )
+            .map_err(io::Error::other)?;
+            assert_eq!(outcome.parent_sync, ParentSyncStatus::NotSynced);
+            assert!(!source.exists());
+            assert!(destination.is_dir());
+        }
         Ok(())
     }
 
