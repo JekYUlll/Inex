@@ -25,8 +25,11 @@ use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
 pub(super) const CANDIDATE_BUNDLE_SCRATCH_PREFIX_V5: &str = "git-index-candidate-scratch-v5-";
 pub(super) const CANDIDATE_BUNDLE_STABLE_PREFIX_V5: &str = "git-index-candidate-v4-bundle-v5-";
+pub(super) const CANDIDATE_BUNDLE_PUBLISH_PREFIX_V5: &str = "git-index-candidate-v4-publish-v5-";
 pub(super) const CANDIDATE_BUNDLE_MANIFEST_V5: &str = "manifest-v5.json";
 pub(super) const CANDIDATE_BUNDLE_INDEX_V5: &str = "candidate.index";
+pub(super) const INDEX_LOCK_MARKER_MAGIC_V5: &[u8] = b"INEXIDX5\0";
+const MAX_INDEX_LOCK_MARKER_BYTES_V5: usize = 1024;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -61,6 +64,35 @@ pub(super) struct CandidateBundleManifestV5 {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct CandidateBundleManifestReferenceV5 {
+    pub(super) size: u64,
+    pub(super) sha256: String,
+}
+
+/// Canonical reference shared by the v5 index-lock marker and stable journal.
+///
+/// The immutable bundle manifest remains the only copy of the complete Git
+/// transaction. This reference binds its exact stable namespace entry and
+/// bytes without duplicating old/final index metadata or the merge payload.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct CandidateBundleTransactionReferenceV5 {
+    pub(super) object_format: GitObjectFormat,
+    pub(super) token: String,
+    pub(super) bundle_basename: String,
+    pub(super) manifest: CandidateBundleManifestReferenceV5,
+    pub(super) publish_staging_basename: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct IndexLockMarkerV5 {
+    pub(super) version: u32,
+    pub(super) reference: CandidateBundleTransactionReferenceV5,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct CanonicalBytesReferenceV5 {
     pub(super) size: u64,
     pub(super) sha256: String,
 }
@@ -101,6 +133,9 @@ struct CandidateBundleInventorySealV5 {
 pub(super) struct PreparedCandidateBundleV5 {
     pub(super) bundle_basename: String,
     pub(super) inventory: InventoryVerifiedCandidateBundleV5,
+    pub(super) transaction_reference: CandidateBundleTransactionReferenceV5,
+    pub(super) index_lock_marker: Vec<u8>,
+    pub(super) index_lock_marker_reference: CanonicalBytesReferenceV5,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -165,6 +200,10 @@ pub(super) fn candidate_bundle_scratch_basename_v5(token: &str) -> Result<String
 
 pub(super) fn candidate_bundle_stable_basename_v5(token: &str) -> Result<String, GitError> {
     exact_token_basename(CANDIDATE_BUNDLE_STABLE_PREFIX_V5, token)
+}
+
+pub(super) fn candidate_bundle_publish_basename_v5(token: &str) -> Result<String, GitError> {
+    exact_token_basename(CANDIDATE_BUNDLE_PUBLISH_PREFIX_V5, token)
 }
 
 fn parse_candidate_bundle_scratch_basename_v5(basename: &str) -> Result<&str, GitError> {
@@ -309,6 +348,112 @@ pub(super) fn validate_manifest_reference_v5(
 ) -> Result<(), GitError> {
     parse_hex_digest(&reference.sha256)?;
     if reference.size == 0 || reference.size > u64::try_from(MAX_JOURNAL_BYTES).unwrap_or(u64::MAX)
+    {
+        return Err(GitError::InvalidJournal);
+    }
+    Ok(())
+}
+
+pub(super) fn candidate_bundle_transaction_reference_v5(
+    bundle_basename: &str,
+    object_format: GitObjectFormat,
+    manifest: CandidateBundleManifestReferenceV5,
+) -> Result<CandidateBundleTransactionReferenceV5, GitError> {
+    let token = parse_candidate_bundle_stable_basename_v5(bundle_basename)?.to_owned();
+    let publish_staging_basename = candidate_bundle_publish_basename_v5(&token)?;
+    let reference = CandidateBundleTransactionReferenceV5 {
+        object_format,
+        token,
+        bundle_basename: bundle_basename.to_owned(),
+        manifest,
+        publish_staging_basename,
+    };
+    validate_candidate_bundle_transaction_reference_v5(&reference)?;
+    Ok(reference)
+}
+
+pub(super) fn validate_candidate_bundle_transaction_reference_v5(
+    reference: &CandidateBundleTransactionReferenceV5,
+) -> Result<(), GitError> {
+    validate_lock_token(&reference.token)?;
+    if reference.bundle_basename != candidate_bundle_stable_basename_v5(&reference.token)?
+        || reference.publish_staging_basename
+            != candidate_bundle_publish_basename_v5(&reference.token)?
+    {
+        return Err(GitError::InvalidJournal);
+    }
+    validate_manifest_reference_v5(&reference.manifest)
+}
+
+fn validate_index_lock_marker_v5(marker: &IndexLockMarkerV5) -> Result<(), GitError> {
+    if marker.version != 5 {
+        return Err(GitError::InvalidJournal);
+    }
+    validate_candidate_bundle_transaction_reference_v5(&marker.reference)
+}
+
+pub(super) fn index_lock_marker_bytes_v5(
+    reference: &CandidateBundleTransactionReferenceV5,
+) -> Result<Vec<u8>, GitError> {
+    let marker = IndexLockMarkerV5 {
+        version: 5,
+        reference: reference.clone(),
+    };
+    validate_index_lock_marker_v5(&marker)?;
+    let payload = serde_json::to_vec(&marker).map_err(|_| GitError::InvalidJournal)?;
+    if payload.is_empty()
+        || payload.len()
+            > MAX_INDEX_LOCK_MARKER_BYTES_V5.saturating_sub(INDEX_LOCK_MARKER_MAGIC_V5.len())
+    {
+        return Err(GitError::InvalidJournal);
+    }
+    let mut bytes = Vec::with_capacity(INDEX_LOCK_MARKER_MAGIC_V5.len() + payload.len());
+    bytes.extend_from_slice(INDEX_LOCK_MARKER_MAGIC_V5);
+    bytes.extend_from_slice(&payload);
+    Ok(bytes)
+}
+
+#[allow(
+    dead_code,
+    reason = "the next writer slice consumes the strict marker parser after no-replace publication"
+)]
+pub(super) fn parse_index_lock_marker_v5(
+    bytes: &[u8],
+) -> Result<CandidateBundleTransactionReferenceV5, GitError> {
+    let payload = bytes
+        .strip_prefix(INDEX_LOCK_MARKER_MAGIC_V5)
+        .ok_or(GitError::InvalidJournal)?;
+    if payload.is_empty() || bytes.len() > MAX_INDEX_LOCK_MARKER_BYTES_V5 {
+        return Err(GitError::InvalidJournal);
+    }
+    let value = parse_duplicate_free_json(payload)?;
+    let marker =
+        serde_json::from_value::<IndexLockMarkerV5>(value).map_err(|_| GitError::InvalidJournal)?;
+    validate_index_lock_marker_v5(&marker)?;
+    if index_lock_marker_bytes_v5(&marker.reference)? != bytes {
+        return Err(GitError::InvalidJournal);
+    }
+    Ok(marker.reference)
+}
+
+pub(super) fn canonical_bytes_reference_v5(
+    bytes: &[u8],
+) -> Result<CanonicalBytesReferenceV5, GitError> {
+    if bytes.is_empty() || bytes.len() > MAX_INDEX_LOCK_MARKER_BYTES_V5 {
+        return Err(GitError::InvalidJournal);
+    }
+    Ok(CanonicalBytesReferenceV5 {
+        size: u64::try_from(bytes.len()).map_err(|_| GitError::InvalidJournal)?,
+        sha256: hex_digest(digest(bytes)),
+    })
+}
+
+pub(super) fn validate_canonical_bytes_reference_v5(
+    reference: &CanonicalBytesReferenceV5,
+) -> Result<(), GitError> {
+    parse_hex_digest(&reference.sha256)?;
+    if reference.size == 0
+        || reference.size > u64::try_from(MAX_INDEX_LOCK_MARKER_BYTES_V5).unwrap_or(u64::MAX)
     {
         return Err(GitError::InvalidJournal);
     }
@@ -492,6 +637,59 @@ pub(super) fn validate_candidate_bundle_inventory_v5(
         bundle_basename,
         expected_manifest_reference,
     )
+}
+
+/// Reopens a stable bundle and binds it to the current repository's exact old
+/// index and expected final stage map without mutating Git or the worktree.
+#[allow(
+    dead_code,
+    reason = "the next writer/recovery slice consumes the fresh-process semantic loader"
+)]
+pub(super) fn load_candidate_bundle_for_git_v5(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+) -> Result<InventoryVerifiedCandidateBundleV5, GitError> {
+    validate_candidate_bundle_transaction_reference_v5(reference)?;
+    if !guard.is_for_root(&git.root) {
+        return Err(GitError::RecoveryConflict);
+    }
+    git.ensure_full_index()?;
+    let inventory = validate_candidate_bundle_inventory_v5(
+        &git.root,
+        &reference.bundle_basename,
+        Some(&reference.manifest),
+    )?;
+    if reference.object_format != git.object_format
+        || inventory.manifest.object_format != reference.object_format
+        || inventory.manifest.token != reference.token
+    {
+        return Err(GitError::InvalidJournal);
+    }
+    let live = read_index_snapshot(&index_path(&git.root))?;
+    if live.size != inventory.manifest.old_index.size
+        || live.sha256 != inventory.manifest.old_index.sha256
+    {
+        return Err(GitError::IndexChanged);
+    }
+    let before = index_entry_map(git)?;
+    let stable_path = candidate_bundle_stable_path_v5(&git.root, &reference.bundle_basename)?;
+    let candidate_git = git.with_index_file(stable_path.join(CANDIDATE_BUNDLE_INDEX_V5))?;
+    verify_candidate_index(&candidate_git, &inventory.manifest.transaction, &before)?;
+    held_inventory_matches_path_v5(&stable_path, &reference.bundle_basename, &inventory)?;
+    if !guard.is_for_root(&git.root) {
+        return Err(GitError::RecoveryConflict);
+    }
+    let rebound_live = read_index_snapshot(&index_path(&git.root))?;
+    if rebound_live.size != inventory.manifest.old_index.size
+        || rebound_live.sha256 != inventory.manifest.old_index.sha256
+        || index_entry_map(git)? != before
+    {
+        return Err(GitError::IndexChanged);
+    }
+    verify_candidate_index(&candidate_git, &inventory.manifest.transaction, &before)?;
+    held_inventory_matches_path_v5(&stable_path, &reference.bundle_basename, &inventory)?;
+    Ok(inventory)
 }
 
 const MAX_SCRATCH_TOKEN_ATTEMPTS_V5: usize = 64;
@@ -724,6 +922,14 @@ fn prepare_candidate_bundle_v5_impl<H: CandidateBundlePrepareHooksV5>(
     };
     let manifest_bytes = serialize_candidate_bundle_manifest_v5(&manifest)?;
     let manifest_reference = manifest_reference_v5(&manifest_bytes);
+    let transaction_reference = candidate_bundle_transaction_reference_v5(
+        &stable_basename,
+        git.object_format,
+        manifest_reference.clone(),
+    )?;
+    let index_lock_marker = index_lock_marker_bytes_v5(&transaction_reference)?;
+    let index_lock_marker_reference = canonical_bytes_reference_v5(&index_lock_marker)?;
+    validate_canonical_bytes_reference_v5(&index_lock_marker_reference)?;
     let manifest_file = create_private_file_retaining_v5(&manifest_path, &manifest_bytes)?;
     drop(manifest_file);
     hooks.checkpoint(
@@ -835,6 +1041,9 @@ fn prepare_candidate_bundle_v5_impl<H: CandidateBundlePrepareHooksV5>(
     Ok(PreparedCandidateBundleV5 {
         bundle_basename: stable_basename,
         inventory: sealed_scratch,
+        transaction_reference,
+        index_lock_marker,
+        index_lock_marker_reference,
     })
 }
 
@@ -1056,6 +1265,108 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn v5_transaction_reference_and_index_lock_marker_are_exact_and_canonical() {
+        let root = TestRoot::new();
+        let (bundle_basename, manifest, manifest_reference) = install_bundle(&root, TOKEN);
+        let reference = candidate_bundle_transaction_reference_v5(
+            &bundle_basename,
+            manifest.object_format,
+            manifest_reference,
+        )
+        .expect("transaction reference builds");
+        assert_eq!(reference.token, TOKEN);
+        assert_eq!(reference.bundle_basename, bundle_basename);
+        assert_eq!(
+            reference.publish_staging_basename,
+            candidate_bundle_publish_basename_v5(TOKEN).expect("publish basename builds")
+        );
+
+        let marker = index_lock_marker_bytes_v5(&reference).expect("v5 marker serializes");
+        assert!(marker.starts_with(INDEX_LOCK_MARKER_MAGIC_V5));
+        assert_eq!(
+            parse_index_lock_marker_v5(&marker).expect("v5 marker parses"),
+            reference
+        );
+        let marker_reference =
+            canonical_bytes_reference_v5(&marker).expect("marker bytes reference builds");
+        validate_canonical_bytes_reference_v5(&marker_reference)
+            .expect("marker bytes reference validates");
+
+        let mut trailing = marker.clone();
+        trailing.push(b'\n');
+        assert!(parse_index_lock_marker_v5(&trailing).is_err());
+        let payload = marker
+            .strip_prefix(INDEX_LOCK_MARKER_MAGIC_V5)
+            .expect("marker magic strips");
+        let duplicate = std::str::from_utf8(payload)
+            .expect("marker payload is UTF-8")
+            .replacen("\"version\":5", "\"version\":5,\"version\":5", 1);
+        let mut duplicate_marker = INDEX_LOCK_MARKER_MAGIC_V5.to_vec();
+        duplicate_marker.extend_from_slice(duplicate.as_bytes());
+        assert!(parse_index_lock_marker_v5(&duplicate_marker).is_err());
+
+        let mut unknown: serde_json::Value =
+            serde_json::from_slice(payload).expect("marker value parses");
+        unknown
+            .as_object_mut()
+            .expect("marker is an object")
+            .insert("unknown".to_owned(), serde_json::Value::Bool(true));
+        let mut unknown_marker = INDEX_LOCK_MARKER_MAGIC_V5.to_vec();
+        unknown_marker.extend_from_slice(
+            &serde_json::to_vec(&unknown).expect("unknown marker fixture serializes"),
+        );
+        assert!(parse_index_lock_marker_v5(&unknown_marker).is_err());
+    }
+
+    #[test]
+    fn v5_transaction_reference_rejects_namespace_and_manifest_aliases() {
+        let root = TestRoot::new();
+        let (bundle_basename, manifest, manifest_reference) = install_bundle(&root, TOKEN);
+        let canonical = candidate_bundle_transaction_reference_v5(
+            &bundle_basename,
+            manifest.object_format,
+            manifest_reference,
+        )
+        .expect("canonical transaction reference builds");
+        for invalid in [
+            {
+                let mut value = canonical.clone();
+                value.token = value.token.to_uppercase();
+                value
+            },
+            {
+                let mut value = canonical.clone();
+                value.bundle_basename.push_str(".extra");
+                value
+            },
+            {
+                let mut value = canonical.clone();
+                value.publish_staging_basename.push_str(".extra");
+                value
+            },
+            {
+                let mut value = canonical.clone();
+                value.manifest.size = 0;
+                value
+            },
+            {
+                let mut value = canonical.clone();
+                value.manifest.sha256 = value.manifest.sha256.to_uppercase();
+                value
+            },
+        ] {
+            assert!(validate_candidate_bundle_transaction_reference_v5(&invalid).is_err());
+            assert!(index_lock_marker_bytes_v5(&invalid).is_err());
+        }
+
+        let stable = candidate_bundle_stable_basename_v5(TOKEN).expect("stable basename builds");
+        let publish = candidate_bundle_publish_basename_v5(TOKEN).expect("publish basename builds");
+        assert!(stable.starts_with(crate::INDEX_CANDIDATE_PREFIX));
+        assert!(publish.starts_with(crate::INDEX_CANDIDATE_PREFIX));
+        assert_eq!(canonical.publish_staging_basename, publish);
     }
 
     #[test]

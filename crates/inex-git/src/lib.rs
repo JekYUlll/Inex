@@ -9767,6 +9767,117 @@ mod tests {
     }
 
     #[test]
+    fn v5_reference_loader_rebinds_real_sha1_and_sha256_git_semantics() {
+        for object_format in [GitObjectFormat::Sha1, GitObjectFormat::Sha256] {
+            let fixture = create_candidate_bundle_preparation_fixture(object_format);
+            let root = fixture.vault.root();
+            let old = read_index_snapshot(&index_path(root)).expect("live old index snapshots");
+            let old_map = index_entry_map(&fixture.git).expect("live old stage map snapshots");
+            let mut hooks = CandidateBundleTestHooks::new(None);
+            let prepared = prepare_test_candidate_bundle(&fixture, &mut hooks)
+                .expect("v5 candidate bundle prepares");
+            let reference = candidate_bundle_v5::candidate_bundle_transaction_reference_v5(
+                &prepared.bundle_basename,
+                prepared.inventory.manifest.object_format,
+                prepared.inventory.manifest_reference.clone(),
+            )
+            .expect("v5 transaction reference builds");
+            let marker = candidate_bundle_v5::index_lock_marker_bytes_v5(&reference)
+                .expect("v5 marker serializes");
+            assert_eq!(prepared.transaction_reference, reference);
+            assert_eq!(prepared.index_lock_marker, marker);
+            assert_eq!(
+                prepared.index_lock_marker_reference,
+                candidate_bundle_v5::canonical_bytes_reference_v5(&marker)
+                    .expect("v5 marker bytes reference rebuilds")
+            );
+            assert_eq!(
+                candidate_bundle_v5::parse_index_lock_marker_v5(&marker).expect("v5 marker parses"),
+                reference
+            );
+
+            let fresh_guard = VaultMutationGuard::acquire(root)
+                .expect("fresh recovery-style mutation guard acquires");
+            let loaded = candidate_bundle_v5::load_candidate_bundle_for_git_v5(
+                &fresh_guard,
+                &fixture.git,
+                &reference,
+            )
+            .expect("fresh loader rebinds inventory and Git semantics");
+            assert_eq!(loaded.manifest, prepared.inventory.manifest);
+            assert_eq!(loaded.manifest_reference, reference.manifest);
+            assert_eq!(
+                read_index_snapshot(&index_path(root))
+                    .map(|snapshot| (snapshot.size, snapshot.sha256))
+                    .expect("live index re-reads"),
+                (old.size, old.sha256)
+            );
+            assert_eq!(
+                index_entry_map(&fixture.git).expect("live stage map re-reads"),
+                old_map
+            );
+            assert!(!index_lock_path(root).exists());
+            assert!(!journal_path(root).exists());
+        }
+    }
+
+    #[test]
+    fn v5_reference_loader_preserves_bundle_on_reference_or_live_index_drift() {
+        let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+        let root = fixture.vault.root();
+        let mut hooks = CandidateBundleTestHooks::new(None);
+        let prepared = prepare_test_candidate_bundle(&fixture, &mut hooks)
+            .expect("v5 candidate bundle prepares");
+        let reference = candidate_bundle_v5::candidate_bundle_transaction_reference_v5(
+            &prepared.bundle_basename,
+            prepared.inventory.manifest.object_format,
+            prepared.inventory.manifest_reference.clone(),
+        )
+        .expect("v5 transaction reference builds");
+        let guard = VaultMutationGuard::acquire(root).expect("v5 loader mutation guard acquires");
+
+        let mut wrong_object_format = reference.clone();
+        wrong_object_format.object_format = GitObjectFormat::Sha256;
+        assert!(matches!(
+            candidate_bundle_v5::load_candidate_bundle_for_git_v5(
+                &guard,
+                &fixture.git,
+                &wrong_object_format,
+            ),
+            Err(GitError::InvalidJournal)
+        ));
+
+        let mut wrong_reference = reference.clone();
+        wrong_reference.manifest.sha256 = hex_digest(digest(b"wrong manifest reference"));
+        assert!(matches!(
+            candidate_bundle_v5::load_candidate_bundle_for_git_v5(
+                &guard,
+                &fixture.git,
+                &wrong_reference,
+            ),
+            Err(GitError::RecoveryConflict)
+        ));
+        candidate_bundle_v5::revalidate_prepared_candidate_bundle_v5(root, &prepared)
+            .expect("reference mismatch preserves stable bundle");
+
+        fs::write(
+            root.join("external-v5-loader-index-owner.bin"),
+            b"ciphertext-only external v5 loader drift",
+        )
+        .expect("external index fixture writes");
+        assert!(test_git(
+            root,
+            ["add", "external-v5-loader-index-owner.bin"]
+        ));
+        assert!(matches!(
+            candidate_bundle_v5::load_candidate_bundle_for_git_v5(&guard, &fixture.git, &reference,),
+            Err(GitError::IndexChanged)
+        ));
+        candidate_bundle_v5::revalidate_prepared_candidate_bundle_v5(root, &prepared)
+            .expect("live drift preserves stable bundle");
+    }
+
+    #[test]
     fn v5_candidate_bundle_rejects_a_guard_from_another_vault_root() {
         let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
         let unrelated = TestDirectory::new();
