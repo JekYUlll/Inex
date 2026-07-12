@@ -124,10 +124,17 @@ The workflow is:
 9. Send only the complete encrypted result to
    `git hash-object -w --stdin`, read the named blob back byte-for-byte with
    replacement objects disabled, synchronize its loose object and directories.
-10. Copy the exact old index bytes to a random private alternate
-    `GIT_INDEX_FILE`, let `git update-index -z --index-info` generate the final
-    candidate there, and verify the complete before/after stage maps. Synchronize
-    and bind both index lengths and SHA-256 digests; they must differ.
+10. Before creating an alternate index, atomically publish the strict
+    create-only `.vault-local/git-index-prelock-v4.json` reservation. It binds
+    the repository object format, a random token, that token's one permitted
+    candidate basename, and the exact old-index length and SHA-256. Then copy
+    the exact old index bytes to that private `GIT_INDEX_FILE`, let
+    `git update-index -z --index-info` generate the final candidate there, and
+    verify the complete before/after stage maps. Synchronize and bind both
+    index lengths and SHA-256 digests; they must differ. A create-only initial
+    ownership receipt binds the exact old-index copy before Git may mutate it;
+    a second create-only receipt binds the verified final candidate before any
+    real-lock marker may be created.
 11. Atomically install a complete random-token marker at the real
     `.git/index.lock`. While that Git lock exists, recheck the old index,
     stage-zero owners, attributes, fixed rename provenance, candidate semantics,
@@ -135,8 +142,9 @@ The workflow is:
     v4 journal, then advance the worktree. Publication is two forward-only
     namespace moves: candidate to `index.lock`, then `index.lock` over `index`.
     Re-read worktree/index and synchronize the index, `.git`, and journal parent
-    before removing the journal. Any unconfirmed barrier retains a recognizable
-    forward-recovery state and returns nonzero.
+    before removing the journal. The pre-lock reservation is removed only after
+    that exact stable v4 journal is visible. Any unconfirmed barrier retains a
+    recognizable forward-recovery state and returns nonzero.
 
 An unresolved result is nevertheless a complete authenticated EDRY file and a
 stage-zero Git object; the command exits nonzero and reports the unresolved
@@ -193,6 +201,20 @@ is discarded and errors retain only a fixed operation category and
 
 ## Journal and recovery
 
+The pre-journal filename `.vault-local/git-index-prelock-v4.json` contains a
+strict duplicate-free canonical reservation for the one token-derived
+candidate and the old-index digest/length. It is published and synchronized
+before any candidate file exists. If a process dies before obtaining the real
+Git lock, recovery requires the stable journal and `.git/index.lock` to be
+absent and the live index to remain the exact reserved old snapshot. It then
+removes only the reservation's token-derived, non-reparse, single-link regular
+candidate/receipt/staging names whose bytes or digest match the recorded phase.
+Unknown reserved names, malformed bytes, another object format, index drift,
+links, or a conflicting journal/lock are preserved and fail closed. A kill
+between candidate creation/mutation and publication of its matching ownership
+receipt is visible as pending but intentionally returns a recovery conflict;
+it is not silently treated as clean or deleted without proof.
+
 The stable filename `.vault-local/git-merge-journal-v1.json` contains one strict
 duplicate-free schema selected by its internal version. Versions 1, 2, and 3
 remain readable for legacy in-place, split-rename, and detected-rename recovery.
@@ -220,8 +242,9 @@ conflict labels. The complete JSON is first written, permission-restricted,
 flushed, and synchronized at a private staging name, then atomically moved
 no-replace to the stable create-only name before the first worktree change.
 Duplicate/unknown fields, partial JSON, and tampered bindings fail closed. An
-exact marker/candidate pair abandoned before stable journal publication is
-reported as pending and can be cleaned without changing index or worktree;
+exact pre-lock reservation or marker/candidate pair abandoned before stable
+journal publication is reported as pending and can be cleaned without changing
+index or worktree;
 unknown or foreign `index.lock` content is not intentionally removed after the
 ownership check. Direct same-user namespace replacement remains outside the
 threat model.

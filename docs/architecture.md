@@ -185,9 +185,12 @@ one full `.git/index`. Object IDs must match the repository's full SHA-1 or
 SHA-256 width; abbreviated prefixes are rejected. Diagnostics use scrubbed
 stderr and validated portable paths/modes/OIDs; no password, key, session token,
 or plaintext reaches Git. Fully automatic locked Git integration remains
-deferred until an authenticated local broker exists. For v4, Git first builds
-the final index through an absolute alternate `GIT_INDEX_FILE`; Inex then owns
-the real `.git/index.lock` across the final semantic recheck, worktree
+deferred until an authenticated local broker exists. For v4, Inex first
+publishes a durable token-bound pre-lock reservation, then builds the final
+index through an absolute alternate `GIT_INDEX_FILE`. Initial/final
+create-only ownership receipts bind the candidate before mutation and before
+lock publication. Inex then owns the real `.git/index.lock` across the final
+semantic recheck, worktree
 advancement, and atomic candidate publication. Deliberate parallel porcelain
 is still unsupported because ref-only mutations, legacy journal recovery, and
 native Windows crash/power-loss behavior are not closed by that index lock.

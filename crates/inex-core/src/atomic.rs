@@ -3460,6 +3460,11 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
 
+    #[cfg(any(target_os = "linux", windows))]
+    use std::process::{Command, Stdio};
+    #[cfg(any(target_os = "linux", windows))]
+    use std::time::{Duration, Instant};
+
     use super::{
         AtomicDirectoryPublishError, AtomicWriteError, AtomicWriteStage, CIPHERTEXT_STAGING_PREFIX,
         CIPHERTEXT_STAGING_SUFFIX, CurrentTarget, FaultInjector, FaultPoint, IMPORT_STAGING_PREFIX,
@@ -4179,6 +4184,125 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn native_abrupt_write_child() -> io::Result<()> {
+        let Some(root) = std::env::var_os("INEX_ATOMIC_ABRUPT_CHILD_ROOT") else {
+            return Ok(());
+        };
+        let Some(ready) = std::env::var_os("INEX_ATOMIC_ABRUPT_CHILD_READY") else {
+            return Err(io::Error::other("abrupt child ready path is missing"));
+        };
+        let point = match std::env::var("INEX_ATOMIC_ABRUPT_CHILD_POINT").as_deref() {
+            Ok("verify-staging") => FaultPoint::VerifyStaging,
+            Ok("before-lock") => FaultPoint::BeforeLock,
+            Ok("replace") => FaultPoint::Replace,
+            Ok("sync-parent") => FaultPoint::SyncParent,
+            _ => return Err(io::Error::other("abrupt child fault point is invalid")),
+        };
+        let root = PathBuf::from(root);
+        let target = root.join("notes").join("abrupt.md.enc");
+        let blocker = BlockAt {
+            point,
+            ready: PathBuf::from(ready),
+        };
+        let _ = atomic_write_ciphertext_with_faults(
+            &root,
+            &target,
+            NEW_CIPHERTEXT,
+            WriteCondition::IfMatch(digest_bytes(OLD_CIPHERTEXT)),
+            &blocker,
+        );
+        Err(io::Error::other(
+            "abrupt child returned instead of blocking at its checkpoint",
+        ))
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn native_force_kill_preserves_a_complete_atomic_write_state() -> io::Result<()> {
+        let points = [
+            ("verify-staging", OLD_CIPHERTEXT, true),
+            ("before-lock", OLD_CIPHERTEXT, true),
+            ("replace", OLD_CIPHERTEXT, true),
+            ("sync-parent", NEW_CIPHERTEXT, false),
+        ];
+
+        for (point, expected_target, expected_abandoned_staging) in points {
+            let fixture = TestVault::new()?;
+            let target = fixture.note("abrupt.md.enc");
+            fs::write(&target, OLD_CIPHERTEXT)?;
+            let ready = fixture.root().join("abrupt-child-ready");
+            let mut child = Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "atomic::tests::native_abrupt_write_child",
+                    "--nocapture",
+                ])
+                .env("INEX_ATOMIC_ABRUPT_CHILD_ROOT", fixture.root())
+                .env("INEX_ATOMIC_ABRUPT_CHILD_READY", &ready)
+                .env("INEX_ATOMIC_ABRUPT_CHILD_POINT", point)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?;
+
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if matches!(fs::read(&ready), Ok(bytes) if bytes == b"ready") {
+                    break;
+                }
+                if let Some(status) = child.try_wait()? {
+                    return Err(io::Error::other(format!(
+                        "abrupt child exited before checkpoint {point}: {status}"
+                    )));
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(io::Error::other(format!(
+                        "abrupt child did not reach checkpoint {point}"
+                    )));
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+
+            child.kill()?;
+            let status = child.wait()?;
+            assert!(
+                !status.success(),
+                "force-killed child reported success: {point}"
+            );
+            assert_eq!(fs::read(&target)?, expected_target, "checkpoint: {point}");
+
+            let abandoned = ciphertext_staging_paths(fixture.notes())?;
+            assert_eq!(
+                abandoned.len(),
+                usize::from(expected_abandoned_staging),
+                "checkpoint: {point}"
+            );
+            for staging in &abandoned {
+                assert_eq!(fs::read(staging)?, NEW_CIPHERTEXT, "checkpoint: {point}");
+            }
+
+            fs::remove_file(&ready)?;
+            let condition = WriteCondition::IfMatch(digest_bytes(expected_target));
+            let replacement = if expected_target == OLD_CIPHERTEXT {
+                NEW_CIPHERTEXT
+            } else {
+                OLD_CIPHERTEXT
+            };
+            atomic_write_ciphertext(fixture.root(), &target, replacement, condition)
+                .map_err(io::Error::other)?;
+            assert_eq!(fs::read(&target)?, replacement, "checkpoint: {point}");
+            for staging in abandoned {
+                fs::remove_file(staging)?;
+            }
+            assert_no_staging_files(fixture.notes())?;
+        }
+        Ok(())
+    }
+
     #[test]
     fn parent_sync_failure_is_nonfatal_and_commit_stays_visible() -> io::Result<()> {
         let fixture = TestVault::new()?;
@@ -4541,6 +4665,29 @@ mod tests {
         barrier: Barrier,
     }
 
+    #[cfg(any(target_os = "linux", windows))]
+    #[derive(Debug)]
+    struct BlockAt {
+        point: FaultPoint,
+        ready: PathBuf,
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    impl FaultInjector for BlockAt {
+        fn check(&self, point: FaultPoint) -> io::Result<()> {
+            if point != self.point {
+                return Ok(());
+            }
+            let staged = self.ready.with_extension("staged");
+            fs::write(&staged, b"ready")?;
+            fs::File::open(&staged)?.sync_all()?;
+            fs::rename(&staged, &self.ready)?;
+            loop {
+                thread::park();
+            }
+        }
+    }
+
     impl FaultInjector for Rendezvous {
         fn check(&self, point: FaultPoint) -> io::Result<()> {
             if point == FaultPoint::BeforeLock {
@@ -4593,6 +4740,26 @@ mod tests {
                 && name.ends_with(CIPHERTEXT_STAGING_SUFFIX))
         }));
         Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    fn ciphertext_staging_paths(directory: &Path) -> io::Result<Vec<PathBuf>> {
+        fs::read_dir(directory)?
+            .filter_map(|entry| match entry {
+                Ok(entry) => {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if name.starts_with(CIPHERTEXT_STAGING_PREFIX)
+                        && name.ends_with(CIPHERTEXT_STAGING_SUFFIX)
+                    {
+                        Some(Ok(entry.path()))
+                    } else {
+                        None
+                    }
+                }
+                Err(error) => Some(Err(error)),
+            })
+            .collect()
     }
 
     #[test]

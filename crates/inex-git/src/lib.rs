@@ -49,12 +49,17 @@ pub const IGNORE_RULE: &str = "/.vault-local/";
 const DRIVER_NAME: &str = "Inex encrypted Markdown (locked-safe)";
 const JOURNAL_FILE: &str = "git-merge-journal-v1.json";
 const JOURNAL_STAGING_PREFIX: &str = "git-merge-journal-stage-v4-";
+const PRELOCK_RESERVATION_FILE: &str = "git-index-prelock-v4.json";
+const PRELOCK_RESERVATION_STAGING_PREFIX: &str = "git-index-prelock-stage-v4-";
+const CANDIDATE_INITIAL_RECEIPT_PREFIX: &str = "git-index-candidate-initial-v4-";
+const CANDIDATE_FINAL_RECEIPT_PREFIX: &str = "git-index-candidate-final-v4-";
 const INDEX_CANDIDATE_PREFIX: &str = "git-index-candidate-v4-";
 const INDEX_MARKER_PREFIX: &str = "git-index-lock-marker-v4-";
 const INDEX_LOCK_MARKER_MAGIC: &[u8] = b"INEXIDX4\0";
 const MAX_GIT_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_REPOSITORY_METADATA_BYTES: usize = 1024 * 1024;
 const MAX_JOURNAL_BYTES: usize = 64 * 1024;
+const MAX_PRELOCK_RESERVATION_BYTES: usize = 1024;
 const MAX_CONFLICTS: usize = 100_000;
 const MAX_GIT_PATH_BYTES: usize = MAX_LOGICAL_PATH_BYTES + ".enc".len();
 const MINIMUM_GIT_VERSION: (u32, u32) = (2, 36);
@@ -332,13 +337,76 @@ pub fn recover(vault: &Vault) -> Result<RecoveryReport, GitError> {
 /// oversized, truncated, or fails the strict versioned schema.
 pub fn has_pending_recovery(vault_root: &Path) -> Result<bool, GitError> {
     let _guard = VaultMutationGuard::acquire(vault_root).map_err(map_atomic_error)?;
-    if read_journal(vault_root)?.is_some() {
+    let reserved_names = exact_reserved_private_names(vault_root)?;
+    let pending = read_journal(vault_root)?;
+    let prelock = read_prelock_reservation(vault_root)?;
+    if let Some(pending) = &pending {
+        if let Some(reservation) = &prelock {
+            let PendingMergeJournal::Cas(journal) = pending else {
+                return Err(GitError::RecoveryConflict);
+            };
+            if !prelock_matches_cas_journal(reservation, journal) {
+                return Err(GitError::RecoveryConflict);
+            }
+            validate_prelock_private_inventory(vault_root, reservation, true, false)?;
+            for (phase, expected) in [
+                (
+                    CandidateReceiptPhase::Initial,
+                    initial_candidate_receipt(reservation),
+                ),
+                (
+                    CandidateReceiptPhase::Final,
+                    final_candidate_receipt(
+                        reservation,
+                        journal.candidate_index_size,
+                        &journal.candidate_index_sha256,
+                    ),
+                ),
+            ] {
+                if let Some(actual) =
+                    read_candidate_receipt(vault_root, &reservation.lock_token, phase)?
+                    && actual != expected
+                {
+                    return Err(GitError::RecoveryConflict);
+                }
+            }
+        } else if reserved_names.iter().any(|name| {
+            name == PRELOCK_RESERVATION_FILE
+                || name.starts_with(PRELOCK_RESERVATION_STAGING_PREFIX)
+                || name.starts_with(CANDIDATE_INITIAL_RECEIPT_PREFIX)
+                || name.starts_with(CANDIDATE_FINAL_RECEIPT_PREFIX)
+        }) {
+            return Err(GitError::RecoveryConflict);
+        }
         return Ok(true);
     }
-    Ok(!matches!(
+    if let Some(reservation) = &prelock {
+        validate_prelock_private_inventory(vault_root, reservation, false, false)?;
+        if !path_entry_is_absent(&prelock_reservation_staging_path(
+            vault_root,
+            &reservation.lock_token,
+        ))? {
+            return Err(GitError::RecoveryConflict);
+        }
+        validate_prelock_owned_files(vault_root, reservation)?;
+        return Ok(true);
+    }
+    match inspect_orphan_prelock_staging(vault_root, &reserved_names)? {
+        OrphanPrelockStaging::Exact { .. } => return Ok(true),
+        OrphanPrelockStaging::Conflict => return Err(GitError::RecoveryConflict),
+        OrphanPrelockStaging::None => {}
+    }
+    if !matches!(
         inspect_abandoned_cas_reservation(vault_root)?,
         AbandonedCasReservation::None
-    ))
+    ) {
+        return Ok(true);
+    }
+    if reserved_names.is_empty() {
+        Ok(false)
+    } else {
+        Err(GitError::RecoveryConflict)
+    }
 }
 
 /// Resolve all currently unmerged encrypted Markdown paths in memory.
@@ -622,6 +690,35 @@ struct CasMergeJournal {
     transaction: MergeJournalPayload,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PreLockReservation {
+    version: u32,
+    object_format: GitObjectFormat,
+    lock_token: String,
+    candidate_file: String,
+    expected_index_sha256: String,
+    expected_index_size: u64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CandidateReceiptPhase {
+    Initial,
+    Final,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CandidateOwnershipReceipt {
+    version: u32,
+    phase: CandidateReceiptPhase,
+    lock_token: String,
+    candidate_file: String,
+    candidate_index_sha256: String,
+    candidate_index_size: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum PendingMergeJournal {
     InPlace(MergeJournal),
@@ -632,6 +729,7 @@ enum PendingMergeJournal {
 
 struct PreparedIndexCas {
     root: PathBuf,
+    prelock: PreLockReservation,
     object_format: GitObjectFormat,
     lock_token: String,
     lock_marker_sha256: String,
@@ -643,14 +741,46 @@ struct PreparedIndexCas {
     armed: bool,
 }
 
-struct PreLockPrivateFiles {
-    paths: Vec<PathBuf>,
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum PreLockOwnershipPhase {
+    Reservation,
+    Candidate,
+    InitialReceipt,
+    FinalReceipt,
+    MarkerStaging,
+}
+
+struct PreLockReservationGuard {
+    root: PathBuf,
+    reservation: PreLockReservation,
+    phase: PreLockOwnershipPhase,
     armed: bool,
 }
 
-impl PreLockPrivateFiles {
-    fn new(paths: Vec<PathBuf>) -> Self {
-        Self { paths, armed: true }
+impl PreLockReservationGuard {
+    fn new(root: PathBuf, reservation: PreLockReservation) -> Self {
+        Self {
+            root,
+            reservation,
+            phase: PreLockOwnershipPhase::Reservation,
+            armed: true,
+        }
+    }
+
+    fn candidate_created(&mut self) {
+        self.phase = PreLockOwnershipPhase::Candidate;
+    }
+
+    fn initial_receipt_created(&mut self) {
+        self.phase = PreLockOwnershipPhase::InitialReceipt;
+    }
+
+    fn final_receipt_created(&mut self) {
+        self.phase = PreLockOwnershipPhase::FinalReceipt;
+    }
+
+    fn marker_staging_created(&mut self) {
+        self.phase = PreLockOwnershipPhase::MarkerStaging;
     }
 
     fn disarm(&mut self) {
@@ -658,14 +788,12 @@ impl PreLockPrivateFiles {
     }
 }
 
-impl Drop for PreLockPrivateFiles {
+impl Drop for PreLockReservationGuard {
     fn drop(&mut self) {
         if !self.armed {
             return;
         }
-        for path in &self.paths {
-            let _ = remove_reserved_regular_file(path);
-        }
+        let _ = abort_owned_prelock_reservation(&self.root, &self.reservation, self.phase);
     }
 }
 
@@ -695,6 +823,9 @@ impl Drop for PreparedIndexCas {
         if !self.armed {
             return;
         }
+        if !matches!(read_journal(&self.root), Ok(None)) {
+            return;
+        }
         let marker = index_lock_marker_bytes(
             &self.lock_token,
             self.expected_index_size,
@@ -702,16 +833,22 @@ impl Drop for PreparedIndexCas {
             self.candidate_index_size,
             &self.candidate_index_sha256,
         );
-        if matches!(
-            remove_regular_file_if_exact(&index_lock_path(&self.root), &marker),
-            Ok(true)
-        ) {
-            let candidate = index_candidate_path(&self.root, &self.candidate_file);
-            let _ = remove_regular_file_if_digest(
-                &candidate,
-                self.candidate_index_size,
-                &self.candidate_index_sha256,
-            );
+        match remove_regular_file_if_exact(&index_lock_path(&self.root), &marker) {
+            Ok(true) => {
+                let _ = abort_owned_prelock_reservation(
+                    &self.root,
+                    &self.prelock,
+                    PreLockOwnershipPhase::FinalReceipt,
+                );
+            }
+            Ok(false) if matches!(path_entry_is_absent(&index_lock_path(&self.root)), Ok(true)) => {
+                let _ = abort_owned_prelock_reservation(
+                    &self.root,
+                    &self.prelock,
+                    PreLockOwnershipPhase::FinalReceipt,
+                );
+            }
+            Ok(false) | Err(_) => {}
         }
     }
 }
@@ -2774,6 +2911,25 @@ fn index_candidate_path(root: &Path, candidate_file: &str) -> PathBuf {
     root.join(VAULT_LOCAL_DIRECTORY).join(candidate_file)
 }
 
+fn prelock_reservation_path(root: &Path) -> PathBuf {
+    root.join(VAULT_LOCAL_DIRECTORY)
+        .join(PRELOCK_RESERVATION_FILE)
+}
+
+fn prelock_reservation_staging_path(root: &Path, lock_token: &str) -> PathBuf {
+    root.join(VAULT_LOCAL_DIRECTORY)
+        .join(format!("{PRELOCK_RESERVATION_STAGING_PREFIX}{lock_token}"))
+}
+
+fn candidate_receipt_path(root: &Path, lock_token: &str, phase: CandidateReceiptPhase) -> PathBuf {
+    let prefix = match phase {
+        CandidateReceiptPhase::Initial => CANDIDATE_INITIAL_RECEIPT_PREFIX,
+        CandidateReceiptPhase::Final => CANDIDATE_FINAL_RECEIPT_PREFIX,
+    };
+    root.join(VAULT_LOCAL_DIRECTORY)
+        .join(format!("{prefix}{lock_token}"))
+}
+
 fn index_marker_staging_path(root: &Path, lock_token: &str) -> PathBuf {
     root.join(VAULT_LOCAL_DIRECTORY)
         .join(format!("{INDEX_MARKER_PREFIX}{lock_token}"))
@@ -2930,29 +3086,6 @@ fn remove_regular_file_if_digest(
     Ok(true)
 }
 
-fn remove_reserved_regular_file(path: &Path) -> Result<bool, GitError> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(io_error(GitIoOperation::InspectMetadata, &error)),
-    };
-    if is_link_or_reparse_point(&metadata) || !metadata.file_type().is_file() {
-        return Ok(false);
-    }
-    let file = File::open(path).map_err(|error| io_error(GitIoOperation::ReadMetadata, &error))?;
-    if !open_file_matches_path_and_is_single_link(path, &file)
-        .map_err(|error| io_error(GitIoOperation::InspectMetadata, &error))?
-    {
-        return Ok(false);
-    }
-    drop(file);
-    fs::remove_file(path).map_err(|error| io_error(GitIoOperation::SyncGitState, &error))?;
-    if let Some(parent) = path.parent() {
-        sync_directory(parent).map_err(|_| GitError::DurabilityNotConfirmed)?;
-    }
-    Ok(true)
-}
-
 fn appended_lock_path(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
     name.push(".lock");
@@ -3018,6 +3151,86 @@ fn validate_candidate_file(lock_token: &str, candidate_file: &str) -> Result<(),
     } else {
         Err(GitError::InvalidJournal)
     }
+}
+
+fn validate_prelock_reservation(reservation: &PreLockReservation) -> Result<(), GitError> {
+    if reservation.version != 4 {
+        return Err(GitError::InvalidJournal);
+    }
+    validate_candidate_file(&reservation.lock_token, &reservation.candidate_file)?;
+    parse_hex_digest(&reservation.expected_index_sha256)?;
+    if reservation.expected_index_size == 0
+        || reservation.expected_index_size > u64::try_from(MAX_GIT_OUTPUT_BYTES).unwrap_or(u64::MAX)
+    {
+        return Err(GitError::InvalidJournal);
+    }
+    Ok(())
+}
+
+fn validate_candidate_receipt(receipt: &CandidateOwnershipReceipt) -> Result<(), GitError> {
+    if receipt.version != 4 {
+        return Err(GitError::InvalidJournal);
+    }
+    validate_candidate_file(&receipt.lock_token, &receipt.candidate_file)?;
+    parse_hex_digest(&receipt.candidate_index_sha256)?;
+    if receipt.candidate_index_size == 0
+        || receipt.candidate_index_size > u64::try_from(MAX_GIT_OUTPUT_BYTES).unwrap_or(u64::MAX)
+    {
+        return Err(GitError::InvalidJournal);
+    }
+    Ok(())
+}
+
+fn receipt_matches_reservation(
+    receipt: &CandidateOwnershipReceipt,
+    reservation: &PreLockReservation,
+) -> bool {
+    receipt.version == reservation.version
+        && receipt.lock_token == reservation.lock_token
+        && receipt.candidate_file == reservation.candidate_file
+        && (receipt.phase != CandidateReceiptPhase::Initial
+            || (receipt.candidate_index_size == reservation.expected_index_size
+                && receipt.candidate_index_sha256 == reservation.expected_index_sha256))
+        && (receipt.phase != CandidateReceiptPhase::Final
+            || receipt.candidate_index_sha256 != reservation.expected_index_sha256)
+}
+
+fn initial_candidate_receipt(reservation: &PreLockReservation) -> CandidateOwnershipReceipt {
+    CandidateOwnershipReceipt {
+        version: 4,
+        phase: CandidateReceiptPhase::Initial,
+        lock_token: reservation.lock_token.clone(),
+        candidate_file: reservation.candidate_file.clone(),
+        candidate_index_sha256: reservation.expected_index_sha256.clone(),
+        candidate_index_size: reservation.expected_index_size,
+    }
+}
+
+fn final_candidate_receipt(
+    reservation: &PreLockReservation,
+    candidate_index_size: u64,
+    candidate_index_sha256: &str,
+) -> CandidateOwnershipReceipt {
+    CandidateOwnershipReceipt {
+        version: 4,
+        phase: CandidateReceiptPhase::Final,
+        lock_token: reservation.lock_token.clone(),
+        candidate_file: reservation.candidate_file.clone(),
+        candidate_index_sha256: candidate_index_sha256.to_owned(),
+        candidate_index_size,
+    }
+}
+
+fn prelock_matches_cas_journal(
+    reservation: &PreLockReservation,
+    journal: &CasMergeJournal,
+) -> bool {
+    reservation.version == journal.version
+        && reservation.object_format == journal.object_format
+        && reservation.lock_token == journal.lock_token
+        && reservation.candidate_file == journal.candidate_file
+        && reservation.expected_index_sha256 == journal.expected_index_sha256
+        && reservation.expected_index_size == journal.expected_index_size
 }
 
 fn validate_payload(payload: &MergeJournalPayload) -> Result<(), GitError> {
@@ -3211,6 +3424,721 @@ fn create_private_file(path: &Path, bytes: &[u8]) -> Result<File, GitError> {
     Ok(file)
 }
 
+fn prelock_reservation_bytes(reservation: &PreLockReservation) -> Result<Vec<u8>, GitError> {
+    validate_prelock_reservation(reservation)?;
+    let bytes = serde_json::to_vec(reservation).map_err(|_| GitError::InvalidJournal)?;
+    if bytes.is_empty() || bytes.len() > MAX_PRELOCK_RESERVATION_BYTES {
+        return Err(GitError::InvalidJournal);
+    }
+    Ok(bytes)
+}
+
+fn read_prelock_reservation_file(path: &Path) -> Result<PreLockReservation, GitError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| io_error(GitIoOperation::ReadJournal, &error))?;
+    if is_link_or_reparse_point(&metadata)
+        || !metadata.file_type().is_file()
+        || metadata.len() == 0
+        || metadata.len() > u64::try_from(MAX_PRELOCK_RESERVATION_BYTES).unwrap_or(u64::MAX)
+    {
+        return Err(GitError::InvalidJournal);
+    }
+    let file = File::open(path).map_err(|error| io_error(GitIoOperation::ReadJournal, &error))?;
+    if !open_file_matches_path_and_is_single_link(path, &file)
+        .map_err(|error| io_error(GitIoOperation::ReadJournal, &error))?
+    {
+        return Err(GitError::InvalidJournal);
+    }
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len())
+            .unwrap_or(MAX_PRELOCK_RESERVATION_BYTES)
+            .min(MAX_PRELOCK_RESERVATION_BYTES),
+    );
+    (&file)
+        .take(
+            u64::try_from(MAX_PRELOCK_RESERVATION_BYTES)
+                .unwrap_or(u64::MAX)
+                .saturating_add(1),
+        )
+        .read_to_end(&mut bytes)
+        .map_err(|error| io_error(GitIoOperation::ReadJournal, &error))?;
+    if bytes.len() != usize::try_from(metadata.len()).unwrap_or(usize::MAX)
+        || bytes.len() > MAX_PRELOCK_RESERVATION_BYTES
+    {
+        return Err(GitError::InvalidJournal);
+    }
+    let value = parse_duplicate_free_json(&bytes)?;
+    let reservation = serde_json::from_value::<PreLockReservation>(value)
+        .map_err(|_| GitError::InvalidJournal)?;
+    validate_prelock_reservation(&reservation)?;
+    if prelock_reservation_bytes(&reservation)? != bytes {
+        return Err(GitError::InvalidJournal);
+    }
+    Ok(reservation)
+}
+
+fn read_prelock_reservation(root: &Path) -> Result<Option<PreLockReservation>, GitError> {
+    let path = prelock_reservation_path(root);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => read_prelock_reservation_file(&path).map(Some),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(io_error(GitIoOperation::ReadJournal, &error)),
+    }
+}
+
+fn candidate_receipt_bytes(receipt: &CandidateOwnershipReceipt) -> Result<Vec<u8>, GitError> {
+    validate_candidate_receipt(receipt)?;
+    let bytes = serde_json::to_vec(receipt).map_err(|_| GitError::InvalidJournal)?;
+    if bytes.is_empty() || bytes.len() > MAX_PRELOCK_RESERVATION_BYTES {
+        return Err(GitError::InvalidJournal);
+    }
+    Ok(bytes)
+}
+
+fn read_candidate_receipt(
+    root: &Path,
+    lock_token: &str,
+    phase: CandidateReceiptPhase,
+) -> Result<Option<CandidateOwnershipReceipt>, GitError> {
+    let path = candidate_receipt_path(root, lock_token, phase);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_error(GitIoOperation::ReadJournal, &error)),
+    };
+    if is_link_or_reparse_point(&metadata)
+        || !metadata.file_type().is_file()
+        || metadata.len() == 0
+        || metadata.len() > u64::try_from(MAX_PRELOCK_RESERVATION_BYTES).unwrap_or(u64::MAX)
+    {
+        return Err(GitError::InvalidJournal);
+    }
+    let file = File::open(&path).map_err(|error| io_error(GitIoOperation::ReadJournal, &error))?;
+    if !open_file_matches_path_and_is_single_link(&path, &file)
+        .map_err(|error| io_error(GitIoOperation::ReadJournal, &error))?
+    {
+        return Err(GitError::InvalidJournal);
+    }
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len())
+            .unwrap_or(MAX_PRELOCK_RESERVATION_BYTES)
+            .min(MAX_PRELOCK_RESERVATION_BYTES),
+    );
+    (&file)
+        .take(
+            u64::try_from(MAX_PRELOCK_RESERVATION_BYTES)
+                .unwrap_or(u64::MAX)
+                .saturating_add(1),
+        )
+        .read_to_end(&mut bytes)
+        .map_err(|error| io_error(GitIoOperation::ReadJournal, &error))?;
+    if bytes.len() != usize::try_from(metadata.len()).unwrap_or(usize::MAX)
+        || bytes.len() > MAX_PRELOCK_RESERVATION_BYTES
+    {
+        return Err(GitError::InvalidJournal);
+    }
+    let value = parse_duplicate_free_json(&bytes)?;
+    let receipt = serde_json::from_value::<CandidateOwnershipReceipt>(value)
+        .map_err(|_| GitError::InvalidJournal)?;
+    validate_candidate_receipt(&receipt)?;
+    if receipt.phase != phase
+        || receipt.lock_token != lock_token
+        || candidate_receipt_bytes(&receipt)? != bytes
+    {
+        return Err(GitError::InvalidJournal);
+    }
+    Ok(Some(receipt))
+}
+
+fn install_candidate_receipt(
+    root: &Path,
+    receipt: &CandidateOwnershipReceipt,
+) -> Result<(), GitError> {
+    let path = candidate_receipt_path(root, &receipt.lock_token, receipt.phase);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => return Err(GitError::RecoveryConflict),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io_error(GitIoOperation::InspectMetadata, &error)),
+    }
+    let bytes = candidate_receipt_bytes(receipt)?;
+    let file = create_private_file(&path, &bytes)?;
+    if !open_file_matches_path_and_is_single_link(&path, &file)
+        .map_err(|error| io_error(GitIoOperation::InspectMetadata, &error))?
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    drop(file);
+    sync_directory(&root.join(VAULT_LOCAL_DIRECTORY))
+        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+    if read_regular_exact(&path, bytes.len())? != bytes {
+        return Err(GitError::RecoveryConflict);
+    }
+    Ok(())
+}
+
+fn remove_candidate_receipt_exact(
+    root: &Path,
+    receipt: &CandidateOwnershipReceipt,
+) -> Result<(), GitError> {
+    let bytes = candidate_receipt_bytes(receipt)?;
+    let path = candidate_receipt_path(root, &receipt.lock_token, receipt.phase);
+    if !remove_regular_file_if_exact(&path, &bytes)? {
+        return Err(GitError::RecoveryConflict);
+    }
+    Ok(())
+}
+
+fn install_prelock_reservation(
+    root: &Path,
+    reservation: &PreLockReservation,
+) -> Result<(), GitError> {
+    match fs::symlink_metadata(prelock_reservation_path(root)) {
+        Ok(_) => return Err(GitError::JournalAlreadyExists),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io_error(GitIoOperation::InspectMetadata, &error)),
+    }
+    let bytes = prelock_reservation_bytes(reservation)?;
+    let staging_path = prelock_reservation_staging_path(root, &reservation.lock_token);
+    let stable_path = prelock_reservation_path(root);
+    let staging_file = create_private_file(&staging_path, &bytes)?;
+    let move_result =
+        atomic_move_verified_file_no_replace(&staging_path, &staging_file, &stable_path);
+    drop(staging_file);
+    match move_result {
+        Ok(outcome) => {
+            require_file_move_durability(outcome)?;
+            if read_regular_exact(&stable_path, bytes.len())? != bytes {
+                return Err(GitError::InvalidJournal);
+            }
+            Ok(())
+        }
+        Err(error) => {
+            let stable_is_exact = matches!(
+                read_regular_exact(&stable_path, bytes.len()),
+                Ok(actual) if actual == bytes
+            );
+            let staging_is_exact = matches!(
+                read_regular_exact(&staging_path, bytes.len()),
+                Ok(actual) if actual == bytes
+            );
+            if stable_is_exact && !staging_is_exact {
+                return Err(GitError::DurabilityNotConfirmed);
+            }
+            if staging_is_exact && !stable_is_exact {
+                let _ = remove_regular_file_if_exact(&staging_path, &bytes);
+                return if error.kind() == io::ErrorKind::AlreadyExists {
+                    Err(GitError::JournalAlreadyExists)
+                } else {
+                    Err(io_error(GitIoOperation::WriteJournal, &error))
+                };
+            }
+            Err(GitError::RecoveryConflict)
+        }
+    }
+}
+
+fn remove_prelock_reservation_exact(
+    root: &Path,
+    reservation: &PreLockReservation,
+) -> Result<(), GitError> {
+    let bytes = prelock_reservation_bytes(reservation)?;
+    if !remove_regular_file_if_exact(&prelock_reservation_path(root), &bytes)? {
+        return Err(GitError::RecoveryConflict);
+    }
+    Ok(())
+}
+
+fn remove_prelock_after_stable_journal(
+    root: &Path,
+    reservation: &PreLockReservation,
+    journal: &CasMergeJournal,
+) -> Result<(), GitError> {
+    if !prelock_matches_cas_journal(reservation, journal)
+        || !path_entry_is_absent(&prelock_reservation_staging_path(
+            root,
+            &reservation.lock_token,
+        ))?
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    match read_journal(root)? {
+        Some(PendingMergeJournal::Cas(actual)) if actual == *journal => {}
+        _ => return Err(GitError::RecoveryConflict),
+    }
+    validate_prelock_private_inventory(root, reservation, true, false)?;
+    let candidate = index_candidate_path(root, &reservation.candidate_file);
+    for path in [
+        appended_lock_path(&candidate),
+        index_marker_staging_path(root, &reservation.lock_token),
+    ] {
+        if !path_entry_is_absent(&path)? {
+            return Err(GitError::RecoveryConflict);
+        }
+    }
+    let expected_initial = initial_candidate_receipt(reservation);
+    let expected_final = final_candidate_receipt(
+        reservation,
+        journal.candidate_index_size,
+        &journal.candidate_index_sha256,
+    );
+    let initial = read_candidate_receipt(
+        root,
+        &reservation.lock_token,
+        CandidateReceiptPhase::Initial,
+    )?;
+    let final_receipt =
+        read_candidate_receipt(root, &reservation.lock_token, CandidateReceiptPhase::Final)?;
+    if initial
+        .as_ref()
+        .is_some_and(|actual| actual != &expected_initial)
+        || final_receipt
+            .as_ref()
+            .is_some_and(|actual| actual != &expected_final)
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    if let Some(receipt) = &final_receipt {
+        remove_candidate_receipt_exact(root, receipt)?;
+    }
+    if let Some(receipt) = &initial {
+        remove_candidate_receipt_exact(root, receipt)?;
+    }
+    remove_prelock_reservation_exact(root, reservation)
+}
+
+fn path_entry_is_absent(path: &Path) -> Result<bool, GitError> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Ok(_) => Ok(false),
+        Err(error) => Err(io_error(GitIoOperation::InspectMetadata, &error)),
+    }
+}
+
+fn ascii_casefold_starts_with(value: &str, prefix: &str) -> bool {
+    value
+        .as_bytes()
+        .get(..prefix.len())
+        .is_some_and(|actual| actual.eq_ignore_ascii_case(prefix.as_bytes()))
+}
+
+fn exact_reserved_private_names(root: &Path) -> Result<BTreeSet<String>, GitError> {
+    let stable_names = [PRELOCK_RESERVATION_FILE, JOURNAL_FILE];
+    let prefixes = [
+        PRELOCK_RESERVATION_STAGING_PREFIX,
+        CANDIDATE_INITIAL_RECEIPT_PREFIX,
+        CANDIDATE_FINAL_RECEIPT_PREFIX,
+        INDEX_CANDIDATE_PREFIX,
+        INDEX_MARKER_PREFIX,
+        JOURNAL_STAGING_PREFIX,
+    ];
+    let local = root.join(VAULT_LOCAL_DIRECTORY);
+    let entries =
+        fs::read_dir(&local).map_err(|error| io_error(GitIoOperation::InspectMetadata, &error))?;
+    let mut reserved_names = BTreeSet::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| io_error(GitIoOperation::InspectMetadata, &error))?;
+        let name = entry.file_name();
+        let name = name.to_str().ok_or(GitError::RecoveryConflict)?;
+        let mut reserved = false;
+        for stable in stable_names {
+            if name.eq_ignore_ascii_case(stable) {
+                if name != stable {
+                    return Err(GitError::RecoveryConflict);
+                }
+                reserved = true;
+            }
+        }
+        for prefix in prefixes {
+            if ascii_casefold_starts_with(name, prefix) {
+                if !name.starts_with(prefix) {
+                    return Err(GitError::RecoveryConflict);
+                }
+                reserved = true;
+            }
+        }
+        if reserved && !reserved_names.insert(name.to_owned()) {
+            return Err(GitError::RecoveryConflict);
+        }
+    }
+    Ok(reserved_names)
+}
+
+enum OrphanPrelockStaging {
+    None,
+    Exact {
+        reservation: PreLockReservation,
+        path: PathBuf,
+    },
+    Conflict,
+}
+
+fn inspect_orphan_prelock_staging(
+    root: &Path,
+    reserved_names: &BTreeSet<String>,
+) -> Result<OrphanPrelockStaging, GitError> {
+    let staging_names = reserved_names
+        .iter()
+        .filter(|name| name.starts_with(PRELOCK_RESERVATION_STAGING_PREFIX))
+        .collect::<Vec<_>>();
+    if staging_names.is_empty() {
+        return Ok(OrphanPrelockStaging::None);
+    }
+    if staging_names.len() != 1
+        || reserved_names.len() != 1
+        || !path_entry_is_absent(&prelock_reservation_path(root))?
+        || !path_entry_is_absent(&journal_path(root))?
+        || !path_entry_is_absent(&index_lock_path(root))?
+    {
+        return Ok(OrphanPrelockStaging::Conflict);
+    }
+    let name = staging_names[0];
+    let Some(lock_token) = name.strip_prefix(PRELOCK_RESERVATION_STAGING_PREFIX) else {
+        return Ok(OrphanPrelockStaging::Conflict);
+    };
+    if validate_lock_token(lock_token).is_err() {
+        return Ok(OrphanPrelockStaging::Conflict);
+    }
+    let path = root.join(VAULT_LOCAL_DIRECTORY).join(name);
+    let reservation = read_prelock_reservation_file(&path)?;
+    if reservation.lock_token != lock_token {
+        return Ok(OrphanPrelockStaging::Conflict);
+    }
+    let live = read_index_snapshot(&index_path(root))?;
+    if !snapshot_matches(
+        &live,
+        reservation.expected_index_size,
+        &reservation.expected_index_sha256,
+    ) {
+        return Ok(OrphanPrelockStaging::Conflict);
+    }
+    Ok(OrphanPrelockStaging::Exact { reservation, path })
+}
+
+fn recover_orphan_prelock_staging(
+    object_format: GitObjectFormat,
+    reservation: &PreLockReservation,
+    path: &Path,
+) -> Result<(), GitError> {
+    if reservation.object_format != object_format
+        || read_prelock_reservation_file(path)? != *reservation
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    let bytes = prelock_reservation_bytes(reservation)?;
+    if !remove_regular_file_if_exact(path, &bytes)? {
+        return Err(GitError::RecoveryConflict);
+    }
+    Ok(())
+}
+
+fn validate_prelock_private_inventory(
+    root: &Path,
+    reservation: &PreLockReservation,
+    allow_stable_journal: bool,
+    allow_journal_staging: bool,
+) -> Result<(), GitError> {
+    let candidate_lock = appended_lock_path(Path::new(&reservation.candidate_file));
+    let candidate_lock = candidate_lock
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or(GitError::RecoveryConflict)?;
+    let mut allowed = BTreeSet::from([
+        PRELOCK_RESERVATION_FILE.to_owned(),
+        reservation.candidate_file.clone(),
+        candidate_lock.to_owned(),
+        format!(
+            "{CANDIDATE_INITIAL_RECEIPT_PREFIX}{}",
+            reservation.lock_token
+        ),
+        format!("{CANDIDATE_FINAL_RECEIPT_PREFIX}{}", reservation.lock_token),
+        format!("{INDEX_MARKER_PREFIX}{}", reservation.lock_token),
+        format!(
+            "{PRELOCK_RESERVATION_STAGING_PREFIX}{}",
+            reservation.lock_token
+        ),
+    ]);
+    if allow_journal_staging {
+        allowed.insert(format!(
+            "{JOURNAL_STAGING_PREFIX}{}",
+            reservation.lock_token
+        ));
+    }
+    if allow_stable_journal {
+        allowed.insert(JOURNAL_FILE.to_owned());
+    }
+    for name in exact_reserved_private_names(root)? {
+        if !allowed.contains(&name) {
+            return Err(GitError::RecoveryConflict);
+        }
+    }
+    Ok(())
+}
+
+fn validate_prelock_owned_files(
+    root: &Path,
+    reservation: &PreLockReservation,
+) -> Result<
+    (
+        Option<CandidateOwnershipReceipt>,
+        Option<CandidateOwnershipReceipt>,
+    ),
+    GitError,
+> {
+    let initial = read_candidate_receipt(
+        root,
+        &reservation.lock_token,
+        CandidateReceiptPhase::Initial,
+    )?;
+    let final_receipt =
+        read_candidate_receipt(root, &reservation.lock_token, CandidateReceiptPhase::Final)?;
+    if initial
+        .as_ref()
+        .is_some_and(|receipt| !receipt_matches_reservation(receipt, reservation))
+        || final_receipt
+            .as_ref()
+            .is_some_and(|receipt| !receipt_matches_reservation(receipt, reservation))
+        || (final_receipt.is_some() && initial.is_none())
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    let candidate_path = index_candidate_path(root, &reservation.candidate_file);
+    if !path_entry_is_absent(&appended_lock_path(&candidate_path))? {
+        return Err(GitError::RecoveryConflict);
+    }
+    let expected_candidate = final_receipt.as_ref().or(initial.as_ref());
+    if let Some(expected) = expected_candidate {
+        if let Some(snapshot) = optional_index_snapshot(&candidate_path)?
+            && !snapshot_matches(
+                &snapshot,
+                expected.candidate_index_size,
+                &expected.candidate_index_sha256,
+            )
+        {
+            return Err(GitError::RecoveryConflict);
+        }
+    } else if !path_entry_is_absent(&candidate_path)? {
+        return Err(GitError::RecoveryConflict);
+    }
+    let marker_path = index_marker_staging_path(root, &reservation.lock_token);
+    if let Some(final_receipt) = &final_receipt {
+        if !path_entry_is_absent(&marker_path)? {
+            let marker = index_lock_marker_bytes(
+                &reservation.lock_token,
+                reservation.expected_index_size,
+                &reservation.expected_index_sha256,
+                final_receipt.candidate_index_size,
+                &final_receipt.candidate_index_sha256,
+            );
+            if read_regular_exact(&marker_path, marker.len())? != marker {
+                return Err(GitError::RecoveryConflict);
+            }
+        }
+    } else if !path_entry_is_absent(&marker_path)? {
+        return Err(GitError::RecoveryConflict);
+    }
+    Ok((initial, final_receipt))
+}
+
+fn remove_verified_candidate_if_present(
+    root: &Path,
+    receipt: &CandidateOwnershipReceipt,
+) -> Result<(), GitError> {
+    let path = index_candidate_path(root, &receipt.candidate_file);
+    if path_entry_is_absent(&path)? {
+        return Ok(());
+    }
+    if !remove_regular_file_if_digest(
+        &path,
+        receipt.candidate_index_size,
+        &receipt.candidate_index_sha256,
+    )? {
+        return Err(GitError::RecoveryConflict);
+    }
+    Ok(())
+}
+
+fn remove_verified_marker_if_present(
+    root: &Path,
+    reservation: &PreLockReservation,
+    final_receipt: &CandidateOwnershipReceipt,
+) -> Result<(), GitError> {
+    let path = index_marker_staging_path(root, &reservation.lock_token);
+    if path_entry_is_absent(&path)? {
+        return Ok(());
+    }
+    let marker = index_lock_marker_bytes(
+        &reservation.lock_token,
+        reservation.expected_index_size,
+        &reservation.expected_index_sha256,
+        final_receipt.candidate_index_size,
+        &final_receipt.candidate_index_sha256,
+    );
+    if !remove_regular_file_if_exact(&path, &marker)? {
+        return Err(GitError::RecoveryConflict);
+    }
+    Ok(())
+}
+
+fn clean_verified_prelock_owned_files(
+    root: &Path,
+    reservation: &PreLockReservation,
+) -> Result<(), GitError> {
+    let (initial, final_receipt) = validate_prelock_owned_files(root, reservation)?;
+    if let Some(final_receipt) = &final_receipt {
+        remove_verified_marker_if_present(root, reservation, final_receipt)?;
+    }
+    if let Some(candidate_receipt) = final_receipt.as_ref().or(initial.as_ref()) {
+        remove_verified_candidate_if_present(root, candidate_receipt)?;
+    }
+    if let Some(receipt) = &final_receipt {
+        remove_candidate_receipt_exact(root, receipt)?;
+    }
+    if let Some(receipt) = &initial {
+        remove_candidate_receipt_exact(root, receipt)?;
+    }
+    Ok(())
+}
+
+fn index_lock_may_belong_to_prelock(
+    root: &Path,
+    reservation: &PreLockReservation,
+) -> Result<bool, GitError> {
+    let path = index_lock_path(root);
+    let metadata = match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Ok(metadata) => metadata,
+        Err(error) => return Err(io_error(GitIoOperation::InspectMetadata, &error)),
+    };
+    if is_link_or_reparse_point(&metadata)
+        || !metadata.file_type().is_file()
+        || metadata.len() == 0
+        || metadata.len() > 512
+    {
+        return Ok(false);
+    }
+    let bytes = read_regular_exact(
+        &path,
+        usize::try_from(metadata.len()).map_err(|_| GitError::RecoveryConflict)?,
+    )?;
+    if !bytes.starts_with(INDEX_LOCK_MARKER_MAGIC) {
+        return Ok(false);
+    }
+    let parsed = parse_index_lock_marker(&bytes).map_err(|_| GitError::RecoveryConflict)?;
+    Ok(parsed.lock_token == reservation.lock_token)
+}
+
+fn abort_owned_prelock_reservation(
+    root: &Path,
+    reservation: &PreLockReservation,
+    phase: PreLockOwnershipPhase,
+) -> Result<(), GitError> {
+    validate_prelock_reservation(reservation)?;
+    if read_prelock_reservation(root)?.as_ref() != Some(reservation)
+        || !path_entry_is_absent(&journal_path(root))?
+        || index_lock_may_belong_to_prelock(root, reservation)?
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    validate_prelock_private_inventory(root, reservation, false, false)?;
+    let candidate_path = index_candidate_path(root, &reservation.candidate_file);
+    let initial = read_candidate_receipt(
+        root,
+        &reservation.lock_token,
+        CandidateReceiptPhase::Initial,
+    )?;
+    let final_receipt =
+        read_candidate_receipt(root, &reservation.lock_token, CandidateReceiptPhase::Final)?;
+    let marker_path = index_marker_staging_path(root, &reservation.lock_token);
+    let candidate_created = phase >= PreLockOwnershipPhase::Candidate;
+    let initial_receipt_created = phase >= PreLockOwnershipPhase::InitialReceipt;
+    let final_receipt_created = phase >= PreLockOwnershipPhase::FinalReceipt;
+    let marker_staging_created = phase == PreLockOwnershipPhase::MarkerStaging;
+    if initial.is_some() != initial_receipt_created
+        || final_receipt.is_some() != final_receipt_created
+        || path_entry_is_absent(&marker_path)? == marker_staging_created
+        || !path_entry_is_absent(&prelock_reservation_staging_path(
+            root,
+            &reservation.lock_token,
+        ))?
+        || !path_entry_is_absent(&appended_lock_path(&candidate_path))?
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    if candidate_created {
+        let expected = final_receipt
+            .as_ref()
+            .or(initial.as_ref())
+            .cloned()
+            .unwrap_or_else(|| initial_candidate_receipt(reservation));
+        let snapshot = read_index_snapshot(&candidate_path)?;
+        if !snapshot_matches(
+            &snapshot,
+            expected.candidate_index_size,
+            &expected.candidate_index_sha256,
+        ) {
+            return Err(GitError::RecoveryConflict);
+        }
+    } else if !path_entry_is_absent(&candidate_path)? {
+        return Err(GitError::RecoveryConflict);
+    }
+    if marker_staging_created {
+        let final_receipt = final_receipt.as_ref().ok_or(GitError::RecoveryConflict)?;
+        remove_verified_marker_if_present(root, reservation, final_receipt)?;
+    }
+    if candidate_created {
+        let expected = final_receipt
+            .as_ref()
+            .or(initial.as_ref())
+            .cloned()
+            .unwrap_or_else(|| initial_candidate_receipt(reservation));
+        remove_verified_candidate_if_present(root, &expected)?;
+    }
+    if let Some(receipt) = &final_receipt {
+        remove_candidate_receipt_exact(root, receipt)?;
+    }
+    if let Some(receipt) = &initial {
+        remove_candidate_receipt_exact(root, receipt)?;
+    }
+    remove_prelock_reservation_exact(root, reservation)
+}
+
+fn recover_prelock_without_index_lock(
+    root: &Path,
+    reservation: &PreLockReservation,
+) -> Result<(), GitError> {
+    validate_prelock_reservation(reservation)?;
+    if read_prelock_reservation(root)?.as_ref() != Some(reservation)
+        || !path_entry_is_absent(&index_lock_path(root))?
+        || !path_entry_is_absent(&journal_path(root))?
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    validate_prelock_private_inventory(root, reservation, false, false)?;
+    if !path_entry_is_absent(&prelock_reservation_staging_path(
+        root,
+        &reservation.lock_token,
+    ))? {
+        return Err(GitError::RecoveryConflict);
+    }
+    let live = read_index_snapshot(&index_path(root))?;
+    if !snapshot_matches(
+        &live,
+        reservation.expected_index_size,
+        &reservation.expected_index_sha256,
+    ) {
+        return Err(GitError::RecoveryConflict);
+    }
+    let journal_staging = root.join(VAULT_LOCAL_DIRECTORY).join(format!(
+        "{JOURNAL_STAGING_PREFIX}{}",
+        reservation.lock_token
+    ));
+    if !path_entry_is_absent(&journal_staging)? {
+        return Err(GitError::RecoveryConflict);
+    }
+    clean_verified_prelock_owned_files(root, reservation)?;
+    remove_prelock_reservation_exact(root, reservation)
+}
+
 fn prepare_index_cas(
     git: &Git,
     transaction: &MergeJournalPayload,
@@ -3233,19 +4161,36 @@ where
     let old = read_index_snapshot(&index_path(&git.root))?;
     let local = git.root.join(VAULT_LOCAL_DIRECTORY);
     validate_local_directory(&local)?;
+    if !exact_reserved_private_names(&git.root)?.is_empty() {
+        return Err(GitError::RecoveryConflict);
+    }
 
     let lock_token = Uuid::new_v4().simple().to_string();
     let candidate_file = format!("{INDEX_CANDIDATE_PREFIX}{lock_token}");
+    let prelock = PreLockReservation {
+        version: 4,
+        object_format: git.object_format,
+        lock_token: lock_token.clone(),
+        candidate_file: candidate_file.clone(),
+        expected_index_sha256: old.sha256.clone(),
+        expected_index_size: old.size,
+    };
+    install_prelock_reservation(&git.root, &prelock)?;
+    let mut prelock_guard = PreLockReservationGuard::new(git.root.clone(), prelock.clone());
+    validate_prelock_private_inventory(&git.root, &prelock, false, false)?;
     let candidate_path = index_candidate_path(&git.root, &candidate_file);
     let marker_path = index_marker_staging_path(&git.root, &lock_token);
     let candidate_file_handle = create_private_file(&candidate_path, &old.bytes)?;
+    prelock_guard.candidate_created();
     drop(candidate_file_handle);
-    let mut private_files = PreLockPrivateFiles::new(vec![
-        marker_path.clone(),
-        appended_lock_path(&candidate_path),
-        candidate_path.clone(),
-    ]);
     sync_directory(&local).map_err(|_| GitError::DurabilityNotConfirmed)?;
+    let initial_candidate = read_index_snapshot(&candidate_path)?;
+    if !snapshot_matches(&initial_candidate, old.size, &old.sha256) {
+        return Err(GitError::RecoveryConflict);
+    }
+    let initial_receipt = initial_candidate_receipt(&prelock);
+    install_candidate_receipt(&git.root, &initial_receipt)?;
+    prelock_guard.initial_receipt_created();
 
     let candidate_git = git.with_index_file(candidate_path.clone())?;
     let before = index_entry_map(&candidate_git)?;
@@ -3255,6 +4200,9 @@ where
     if candidate.sha256 == old.sha256 {
         return Err(GitError::IndexChanged);
     }
+    let final_receipt = final_candidate_receipt(&prelock, candidate.size, &candidate.sha256);
+    install_candidate_receipt(&git.root, &final_receipt)?;
+    prelock_guard.final_receipt_created();
     before_lock()?;
 
     let marker = index_lock_marker_bytes(
@@ -3265,6 +4213,7 @@ where
         &candidate.sha256,
     );
     let marker_file = create_private_file(&marker_path, &marker)?;
+    prelock_guard.marker_staging_created();
     sync_directory(&local).map_err(|_| GitError::DurabilityNotConfirmed)?;
     let lock_path = index_lock_path(&git.root);
     let move_result = atomic_move_verified_file_no_replace(&marker_path, &marker_file, &lock_path);
@@ -3289,7 +4238,7 @@ where
                     Err(io_error(GitIoOperation::SyncGitState, &error))
                 };
             } else {
-                private_files.disarm();
+                prelock_guard.disarm();
                 return Err(GitError::RecoveryConflict);
             }
         }
@@ -3297,6 +4246,7 @@ where
 
     let mut prepared = PreparedIndexCas {
         root: git.root.clone(),
+        prelock,
         object_format: git.object_format,
         lock_token,
         lock_marker_sha256: hex_digest(digest(&marker)),
@@ -3307,7 +4257,7 @@ where
         candidate_index_size: candidate.size,
         armed: true,
     };
-    private_files.disarm();
+    prelock_guard.disarm();
     if !namespace_durable {
         prepared.disarm();
         return Err(GitError::DurabilityNotConfirmed);
@@ -3339,6 +4289,10 @@ fn write_cas_journal(
     match write_journal(root, &pending) {
         Ok(()) => {
             prepared.disarm();
+            let PendingMergeJournal::Cas(journal) = &pending else {
+                return Err(GitError::InvalidJournal);
+            };
+            remove_prelock_after_stable_journal(root, &prepared.prelock, journal)?;
             Ok(pending)
         }
         Err(error) => {
@@ -3351,6 +4305,9 @@ fn write_cas_journal(
                     && fs::symlink_metadata(journal_path(root)).is_ok())
             {
                 prepared.disarm();
+            }
+            if exact_journal_is_visible && let PendingMergeJournal::Cas(journal) = &pending {
+                let _ = remove_prelock_after_stable_journal(root, &prepared.prelock, journal);
             }
             Err(error)
         }
@@ -3418,6 +4375,10 @@ enum AbandonedCasReservation {
     None,
     Exact {
         marker: Vec<u8>,
+        lock_token: String,
+        candidate_file: String,
+        expected_index_size: u64,
+        expected_index_sha256: String,
         candidate_path: PathBuf,
         candidate_size: u64,
         candidate_sha256: String,
@@ -3462,7 +4423,7 @@ fn inspect_abandoned_cas_reservation(root: &Path) -> Result<AbandonedCasReservat
     };
     let candidate_file = format!("{INDEX_CANDIDATE_PREFIX}{}", parsed.lock_token);
     let candidate_path = index_candidate_path(root, &candidate_file);
-    if index_marker_staging_path(root, &parsed.lock_token).exists() {
+    if !path_entry_is_absent(&index_marker_staging_path(root, &parsed.lock_token))? {
         return Ok(AbandonedCasReservation::Conflict);
     }
     let Ok(Some(candidate)) = optional_index_snapshot(&candidate_path) else {
@@ -3490,11 +4451,15 @@ fn inspect_abandoned_cas_reservation(root: &Path) -> Result<AbandonedCasReservat
         Ok(metadata) if !is_link_or_reparse_point(&metadata) && metadata.file_type().is_file() => {
             Some(journal_staging_path)
         }
-        Ok(_) => None,
+        Ok(_) => return Ok(AbandonedCasReservation::Conflict),
         Err(error) => return Err(io_error(GitIoOperation::InspectMetadata, &error)),
     };
     Ok(AbandonedCasReservation::Exact {
         marker,
+        lock_token: parsed.lock_token,
+        candidate_file,
+        expected_index_size: parsed.expected_index_size,
+        expected_index_sha256: parsed.expected_index_sha256,
         candidate_path,
         candidate_size: parsed.candidate_index_size,
         candidate_sha256: parsed.candidate_index_sha256,
@@ -3502,25 +4467,98 @@ fn inspect_abandoned_cas_reservation(root: &Path) -> Result<AbandonedCasReservat
     })
 }
 
-fn recover_abandoned_cas_reservation(root: &Path) -> Result<bool, GitError> {
+fn recover_abandoned_cas_reservation(
+    root: &Path,
+    object_format: GitObjectFormat,
+) -> Result<bool, GitError> {
+    let prelock = read_prelock_reservation(root)?;
     match inspect_abandoned_cas_reservation(root)? {
-        AbandonedCasReservation::None => Ok(false),
+        AbandonedCasReservation::None => {
+            let Some(reservation) = prelock else {
+                return Ok(false);
+            };
+            if reservation.object_format != object_format {
+                return Err(GitError::RecoveryConflict);
+            }
+            recover_prelock_without_index_lock(root, &reservation)?;
+            Ok(true)
+        }
         AbandonedCasReservation::Conflict => Err(GitError::RecoveryConflict),
         AbandonedCasReservation::Exact {
             marker,
+            lock_token,
+            candidate_file,
+            expected_index_size,
+            expected_index_sha256,
             candidate_path,
             candidate_size,
             candidate_sha256,
             journal_staging_path,
         } => {
+            if let Some(reservation) = &prelock
+                && (reservation.object_format != object_format
+                    || reservation.lock_token != lock_token
+                    || reservation.candidate_file != candidate_file
+                    || reservation.expected_index_size != expected_index_size
+                    || reservation.expected_index_sha256 != expected_index_sha256)
+            {
+                return Err(GitError::RecoveryConflict);
+            }
+            if let Some(reservation) = &prelock {
+                validate_prelock_private_inventory(root, reservation, false, true)?;
+                let initial = read_candidate_receipt(
+                    root,
+                    &reservation.lock_token,
+                    CandidateReceiptPhase::Initial,
+                )?
+                .ok_or(GitError::RecoveryConflict)?;
+                let final_receipt = read_candidate_receipt(
+                    root,
+                    &reservation.lock_token,
+                    CandidateReceiptPhase::Final,
+                )?
+                .ok_or(GitError::RecoveryConflict)?;
+                if initial != initial_candidate_receipt(reservation)
+                    || final_receipt
+                        != final_candidate_receipt(reservation, candidate_size, &candidate_sha256)
+                {
+                    return Err(GitError::RecoveryConflict);
+                }
+            }
             if let Some(staging_path) = journal_staging_path {
-                let _ = remove_reserved_regular_file(&staging_path);
+                let pending = read_journal_file(&staging_path)?;
+                let PendingMergeJournal::Cas(journal) = pending else {
+                    return Err(GitError::RecoveryConflict);
+                };
+                if journal.lock_token != lock_token
+                    || journal.candidate_file != candidate_file
+                    || journal.expected_index_size != expected_index_size
+                    || journal.expected_index_sha256 != expected_index_sha256
+                    || journal.candidate_index_size != candidate_size
+                    || journal.candidate_index_sha256 != candidate_sha256
+                {
+                    return Err(GitError::RecoveryConflict);
+                }
+                let bytes = serde_json::to_vec(&journal).map_err(|_| GitError::InvalidJournal)?;
+                if read_regular_exact(&staging_path, bytes.len())? != bytes
+                    || !remove_regular_file_if_exact(&staging_path, &bytes)?
+                {
+                    return Err(GitError::RecoveryConflict);
+                }
             }
             if !remove_regular_file_if_exact(&index_lock_path(root), &marker)? {
                 return Err(GitError::RecoveryConflict);
             }
             if !remove_regular_file_if_digest(&candidate_path, candidate_size, &candidate_sha256)? {
                 return Err(GitError::RecoveryConflict);
+            }
+            if let Some(reservation) = &prelock {
+                let final_receipt =
+                    final_candidate_receipt(reservation, candidate_size, &candidate_sha256);
+                let initial = initial_candidate_receipt(reservation);
+                remove_candidate_receipt_exact(root, &final_receipt)?;
+                remove_candidate_receipt_exact(root, &initial)?;
+                remove_prelock_reservation_exact(root, reservation)?;
             }
             Ok(true)
         }
@@ -4380,20 +5418,57 @@ fn recover_cas_pending(
 
 fn recover_pending(vault: &Vault, git: &Git) -> Result<bool, GitError> {
     let guard = VaultMutationGuard::acquire(vault.root()).map_err(map_atomic_error)?;
+    let reserved_names = exact_reserved_private_names(vault.root())?;
     let Some(pending) = read_journal(vault.root())? else {
-        return recover_abandoned_cas_reservation(vault.root());
+        if read_prelock_reservation(vault.root())?.is_none() {
+            match inspect_orphan_prelock_staging(vault.root(), &reserved_names)? {
+                OrphanPrelockStaging::Exact { reservation, path } => {
+                    recover_orphan_prelock_staging(git.object_format, &reservation, &path)?;
+                    return Ok(true);
+                }
+                OrphanPrelockStaging::Conflict => return Err(GitError::RecoveryConflict),
+                OrphanPrelockStaging::None => {}
+            }
+        }
+        let recovered = recover_abandoned_cas_reservation(vault.root(), git.object_format)?;
+        if !recovered && !reserved_names.is_empty() {
+            return Err(GitError::RecoveryConflict);
+        }
+        return Ok(recovered);
     };
+    let prelock = read_prelock_reservation(vault.root())?;
+    if prelock.is_none()
+        && reserved_names.iter().any(|name| {
+            name.starts_with(PRELOCK_RESERVATION_STAGING_PREFIX)
+                || name.starts_with(CANDIDATE_INITIAL_RECEIPT_PREFIX)
+                || name.starts_with(CANDIDATE_FINAL_RECEIPT_PREFIX)
+        })
+    {
+        return Err(GitError::RecoveryConflict);
+    }
     match &pending {
         PendingMergeJournal::InPlace(journal) => {
+            if prelock.is_some() {
+                return Err(GitError::RecoveryConflict);
+            }
             recover_in_place_pending(vault, git, &guard, journal)?;
         }
         PendingMergeJournal::Rename(journal) => {
+            if prelock.is_some() {
+                return Err(GitError::RecoveryConflict);
+            }
             recover_split_rename_pending(vault, git, &guard, journal)?;
         }
         PendingMergeJournal::DetectedRename(journal) => {
+            if prelock.is_some() {
+                return Err(GitError::RecoveryConflict);
+            }
             recover_detected_rename_pending(vault, git, &guard, journal)?;
         }
         PendingMergeJournal::Cas(journal) => {
+            if let Some(reservation) = &prelock {
+                remove_prelock_after_stable_journal(vault.root(), reservation, journal)?;
+            }
             recover_cas_pending(vault, git, &guard, journal)?;
         }
     }
@@ -6352,7 +7427,29 @@ mod tests {
         let PendingMergeJournal::Cas(journal) = pending else {
             panic!("expected CAS journal");
         };
+        assert!(!prelock_reservation_path(fixture.vault.root()).exists());
         journal
+    }
+
+    fn test_prelock_reservation(fixture: &RenameRecoveryFixture) -> PreLockReservation {
+        let old = read_index_snapshot(&index_path(fixture.vault.root()))
+            .expect("old index snapshots for prelock fixture");
+        let lock_token = Uuid::new_v4().simple().to_string();
+        PreLockReservation {
+            version: 4,
+            object_format: fixture.git.object_format,
+            candidate_file: format!("{INDEX_CANDIDATE_PREFIX}{lock_token}"),
+            lock_token,
+            expected_index_sha256: old.sha256,
+            expected_index_size: old.size,
+        }
+    }
+
+    fn install_test_prelock_reservation(fixture: &RenameRecoveryFixture) -> PreLockReservation {
+        let reservation = test_prelock_reservation(fixture);
+        install_prelock_reservation(fixture.vault.root(), &reservation)
+            .expect("prelock fixture publishes durably");
+        reservation
     }
 
     fn assert_no_cas_private_files(root: &Path) {
@@ -6367,6 +7464,10 @@ mod tests {
                     !name.starts_with(INDEX_CANDIDATE_PREFIX)
                         && !name.starts_with(INDEX_MARKER_PREFIX)
                         && !name.starts_with(JOURNAL_STAGING_PREFIX)
+                        && !name.starts_with(PRELOCK_RESERVATION_STAGING_PREFIX)
+                        && !name.starts_with(CANDIDATE_INITIAL_RECEIPT_PREFIX)
+                        && !name.starts_with(CANDIDATE_FINAL_RECEIPT_PREFIX)
+                        && name != PRELOCK_RESERVATION_FILE
                 })
         );
     }
@@ -7634,28 +8735,620 @@ mod tests {
     }
 
     #[test]
+    fn prelock_recovery_cleans_process_kill_state_without_running_raii() {
+        let fixture = create_rename_recovery_fixture();
+        let reservation = install_test_prelock_reservation(&fixture);
+        let candidate = index_candidate_path(fixture.vault.root(), &reservation.candidate_file);
+        let old = read_index_snapshot(&index_path(fixture.vault.root()))
+            .expect("old index snapshots for killed process fixture");
+        fs::write(&candidate, &old.bytes).expect("owned candidate fixture writes");
+        install_candidate_receipt(
+            fixture.vault.root(),
+            &initial_candidate_receipt(&reservation),
+        )
+        .expect("initial ownership receipt publishes");
+
+        assert!(!index_lock_path(fixture.vault.root()).exists());
+        assert!(
+            has_pending_recovery(fixture.vault.root()).expect("durable prelock reports pending")
+        );
+        fixture.assert_original_index();
+
+        let report = recover(&fixture.vault).expect("prelock-only state recovers");
+        assert_eq!(report.recovered_transactions, 1);
+        fixture.assert_original_index();
+        assert!(fixture.source_target.is_file());
+        assert!(fixture.destination_target.is_file());
+        assert!(
+            !has_pending_recovery(fixture.vault.root())
+                .expect("cleaned prelock is no longer pending")
+        );
+        assert_no_cas_private_files(fixture.vault.root());
+    }
+
+    #[test]
+    fn receipt_gap_crash_states_are_visible_preserved_and_fail_closed() {
+        let fixture = create_rename_recovery_fixture();
+        let reservation = install_test_prelock_reservation(&fixture);
+        let candidate = index_candidate_path(fixture.vault.root(), &reservation.candidate_file);
+        let old = read_index_snapshot(&index_path(fixture.vault.root()))
+            .expect("old index snapshots for receipt-gap fixture");
+        fs::write(&candidate, &old.bytes).expect("pre-receipt candidate fixture writes");
+
+        assert!(matches!(
+            has_pending_recovery(fixture.vault.root()),
+            Err(GitError::RecoveryConflict)
+        ));
+        assert!(matches!(
+            recover_pending(&fixture.vault, &fixture.git),
+            Err(GitError::RecoveryConflict)
+        ));
+        assert_eq!(
+            fs::read(&candidate).expect("pre-receipt candidate remains"),
+            old.bytes
+        );
+        assert_eq!(
+            read_prelock_reservation(fixture.vault.root())
+                .expect("pre-receipt reservation re-reads")
+                .as_ref(),
+            Some(&reservation)
+        );
+        fixture.assert_original_index();
+
+        install_candidate_receipt(
+            fixture.vault.root(),
+            &initial_candidate_receipt(&reservation),
+        )
+        .expect("initial receipt fixture publishes");
+        let partial_candidate = b"partial candidate after Git process kill";
+        fs::write(&candidate, partial_candidate).expect("partial candidate fixture writes");
+
+        assert!(matches!(
+            has_pending_recovery(fixture.vault.root()),
+            Err(GitError::RecoveryConflict | GitError::IndexChanged)
+        ));
+        assert!(matches!(
+            recover_pending(&fixture.vault, &fixture.git),
+            Err(GitError::RecoveryConflict | GitError::IndexChanged)
+        ));
+        assert_eq!(
+            fs::read(&candidate).expect("partial candidate remains"),
+            partial_candidate
+        );
+        assert_eq!(
+            read_candidate_receipt(
+                fixture.vault.root(),
+                &reservation.lock_token,
+                CandidateReceiptPhase::Initial,
+            )
+            .expect("initial receipt re-reads")
+            .as_ref(),
+            Some(&initial_candidate_receipt(&reservation))
+        );
+        fixture.assert_original_index();
+    }
+
+    #[test]
+    fn exact_final_receipt_before_marker_is_recoverable() {
+        let fixture = create_rename_recovery_fixture();
+        let reservation = install_test_prelock_reservation(&fixture);
+        let candidate = index_candidate_path(fixture.vault.root(), &reservation.candidate_file);
+        let old = read_index_snapshot(&index_path(fixture.vault.root()))
+            .expect("old index snapshots for final-receipt fixture");
+        fs::write(&candidate, &old.bytes).expect("candidate fixture writes");
+        install_candidate_receipt(
+            fixture.vault.root(),
+            &initial_candidate_receipt(&reservation),
+        )
+        .expect("initial receipt fixture publishes");
+        let candidate_git = fixture
+            .git
+            .with_index_file(candidate.clone())
+            .expect("candidate Git fixture opens");
+        let transaction = MergeJournalPayload::Rename(fixture.journal.clone());
+        let before = index_entry_map(&candidate_git).expect("candidate stage map snapshots");
+        apply_payload_to_index(&candidate_git, &transaction)
+            .expect("candidate transaction applies");
+        verify_candidate_index(&candidate_git, &transaction, &before)
+            .expect("candidate transaction verifies");
+        let final_candidate = read_index_snapshot(&candidate).expect("final candidate snapshots");
+        install_candidate_receipt(
+            fixture.vault.root(),
+            &final_candidate_receipt(&reservation, final_candidate.size, &final_candidate.sha256),
+        )
+        .expect("final receipt fixture publishes");
+
+        assert!(has_pending_recovery(fixture.vault.root()).expect("final receipt is pending"));
+        assert!(recover_pending(&fixture.vault, &fixture.git).expect("final receipt recovers"));
+        fixture.assert_original_index();
+        assert_no_cas_private_files(fixture.vault.root());
+        assert!(
+            !has_pending_recovery(fixture.vault.root())
+                .expect("final-receipt recovery leaves no pending state")
+        );
+    }
+
+    #[test]
+    fn partial_candidate_receipt_is_preserved_and_fails_closed() {
+        let fixture = create_rename_recovery_fixture();
+        let reservation = install_test_prelock_reservation(&fixture);
+        let candidate = index_candidate_path(fixture.vault.root(), &reservation.candidate_file);
+        let old = read_index_snapshot(&index_path(fixture.vault.root()))
+            .expect("old index snapshots for partial receipt fixture");
+        fs::write(&candidate, &old.bytes).expect("candidate fixture writes");
+        let receipt = initial_candidate_receipt(&reservation);
+        let receipt_bytes = candidate_receipt_bytes(&receipt).expect("receipt serializes");
+        let receipt_path = candidate_receipt_path(
+            fixture.vault.root(),
+            &reservation.lock_token,
+            CandidateReceiptPhase::Initial,
+        );
+        let partial = &receipt_bytes[..receipt_bytes.len() / 2];
+        fs::write(&receipt_path, partial).expect("partial receipt fixture writes");
+
+        assert!(matches!(
+            has_pending_recovery(fixture.vault.root()),
+            Err(GitError::InvalidJournal)
+        ));
+        assert!(matches!(
+            recover_pending(&fixture.vault, &fixture.git),
+            Err(GitError::InvalidJournal)
+        ));
+        assert_eq!(
+            fs::read(&receipt_path).expect("partial receipt remains"),
+            partial
+        );
+        assert_eq!(
+            fs::read(&candidate).expect("candidate remains with partial receipt"),
+            old.bytes
+        );
+        assert_eq!(
+            read_prelock_reservation(fixture.vault.root())
+                .expect("partial-receipt reservation re-reads")
+                .as_ref(),
+            Some(&reservation)
+        );
+        fixture.assert_original_index();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_prelock_transaction_links_are_preserved_and_fail_closed() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = create_rename_recovery_fixture();
+        let reservation = install_test_prelock_reservation(&fixture);
+        let local = fixture.vault.root().join(VAULT_LOCAL_DIRECTORY);
+        let missing_target = local.join("missing-link-target");
+        let paths = [
+            prelock_reservation_staging_path(fixture.vault.root(), &reservation.lock_token),
+            index_marker_staging_path(fixture.vault.root(), &reservation.lock_token),
+            local.join(format!(
+                "{JOURNAL_STAGING_PREFIX}{}",
+                reservation.lock_token
+            )),
+        ];
+
+        for path in paths {
+            symlink(&missing_target, &path).expect("dangling transaction link creates");
+            assert!(matches!(
+                has_pending_recovery(fixture.vault.root()),
+                Err(GitError::RecoveryConflict | GitError::InvalidJournal)
+            ));
+            assert!(matches!(
+                recover_pending(&fixture.vault, &fixture.git),
+                Err(GitError::RecoveryConflict | GitError::InvalidJournal)
+            ));
+            let metadata = fs::symlink_metadata(&path).expect("dangling link remains");
+            assert!(metadata.file_type().is_symlink());
+            assert!(!missing_target.exists());
+            fs::remove_file(path).expect("dangling link fixture removes");
+        }
+        fixture.assert_original_index();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_journal_staging_in_abandoned_marker_state_is_preserved() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = create_rename_recovery_fixture();
+        let transaction = MergeJournalPayload::Rename(fixture.journal.clone());
+        let mut prepared =
+            prepare_index_cas(&fixture.git, &transaction).expect("CAS marker state prepares");
+        let lock_token = prepared.lock_token.clone();
+        let candidate = index_candidate_path(fixture.vault.root(), &prepared.candidate_file);
+        let initial_receipt = candidate_receipt_path(
+            fixture.vault.root(),
+            &lock_token,
+            CandidateReceiptPhase::Initial,
+        );
+        let final_receipt = candidate_receipt_path(
+            fixture.vault.root(),
+            &lock_token,
+            CandidateReceiptPhase::Final,
+        );
+        prepared.disarm();
+        drop(prepared);
+        let local = fixture.vault.root().join(VAULT_LOCAL_DIRECTORY);
+        let journal_staging = local.join(format!("{JOURNAL_STAGING_PREFIX}{lock_token}"));
+        let missing_target = local.join("missing-journal-staging-target");
+        symlink(&missing_target, &journal_staging)
+            .expect("dangling journal staging fixture creates");
+
+        assert!(matches!(
+            recover_pending(&fixture.vault, &fixture.git),
+            Err(GitError::RecoveryConflict)
+        ));
+        assert!(
+            fs::symlink_metadata(&journal_staging)
+                .expect("dangling journal staging remains")
+                .file_type()
+                .is_symlink()
+        );
+        assert!(index_lock_path(fixture.vault.root()).is_file());
+        assert!(candidate.is_file());
+        assert!(initial_receipt.is_file());
+        assert!(final_receipt.is_file());
+        assert!(prelock_reservation_path(fixture.vault.root()).is_file());
+        assert!(!missing_target.exists());
+        fixture.assert_original_index();
+    }
+
+    #[test]
+    fn canonical_orphan_prelock_staging_is_pending_and_recoverable() {
+        let fixture = create_rename_recovery_fixture();
+        let reservation = test_prelock_reservation(&fixture);
+        let bytes = prelock_reservation_bytes(&reservation).expect("prelock serializes");
+        let path = prelock_reservation_staging_path(fixture.vault.root(), &reservation.lock_token);
+        drop(create_private_file(&path, &bytes).expect("orphan staging fixture writes"));
+
+        assert!(has_pending_recovery(fixture.vault.root()).expect("orphan staging is pending"));
+        let report = recover(&fixture.vault).expect("canonical orphan staging recovers");
+        assert_eq!(report.recovered_transactions, 1);
+        assert!(!path.exists());
+        fixture.assert_original_index();
+        assert_no_cas_private_files(fixture.vault.root());
+    }
+
+    #[test]
+    fn partial_or_multiple_prelock_staging_fails_closed_and_is_preserved() {
+        let fixture = create_rename_recovery_fixture();
+        let reservation = test_prelock_reservation(&fixture);
+        let bytes = prelock_reservation_bytes(&reservation).expect("prelock serializes");
+        let path = prelock_reservation_staging_path(fixture.vault.root(), &reservation.lock_token);
+        fs::write(&path, &bytes[..bytes.len() / 2]).expect("partial staging fixture writes");
+        assert!(has_pending_recovery(fixture.vault.root()).is_err());
+        assert!(recover_pending(&fixture.vault, &fixture.git).is_err());
+        assert_eq!(
+            fs::read(&path).expect("partial staging remains"),
+            &bytes[..bytes.len() / 2]
+        );
+        fs::remove_file(&path).expect("partial staging fixture removes");
+
+        let second = test_prelock_reservation(&fixture);
+        for reservation in [&reservation, &second] {
+            let bytes = prelock_reservation_bytes(reservation).expect("prelock serializes");
+            let path =
+                prelock_reservation_staging_path(fixture.vault.root(), &reservation.lock_token);
+            fs::write(path, bytes).expect("multiple staging fixture writes");
+        }
+        assert!(matches!(
+            has_pending_recovery(fixture.vault.root()),
+            Err(GitError::RecoveryConflict)
+        ));
+        assert!(matches!(
+            recover_pending(&fixture.vault, &fixture.git),
+            Err(GitError::RecoveryConflict)
+        ));
+        for reservation in [&reservation, &second] {
+            assert!(
+                prelock_reservation_staging_path(fixture.vault.root(), &reservation.lock_token)
+                    .is_file()
+            );
+        }
+        fixture.assert_original_index();
+    }
+
+    #[test]
+    fn wrong_case_reserved_prelock_name_fails_closed_cross_platform() {
+        let fixture = create_rename_recovery_fixture();
+        let reservation = test_prelock_reservation(&fixture);
+        let wrong_case = format!("GIT-INDEX-PRELOCK-STAGE-V4-{}", reservation.lock_token);
+        let path = fixture
+            .vault
+            .root()
+            .join(VAULT_LOCAL_DIRECTORY)
+            .join(wrong_case);
+        fs::write(
+            &path,
+            prelock_reservation_bytes(&reservation).expect("prelock serializes"),
+        )
+        .expect("wrong-case staging fixture writes");
+
+        assert!(matches!(
+            has_pending_recovery(fixture.vault.root()),
+            Err(GitError::RecoveryConflict)
+        ));
+        assert!(matches!(
+            recover_pending(&fixture.vault, &fixture.git),
+            Err(GitError::RecoveryConflict)
+        ));
+        assert!(path.is_file());
+        fixture.assert_original_index();
+    }
+
+    #[test]
+    fn raii_does_not_delete_foreign_candidate_when_create_phase_never_completed() {
+        let fixture = create_rename_recovery_fixture();
+        let reservation = install_test_prelock_reservation(&fixture);
+        let candidate = index_candidate_path(fixture.vault.root(), &reservation.candidate_file);
+        let foreign = b"foreign same-token ordinary file";
+        fs::write(&candidate, foreign).expect("foreign candidate fixture writes");
+        drop(PreLockReservationGuard::new(
+            fixture.vault.root().to_path_buf(),
+            reservation.clone(),
+        ));
+
+        assert_eq!(
+            fs::read(&candidate).expect("foreign candidate remains"),
+            foreign
+        );
+        assert!(prelock_reservation_path(fixture.vault.root()).is_file());
+        assert!(matches!(
+            recover_pending(&fixture.vault, &fixture.git),
+            Err(GitError::RecoveryConflict | GitError::IndexChanged)
+        ));
+        fixture.assert_original_index();
+    }
+
+    #[test]
+    fn prelock_recovery_preserves_hardlinked_token_file_and_fails_closed() {
+        let fixture = create_rename_recovery_fixture();
+        let reservation = install_test_prelock_reservation(&fixture);
+        let local = fixture.vault.root().join(VAULT_LOCAL_DIRECTORY);
+        let sentinel = local.join("prelock-hardlink-sentinel");
+        let candidate = index_candidate_path(fixture.vault.root(), &reservation.candidate_file);
+        fs::write(&sentinel, b"foreign same-inode sentinel")
+            .expect("hardlink sentinel fixture writes");
+        fs::hard_link(&sentinel, &candidate).expect("candidate hardlink fixture installs");
+
+        assert!(matches!(
+            recover_pending(&fixture.vault, &fixture.git),
+            Err(GitError::RecoveryConflict)
+        ));
+        assert_eq!(
+            fs::read(&sentinel).expect("sentinel re-reads"),
+            b"foreign same-inode sentinel"
+        );
+        assert!(candidate.is_file());
+        assert!(prelock_reservation_path(fixture.vault.root()).is_file());
+        fixture.assert_original_index();
+    }
+
+    #[test]
+    fn prelock_recovery_rejects_unrelated_reserved_transaction_file() {
+        let fixture = create_rename_recovery_fixture();
+        let reservation = install_test_prelock_reservation(&fixture);
+        let unrelated = fixture
+            .vault
+            .root()
+            .join(VAULT_LOCAL_DIRECTORY)
+            .join(format!(
+                "{INDEX_CANDIDATE_PREFIX}{}",
+                Uuid::new_v4().simple()
+            ));
+        fs::write(&unrelated, b"unrelated private transaction state")
+            .expect("unrelated reserved fixture writes");
+
+        assert!(matches!(
+            recover_pending(&fixture.vault, &fixture.git),
+            Err(GitError::RecoveryConflict)
+        ));
+        assert!(unrelated.is_file());
+        assert!(prelock_reservation_path(fixture.vault.root()).is_file());
+        assert_eq!(
+            read_prelock_reservation(fixture.vault.root())
+                .expect("prelock re-reads")
+                .as_ref(),
+            Some(&reservation)
+        );
+        fixture.assert_original_index();
+    }
+
+    #[test]
+    fn malformed_prelock_reservation_is_reported_and_never_removed() {
+        let fixture = create_rename_recovery_fixture();
+        let path = prelock_reservation_path(fixture.vault.root());
+        let malformed = b"{\"version\":4,\"version\":4}";
+        fs::write(&path, malformed).expect("malformed prelock fixture writes");
+
+        assert!(matches!(
+            has_pending_recovery(fixture.vault.root()),
+            Err(GitError::InvalidJournal)
+        ));
+        assert!(matches!(
+            recover_pending(&fixture.vault, &fixture.git),
+            Err(GitError::InvalidJournal)
+        ));
+        assert_eq!(
+            fs::read(path).expect("malformed prelock remains"),
+            malformed
+        );
+        fixture.assert_original_index();
+    }
+
+    #[test]
+    fn prelock_schema_rejects_unknown_types_and_noncanonical_json() {
+        let fixture = create_rename_recovery_fixture();
+        let reservation = test_prelock_reservation(&fixture);
+        let canonical = prelock_reservation_bytes(&reservation).expect("prelock serializes");
+        let text = std::str::from_utf8(&canonical).expect("prelock JSON is UTF-8");
+        let path = prelock_reservation_path(fixture.vault.root());
+        let mut mutations = vec![
+            text.replacen('{', "{\"unknown\":true,", 1).into_bytes(),
+            text.replacen("\"version\":4", "\"version\":true", 1)
+                .into_bytes(),
+            text.replacen(
+                &format!(
+                    "\"expected_index_size\":{}",
+                    reservation.expected_index_size
+                ),
+                "\"expected_index_size\":1.0",
+                1,
+            )
+            .into_bytes(),
+            text.replacen("\"object_format\":\"sha1\"", "\"object_format\":7", 1)
+                .into_bytes(),
+        ];
+        let mut missing: serde_json::Value =
+            serde_json::from_slice(&canonical).expect("prelock value parses");
+        missing
+            .as_object_mut()
+            .expect("prelock is an object")
+            .remove("candidate_file");
+        mutations.push(serde_json::to_vec(&missing).expect("missing-field value serializes"));
+        let mut reordered: serde_json::Value =
+            serde_json::from_slice(&canonical).expect("prelock value parses");
+        let version = reordered
+            .as_object_mut()
+            .expect("prelock is an object")
+            .remove("version")
+            .expect("version exists");
+        reordered
+            .as_object_mut()
+            .expect("prelock is an object")
+            .insert("version".to_owned(), version);
+        mutations.push(serde_json::to_vec(&reordered).expect("reordered prelock serializes"));
+        let reordered = serde_json::to_vec_pretty(&reordered).expect("pretty prelock serializes");
+        mutations.push(reordered);
+        let mut whitespace = canonical.clone();
+        whitespace.push(b'\n');
+        mutations.push(whitespace);
+
+        for mutation in mutations {
+            fs::write(&path, &mutation).expect("invalid prelock fixture writes");
+            assert!(matches!(
+                read_prelock_reservation(fixture.vault.root()),
+                Err(GitError::InvalidJournal)
+            ));
+            assert_eq!(fs::read(&path).expect("invalid prelock remains"), mutation);
+            fs::remove_file(&path).expect("invalid prelock fixture removes");
+        }
+    }
+
+    #[test]
+    fn prelock_recovery_rejects_object_format_and_live_index_drift() {
+        let fixture = create_rename_recovery_fixture();
+        let mut wrong_format = test_prelock_reservation(&fixture);
+        wrong_format.object_format = GitObjectFormat::Sha256;
+        install_prelock_reservation(fixture.vault.root(), &wrong_format)
+            .expect("wrong-format prelock fixture publishes");
+        assert!(matches!(
+            recover_pending(&fixture.vault, &fixture.git),
+            Err(GitError::RecoveryConflict)
+        ));
+        assert!(prelock_reservation_path(fixture.vault.root()).is_file());
+        fs::remove_file(prelock_reservation_path(fixture.vault.root()))
+            .expect("wrong-format fixture removes");
+
+        let reservation = install_test_prelock_reservation(&fixture);
+        fs::write(
+            fixture.vault.root().join("external-index-owner.bin"),
+            b"ciphertext-only external index drift",
+        )
+        .expect("external index fixture writes");
+        assert!(test_git(
+            fixture.vault.root(),
+            ["add", "external-index-owner.bin"]
+        ));
+        assert!(matches!(
+            recover_pending(&fixture.vault, &fixture.git),
+            Err(GitError::RecoveryConflict)
+        ));
+        assert_eq!(
+            read_prelock_reservation(fixture.vault.root())
+                .expect("drifted prelock re-reads")
+                .as_ref(),
+            Some(&reservation)
+        );
+    }
+
+    #[test]
+    fn prelock_recovery_preserves_state_when_live_index_is_missing() {
+        let fixture = create_rename_recovery_fixture();
+        let reservation = install_test_prelock_reservation(&fixture);
+        let index = index_path(fixture.vault.root());
+        let saved_index = fixture.vault.root().join("saved-index-for-test");
+        fs::rename(&index, &saved_index).expect("live index fixture retires");
+
+        assert!(recover_pending(&fixture.vault, &fixture.git).is_err());
+        assert!(prelock_reservation_path(fixture.vault.root()).is_file());
+        assert_eq!(
+            read_prelock_reservation(fixture.vault.root())
+                .expect("missing-index prelock re-reads")
+                .as_ref(),
+            Some(&reservation)
+        );
+        fs::rename(saved_index, index).expect("live index fixture restores");
+        fixture.assert_original_index();
+    }
+
+    #[test]
+    fn sha256_repository_recovers_canonical_orphan_prelock_staging() {
+        let (directory, vault) = create_conflicted_repository_with_format(GitObjectFormat::Sha256);
+        let git = Git::open(directory.path()).expect("SHA-256 repository opens");
+        let old =
+            read_index_snapshot(&index_path(directory.path())).expect("SHA-256 index snapshots");
+        let lock_token = Uuid::new_v4().simple().to_string();
+        let reservation = PreLockReservation {
+            version: 4,
+            object_format: GitObjectFormat::Sha256,
+            candidate_file: format!("{INDEX_CANDIDATE_PREFIX}{lock_token}"),
+            lock_token,
+            expected_index_sha256: old.sha256,
+            expected_index_size: old.size,
+        };
+        let path = prelock_reservation_staging_path(directory.path(), &reservation.lock_token);
+        fs::write(
+            &path,
+            prelock_reservation_bytes(&reservation).expect("SHA-256 prelock serializes"),
+        )
+        .expect("SHA-256 orphan staging writes");
+
+        assert!(recover_pending(&vault, &git).expect("SHA-256 orphan staging recovers"));
+        assert!(!path.exists());
+        assert_no_cas_private_files(directory.path());
+    }
+
+    #[test]
+    fn stable_v4_journal_recovers_if_prelock_removal_was_not_durable() {
+        let fixture = create_rename_recovery_fixture();
+        let transaction = MergeJournalPayload::Rename(fixture.journal.clone());
+        let mut prepared =
+            prepare_index_cas(&fixture.git, &transaction).expect("CAS prepares with prelock");
+        let reservation = prepared.prelock.clone();
+        write_cas_journal(fixture.vault.root(), &mut prepared, transaction)
+            .expect("stable v4 journal publishes");
+        assert!(!prelock_reservation_path(fixture.vault.root()).exists());
+        install_prelock_reservation(fixture.vault.root(), &reservation)
+            .expect("post-crash prelock visibility is reconstructed");
+
+        assert!(recover_pending(&fixture.vault, &fixture.git).expect("v4 state recovers"));
+        fixture.assert_final_state();
+        assert_no_cas_private_files(fixture.vault.root());
+    }
+
+    #[test]
     fn abandoned_prejournal_cas_reservation_is_recognized_and_cleaned() {
         let fixture = create_rename_recovery_fixture();
         let transaction = MergeJournalPayload::Rename(fixture.journal.clone());
         let mut prepared =
             prepare_index_cas(&fixture.git, &transaction).expect("prejournal reservation prepares");
-        let pending = PendingMergeJournal::Cas(prepared.journal(transaction));
-        let journal_bytes = match &pending {
-            PendingMergeJournal::Cas(journal) => {
-                serde_json::to_vec(journal).expect("staged journal serializes")
-            }
-            PendingMergeJournal::InPlace(_)
-            | PendingMergeJournal::Rename(_)
-            | PendingMergeJournal::DetectedRename(_) => panic!("expected v4 journal"),
-        };
-        let staging_path = journal_staging_path(fixture.vault.root(), &pending);
-        drop(
-            create_private_file(&staging_path, &journal_bytes[..journal_bytes.len() / 2])
-                .expect("truncated staged journal fixture writes"),
-        );
         prepared.disarm();
         drop(prepared);
         assert!(!journal_path(fixture.vault.root()).exists());
+        assert!(prelock_reservation_path(fixture.vault.root()).is_file());
         assert!(
             has_pending_recovery(fixture.vault.root())
                 .expect("abandoned reservation reports pending")

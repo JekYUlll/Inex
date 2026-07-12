@@ -217,8 +217,10 @@ copies, rename/rename, multiple merge bases, executable/mode disagreement, and
 ambiguous identities fail closed. Versioned source-aware journals recover both
 paths without deleting an unexpected source. Split indexes, unsafe Git
 directories, attribute overrides, non-regular modes, and observed concurrent
-changes also fail closed. New transactions use a v4 alternate-index candidate,
-an Inex-owned real `.git/index.lock`, and exact old/candidate index digest
+changes also fail closed. New transactions publish a v4 pre-lock reservation
+before creating the alternate-index candidate, then use an Inex-owned real
+`.git/index.lock`, phase-bound candidate ownership receipts, and exact
+old/candidate index digest
 bindings. Ordinary index writers that win before the lock are detected by the
 locked recheck; writers started while it is held fail instead of being
 overwritten. Continue to avoid deliberate parallel Git: legacy v1/v2/v3
@@ -244,7 +246,8 @@ vault/Git snapshot.
 ### Recover an interrupted encrypted merge
 
 `inex verify <vault>` reports a structurally valid pending Git journal or an
-Inex-marked pre-journal v4 reservation as:
+Inex-marked pre-journal v4 reservation, including the reservation that precedes
+candidate creation, as:
 
 ```text
 pending-git-merge-transaction: present-authenticated-recovery-required
@@ -256,13 +259,16 @@ Authenticate and reconcile it with:
 "$INEX" git recover /absolute/inex-vault
 ```
 
-For v4, recovery recognizes only `old index + marker + candidate`, `old index +
+For v4, recovery recognizes only `old index + pre-lock reservation` with its
+token-derived transient files, `old index + marker + candidate`, `old index +
 candidate lock`, or a published index whose owned names were consumed. It
 re-authenticates the EDRY result, owner set, fixed rename provenance, target
 stage, and worktree before moving forward. A later unrelated stage may remain;
 a changed/removed result stage is a conflict. Exact abandoned pre-journal
 marker/candidate state is cleaned without changing the index/worktree. Unknown
-or foreign locks are preserved. Legacy v1/v2/v3 journals remain readable but
+or foreign locks are preserved. A force-kill between candidate creation or
+mutation and its matching ownership receipt is also preserved as a recovery
+conflict; do not delete those files by hand. Legacy v1/v2/v3 journals remain readable but
 must be recovered with all other Git stopped. A recovery conflict leaves the
 current state for audit. Do not delete the journal, run `git reset --hard`,
 abort the Git operation, or retry merge writes until the state has been copied
