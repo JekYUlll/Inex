@@ -30,6 +30,45 @@ timeout --signal=TERM --kill-after=5s 90s \
   python3 editors/sublime/test/build4200/run_build4200.py
 ```
 
+That no-argument form is a developer smoke: it copies the current source
+package and uses `target/debug/inex` plus `target/debug/inexd`. It is not
+release-artifact evidence.
+
+To bind the same flow to a strict four-file native release set, run from a
+clean standalone checkout with exact CPython 3.13.14. The report parent must
+already exist outside both the checkout and artifact directory, and each
+output path must be absent:
+
+```sh
+mkdir -m 700 /absolute/private-evidence
+PYTHONDONTWRITEBYTECODE=1 timeout --signal=TERM --kill-after=5s 90s \
+  python3.13 editors/sublime/test/build4200/run_build4200.py \
+  --artifact-directory /absolute/linux-x64-four-file-artifact \
+  --output /absolute/private-evidence/sublime-normal.json
+
+PYTHONDONTWRITEBYTECODE=1 timeout --signal=TERM --kill-after=5s 90s \
+  python3.13 editors/sublime/test/build4200/run_build4200.py \
+  --artifact-directory /absolute/linux-x64-four-file-artifact \
+  --output /absolute/private-evidence/sublime-plugin-host-crash.json \
+  --plugin-host-crash
+```
+
+Artifact mode snapshots and strictly audits all four files, materializes the
+CLI and unpacked Sublime package only from the captured archive bytes, and
+forces production's package-owned `Inex/bin/inexd` resolution. It seals the
+artifact snapshot, installed package, executable and harness identities across
+the run, checks the observed sidecar through Linux `/proc`, removes the
+isolated root, and only then creates the external canonical report as mode
+0600. The artifact and clean harness commits are recorded separately and need
+not be the same commit.
+
+These two single-scenario reports establish an exact-packaged Linux baseline.
+They do not close the persistent-profile matrix: same-profile application
+restart, keyboard/menu Save variants, export/clipboard/macro surfaces,
+matching/stale/corrupt drafts, project/non-project windows, idle/daemon/full
+application kills, all CRUD negative paths, other native platforms, and
+signing/publication remain explicitly outside this increment.
+
 After the minimal flow passes, probe abrupt Python plugin-host loss with:
 
 ```sh
