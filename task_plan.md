@@ -283,6 +283,7 @@ Phase 7 — 跨平台验证、打包与发布准备
 | First payload-authorization Clippy run found one collapsible condition and four needless borrows introduced by the in-place recovery extraction | 1 | Apply the exact lint suggestions without suppressions; targeted authorization tests and pedantic Clippy then pass |
 | Independent payload-authorization review could not start because classifier, marker, and existing review threads occupied the agent limit | 2 | Commit the fully green seam as an isolated reversible checkpoint; request an independent review as soon as either implementation agent finishes, before wiring journal publication |
 | The first post-cherry-pick marker test command used a nonexistent `v5_index_lock_marker` filter and therefore ran zero tests | 1 | Rerun with the exact `v5_marker_lock` filter; all 7 marker tests passed, then run the unfiltered 128-test suite and native/Windows GNU gates |
+| The first durable-journal targeted run blocked because fault tests held a mutation guard and then called a helper that reacquired the same non-reentrant lock | 1 | Stop only the independent-worktree test process; drop the held guard before every fresh-process inspector/recovery call or reuse the existing guard for same-process classification, then rerun sequentially |
 
 ## Notes
 
