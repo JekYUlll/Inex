@@ -100,7 +100,8 @@ Phase 7 — 跨平台验证、打包与发布准备
         - [x] 从 immutable bundle 生成 token-derived publish staging，并支持 fresh-process 重新形成 held bundle/publish proofs；partial scratch 保留不阻塞，foreign/link/rebind/live drift fail closed
         - [x] 严格只读分类真实 `.git/index.lock` 的 absent/exact marker/exact candidate/foreign 状态；candidate 枚举不替代 stage-map/live-old/worktree授权
         - [x] 获取真实 `.git/index.lock` v5 marker：随机 retained scratch、verified no-replace move、双 parent durability、fresh reclassification 与所有失败态保留
-        - [ ] 完成 durable journal、worktree/index 前滚、bundle retire/cleanup 与 force-kill recovery
+        - [x] 发布 v5 durable journal：fresh held marker、三 payload 双授权、随机 retained scratch、no-replace/reconciliation、双目录 durability 与四态 fresh recovery
+        - [ ] 完成 worktree/index 前滚、later-unrelated、bundle retire/cleanup receipt 与 force-kill recovery
   - [ ] 原生 Windows NTFS/ReFS 复验 replace/write-through/power-loss，并由绑定证据决定是否取消 no-parallel-Git 边界
 - [x] 配置 Linux/Windows x64/arm64 CI、Rust 二进制、VSIX 与 Sublime 包产物；远端 hosted jobs 尚待执行
 - [x] 完成 threat model、用户指南、安全配置、迁移/升级与故障恢复文档
@@ -284,6 +285,8 @@ Phase 7 — 跨平台验证、打包与发布准备
 | Independent payload-authorization review could not start because classifier, marker, and existing review threads occupied the agent limit | 2 | Commit the fully green seam as an isolated reversible checkpoint; request an independent review as soon as either implementation agent finishes, before wiring journal publication |
 | The first post-cherry-pick marker test command used a nonexistent `v5_index_lock_marker` filter and therefore ran zero tests | 1 | Rerun with the exact `v5_marker_lock` filter; all 7 marker tests passed, then run the unfiltered 128-test suite and native/Windows GNU gates |
 | The first durable-journal targeted run blocked because fault tests held a mutation guard and then called a helper that reacquired the same non-reentrant lock | 1 | Stop only the independent-worktree test process; drop the held guard before every fresh-process inspector/recovery call or reuse the existing guard for same-process classification, then rerun sequentially |
+| Durable-journal Clippy first rejected two test fixture destructures whose underscore-prefixed bindings were subsequently used | 1 | Rename the bindings to normal identifiers instead of suppressing the lint; rerun targeted tests and pedantic Clippy |
+| A later durable-journal Clippy pass rejected the intentionally exhaustive fresh-entry test as too many lines | 1 | Add a narrow reasoned allow on that single test after confirming its payload/object-format/state matrix is one audit unit; rerun pedantic Clippy with warnings denied |
 
 ## Notes
 
