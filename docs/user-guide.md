@@ -147,22 +147,25 @@ be restarted to end that editor-process plaintext lifetime. The fixed marker
 is therefore not observed same-process crash recovery or instantaneous
 fail-safe containment.
 
-Current checkpoint evidence is deliberately split: 61/61 pure-Python tests
-pass, and an exact Build 4200 normal E2E passed unlock/open/edit/save/close plus
-real InputPanel/QuickPanel New Folder, New Markdown, rename, and etag-bound delete.
-Authenticated tree state was checked after every mutation; the report records
-all four CRUD events, `crud_complete=true`, `vault_envelope=EDRY`, and zero
-scanned disk residue. The
-plugin-host SIGKILL scenario reproduced the copyable-buffer/restart boundary
-and is recorded as
+Current checkpoint evidence is deliberately split: 72/72 Python tests pass
+(61 product tests plus 11 runner/evidence tests), and separately preserved
+canonical reports bind one exact packaged Build 4200 Linux normal scenario and
+one exact packaged plugin-host-crash scenario. The normal scenario passed
+unlock/open/edit/save/close plus real InputPanel/QuickPanel New Folder, New
+Markdown, rename, and etag-bound delete. Authenticated tree state was checked
+after every mutation; the report records all four CRUD events,
+`crud_complete=true`, `vault_envelope=EDRY`, and zero scanned disk residue. The
+plugin-host SIGKILL scenario reproduced the copyable-buffer/restart boundary and
+is recorded as
 `PASS_WITH_DOCUMENTED_BOUNDARY`, not as a crash-erasure pass. That boundary is
 within the existing editor-memory/active-clipboard exclusion, but is a binding
 reason to keep Sublime experimental.
 
 Sublime cannot veto every application-exit path. A final edit may be lost on an
 abrupt exit rather than written as plaintext. This is an intentional
-security-over-availability choice. The complete crash/export/macro/project
-residue matrix remains pending.
+security-over-availability choice. The two isolated scenarios do not prove a
+restart against the same installed persistent profile. That restart and the
+complete crash/export/macro/project/full-platform residue matrix remain pending.
 
 ## CLI administration
 

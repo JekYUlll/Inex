@@ -382,11 +382,13 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=editors/sublime \
   python3 -m unittest discover -s editors/sublime/tests -v
 ```
 
-It does not replace the binding open/edit/save/close/crash residue matrix. The
-current pure suite passes 61/61. An isolated exact Build 4200 normal E2E passed
-unlock/open/edit/save/close and used registered WindowCommands plus real InputPanel/
-QuickPanel interaction for New Folder, New Markdown, rename, and etag-bound
-delete. Authenticated `listTree` checks passed after each step,
+The suite passes 72/72: 61 product tests plus 11 runner/evidence tests. It does
+not by itself replace exact-package black-box evidence. On Linux, separately
+preserved canonical reports bind one exact packaged Build 4200 normal scenario
+and one exact packaged plugin-host-crash scenario. The normal scenario passed
+unlock/open/edit/save/close and used registered WindowCommands plus real
+InputPanel/QuickPanel interaction for New Folder, New Markdown, rename, and
+etag-bound delete. Authenticated `listTree` checks passed after each step,
 `crud_complete=true`, events record `folder_created`, `markdown_created`,
 `renamed`, and `deleted`, `vault_envelope=EDRY`, and `root_scan_hits=0`. Its
 plugin-host SIGKILL probe is classified
@@ -396,8 +398,10 @@ required, `vault_envelope=EDRY`, and the roots scanned after application exit
 reported zero disk hits. Its `crud_complete=false` is intentional: the crash
 branch kills the host after open/edit/save, while the normal branch separately
 covers CRUD. That reproduces the editor-memory/active-clipboard boundary; it is
-not a crash-erasure pass. The package remains experimental until the complete
-matrix passes for the exact packaged artifact and platform.
+not a crash-erasure pass. These are isolated single-scenario baselines, not a
+same-profile restart result. The package remains experimental until the same
+installed persistent profile and the complete matrix pass for every advertised
+platform.
 
 ### Candidate Sublime archive shape
 

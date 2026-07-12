@@ -182,13 +182,16 @@ binding crash matrix.
 
 ### Experimental release gate
 
-The current pure-Python suite passes 61/61. An isolated exact Build 4200 normal
-E2E drives unlock/open/edit/save/close and registered WindowCommands with real
-InputPanel/QuickPanel interaction for New Folder, New Markdown, rename, and
-etag-bound delete. Authenticated tree checks pass after every mutation; events
-record `folder_created`, `markdown_created`, `renamed`, and `deleted`, with
-`crud_complete=true`, `vault_envelope=EDRY`, and `root_scan_hits=0`.
-Its plugin-host SIGKILL probe reports `PASS_WITH_DOCUMENTED_BOUNDARY`,
+The current Python suite passes 72/72: 61 product tests plus 11 runner/evidence
+tests. On Linux, separately preserved canonical reports bind one exact packaged
+Build 4200 normal scenario and one exact packaged plugin-host-crash scenario.
+The normal scenario drives unlock/open/edit/save/close and registered
+WindowCommands with real InputPanel/QuickPanel interaction for New Folder, New
+Markdown, rename, and etag-bound delete. Authenticated tree checks pass after
+every mutation; events record `folder_created`, `markdown_created`, `renamed`,
+and `deleted`, with `crud_complete=true`, `vault_envelope=EDRY`, and
+`root_scan_hits=0`. The plugin-host SIGKILL scenario reports
+`PASS_WITH_DOCUMENTED_BOUNDARY`,
 `host_dead_clipboard_read_ok=true`, `host_dead_plaintext_copyable=true`,
 `plugin_host_restarted=false`, and `sublime_restart_required=true`; roots
 scanned after application exit report `root_scan_hits=0` and
@@ -197,11 +200,12 @@ scanned after application exit report `root_scan_hits=0` and
 branch above covers CRUD independently. This proves the boundary was
 reproduced, not that crash-time plaintext was erased.
 
-The remaining exact-package gate covers keyboard/menu Save, Save As, Save All,
-tab/window/application close, project/non-project windows, export/macro routes,
-plugin-host crash, and forced process termination. It scans session/workspace
-files, Cache, Index, temp roots, logs, and the vault for a canary. No Sublime
-build is called supported until its complete matrix passes; APIs marked for
+The remaining gate starts with a same-profile full-application restart and then
+covers keyboard/menu Save, Save As, Save All, tab/window/application close,
+project/non-project windows, export/macro routes, additional crash/forced-kill
+states, and every advertised platform. It scans session/workspace files, Cache,
+Index, temp roots, logs, and the vault for a canary. No Sublime build is called
+supported until this complete persistent-profile matrix passes; APIs marked for
 builds newer than the tested baseline are not used.
 
 ## Shared client rules

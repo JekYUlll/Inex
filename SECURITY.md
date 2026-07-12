@@ -18,12 +18,15 @@ In particular:
   workbench storage is forced in-memory, and InputBox/QuickPick mouse interaction
   is not automated; it does not prove persistent cross-process Hot Exit or
   Local History behavior;
-- the Sublime pure suite passes 61/61 and an exact Build 4200 normal E2E drives
-  unlock/open/edit/save/close plus folder/file create, rename, and etag-bound delete,
-  with authenticated tree checks and zero scanned disk residue. Killing the
-  plugin host still leaves the visible buffer actively copyable and requires a
-  full Sublime restart; the client therefore remains experimental until the
-  complete package canary matrix passes; and
+- the Sublime Python suite passes 72/72: 61 product tests plus 11
+  runner/evidence tests. On Linux, separately preserved canonical reports bind
+  one exact packaged Build 4200 normal scenario and one exact packaged
+  plugin-host-crash scenario. The normal flow drives unlock/open/edit/save/close
+  plus folder/file create, rename, and etag-bound delete with authenticated tree
+  checks and zero scanned disk residue. Killing the plugin host still leaves the
+  visible buffer actively copyable and requires a full Sublime restart. A
+  same-profile restart and the complete persistent-profile/full-platform canary
+  matrix remain unproven, so the client remains experimental; and
 - release-tool tests pass 76/76, `actionlint` and pedantic/all-features Clippy
   pass, and independent release-tool code review is GO. The binding artifact
   workflow requires two standalone clean system-GCC builds to be byte-identical

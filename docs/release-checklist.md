@@ -34,7 +34,7 @@ Status terms in this document mean:
 | Git | verified Linux fail-closed source checkpoint | Locked-safe driver, local installer, encrypted diff3, fixed tree provenance, full-width SHA-1/SHA-256, detected/split rename/modify, and legacy v1/v2/v3 recovery pass. New v4 transactions publish a canonical pre-lock reservation plus initial/final ownership receipts before holding the real `.git/index.lock`; Linux regressions cover orphan/partial/wrong-case/link/foreign state, pre-lock winner, lock-held Git failure, marker/candidate/published recovery, target drift, and foreign-lock preservation. A kill between candidate mutation and its matching receipt is detected and preserved as `RecoveryConflict`, not automatically recovered. Native Windows abrupt-kill/power-loss, ref-only concurrency, and legacy recovery CAS remain pending |
 | VS Code unit/bundle | verified checkpoint | Strict TypeScript, 23/23 Node tests, production bundle, and integration bundle pass |
 | VS Code Extension Host | partial | The current local build and 1.125.0 directly drive the production create/folder-create/file-rename/file-delete actions plus encrypted backup/recovery against the daemon/custom editor. Close refusal, rename collision, Unix delete-I/O failure recovery, command registration, and isolated-root residue pass. InputBox/QuickPick mouse interaction is not automated, and test-mode workbench storage is in-memory, so persistent cross-process restore/Local History is unproven |
-| Sublime current source | partial | Pure-Python tests pass 61/61. An exact Build 4200 normal E2E drives unlock/open/edit/save/close and real-panel New Folder/New Markdown/rename/etag-delete through registered commands. `xdotool type --file -` reads the random password from its stdin and injects X11 keyboard events into the real absolute zenity masked entry; that password then joins the encoded full-root residue scan. Authenticated tree checks pass after each mutation; `folder_created`, `markdown_created`, `renamed`, and `deleted` are present, `crud_complete=true`, `vault_envelope=EDRY`, and `root_scan_hits=0`. The plugin-host SIGKILL probe remains `PASS_WITH_DOCUMENTED_BOUNDARY`: the visible buffer is copyable, the host does not restart in-process, a full Sublime restart is required, `vault_envelope=EDRY`, and roots scanned after application exit remain clean. Its `crud_complete=false` is intentional because the crash branch kills after open/edit/save; this is not crash-time plaintext erasure. The full packaged matrix is pending |
+| Sublime source and exact packaged Linux baseline | partial | Python tests pass 72/72: 61 product tests plus 11 runner/evidence tests. Separately preserved canonical reports bind one exact packaged Build 4200 Linux normal scenario and one exact packaged plugin-host SIGKILL scenario. The normal flow drives unlock/open/edit/save/close and real-panel New Folder/New Markdown/rename/etag-delete; authenticated tree checks pass after each mutation and the residue scan is clean. The crash flow remains `PASS_WITH_DOCUMENTED_BOUNDARY`: the visible buffer is copyable, the host does not restart in-process, a full Sublime restart is required, and roots scanned after application exit remain clean. This is not crash-time plaintext erasure. Same-profile restart and the remaining persistent-profile/full-platform matrix are pending, so Sublime remains experimental |
 | Linux x64 packaging | binding evidence must be external | Two independent standalone system-GCC release builds must bind one clean source commit and produce byte-identical binaries, Rust ZIP, VSIX, Sublime ZIP, and SHA256SUMS. Both must pass strict release-set/native audit and isolated VS Code install/bundled-sidecar smoke; runtime must report GNU x64, release profile, and reviewed libsodium version/ABI/non-minimal status. Exact hashes cannot be self-attested by this bundled document |
 | Linux x64 artifact lifecycle | binding evidence must be external | A third standalone clean clone must re-audit the exact artifact hashes and same product commit. Five expected bodies including exact 16 MiB content must authenticate after import, password rewrap, single-ref/single-commit Git bundle and clean tree-copy restores. CLI wrong-password, RPC auth-failure, locked merge-driver, driver relocation, frozen-v1, physical allowlist and descendant cleanup must pass with all three nondisclosure flags true and outside-source sensitive hits zero. Scope remains lifecycle-only, not release approval, independent build attestation, native fault-state, or two-version evidence |
 | License collection | verified mechanism; artifact digest external | Strict audit requires all three packages to share one target-bound Cargo inventory, complete hashed license/NOTICE texts, and one sidecar digest. Exact counts and hashes must come from the external report matching the package manifests. Independent all-native artifact runs, legal review, and license-choice/signature policy remain pending |
@@ -58,9 +58,10 @@ These are not documentation polish items; each changes the release decision:
 2. Prove the final packaged VSIX plus bundled platform `inexd` in persistent
    Windows and Linux profiles across dirty close, normal restart, forced crash,
    Hot Exit, Local History, and recovery.
-3. Complete the exact Sublime Build 4200 packaged open/edit/save/close/crash,
-   macro/export/clipboard, draft, project/non-project, and canary residue matrix
-   on every advertised OS.
+3. Extend the passed exact packaged Build 4200 Linux normal and plugin-host
+   crash single-scenario baselines into a same-profile restart plus the complete
+   macro/export/clipboard, draft, project/non-project, forced-kill, and canary
+   residue matrix on every advertised OS.
 4. Close the remaining GA Git transaction boundary. New v4 index updates have
    a held-lock expected-old CAS on Linux, but native Windows NTFS/ReFS
    abrupt-kill/power-loss remains unproven. Candidate/initial/final receipt-gap
@@ -356,10 +357,14 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=editors/sublime \
   python3 -m unittest discover -s editors/sublime/tests -v
 ```
 
-- [ ] Build 4200 is exact; the profile/data, cache, temp, D-Bus/X11 control,
-      package, and vault roots are isolated from the user's real profile.
-- [ ] The packaged regular `inexd` and external password helper paths are
-      exercised, not source-only test doubles for the binding flow.
+- [x] The Linux single-scenario baseline uses exact Build 4200 and isolates the
+      profile/data, cache, temp, D-Bus/X11 control, package, and vault roots from
+      the user's real profile; its canonical evidence is preserved externally.
+- [x] The Linux single-scenario baseline exercises the packaged regular `inexd`
+      and external password helper, not source-only test doubles.
+- [ ] Repeat normal and plugin-host-crash coverage across a full application
+      restart of the same installed persistent profile before extending the
+      remaining matrix.
 - [ ] Keyboard/menu Save, Save As, Save All, clipboard, HTML print/export,
       preview, macro recording/save/playback, tab/window/application close,
       project/non-project, draft matching/stale/corrupt, idle expiry, daemon and
