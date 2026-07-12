@@ -210,8 +210,9 @@ def capture_physical_file_seal(
             if stat.S_IMODE(opened.st_mode) & 0o111 == 0:
                 raise QaFailure(label + " is not executable")
             if strip_posix_write_bits:
-                os.fchmod(descriptor, stat.S_IMODE(opened.st_mode) & ~0o222)
-                opened = os.fstat(descriptor)
+                if stat.S_IMODE(opened.st_mode) & 0o222:
+                    os.fchmod(descriptor, stat.S_IMODE(opened.st_mode) & ~0o222)
+                    opened = os.fstat(descriptor)
                 if stat.S_IMODE(opened.st_mode) & 0o222:
                     raise QaFailure(label + " retains a POSIX write bit")
         digest = hashlib.sha256()
