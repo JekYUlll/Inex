@@ -126,16 +126,57 @@ def _valid_report(scenario: str = "normal") -> dict:
         "dirtySourceTree": False,
         "repository": "https://github.com/JekYUlll/Inex",
     }
+    rust_manifest = {
+        "schemaVersion": 1,
+        "package": "rust-binaries",
+        "platform": "linux-x64",
+        "version": "0.1.0",
+        "installFormat": "portable ZIP with bin/inex and bin/inexd",
+        "source": artifact_source,
+        "files": [
+            {
+                "path": "inex-0.1.0-linux-x64/bin/inex",
+                "sha256": _digest("c"),
+                "size": 3,
+            },
+            {
+                "path": "inex-0.1.0-linux-x64/bin/inexd",
+                "sha256": _digest("d"),
+                "size": 4,
+            },
+        ],
+    }
+    sublime_manifest = {
+        "schemaVersion": 1,
+        "package": "sublime-unpacked-package",
+        "platform": "linux-x64",
+        "version": "0.1.0",
+        "installFormat": "extract the Inex directory into the Sublime Text Packages directory",
+        "source": artifact_source,
+        "files": [
+            {"path": "Inex/Inex.py", "sha256": _digest("b"), "size": 5},
+            {"path": "Inex/bin/inexd", "sha256": _digest("d"), "size": 4},
+        ],
+    }
+    manifest_bytes = {
+        kind: (
+            json.dumps(manifest, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        for kind, manifest in {
+            "rust": rust_manifest,
+            "sublime": sublime_manifest,
+        }.items()
+    }
     artifact_records = [
         {
             "name": "inex-rust-0.1.0-linux-x64.zip",
             "sha256": _digest("3"),
-            "packageManifestSha256": _digest("6"),
+            "packageManifestSha256": runner.sha256_bytes(manifest_bytes["rust"]),
         },
         {
             "name": "inex-sublime-0.1.0-linux-x64.zip",
             "sha256": _digest("4"),
-            "packageManifestSha256": _digest("7"),
+            "packageManifestSha256": runner.sha256_bytes(manifest_bytes["sublime"]),
         },
         {
             "name": "inex-vscode-0.1.0-linux-x64.vsix",
@@ -143,6 +184,9 @@ def _valid_report(scenario: str = "normal") -> dict:
             "packageManifestSha256": _digest("8"),
         },
     ]
+    checksum_bytes = "".join(
+        f"{record['sha256']}  {record['name']}\n" for record in artifact_records
+    ).encode("ascii")
     release_audit = {
         "schemaVersion": 1,
         "reportType": "inex-release-set-audit",
@@ -176,13 +220,36 @@ def _valid_report(scenario: str = "normal") -> dict:
         },
         {
             "archiveKind": "sublime",
+            "memberName": "Inex/Inex.py",
+            "mode": 0o644,
+            "size": 5,
+            "sha256": _digest("b"),
+        },
+        {
+            "archiveKind": "sublime",
+            "memberName": "Inex/PACKAGE-MANIFEST.json",
+            "mode": 0o644,
+            "size": len(manifest_bytes["sublime"]),
+            "sha256": runner.sha256_bytes(manifest_bytes["sublime"]),
+        },
+        {
+            "archiveKind": "sublime",
             "memberName": "Inex/bin/inexd",
             "mode": 0o555,
             "size": 4,
             "sha256": _digest("d"),
         },
     ]
-    tree_files = [_seal("bin/inexd", _digest("d"), size=4, mode=0o555)]
+    tree_files = [
+        _seal("Inex.py", _digest("b"), size=5, mode=0o644),
+        _seal(
+            "PACKAGE-MANIFEST.json",
+            runner.sha256_bytes(manifest_bytes["sublime"]),
+            size=len(manifest_bytes["sublime"]),
+            mode=0o644,
+        ),
+        _seal("bin/inexd", _digest("d"), size=4, mode=0o555),
+    ]
     tree_digest = runner.sha256_bytes(
         json.dumps(
             tree_files,
@@ -237,6 +304,10 @@ def _valid_report(scenario: str = "normal") -> dict:
             "normalizedObservations": normalized,
         },
         "releaseSetAudit": release_audit,
+        "packageManifests": {
+            "rust": rust_manifest,
+            "sublime": sublime_manifest,
+        },
         "releaseVersion": "0.1.0",
         "nativePlatform": "linux-x64",
         "scenario": scenario,
@@ -255,7 +326,12 @@ def _valid_report(scenario: str = "normal") -> dict:
             "seal": next(tool["seal"] for tool in tools if tool["name"] == "sublime-text"),
         },
         "artifactSetFiles": [
-            _seal("SHA256SUMS", _digest("9"), size=9, mode=0o644),
+            _seal(
+                "SHA256SUMS",
+                runner.sha256_bytes(checksum_bytes),
+                size=len(checksum_bytes),
+                mode=0o644,
+            ),
             *[
                 _seal(record["name"], record["sha256"], size=10, mode=0o644)
                 for record in artifact_records
@@ -264,7 +340,7 @@ def _valid_report(scenario: str = "normal") -> dict:
         "materializedMembers": materialized,
         "installedInexTree": {
             "directoryCount": 2,
-            "fileCount": 1,
+            "fileCount": len(tree_files),
             "treeSha256": tree_digest,
             "files": tree_files,
         },
@@ -535,6 +611,41 @@ class Build4200RunnerFoundationTests(unittest.TestCase):
         def wrong_archive_digest(report: dict) -> None:
             report["artifactSetFiles"][1]["sha256"] = _digest("0")
 
+        def wrong_checksum_manifest_digest(report: dict) -> None:
+            report["artifactSetFiles"][0]["sha256"] = _digest("0")
+
+        def omit_sublime_product_module(report: dict) -> None:
+            report["materializedMembers"] = [
+                record
+                for record in report["materializedMembers"]
+                if record["memberName"] != "Inex/Inex.py"
+            ]
+            tree = report["installedInexTree"]
+            tree["files"] = [
+                record for record in tree["files"] if record["name"] != "Inex.py"
+            ]
+            tree["fileCount"] = len(tree["files"])
+            tree["treeSha256"] = runner.sha256_bytes(
+                json.dumps(
+                    tree["files"],
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            )
+
+        def arbitrary_cli_digest(report: dict) -> None:
+            next(
+                record
+                for record in report["materializedMembers"]
+                if record["archiveKind"] == "rust"
+            )["sha256"] = _digest("0")
+            next(
+                record
+                for record in report["packagedExecutables"]
+                if record["product"] == "inex"
+            )["seal"]["sha256"] = _digest("0")
+
         def extra_root_field(report: dict) -> None:
             report["unexpected"] = True
 
@@ -547,6 +658,9 @@ class Build4200RunnerFoundationTests(unittest.TestCase):
             wrong_helper_digest,
             extra_residue_field,
             wrong_archive_digest,
+            wrong_checksum_manifest_digest,
+            omit_sublime_product_module,
+            arbitrary_cli_digest,
             extra_root_field,
         )
         baseline = _valid_report()
@@ -578,6 +692,28 @@ class Build4200RunnerFoundationTests(unittest.TestCase):
                     )
                 with self.assertRaises(runner.QaFailure):
                     runner.validate_artifact_report(candidate)
+
+    def test_report_validator_rejects_self_attested_crash_ready_fingerprint(self) -> None:
+        candidate = _valid_report("plugin-host-crash")
+        forged_fingerprint = {"byte_count": 99, "content_sha256": _digest("a")}
+        observations = candidate["helperReport"]["normalizedObservations"]
+        for observation in observations:
+            if observation["event"] in {
+                "plugin_host_crash_ready",
+                "plugin_host_dead_clipboard_checked",
+            }:
+                observation.update(forged_fingerprint)
+        normalized_bytes = json.dumps(
+            observations,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        candidate["helperReport"]["normalizedSha256"] = runner.sha256_bytes(
+            normalized_bytes
+        )
+        with self.assertRaises(runner.QaFailure):
+            runner.validate_artifact_report(candidate)
 
 
 if __name__ == "__main__":

@@ -64,6 +64,7 @@ COMMON_NOT_COVERED = (
     "real-user-persistent-profile-hot-exit-local-history-sync-and-backup",
     "operating-system-memory-swap-gpu-and-window-system-forensics",
     "input-panel-quick-panel-mouse-accessibility-and-ime-interaction",
+    "vscode-runtime-behavior-from-audited-but-not-executed-vsix",
 )
 SCAN_ENCODINGS = (
     "utf-8",
@@ -1265,7 +1266,7 @@ def normalize_helper_records(
         clipboard = by_event["plugin_host_dead_clipboard_checked"]
         known_plaintext_fingerprints = {
             (by_event[name].get("byte_count"), by_event[name].get("content_sha256"))
-            for name in ("opened", "saved", "plugin_host_crash_ready")
+            for name in ("opened", "saved")
         }
         if (
             ready.get("marker") is not True
@@ -1276,6 +1277,11 @@ def normalize_helper_records(
             or isinstance(ready.get("byte_count"), bool)
             or ready["byte_count"] <= 0
             or not _valid_digest(ready.get("content_sha256"))
+            or (ready.get("byte_count"), ready.get("content_sha256"))
+            != (
+                by_event["saved"].get("byte_count"),
+                by_event["saved"].get("content_sha256"),
+            )
             or (clipboard.get("byte_count"), clipboard.get("content_sha256"))
             not in known_plaintext_fingerprints
             or clipboard.get("same_length_and_hash") is not True
@@ -1293,6 +1299,96 @@ def normalize_helper_records(
 
 def _valid_digest(value: object) -> bool:
     return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def _validate_bound_package_manifest(
+    value: object,
+    *,
+    kind: str,
+    artifact_source: object,
+    release_version: object,
+    native_platform: object,
+    expected_sha256: object,
+) -> Dict[str, Dict[str, object]]:
+    expected = {
+        "rust": (
+            "rust-binaries",
+            "portable ZIP with bin/inex and bin/inexd",
+            f"inex-{release_version}-{native_platform}/",
+            f"inex-{release_version}-{native_platform}/PACKAGE-MANIFEST.json",
+        ),
+        "sublime": (
+            "sublime-unpacked-package",
+            "extract the Inex directory into the Sublime Text Packages directory",
+            "Inex/",
+            "Inex/PACKAGE-MANIFEST.json",
+        ),
+    }.get(kind)
+    if expected is None:
+        raise QaFailure("artifact report has an unknown package-manifest kind")
+    package_name, install_format, prefix, manifest_name = expected
+    if (
+        not isinstance(value, dict)
+        or set(value)
+        != {
+            "schemaVersion",
+            "package",
+            "platform",
+            "version",
+            "installFormat",
+            "source",
+            "files",
+        }
+        or value.get("schemaVersion") != 1
+        or isinstance(value.get("schemaVersion"), bool)
+        or value.get("package") != package_name
+        or value.get("platform") != native_platform
+        or value.get("version") != release_version
+        or value.get("installFormat") != install_format
+        or value.get("source") != artifact_source
+        or not isinstance(value.get("files"), list)
+        or not value["files"]
+        or len(value["files"]) > 4096
+    ):
+        raise QaFailure("artifact report has an invalid bound package manifest")
+    file_map: Dict[str, Dict[str, object]] = {}
+    paths: List[str] = []
+    for record in value["files"]:
+        if (
+            not isinstance(record, dict)
+            or set(record) != {"path", "sha256", "size"}
+            or not isinstance(record.get("path"), str)
+            or not isinstance(record.get("size"), int)
+            or isinstance(record.get("size"), bool)
+            or record["size"] < 0
+            or not _valid_digest(record.get("sha256"))
+        ):
+            raise QaFailure("artifact report package manifest has invalid file metadata")
+        path = str(record["path"])
+        pure = PurePosixPath(path)
+        if (
+            not path.startswith(prefix)
+            or path == manifest_name
+            or pure.is_absolute()
+            or pure.as_posix() != path
+            or any(component in {"", ".", ".."} for component in pure.parts)
+            or "\\" in path
+            or path in file_map
+        ):
+            raise QaFailure("artifact report package manifest has an unsafe file path")
+        paths.append(path)
+        file_map[path] = record
+    if paths != sorted(paths):
+        raise QaFailure("artifact report package manifest files are not sorted")
+    try:
+        encoded = (
+            json.dumps(value, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise QaFailure("artifact report package manifest is not canonical JSON") from error
+    if len(encoded) > 2 * 1024 * 1024 or sha256_bytes(encoded) != expected_sha256:
+        raise QaFailure("artifact report package manifest digest differs from its audit")
+    return file_map
 
 
 def _validate_source(value: object, label: str) -> None:
@@ -1344,6 +1440,7 @@ def validate_artifact_report(report: Dict[str, object]) -> None:
         "harnessFiles",
         "helperReport",
         "releaseSetAudit",
+        "packageManifests",
         "releaseVersion",
         "nativePlatform",
         "scenario",
@@ -1437,6 +1534,48 @@ def validate_artifact_report(report: Dict[str, object]) -> None:
             != audit_record.get("sha256")
         ):
             raise QaFailure("artifact report archive digest differs from its audit")
+    expected_checksum_bytes = "".join(
+        f"{record['sha256']}  {record['name']}\n" for record in audit_artifacts
+    ).encode("ascii")
+    checksum_seal = artifact_file_map["SHA256SUMS"]
+    if (
+        checksum_seal.get("size") != len(expected_checksum_bytes)
+        or checksum_seal.get("sha256") != sha256_bytes(expected_checksum_bytes)
+    ):
+        raise QaFailure("artifact report checksum manifest differs from its audit")
+
+    audit_manifest_digests: Dict[str, object] = {}
+    for audit_record in audit_artifacts:
+        if not isinstance(audit_record, dict):
+            raise QaFailure("artifact report has an invalid audited artifact record")
+        name = str(audit_record.get("name"))
+        if name.startswith("inex-rust-"):
+            kind = "rust"
+        elif name.startswith("inex-sublime-"):
+            kind = "sublime"
+        else:
+            continue
+        if kind in audit_manifest_digests:
+            raise QaFailure("artifact report repeats an audited package kind")
+        audit_manifest_digests[kind] = audit_record.get("packageManifestSha256")
+    package_manifests = report.get("packageManifests")
+    if (
+        not isinstance(package_manifests, dict)
+        or set(package_manifests) != {"rust", "sublime"}
+        or set(audit_manifest_digests) != {"rust", "sublime"}
+    ):
+        raise QaFailure("artifact report omits its executed package manifests")
+    manifest_file_maps = {
+        kind: _validate_bound_package_manifest(
+            package_manifests[kind],
+            kind=kind,
+            artifact_source=report.get("artifactSource"),
+            release_version=report.get("releaseVersion"),
+            native_platform=report.get("nativePlatform"),
+            expected_sha256=audit_manifest_digests[kind],
+        )
+        for kind in ("rust", "sublime")
+    }
 
     members = report.get("materializedMembers")
     if not isinstance(members, list) or not members:
@@ -1470,6 +1609,53 @@ def validate_artifact_report(report: Dict[str, object]) -> None:
     sublime_members = [key for key in member_map if key[0] == "sublime"]
     if len(rust_members) != 1 or not sublime_members:
         raise QaFailure("artifact report has an invalid package member split")
+    rust_prefix = f"inex-{report.get('releaseVersion')}-{report.get('nativePlatform')}"
+    rust_cli_name = rust_prefix + "/bin/inex"
+    rust_sidecar_name = rust_prefix + "/bin/inexd"
+    rust_manifest_files = manifest_file_maps["rust"]
+    sublime_manifest_files = manifest_file_maps["sublime"]
+    expected_sublime_member_names = sorted(
+        ["Inex/PACKAGE-MANIFEST.json", *sublime_manifest_files]
+    )
+    if (
+        rust_members[0][1] != rust_cli_name
+        or rust_cli_name not in rust_manifest_files
+        or rust_sidecar_name not in rust_manifest_files
+        or sorted(key[1] for key in sublime_members) != expected_sublime_member_names
+        or "Inex/bin/inexd" not in sublime_manifest_files
+    ):
+        raise QaFailure("artifact report package members differ from their manifests")
+    sublime_manifest_bytes = (
+        json.dumps(
+            package_manifests["sublime"],
+            ensure_ascii=True,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("utf-8")
+    materialized_sublime_manifest = member_map[
+        ("sublime", "Inex/PACKAGE-MANIFEST.json")
+    ]
+    if (
+        materialized_sublime_manifest.get("size") != len(sublime_manifest_bytes)
+        or materialized_sublime_manifest.get("sha256")
+        != sha256_bytes(sublime_manifest_bytes)
+    ):
+        raise QaFailure("artifact report materialized Sublime manifest is not bound")
+    for key in sublime_members:
+        if key[1] == "Inex/PACKAGE-MANIFEST.json":
+            continue
+        member = member_map[key]
+        manifest_record = sublime_manifest_files[key[1]]
+        if any(member[field] != manifest_record[field] for field in ("size", "sha256")):
+            raise QaFailure("artifact report Sublime member differs from its manifest")
+    rust_cli_member = member_map[rust_members[0]]
+    if any(
+        rust_cli_member[field] != rust_manifest_files[rust_cli_name][field]
+        for field in ("size", "sha256")
+    ):
+        raise QaFailure("artifact report CLI differs from its package manifest")
 
     tree = report.get("installedInexTree")
     if (
@@ -1890,6 +2076,7 @@ def main() -> int:
     release_version: Optional[str] = None
     platform_name: Optional[str] = None
     release_set_audit: Dict[str, object] = {}
+    package_manifests: Dict[str, object] = {}
     materialized_members: List[Dict[str, object]] = []
     installed_inex_seal: Optional[PhysicalTreeSeal] = None
     executable_seals: Dict[str, PhysicalFileSeal] = {}
@@ -1910,6 +2097,17 @@ def main() -> int:
         ) = capture_audited_artifact_entries(
             artifact_snapshot, artifact_snapshot_seals
         )
+        manifest_members = {
+            "rust": f"inex-{release_version}-{platform_name}/PACKAGE-MANIFEST.json",
+            "sublime": "Inex/PACKAGE-MANIFEST.json",
+        }
+        try:
+            package_manifests = {
+                kind: json.loads(artifact_entries[kind][member][0].decode("utf-8"))
+                for kind, member in manifest_members.items()
+            }
+        except (KeyError, UnicodeError, json.JSONDecodeError) as error:
+            raise QaFailure("audited package manifests are unavailable") from error
         inex, inexd, materialized_members = materialize_packaged_inputs(
             artifact_entries,
             platform_name,
@@ -2928,6 +3126,7 @@ def main() -> int:
                     "normalizedObservations": normalized_helper_records,
                 },
                 "releaseSetAudit": release_set_audit,
+                "packageManifests": package_manifests,
                 "releaseVersion": release_version,
                 "nativePlatform": platform_name,
                 "scenario": scenario,
