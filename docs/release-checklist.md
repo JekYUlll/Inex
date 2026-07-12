@@ -27,16 +27,16 @@ Status terms in this document mean:
 
 | Area | Status | Evidence and exact boundary |
 |------|--------|-----------------------------|
-| Linux Rust workspace | verified source checkpoint | 285/285 workspace tests after index-CAS v4 hardening, plus rustfmt, all-target/all-feature pedantic Clippy with warnings denied, rustdoc warnings denied, and whitespace checks |
+| Linux Rust workspace | verified source checkpoint | 287/287 workspace tests pass with index-CAS v4 and exact runtime-info regressions, plus rustfmt, all-target/all-feature pedantic Clippy with warnings denied, rustdoc warnings denied, and whitespace checks |
 | EDRY/vault compatibility | checkpoint | Frozen v1 fixture rebuild/unlock/decrypt and broad format/path/tamper tests pass on Linux; Windows GNU compiles and earlier Wine suites pass, but this is not native Windows evidence |
 | Import | verified checkpoint | Copy-only absent-destination staging, re-open/seal/allowlist/publication, source-preservation, and failure-class tests pass. The final clean Linux x64 artifact also imports a five-document synthetic tree including exact 16 MiB content, preserves every source hash, and produces no plaintext Markdown in the vault; publication ambiguity and native-platform fault cases remain pending |
 | Git | verified Linux source checkpoint | Locked-safe driver, local installer, encrypted diff3, fixed tree provenance, full-width SHA-1/SHA-256, detected/split rename/modify, and legacy v1/v2/v3 recovery pass. New v4 transactions bind an alternate candidate to the old index and hold the real `.git/index.lock`; Linux real-repository regressions cover pre-lock winner, lock-held Git failure, marker/candidate/published recovery, target drift, and foreign-lock preservation. Native Windows abrupt-kill/power-loss, ref-only concurrency, and legacy recovery CAS remain pending |
 | VS Code unit/bundle | verified checkpoint | Strict TypeScript, 23/23 Node tests, production bundle, and integration bundle pass |
 | VS Code Extension Host | partial | The current local build and 1.125.0 directly drive the production create/folder-create/file-rename/file-delete actions plus encrypted backup/recovery against the daemon/custom editor. Close refusal, rename collision, Unix delete-I/O failure recovery, command registration, and isolated-root residue pass. InputBox/QuickPick mouse interaction is not automated, and test-mode workbench storage is in-memory, so persistent cross-process restore/Local History is unproven |
 | Sublime current source | partial | Pure-Python tests pass 61/61. An exact Build 4200 normal E2E drives unlock/open/edit/save/close and real-panel New Folder/New Markdown/rename/etag-delete through registered commands. Authenticated tree checks pass after each mutation; `folder_created`, `markdown_created`, `renamed`, and `deleted` are present, `crud_complete=true`, `vault_envelope=EDRY`, and `root_scan_hits=0`. The plugin-host SIGKILL probe remains `PASS_WITH_DOCUMENTED_BOUNDARY`: the visible buffer is copyable, the host does not restart in-process, a full Sublime restart is required, `vault_envelope=EDRY`, and roots scanned after application exit remain clean. Its `crud_complete=false` is intentional because the crash branch kills after open/edit/save; this is not crash-time plaintext erasure. The full packaged matrix is pending |
-| Linux x64 packaging | verified clean-source checkpoint, release-tool review GO | Release-tooling unit tests pass 49/49; local `actionlint` and pedantic/all-features Clippy pass. Two system-GCC builds from the final clean source are byte-identical across Rust ZIP, VSIX, unpacked Sublime ZIP, and SHA256SUMS; both pass strict artifact/native-dependency audit and VS Code 1.125.0 CLI install/bundled-sidecar smoke. Manifest provenance records the canonical repository, exact commit, and `dirtySourceTree=false`; it is not independent build attestation for generated inputs |
+| Linux x64 packaging | historical clean-source checkpoint; strict-v1 rebuild pending | The earlier 49-test checkpoint produced two byte-identical system-GCC builds across Rust ZIP, VSIX, unpacked Sublime ZIP, and SHA256SUMS; both passed the then-current artifact/native-dependency audit and VS Code 1.125.0 CLI install/bundled-sidecar smoke. Those artifacts predate target-bound strict release-set evidence v1 and cannot close the current gate |
 | Linux x64 artifact lifecycle | verified clean standalone checkpoint | Harness commit `1e01842fc26ec24183f911ca38a9eb32924db579` and artifact commit `76ac04aa594001c9259a3117cbd933436357e0ce` both report `dirtySourceTree=false`. SHA-256: Rust ZIP `d551f3ca18f62f954e3f0ffe8c0aac1dad2d3821193ecb2e6116435886595e8a`; Sublime ZIP `590dcd1411312a366d1a82017fee4e8e40ed608941afab3b9cb06f903a35bf02`; VSIX `34d61157cbf570a0e25fb0f4a5d5db27d5e096838056025a89679f5d940f32eb`. Five expected bodies including exact 16 MiB content authenticate after import, password rewrap, single-ref/single-commit Git bundle and clean regular-file tree-copy restores. Driver relocation, frozen-v1 unchanged bytes, exact physical ciphertext allowlist and Linux descendant cleanup pass; sensitive content/path hits outside `plaintext-source` are zero. Report scope is lifecycle-only, not release approval or native/fault-state/two-version evidence |
-| License collection | verified engineering checkpoint | The native-target inventory contains 77 resolved Cargo components and 147 collected license/NOTICE texts: 146 Cargo files plus bundled libsodium 1.0.22 ISC. Independent legal review and license-choice/signature policy remain pending |
+| License collection | source-verified engineering checkpoint; artifact rerun pending | The target-bound Linux inventory contains 77 resolved Cargo components and 147 hashed license/NOTICE texts: 146 Cargo files plus bundled libsodium 1.0.22 ISC. The fixed four-workspace-member policy, exact expression set, three-package consistency and runtime target/profile checks pass in 59/59 source tests. Independent artifact rerun, legal review, and license-choice/signature policy remain pending |
 | CI configuration | source-only, non-binding | Linux x64, Windows x64, Linux arm64, and Windows arm64 labels are configured; actions are immutable-SHA pinned and local `actionlint` passes. Push/manual tag refs bind the exact version; the required job runs binding source-quality gates; package targets rerun x64 native tests or ARM no-run compilation, enforce canonical provenance, and install/smoke each platform VSIX. The workflows have not been pushed or run remotely, so every matrix result remains unproven |
 | Native Windows | pending | No native MSVC/NTFS/ReFS/FAT/exFAT release host result is available; GNU cross-check and Wine are non-binding |
 | arm64 | pending | Linux arm64 and Windows arm64 native build/package/runtime matrices are not available |
@@ -311,9 +311,11 @@ PYTHONPATH=scripts python3.13 scripts/smoke_release_artifacts.py \
   "target/release-artifacts/$PLATFORM" --vscode-cli "$VSCODE_CLI"
 ```
 
-On the current Linux x64 host, release-tool tests pass 49/49. Two clean-source
-system-GCC packages are byte-identical and both pass artifact/native-dependency
-audits plus VS Code 1.125.0 CLI install/bundled-sidecar smoke. Validation covers VSIX control metadata,
+On the current Linux x64 host, strict release-tool source tests pass 59/59.
+The two earlier clean-source system-GCC packages are byte-identical and passed
+the then-current artifact/native-dependency audits plus VS Code 1.125.0 CLI
+install/bundled-sidecar smoke, but they predate strict release-set evidence v1.
+Current validation covers VSIX control metadata,
 bounded regular ZIP members and Windows-portable path/mode collisions, exact
 workspace/tag parsing, canonical provenance, and PE32+ structure/import ranges;
 the original malformed-VSIX and ZIP bypass samples are rejected. Independent
@@ -341,6 +343,11 @@ release.
 - [ ] The release inventory is generated from locked native-target dependencies;
       all component license-file references resolve, and the bundled libsodium
       version/license are verified at runtime and in the archive.
+      Current source tooling binds fixed target triples, Cargo.lock checksums,
+      an explicit non-legal-approval expression policy, exact ISC text, shared
+      three-package inventory/sidecar digests, and runtime-info target/release
+      profile plus `1.0.22`/ABI `26.4`; native artifact reruns remain required
+      before checking this row.
 - [ ] Project GPL-3.0-only terms, the collected Cargo license/NOTICE texts, and
       bundled libsodium ISC are independently reviewed for legal completeness.
       Successful automated collection is not legal approval.

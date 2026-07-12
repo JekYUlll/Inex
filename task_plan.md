@@ -83,6 +83,10 @@ Phase 7 — 跨平台验证、打包与发布准备
 - [x] 配置 Linux/Windows x64/arm64 CI、Rust 二进制、VSIX 与 Sublime 包产物；远端 hosted jobs 尚待执行
 - [x] 完成 threat model、用户指南、安全配置、迁移/升级与故障恢复文档
 - [ ] 审计磁盘明文残留、日志秘密、依赖许可与发布清单
+  - [x] 将 target-bound Cargo graph、固定四 workspace member、精确许可策略/checksum、许可文本摘要与 libsodium 声明绑定到严格 `THIRD_PARTY_LICENSES.json`
+  - [x] 严格验证三包共享 inventory/sidecar，并为 package/lifecycle evidence 定义 canonical report v1 与动态秘密自扫描
+  - [ ] 从新 clean HEAD 重建 Linux x64 三包，复验 audit/smoke/lifecycle 并另做 RPC/CLI/Git 负路径秘密 drill
+  - [ ] 在所有原生目标重复许可/残留证据并完成独立法务、签名与发布渠道审查
 - [x] 在最终 clean commit 上用 system GCC 完成两次逐字节一致的 Linux x64 package/audit/native-dependency/VSIX-install smoke
 - [x] 从独立 standalone clean clone 对最终 Linux x64 artifact 完成 import/password/Git-bundle/tree-copy restore/frozen-v1/residue lifecycle drill
 - **Status:** in_progress
@@ -221,6 +225,9 @@ Phase 7 — 跨平台验证、打包与发布准备
 | Wine replace returned `AccessDenied` while the verified destination handle remained open | 1 | Consume and release both verified handles immediately before the path-based replace, document the cooperative same-user boundary, and rerun the Windows GNU/Wine tests |
 | A truncated reserved v4 journal staging file could leave an exact pre-journal marker/candidate reservation wedged | 1 | When the stable journal is absent, remove only the exact regular deterministic staging name paired with an authenticated reservation, then clean marker/candidate and add a truncated-staging recovery regression |
 | Full workspace Clippy passed product code but rejected two newly extended test functions at 105/100 and 101/100 lines | 1 | Split the parent-ancestor and durability scenarios into focused regression tests, apply canonical rustfmt, and restart the strict Clippy gate |
+| A read-only Phase 7 inventory command queried the obsolete `clients/vscode/package.json` path | 1 | The command made no writes; use the repository's actual `editors/vscode/package.json` path and record the inspection miss before implementation |
+| First strict-license test run passed 52/53; the duplicate-component fixture correctly failed earlier on its repeated license path than the asserted component-order message | 1 | Keep the earlier fail-closed validation, assert its actual repeated-path error, and rerun the complete release-tool suite |
+| Initial exact-libsodium patch assumed the salt constant was derived inline rather than frozen as `16` | 1 | No partial edit occurred; inspect the actual sodium constant/error/version blocks and apply the exact-version patch against current context |
 
 ## Notes
 

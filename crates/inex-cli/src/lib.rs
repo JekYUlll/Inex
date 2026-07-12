@@ -22,7 +22,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use inex_core::atomic::ParentSyncStatus;
 use inex_core::search::{CaseSensitivity, DEFAULT_SEARCH_SNIPPET_BYTES, SearchQuery};
-use inex_core::sodium::DEFAULT_ARGON2ID_PARAMS;
+use inex_core::sodium::{self, DEFAULT_ARGON2ID_PARAMS};
 use inex_core::vault::{PasswordSlotCommit, Vault, VaultError};
 use inex_core::vault_config::{ConfigWarning, KdfPolicy};
 use uuid::Uuid;
@@ -60,6 +60,10 @@ fn run_from_environment() -> Result<ExitCode, AppError> {
         println!("inex {}", env!("CARGO_PKG_VERSION"));
         return Ok(ExitCode::SUCCESS);
     }
+    if matches!(cli.command, Command::RuntimeInfo) {
+        write_runtime_info("inex")?;
+        return Ok(ExitCode::SUCCESS);
+    }
 
     execute(cli.command)
 }
@@ -94,8 +98,32 @@ fn execute(command: Command) -> Result<ExitCode, AppError> {
         Command::MergeDriver { inputs } => Ok(command_merge_driver(inputs)),
         Command::Git(command) => command_git(command),
         Command::Serve => command_serve(),
-        Command::Help | Command::Version => unreachable!("handled before password input setup"),
+        Command::Help | Command::Version | Command::RuntimeInfo => {
+            unreachable!("handled before password input setup")
+        }
     }
+}
+
+fn write_runtime_info(product: &str) -> Result<(), AppError> {
+    let runtime = sodium::version()?;
+    let mut stdout = io::stdout().lock();
+    writeln!(stdout, "runtime-info-schema: inex-runtime-v1")
+        .and_then(|()| writeln!(stdout, "product: {product}"))
+        .and_then(|()| writeln!(stdout, "version: {}", env!("CARGO_PKG_VERSION")))
+        .and_then(|()| writeln!(stdout, "rust-target: {}", sodium::COMPILED_RUST_TARGET))
+        .and_then(|()| {
+            writeln!(
+                stdout,
+                "rust-debug-assertions: {}",
+                sodium::COMPILED_WITH_DEBUG_ASSERTIONS
+            )
+        })
+        .and_then(|()| writeln!(stdout, "libsodium-version: {}", runtime.version))
+        .and_then(|()| writeln!(stdout, "libsodium-library-major: {}", runtime.library_major))
+        .and_then(|()| writeln!(stdout, "libsodium-library-minor: {}", runtime.library_minor))
+        .and_then(|()| writeln!(stdout, "libsodium-minimal: {}", runtime.minimal))
+        .and_then(|()| stdout.flush())
+        .map_err(|error| AppError::io(IoOperation::WriteOutput, &error))
 }
 
 fn command_merge_driver(inputs: Option<[PathBuf; 4]>) -> ExitCode {
@@ -596,6 +624,7 @@ enum AppError {
     Vault(VaultError),
     Search(inex_core::search::SearchError),
     Git(inex_git::GitError),
+    Sodium(inex_core::sodium::SodiumError),
     PasswordRetirementDeferred {
         new_slot: Uuid,
     },
@@ -626,6 +655,7 @@ impl AppError {
             | Self::Vault(_)
             | Self::Search(_)
             | Self::Git(_)
+            | Self::Sodium(_)
             | Self::PasswordRetirementDeferred { .. }
             | Self::InvalidDaemonPath
             | Self::DaemonNotFound
@@ -646,6 +676,7 @@ impl fmt::Display for AppError {
             Self::Vault(error) => error.fmt(formatter),
             Self::Search(error) => error.fmt(formatter),
             Self::Git(error) => error.fmt(formatter),
+            Self::Sodium(error) => error.fmt(formatter),
             Self::PasswordRetirementDeferred { new_slot } => write!(
                 formatter,
                 "new password slot {new_slot} is committed, but old-slot retirement could not be confirmed"
@@ -707,6 +738,12 @@ impl From<inex_core::search::SearchError> for AppError {
 impl From<inex_git::GitError> for AppError {
     fn from(error: inex_git::GitError) -> Self {
         Self::Git(error)
+    }
+}
+
+impl From<inex_core::sodium::SodiumError> for AppError {
+    fn from(error: inex_core::sodium::SodiumError) -> Self {
+        Self::Sodium(error)
     }
 }
 

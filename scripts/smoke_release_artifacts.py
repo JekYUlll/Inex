@@ -14,8 +14,8 @@ import sys
 import tempfile
 import zipfile
 
-from audit_release_artifacts import audit_directory
-from release_common import ReleaseError, safe_archive_name
+from audit_release_artifacts import artifact_identity, audit_directory
+from release_common import PLATFORMS, ReleaseError, safe_archive_name
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -70,6 +70,22 @@ def run_binary(executable: Path, arguments: list[str], expected_stdout: str | No
         raise ReleaseError(f"packaged executable wrote unexpected stderr: {executable.name}")
 
 
+def expected_runtime_info(product: str, version: str, platform: str) -> str:
+    return "\n".join(
+        (
+            "runtime-info-schema: inex-runtime-v1",
+            f"product: {product}",
+            f"version: {version}",
+            f"rust-target: {PLATFORMS[platform]['rust_target']}",
+            "rust-debug-assertions: false",
+            "libsodium-version: 1.0.22",
+            "libsodium-library-major: 26",
+            "libsodium-library-minor: 4",
+            "libsodium-minimal: false",
+        )
+    )
+
+
 def smoke_portable_archives(directory: Path, temporary: Path) -> None:
     rust_archive = next(directory.glob("inex-rust-*.zip"))
     sublime_archive = next(directory.glob("inex-sublime-*.zip"))
@@ -85,13 +101,24 @@ def smoke_portable_archives(directory: Path, temporary: Path) -> None:
     if len(inex_matches) != 1 or len(inexd_matches) != 1 or not sublime_inexd.is_file():
         raise ReleaseError("packaged executable layout is invalid")
 
-    package_name = rust_archive.name
-    try:
-        version = package_name.split("-", 3)[2]
-    except IndexError as error:
-        raise ReleaseError("Rust package name has no version") from error
+    _kind, version, platform = artifact_identity(rust_archive.name)
     run_binary(inex_matches[0], ["--version"], f"inex {version}")
+    run_binary(
+        inex_matches[0],
+        ["runtime-info"],
+        expected_runtime_info("inex", version, platform),
+    )
+    run_binary(
+        inexd_matches[0],
+        ["--runtime-info"],
+        expected_runtime_info("inexd", version, platform),
+    )
     run_binary(inexd_matches[0], [], "")
+    run_binary(
+        sublime_inexd,
+        ["--runtime-info"],
+        expected_runtime_info("inexd", version, platform),
+    )
     run_binary(sublime_inexd, [], "")
 
 
@@ -166,6 +193,12 @@ def smoke_vsix(directory: Path, vscode_cli: Path, temporary: Path) -> None:
         raise ReleaseError("installed VSIX does not contain exactly one sidecar")
     if os.name != "nt" and sidecars[0].stat().st_mode & 0o111 == 0:
         raise ReleaseError("installed VSIX sidecar lost its executable mode")
+    _kind, version, platform = artifact_identity(vsix.name)
+    run_binary(
+        sidecars[0],
+        ["--runtime-info"],
+        expected_runtime_info("inexd", version, platform),
+    )
     run_binary(sidecars[0], [], "")
 
 

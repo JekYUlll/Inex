@@ -62,6 +62,54 @@ pub const XCHACHA20_NONCE_BYTES: usize = 24;
 pub const XCHACHA20_TAG_BYTES: usize = 16;
 /// Size of an Argon2id salt accepted by libsodium.
 pub const ARGON2ID_SALT_BYTES: usize = 16;
+/// Exact libsodium release reviewed and bundled by this Inex version.
+pub const EXPECTED_LIBSODIUM_VERSION: &str = "1.0.22";
+/// Exact libsodium ABI major reviewed for the bundled release.
+pub const EXPECTED_LIBSODIUM_LIBRARY_MAJOR: i32 = 26;
+/// Exact libsodium ABI minor reviewed for the bundled release.
+pub const EXPECTED_LIBSODIUM_LIBRARY_MINOR: i32 = 4;
+/// Exact Rust target family compiled into this executable.
+pub const COMPILED_RUST_TARGET: &str = if cfg!(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu"
+)) {
+    "x86_64-unknown-linux-gnu"
+} else if cfg!(all(
+    target_os = "linux",
+    target_arch = "aarch64",
+    target_env = "gnu"
+)) {
+    "aarch64-unknown-linux-gnu"
+} else if cfg!(all(
+    target_os = "windows",
+    target_arch = "x86_64",
+    target_env = "msvc"
+)) {
+    "x86_64-pc-windows-msvc"
+} else if cfg!(all(
+    target_os = "windows",
+    target_arch = "aarch64",
+    target_env = "msvc"
+)) {
+    "aarch64-pc-windows-msvc"
+} else if cfg!(all(
+    target_os = "windows",
+    target_arch = "x86_64",
+    target_env = "gnu"
+)) {
+    "x86_64-pc-windows-gnu"
+} else if cfg!(all(
+    target_os = "windows",
+    target_arch = "aarch64",
+    target_env = "gnu"
+)) {
+    "aarch64-pc-windows-gnullvm"
+} else {
+    "unsupported"
+};
+/// Whether the executable was compiled with Rust debug assertions enabled.
+pub const COMPILED_WITH_DEBUG_ASSERTIONS: bool = cfg!(debug_assertions);
 
 /// Maximum v1 Markdown plaintext size.
 pub const MAX_AEAD_PLAINTEXT_BYTES: usize = 16 * 1024 * 1024;
@@ -93,7 +141,7 @@ pub const VAULT_ARGON2ID_READER_LIMITS: Argon2idLimits = Argon2idLimits {
     max_mem_limit_bytes: 1024 * 1024 * 1024,
 };
 
-static SODIUM_INIT: OnceLock<Result<(), SodiumError>> = OnceLock::new();
+static SODIUM_INIT: OnceLock<Result<SodiumVersion, SodiumError>> = OnceLock::new();
 
 /// Errors raised by the narrow libsodium boundary.
 ///
@@ -104,6 +152,9 @@ pub enum SodiumError {
     /// The process-wide libsodium initialization failed.
     #[error("libsodium initialization failed")]
     InitializationFailed,
+    /// The linked runtime does not match the exact reviewed bundled release.
+    #[error("libsodium runtime version does not match the reviewed release")]
+    UnexpectedRuntimeVersion,
     /// Libsodium returned a missing or non-UTF-8 version string.
     #[error("libsodium returned an invalid version string")]
     InvalidVersionString,
@@ -647,30 +698,28 @@ impl Drop for AccessGuard<'_> {
 ///
 /// # Errors
 ///
-/// Returns [`SodiumError::InitializationFailed`] if libsodium cannot initialize.
+/// Returns an error if libsodium cannot initialize or if the linked runtime is
+/// not the exact reviewed, non-minimal release.
 pub fn initialize() -> Result<(), SodiumError> {
+    initialized_runtime().map(|_| ())
+}
+
+fn initialized_runtime() -> Result<SodiumVersion, SodiumError> {
     SODIUM_INIT
         .get_or_init(|| {
             // SAFETY: `sodium_init` takes no pointers and is documented as
             // thread-safe. `OnceLock` additionally calls it only once here.
             let result = unsafe { libsodium_sys::sodium_init() };
-            if result >= 0 {
-                Ok(())
-            } else {
-                Err(SodiumError::InitializationFailed)
+            if result < 0 {
+                return Err(SodiumError::InitializationFailed);
             }
+
+            runtime_version_after_initialization()
         })
         .clone()
 }
 
-/// Returns runtime version details for diagnostics and release manifests.
-///
-/// # Errors
-///
-/// Returns an error when libsodium cannot initialize or exposes an invalid
-/// version string.
-pub fn version() -> Result<SodiumVersion, SodiumError> {
-    initialize()?;
+fn runtime_version_after_initialization() -> Result<SodiumVersion, SodiumError> {
     // SAFETY: initialized libsodium returns a process-lifetime NUL-terminated
     // version string, or null on an invalid library build (checked below).
     let raw_version = unsafe { libsodium_sys::sodium_version_string() };
@@ -693,19 +742,38 @@ pub fn version() -> Result<SodiumVersion, SodiumError> {
             libsodium_sys::sodium_library_minimal() != 0,
         )
     };
-    Ok(SodiumVersion {
+    let version = SodiumVersion {
         version,
         library_major,
         library_minor,
         minimal,
-    })
+    };
+    if version.version != EXPECTED_LIBSODIUM_VERSION
+        || version.library_major != EXPECTED_LIBSODIUM_LIBRARY_MAJOR
+        || version.library_minor != EXPECTED_LIBSODIUM_LIBRARY_MINOR
+        || version.minimal
+    {
+        return Err(SodiumError::UnexpectedRuntimeVersion);
+    }
+    Ok(version)
+}
+
+/// Returns runtime version details for diagnostics and release manifests.
+///
+/// # Errors
+///
+/// Returns an error when libsodium cannot initialize or does not match the
+/// exact reviewed, non-minimal runtime.
+pub fn version() -> Result<SodiumVersion, SodiumError> {
+    initialized_runtime()
 }
 
 /// Fills a caller-owned buffer from libsodium's CSPRNG.
 ///
 /// # Errors
 ///
-/// Returns [`SodiumError::InitializationFailed`] if libsodium cannot initialize.
+/// Returns an error if libsodium cannot initialize or does not match the exact
+/// reviewed runtime.
 pub fn random_bytes(output: &mut [u8]) -> Result<(), SodiumError> {
     initialize()?;
     if output.is_empty() {
@@ -720,7 +788,7 @@ pub fn random_bytes(output: &mut [u8]) -> Result<(), SodiumError> {
 ///
 /// # Errors
 ///
-/// Returns [`SodiumError::InitializationFailed`] if libsodium cannot initialize.
+/// Returns an error if the exact reviewed libsodium runtime cannot be established.
 pub fn random_array<const N: usize>() -> Result<[u8; N], SodiumError> {
     let mut output = [0_u8; N];
     random_bytes(&mut output)?;
@@ -974,7 +1042,7 @@ fn blake2b_256_inner(input: &[u8], key: Option<&[u8]>) -> Result<[u8; KEY_BYTES]
 ///
 /// # Errors
 ///
-/// Returns [`SodiumError::InitializationFailed`] if libsodium cannot initialize.
+/// Returns an error if the exact reviewed libsodium runtime cannot be established.
 pub fn constant_time_eq(left: &[u8], right: &[u8]) -> Result<bool, SodiumError> {
     initialize()?;
     if left.len() != right.len() {
@@ -1033,8 +1101,9 @@ mod tests {
         initialize()?;
         initialize()?;
         let runtime = version()?;
-        assert!(runtime.version.starts_with("1.0."));
-        assert!(runtime.library_major > 0);
+        assert_eq!(runtime.version, EXPECTED_LIBSODIUM_VERSION);
+        assert_eq!(runtime.library_major, EXPECTED_LIBSODIUM_LIBRARY_MAJOR);
+        assert_eq!(runtime.library_minor, EXPECTED_LIBSODIUM_LIBRARY_MINOR);
         assert!(!runtime.minimal);
         Ok(())
     }

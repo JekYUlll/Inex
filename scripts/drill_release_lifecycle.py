@@ -31,6 +31,7 @@ from audit_release_artifacts import (
     audit_directory,
     parse_checksums,
     read_zip_entries_from_bytes,
+    validate_release_set_report,
     validate_rust,
     validate_sublime,
     validate_vscode,
@@ -66,6 +67,40 @@ MAX_DESCENDANT_PROCESSES = 1024
 MAX_PROC_CHILDREN_BYTES = 64 * 1024
 DESCENDANT_CLEANUP_SECONDS = 10
 _LINUX_SUBREAPER_ENABLED = False
+LIFECYCLE_REPORT_COVERED = (
+    "copy-import-normal-path",
+    "password-rewrap-and-historical-metadata-scope",
+    "authenticated-expected-tree-and-body-comparison",
+    "git-bundle-clone-and-fsck",
+    "clean-regular-file-tree-copy-restore",
+    "frozen-v1-compatibility-read",
+    "sensitive-residue-scan-outside-designated-plaintext-source",
+    "linux-subreaper-procfs-pidfd-descendant-cleanup",
+    "clean-harness-provenance-recheck",
+)
+LIFECYCLE_REPORT_NOT_COVERED = (
+    "adversarial-same-user-release-host-writer",
+    "artifact-signing-and-publication",
+    "fault-state-preservation-and-power-loss",
+    "hosted-ci-execution",
+    "independent-legal-review",
+    "two-version-upgrade-and-rollback",
+    "native-platforms-other-than-this-report",
+    "editor-persistent-profile-residue",
+    "independent-build-attestation-for-generated-inputs",
+)
+LIFECYCLE_REPORT_TRUST_ASSUMPTIONS = (
+    "exclusive-quiescent-standalone-release-checkout",
+    "no-same-principal-writer-from-process-start-through-evidence-capture",
+    "trusted-immutable-toolchain-generated-inputs-and-artifact-directory",
+)
+LIFECYCLE_HARNESS_FILES = (
+    "scripts/audit_release_artifacts.py",
+    "scripts/drill_release_lifecycle.py",
+    "scripts/release_common.py",
+    "scripts/tests/test_release_artifacts.py",
+    "scripts/tests/test_release_lifecycle.py",
+)
 
 
 def is_link_like(path: Path, metadata: os.stat_result | None = None) -> bool:
@@ -160,6 +195,8 @@ def sensitive_variants(values: Iterable[bytes]) -> tuple[bytes, ...]:
             text = value.decode("utf-8", "strict")
         except UnicodeError:
             continue
+        escaped_json = json.dumps(text, ensure_ascii=True)[1:-1].encode("ascii")
+        variants.add(escaped_json)
         variants.add(text.encode("utf-16-le"))
         variants.add(text.encode("utf-16-be"))
     return tuple(sorted(variants, key=lambda item: (len(item), item)))
@@ -1103,8 +1140,16 @@ def capture_audited_artifacts(
     dict[str, object],
     str,
     str,
+    dict[str, object],
 ]:
-    validated = audit_directory(snapshot, require_clean_source=True)
+    audit_report = audit_directory(snapshot, require_clean_source=True)
+    artifact_records = audit_report.get("artifacts")
+    if not isinstance(artifact_records, list) or any(
+        not isinstance(record, dict) or not isinstance(record.get("name"), str)
+        for record in artifact_records
+    ):
+        raise ReleaseError("release-set audit report has invalid artifact records")
+    validated = [record["name"] for record in artifact_records]
     checksums = parse_checksums(snapshot / "SHA256SUMS")
     if set(validated) != set(checksums):
         raise ReleaseError("audited artifact names differ from the captured checksums")
@@ -1165,6 +1210,7 @@ def capture_audited_artifacts(
         source_identity,
         release_version,
         release_platform,
+        audit_report,
     )
 
 
@@ -2065,7 +2111,217 @@ class EvidenceDirectory:
             )
 
 
-def run_lifecycle_drill(artifact_directory: Path, fixture_directory: Path) -> dict[str, object]:
+def _validate_evidence_source(value: object, label: str) -> None:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"commit", "dirtySourceTree", "repository"}
+        or value.get("dirtySourceTree") is not False
+        or value.get("repository") != "https://github.com/JekYUlll/Inex"
+        or not isinstance(value.get("commit"), str)
+        or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", value["commit"]) is None
+    ):
+        raise ReleaseError(f"lifecycle report has invalid {label} provenance")
+
+
+def _validate_evidence_files(value: object, label: str, *, expected_count: int) -> None:
+    if not isinstance(value, list) or len(value) != expected_count:
+        raise ReleaseError(f"lifecycle report has an invalid {label} count")
+    names = []
+    for record in value:
+        if not isinstance(record, dict) or set(record) != {"name", "sha256"}:
+            raise ReleaseError(f"lifecycle report has an invalid {label} record")
+        name = record.get("name")
+        digest_value = record.get("sha256")
+        if (
+            not isinstance(name, str)
+            or not name
+            or len(name) > 512
+            or not isinstance(digest_value, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest_value) is None
+        ):
+            raise ReleaseError(f"lifecycle report has an invalid {label} identity")
+        names.append(name)
+    if names != sorted(set(names)):
+        raise ReleaseError(f"lifecycle report {label} records are not unique and sorted")
+
+
+def validate_lifecycle_report(report: dict[str, object]) -> None:
+    if set(report) != {
+        "schemaVersion",
+        "reportType",
+        "artifactSource",
+        "auditedArtifactCount",
+        "auditedArtifacts",
+        "authenticatedExpectedBodies",
+        "cleanRegularFileTreeCopyRestoreVerified",
+        "covered",
+        "sensitiveResidueHitsOutsideDesignatedPlaintextSource",
+        "residueContentScanExcludedRoots",
+        "designatedPlaintextSourcePathComponentsScanned",
+        "driverRelocationVerified",
+        "fixtureFiles",
+        "frozenV1CompatibilityRead",
+        "frozenV1ProductBytesUnchanged",
+        "filesystemType",
+        "gitBundleVerified",
+        "gitVersion",
+        "linuxDescendantControl",
+        "harnessFiles",
+        "harnessSource",
+        "markdownFiles",
+        "maxMarkdownBytes",
+        "nativePlatform",
+        "nativeRuntime",
+        "notCovered",
+        "importedVaultPhysicalAllowlistVerified",
+        "pythonVersion",
+        "releaseLifecycleDrill",
+        "reportScope",
+        "releaseVersion",
+        "releaseSetAudit",
+        "restoredDriverReinstalled",
+        "sourceHashesUnchanged",
+        "sourceDirectorySetUnchanged",
+        "historicalPasswordScopeVerified",
+        "trustAssumptions",
+    }:
+        raise ReleaseError("lifecycle report has an invalid root schema")
+    schema = report.get("schemaVersion")
+    if not isinstance(schema, int) or isinstance(schema, bool) or schema != 1:
+        raise ReleaseError("lifecycle report has an invalid schema version")
+    if (
+        report.get("reportType") != "inex-release-lifecycle"
+        or report.get("releaseLifecycleDrill") != "passed"
+        or report.get("reportScope") != "lifecycle-only-non-release-approval"
+        or report.get("covered") != list(LIFECYCLE_REPORT_COVERED)
+        or report.get("notCovered") != list(LIFECYCLE_REPORT_NOT_COVERED)
+        or report.get("trustAssumptions") != list(LIFECYCLE_REPORT_TRUST_ASSUMPTIONS)
+        or report.get("linuxDescendantControl") != "subreaper-procfs-pidfd"
+    ):
+        raise ReleaseError("lifecycle report has invalid fixed scope metadata")
+    _validate_evidence_source(report.get("artifactSource"), "artifact source")
+    _validate_evidence_source(report.get("harnessSource"), "harness source")
+    release_set_audit = report.get("releaseSetAudit")
+    if not isinstance(release_set_audit, dict):
+        raise ReleaseError("lifecycle report has an invalid nested release-set audit")
+    validate_release_set_report(release_set_audit)
+    artifact_count = report.get("auditedArtifactCount")
+    if not isinstance(artifact_count, int) or isinstance(artifact_count, bool) or artifact_count != 3:
+        raise ReleaseError("lifecycle report has an invalid artifact count")
+    _validate_evidence_files(report.get("auditedArtifacts"), "artifact", expected_count=3)
+    _validate_evidence_files(
+        report.get("fixtureFiles"), "frozen fixture", expected_count=len(FROZEN_V1_HASHES)
+    )
+    _validate_evidence_files(
+        report.get("harnessFiles"),
+        "harness file",
+        expected_count=len(LIFECYCLE_HARNESS_FILES),
+    )
+    fixture_files = report["fixtureFiles"]
+    if not isinstance(fixture_files, list) or {
+        record["name"]: record["sha256"] for record in fixture_files
+    } != FROZEN_V1_HASHES:
+        raise ReleaseError("lifecycle report has invalid frozen fixture hashes")
+    artifacts = report["auditedArtifacts"]
+    if not isinstance(artifacts, list):
+        raise ReleaseError("lifecycle report has invalid artifacts")
+    artifact_kinds = set()
+    version = report.get("releaseVersion")
+    platform_name = report.get("nativePlatform")
+    if (
+        not isinstance(version, str)
+        or re.fullmatch(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", version)
+        is None
+        or platform_name not in {"linux-x64", "linux-arm64"}
+    ):
+        raise ReleaseError("lifecycle report has invalid release identity")
+    if (
+        release_set_audit.get("releaseVersion") != version
+        or release_set_audit.get("platform") != platform_name
+        or release_set_audit.get("source") != report.get("artifactSource")
+    ):
+        raise ReleaseError("lifecycle report and release-set audit identities differ")
+    for record in artifacts:
+        kind, artifact_version, artifact_platform = artifact_identity(record["name"])
+        if artifact_version != version or artifact_platform != platform_name:
+            raise ReleaseError("lifecycle report mixes artifact identities")
+        artifact_kinds.add(kind)
+    if artifact_kinds != {"rust", "vscode", "sublime"}:
+        raise ReleaseError("lifecycle report omits an artifact kind")
+    release_set_artifacts = release_set_audit.get("artifacts")
+    if not isinstance(release_set_artifacts, list) or artifacts != [
+        {"name": record["name"], "sha256": record["sha256"]}
+        for record in release_set_artifacts
+    ]:
+        raise ReleaseError(
+            "lifecycle report artifact hashes differ from the release-set audit"
+        )
+    harness_files = report["harnessFiles"]
+    if not isinstance(harness_files, list) or [
+        record["name"] for record in harness_files
+    ] != list(LIFECYCLE_HARNESS_FILES):
+        raise ReleaseError("lifecycle report has an invalid harness file set")
+    for field in (
+        "cleanRegularFileTreeCopyRestoreVerified",
+        "designatedPlaintextSourcePathComponentsScanned",
+        "driverRelocationVerified",
+        "frozenV1CompatibilityRead",
+        "frozenV1ProductBytesUnchanged",
+        "gitBundleVerified",
+        "importedVaultPhysicalAllowlistVerified",
+        "restoredDriverReinstalled",
+        "sourceHashesUnchanged",
+        "sourceDirectorySetUnchanged",
+        "historicalPasswordScopeVerified",
+    ):
+        if report.get(field) is not True:
+            raise ReleaseError("lifecycle report has a false required result")
+    if (
+        not isinstance(
+            report.get("sensitiveResidueHitsOutsideDesignatedPlaintextSource"), int
+        )
+        or isinstance(
+            report.get("sensitiveResidueHitsOutsideDesignatedPlaintextSource"), bool
+        )
+        or report.get("sensitiveResidueHitsOutsideDesignatedPlaintextSource") != 0
+        or report.get("residueContentScanExcludedRoots") != ["plaintext-source"]
+        or report.get("authenticatedExpectedBodies") != report.get("markdownFiles")
+        or report.get("markdownFiles") != 5
+        or report.get("maxMarkdownBytes") != MAX_MARKDOWN_BYTES
+    ):
+        raise ReleaseError("lifecycle report has invalid result counts or exclusions")
+    runtime = report.get("nativeRuntime")
+    if (
+        not isinstance(runtime, dict)
+        or set(runtime) != {"machine", "release", "system"}
+        or any(
+            not isinstance(runtime.get(field), str)
+            or not runtime[field]
+            or len(runtime[field]) > 256
+            for field in runtime
+        )
+    ):
+        raise ReleaseError("lifecycle report has invalid native runtime metadata")
+    for field in ("filesystemType", "gitVersion", "pythonVersion"):
+        value = report.get(field)
+        if not isinstance(value, str) or not value or len(value) > 256:
+            raise ReleaseError("lifecycle report has invalid toolchain metadata")
+
+
+def encode_lifecycle_report(
+    report: dict[str, object], needles: Sequence[bytes] = ()
+) -> bytes:
+    validate_lifecycle_report(report)
+    encoded = (json.dumps(report, ensure_ascii=True, indent=2, sort_keys=True) + "\n").encode(
+        "utf-8"
+    )
+    assert_no_sensitive_bytes(encoded, needles, "lifecycle evidence report")
+    return encoded
+
+
+def run_lifecycle_drill(
+    artifact_directory: Path, fixture_directory: Path
+) -> tuple[dict[str, object], bytes]:
     if os.name == "nt":
         raise ReleaseError(
             "native Windows lifecycle evidence requires Job Object and NTFS ADS coverage"
@@ -2099,6 +2355,7 @@ def run_lifecycle_drill(artifact_directory: Path, fixture_directory: Path) -> di
             artifact_source,
             release_version,
             platform_name,
+            release_set_audit,
         ) = capture_audited_artifacts(artifact_snapshot)
         environment = controlled_environment(temporary / "environment")
         cli, daemon = extract_packaged_binaries(
@@ -2371,7 +2628,9 @@ def run_lifecycle_drill(artifact_directory: Path, fixture_directory: Path) -> di
             harness_source,
         )
 
-        return {
+        report: dict[str, object] = {
+            "schemaVersion": 1,
+            "reportType": "inex-release-lifecycle",
             "artifactSource": artifact_source,
             "auditedArtifactCount": len(artifact_hashes),
             "auditedArtifacts": [
@@ -2380,17 +2639,7 @@ def run_lifecycle_drill(artifact_directory: Path, fixture_directory: Path) -> di
             ],
             "authenticatedExpectedBodies": len(expected),
             "cleanRegularFileTreeCopyRestoreVerified": True,
-            "covered": [
-                "copy-import-normal-path",
-                "password-rewrap-and-historical-metadata-scope",
-                "authenticated-expected-tree-and-body-comparison",
-                "git-bundle-clone-and-fsck",
-                "clean-regular-file-tree-copy-restore",
-                "frozen-v1-compatibility-read",
-                "sensitive-residue-scan-outside-designated-plaintext-source",
-                "linux-subreaper-procfs-pidfd-descendant-cleanup",
-                "clean-harness-provenance-recheck",
-            ],
+            "covered": list(LIFECYCLE_REPORT_COVERED),
             "sensitiveResidueHitsOutsideDesignatedPlaintextSource": 0,
             "residueContentScanExcludedRoots": ["plaintext-source"],
             "designatedPlaintextSourcePathComponentsScanned": True,
@@ -2418,38 +2667,29 @@ def run_lifecycle_drill(artifact_directory: Path, fixture_directory: Path) -> di
                 "release": host_platform.release(),
                 "system": host_platform.system(),
             },
-            "notCovered": [
-                "adversarial-same-user-release-host-writer",
-                "artifact-signing-and-publication",
-                "fault-state-preservation-and-power-loss",
-                "hosted-ci-execution",
-                "independent-legal-review",
-                "two-version-upgrade-and-rollback",
-                "native-platforms-other-than-this-report",
-                "editor-persistent-profile-residue",
-                "independent-build-attestation-for-generated-inputs",
-            ],
+            "notCovered": list(LIFECYCLE_REPORT_NOT_COVERED),
             "importedVaultPhysicalAllowlistVerified": True,
             "pythonVersion": host_platform.python_version(),
             "releaseLifecycleDrill": "passed",
             "reportScope": "lifecycle-only-non-release-approval",
             "releaseVersion": release_version,
+            "releaseSetAudit": release_set_audit,
             "restoredDriverReinstalled": True,
             "sourceHashesUnchanged": True,
             "sourceDirectorySetUnchanged": True,
             "historicalPasswordScopeVerified": True,
-            "trustAssumptions": [
-                "exclusive-quiescent-standalone-release-checkout",
-                "no-same-principal-writer-from-process-start-through-evidence-capture",
-                "trusted-immutable-toolchain-generated-inputs-and-artifact-directory",
-            ],
+            "trustAssumptions": list(LIFECYCLE_REPORT_TRUST_ASSUMPTIONS),
         }
+        encoded_report = encode_lifecycle_report(report, needles)
+        return report, encoded_report
 
 
 def main() -> int:
     arguments = parse_arguments()
-    result = run_lifecycle_drill(arguments.directory, arguments.fixture_directory)
-    print(json.dumps(result, sort_keys=True))
+    _result, encoded_report = run_lifecycle_drill(
+        arguments.directory, arguments.fixture_directory
+    )
+    sys.stdout.buffer.write(encoded_report)
     return 0
 
 

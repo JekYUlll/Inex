@@ -164,6 +164,14 @@
 - stable v4 journal 不能直接 create+write：崩溃留下的 partial JSON 会阻断后续 recovery。安全路径是先在 token 派生的私有 staging 完整写入并 fsync，再 no-replace 发布；只有 stable journal 缺失、reservation marker/candidate 精确认证且 staging 是预留 regular file 时，恢复才可删除该残片。
 - Windows `MoveFileExW` 在 Wine 下不允许替换一个仍由调用方持句柄打开的 destination；最终 path/handle identity 复核后必须释放句柄再执行路径替换。该选择可满足真实 Git `index.lock` 的协作式排他模型，但公共 helper 和架构必须明确它不是抵抗同用户直接 namespace swap 的内核级 compare-exchange。
 - v4 的 `object_format` 不仅约束 stage/result OID 宽度，还必须与 v2/v3 内层 rename provenance 格式一致，并在无 Git 的 journal 结构校验阶段拒绝三个 commit OID 的错误宽度或非 canonical hex；运行期 tree/provenance 重验仍是第二道语义边界。
+- 许可生成器若只读取 build host triple，会在交叉打包时把 host 依赖图写进 target artifact；四目标当前都恰有 77 个组件，但 Linux/Windows 各有 5 个平台组件互换，因此计数相等不能证明清单正确。`--platform` 必须映射到固定 Rust target triple 并写入/验证 inventory。
+- 当前 artifact auditor 对 `THIRD_PARTY_LICENSES.json` 使用宽松 `json.loads(bytes)`，允许 UTF-16、重复键 last-wins、bool schema、未知字段、任意非空 source/license 和缺 checksum；三包也未互证 inventory bytes 与内嵌 `inexd` digest。package manifest 的文件哈希不能替代这些许可/发行集合语义约束。
+- 自动许可门应对当前 Cargo 表达式采取精确、人工登记的工程 policy，并默认拒绝未知表达式/source/缺 checksum；不要临时实现不完整 SPDX parser。它只能形成可追踪的工程证据，不能替代 `OR`/`AND` 选择、GPL 对应源码与归属义务的独立法律审查。
+- Cargo 的 `workspace_members` 不是可信的第一方 allowlist：根目录内 path dependency 会被自动提升为 workspace member。许可生成器必须把第一方集合固定到四个受审 `crates/inex-*` manifest，并拒绝额外/缺失 member 与其他 `source = null` dependency。
+- 许可 inventory 仅列路径不足以绑定实际法律文本；每个 Cargo/native `licenseFiles` record 必须包含内容 SHA-256，artifact auditor 逐项复算，三包共享 inventory bytes 才能同时证明共享文本摘要。
+- `windows-x64` 发布许可图固定为 MSVC triple，单凭 PE machine 不能区分 GNU/MSVC。`runtime-info` 必须同时报告编译 target、debug assertions 与 libsodium runtime；release smoke 固定要求 MSVC triple 和 `rust-debug-assertions: false`，因此 GNU/debug 产物不能被错标。
+- 生命周期报告的秘密自扫描必须覆盖 JSON `ensure_ascii` 转义后的 Unicode/引号/反斜杠形态，并将已扫描的同一序列化 bytes 直接写到 stdout；重新序列化一份逻辑等价对象会削弱证据链。
+- 严格离线许可测试读取 Linux/Windows target metadata 与 registry license texts；独立 CI job 必须先安装固定 Rust 并 `cargo fetch --locked`，否则空 Cargo cache 会在测试收集后因 offline metadata 缺包失败。
 
 ## Issues Encountered
 

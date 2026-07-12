@@ -14,6 +14,8 @@ import xml.etree.ElementTree as ElementTree
 import zipfile
 
 from release_common import (
+    ACCEPTED_CARGO_LICENSE_EXPRESSIONS,
+    LIBSODIUM_LICENSE_SHA256,
     MAX_ARCHIVE_MEMBER_BYTES,
     MAX_ARCHIVE_MEMBERS,
     MAX_ARCHIVE_TOTAL_BYTES,
@@ -80,6 +82,30 @@ CONTENT_TYPES_NAMESPACE = (
     "http://schemas.openxmlformats.org/package/2006/content-types"
 )
 MAX_VSIX_METADATA_BYTES = 1024 * 1024
+LICENSE_POLICY_ARCHIVE_PATH = "DEPENDENCY_LICENSE_POLICY.json"
+LICENSE_POLICY_TYPE = "engineering-collection-not-legal-approval"
+LICENSE_POLICY_REQUIRED_REVIEW = "independent-legal-review-pending"
+LICENSE_INVENTORY_POLICY_STATUS = (
+    "engineering-collection-only-independent-legal-review-pending"
+)
+CARGO_REGISTRY_SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
+LICENSE_INVENTORY_SCOPE = {
+    "rust": "locked normal/build Cargo packages reachable for the native package target",
+    "vscodeRuntime": (
+        "no shipped npm runtime dependencies; vscode and Node built-ins are host-provided"
+    ),
+    "sublimeRuntime": "Python standard library and Sublime host API only",
+    "buildTools": "not shipped and intentionally excluded",
+}
+RELEASE_SET_NOT_COVERED = (
+    "artifact-signing-and-publication",
+    "independent-legal-review",
+    "native-runtime-install-and-editor-behavior",
+)
+RELEASE_SET_TRUST_ASSUMPTIONS = (
+    "artifact-directory-remains-stable-during-audit",
+    "auditor-source-and-runtime-are-trusted",
+)
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -211,7 +237,7 @@ def _strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     result: dict[str, object] = {}
     for key, value in pairs:
         if key in result:
-            raise ReleaseError(f"VSIX package.json repeats a key: {key}")
+            raise ReleaseError(f"release JSON repeats a JSON key: {key}")
         result[key] = value
     return result
 
@@ -408,70 +434,217 @@ def validate_vsix_metadata(
         raise ReleaseError("VSIX content-types document omits a required mapping")
 
 
+def _parse_canonical_release_json(data: bytes, label: str) -> dict[str, object]:
+    try:
+        text = data.decode("utf-8", "strict")
+        value = json.loads(text, object_pairs_hook=_strict_json_object)
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise ReleaseError(f"{label} is not strict UTF-8 JSON") from error
+    if not isinstance(value, dict):
+        raise ReleaseError(f"{label} is not a JSON object")
+    canonical = (
+        json.dumps(value, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    if data != canonical:
+        raise ReleaseError(f"{label} is not canonical JSON")
+    return value
+
+
+def _validate_dependency_license_policy(
+    data: bytes,
+) -> tuple[set[str], dict[str, object]]:
+    policy = _parse_canonical_release_json(data, "dependency license policy")
+    if set(policy) != {
+        "schemaVersion",
+        "policyType",
+        "requiredReview",
+        "cargoRegistrySource",
+        "acceptedCargoLicenseExpressions",
+        "bundledNativeLibraries",
+    }:
+        raise ReleaseError("dependency license policy has an invalid root schema")
+    schema = policy.get("schemaVersion")
+    if not isinstance(schema, int) or isinstance(schema, bool) or schema != 1:
+        raise ReleaseError("dependency license policy has an invalid schema version")
+    if (
+        policy.get("policyType") != LICENSE_POLICY_TYPE
+        or policy.get("requiredReview") != LICENSE_POLICY_REQUIRED_REVIEW
+        or policy.get("cargoRegistrySource") != CARGO_REGISTRY_SOURCE
+    ):
+        raise ReleaseError("dependency license policy has invalid fixed metadata")
+    expressions = policy.get("acceptedCargoLicenseExpressions")
+    if (
+        not isinstance(expressions, list)
+        or expressions != list(ACCEPTED_CARGO_LICENSE_EXPRESSIONS)
+    ):
+        raise ReleaseError("dependency license policy expressions differ from the reviewed set")
+    native = policy.get("bundledNativeLibraries")
+    if not isinstance(native, list) or len(native) != 1:
+        raise ReleaseError("dependency license policy has invalid native metadata")
+    sodium = native[0]
+    if not isinstance(sodium, dict) or sodium != {
+        "name": "libsodium",
+        "version": "1.0.22",
+        "license": "ISC",
+        "source": "bundled by libsodium-sys-stable 1.24.0",
+        "licenseSha256": LIBSODIUM_LICENSE_SHA256,
+    }:
+        raise ReleaseError("dependency license policy has invalid libsodium metadata")
+    return set(expressions), sodium
+
+
+def _require_license_text(
+    entries: dict[str, tuple[bytes, int]], archive_name: str
+) -> bytes:
+    content, mode = require_entry(entries, archive_name)
+    if not content or mode != 0o644:
+        raise ReleaseError("third-party license text is empty or has an invalid mode")
+    return content
+
+
 def validate_license_inventory(
     data: bytes,
     entries: dict[str, tuple[bytes, int]],
     root_prefix: str,
     expected_version: str,
+    expected_platform: str,
 ) -> None:
-    try:
-        inventory = json.loads(data)
-    except (UnicodeError, json.JSONDecodeError) as error:
-        raise ReleaseError("third-party license inventory is invalid JSON") from error
-    if not isinstance(inventory, dict) or inventory.get("schemaVersion") != 1:
-        raise ReleaseError("third-party license inventory has an invalid schema")
+    policy_name = safe_archive_name(root_prefix + LICENSE_POLICY_ARCHIVE_PATH)
+    policy_data, policy_mode = require_entry(entries, policy_name)
+    if policy_mode != 0o644:
+        raise ReleaseError("dependency license policy has an invalid archive mode")
+    accepted_expressions, sodium_policy = _validate_dependency_license_policy(policy_data)
+
+    inventory = _parse_canonical_release_json(data, "third-party license inventory")
+    if set(inventory) != {
+        "schemaVersion",
+        "project",
+        "target",
+        "licensePolicy",
+        "scope",
+        "components",
+        "bundledNativeLibraries",
+    }:
+        raise ReleaseError("third-party license inventory has an invalid root schema")
+    schema = inventory.get("schemaVersion")
+    if not isinstance(schema, int) or isinstance(schema, bool) or schema != 1:
+        raise ReleaseError("third-party license inventory has an invalid schema version")
     project = inventory.get("project")
-    if (
-        not isinstance(project, dict)
-        or project.get("name") != "Inex"
-        or project.get("version") != expected_version
-        or project.get("license") != "GPL-3.0-only"
-        or project.get("repository") != "https://github.com/JekYUlll/Inex"
-    ):
+    if not isinstance(project, dict) or project != {
+        "name": "Inex",
+        "version": expected_version,
+        "license": "GPL-3.0-only",
+        "repository": "https://github.com/JekYUlll/Inex",
+    }:
         raise ReleaseError("third-party license inventory has invalid project provenance")
+    configuration = PLATFORMS.get(expected_platform)
+    if configuration is None or inventory.get("target") != {
+        "platform": expected_platform,
+        "rustTriple": configuration["rust_target"],
+    }:
+        raise ReleaseError("third-party license inventory has the wrong target graph")
+    if inventory.get("licensePolicy") != {
+        "path": LICENSE_POLICY_ARCHIVE_PATH,
+        "sha256": sha256_bytes(policy_data),
+        "status": LICENSE_INVENTORY_POLICY_STATUS,
+    }:
+        raise ReleaseError("third-party license inventory has invalid policy provenance")
+    if inventory.get("scope") != LICENSE_INVENTORY_SCOPE:
+        raise ReleaseError("third-party license inventory has invalid scope metadata")
+
     components = inventory.get("components")
     if not isinstance(components, list) or not components:
         raise ReleaseError("third-party license inventory is empty")
+    component_keys: list[tuple[str, str]] = []
     declared_license_files: set[str] = set()
     for component in components:
-        if not isinstance(component, dict) or not all(
-            isinstance(component.get(key), str) and component[key]
-            for key in ("name", "version", "license", "source")
+        if not isinstance(component, dict) or set(component) != {
+            "ecosystem",
+            "name",
+            "version",
+            "license",
+            "source",
+            "checksum",
+            "licenseFiles",
+        }:
+            raise ReleaseError("third-party license inventory has an invalid Cargo component")
+        name = component.get("name")
+        version = component.get("version")
+        license_expression = component.get("license")
+        if not all(isinstance(value, str) and value for value in (name, version)):
+            raise ReleaseError("third-party Cargo component has an invalid identity")
+        if (
+            component.get("ecosystem") != "cargo"
+            or component.get("source") != CARGO_REGISTRY_SOURCE
+            or not isinstance(license_expression, str)
+            or license_expression not in accepted_expressions
+            or not isinstance(component.get("checksum"), str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", component["checksum"]) is None
         ):
-            raise ReleaseError("third-party license inventory has an invalid component")
+            raise ReleaseError("third-party Cargo component violates the license policy")
+        component_keys.append((name, version))
         license_files = component.get("licenseFiles")
-        if not isinstance(license_files, list) or not license_files:
-            raise ReleaseError("third-party component has no bundled license text")
-        for relative in license_files:
-            if not isinstance(relative, str):
-                raise ReleaseError("third-party component license path is invalid")
+        if (
+            not isinstance(license_files, list)
+            or not license_files
+            or any(
+                not isinstance(record, dict)
+                or set(record) != {"path", "sha256"}
+                or not isinstance(record.get("path"), str)
+                or not isinstance(record.get("sha256"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", record["sha256"]) is None
+                for record in license_files
+            )
+            or license_files
+            != sorted(license_files, key=lambda record: record["path"])
+            or len({record["path"] for record in license_files}) != len(license_files)
+        ):
+            raise ReleaseError("third-party Cargo license paths are not unique and sorted")
+        expected_prefix = f"THIRD_PARTY_LICENSE_TEXTS/cargo/{name}-{version}/"
+        for record in license_files:
+            relative = record["path"]
+            if not relative.startswith(expected_prefix):
+                raise ReleaseError("third-party Cargo license path has the wrong component")
             archive_name = safe_archive_name(root_prefix + relative)
+            if archive_name in declared_license_files:
+                raise ReleaseError("third-party license inventory repeats a license path")
             declared_license_files.add(archive_name)
-            content = require_entry(entries, archive_name)[0]
-            if not content:
-                raise ReleaseError("third-party component license text is empty")
+            if sha256_bytes(_require_license_text(entries, archive_name)) != record["sha256"]:
+                raise ReleaseError("third-party Cargo license text has the wrong digest")
+    if component_keys != sorted(set(component_keys)):
+        raise ReleaseError("third-party Cargo components are not unique and sorted")
+
     native = inventory.get("bundledNativeLibraries")
-    if not isinstance(native, list) or not any(
-        isinstance(component, dict)
-        and component.get("name") == "libsodium"
-        and component.get("version") == "1.0.22"
-        for component in native
+    if not isinstance(native, list) or len(native) != 1:
+        raise ReleaseError("third-party inventory has invalid native components")
+    sodium = native[0]
+    if not isinstance(sodium, dict) or set(sodium) != {
+        "name",
+        "version",
+        "license",
+        "source",
+        "licenseSha256",
+        "licenseFiles",
+    }:
+        raise ReleaseError("native license inventory component has an invalid schema")
+    license_files = sodium.get("licenseFiles")
+    expected_native_path = "THIRD_PARTY_LICENSE_TEXTS/native/libsodium-1.0.22/LICENSE"
+    expected_native_files = [
+        {"path": expected_native_path, "sha256": LIBSODIUM_LICENSE_SHA256}
+    ]
+    if (
+        {key: sodium.get(key) for key in sodium_policy} != sodium_policy
+        or license_files != expected_native_files
     ):
-        raise ReleaseError("third-party inventory omits bundled libsodium 1.0.22")
-    for component in native:
-        if not isinstance(component, dict):
-            raise ReleaseError("native license inventory component is invalid")
-        license_files = component.get("licenseFiles")
-        if not isinstance(license_files, list) or not license_files:
-            raise ReleaseError("native dependency has no bundled license text")
-        for relative in license_files:
-            if not isinstance(relative, str):
-                raise ReleaseError("native dependency license path is invalid")
-            archive_name = safe_archive_name(root_prefix + relative)
-            declared_license_files.add(archive_name)
-            content = require_entry(entries, archive_name)[0]
-            if not content:
-                raise ReleaseError("native dependency license text is empty")
+        raise ReleaseError("native license inventory does not match the reviewed libsodium")
+    native_archive_name = safe_archive_name(root_prefix + expected_native_path)
+    if native_archive_name in declared_license_files:
+        raise ReleaseError("third-party license inventory repeats the native license path")
+    declared_license_files.add(native_archive_name)
+    native_license = _require_license_text(entries, native_archive_name)
+    if sha256_bytes(native_license) != LIBSODIUM_LICENSE_SHA256:
+        raise ReleaseError("bundled libsodium license text has the wrong digest")
+
     actual_license_files = {
         name
         for name in entries
@@ -530,15 +703,6 @@ def validate_documentation(
             target = _resolve_markdown_target(root_prefix, name, match.group(1))
             if target is not None:
                 require_entry(entries, target)
-
-
-def _strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    result: dict[str, object] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ReleaseError(f"package manifest repeats a JSON key: {key}")
-        result[key] = value
-    return result
 
 
 def validate_package_manifest(
@@ -676,7 +840,11 @@ def validate_rust(
     validate_native_binary(entries[cli][0], expected_platform, "packaged inex")
     validate_native_binary(entries[sidecar][0], expected_platform, "packaged inexd")
     validate_license_inventory(
-        require_entry(entries, license_name)[0], entries, root_prefix, expected_version
+        require_entry(entries, license_name)[0],
+        entries,
+        root_prefix,
+        expected_version,
+        expected_platform,
     )
     validate_documentation(entries, root_prefix)
     validate_package_manifest(
@@ -743,6 +911,7 @@ def validate_vscode(
         entries,
         "extension/",
         expected_version,
+        expected_platform,
     )
     validate_documentation(entries, "extension/")
     validate_package_manifest(
@@ -784,7 +953,11 @@ def validate_sublime(
         raise ReleaseError("Sublime sidecar suffix does not match the artifact platform")
     validate_native_binary(entries[sidecars[0]][0], expected_platform, "Sublime inexd")
     validate_license_inventory(
-        entries["Inex/THIRD_PARTY_LICENSES.json"][0], entries, "Inex/", expected_version
+        entries["Inex/THIRD_PARTY_LICENSES.json"][0],
+        entries,
+        "Inex/",
+        expected_version,
+        expected_platform,
     )
     validate_documentation(entries, "Inex/")
     validate_package_manifest(
@@ -816,7 +989,107 @@ def parse_checksums(path: Path) -> dict[str, str]:
     return checksums
 
 
-def audit_directory(directory: Path, *, require_clean_source: bool = True) -> list[str]:
+def validate_release_set_report(report: dict[str, object]) -> None:
+    if set(report) != {
+        "schemaVersion",
+        "reportType",
+        "reportScope",
+        "releaseVersion",
+        "platform",
+        "source",
+        "artifactCount",
+        "artifacts",
+        "cargoComponentCount",
+        "licenseTextCount",
+        "sharedLicenseInventorySha256",
+        "sharedSidecarSha256",
+        "notCovered",
+        "trustAssumptions",
+    }:
+        raise ReleaseError("release-set audit report has an invalid root schema")
+    schema = report.get("schemaVersion")
+    if not isinstance(schema, int) or isinstance(schema, bool) or schema != 1:
+        raise ReleaseError("release-set audit report has an invalid schema version")
+    if (
+        report.get("reportType") != "inex-release-set-audit"
+        or report.get("reportScope")
+        != "artifact-structure-cross-package-consistency-not-release-approval"
+        or report.get("notCovered") != list(RELEASE_SET_NOT_COVERED)
+        or report.get("trustAssumptions") != list(RELEASE_SET_TRUST_ASSUMPTIONS)
+    ):
+        raise ReleaseError("release-set audit report has invalid fixed scope metadata")
+    version = report.get("releaseVersion")
+    platform = report.get("platform")
+    if (
+        not isinstance(version, str)
+        or re.fullmatch(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", version)
+        is None
+        or platform not in PLATFORMS
+    ):
+        raise ReleaseError("release-set audit report has invalid release identity")
+    source = report.get("source")
+    if (
+        not isinstance(source, dict)
+        or set(source) != {"commit", "dirtySourceTree", "repository"}
+        or not isinstance(source.get("dirtySourceTree"), bool)
+        or source.get("repository") != "https://github.com/JekYUlll/Inex"
+        or not isinstance(source.get("commit"), str)
+        or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", source["commit"]) is None
+    ):
+        raise ReleaseError("release-set audit report has invalid source provenance")
+    artifacts = report.get("artifacts")
+    artifact_count = report.get("artifactCount")
+    if (
+        not isinstance(artifacts, list)
+        or len(artifacts) != 3
+        or not isinstance(artifact_count, int)
+        or isinstance(artifact_count, bool)
+        or artifact_count != len(artifacts)
+    ):
+        raise ReleaseError("release-set audit report has an invalid artifact count")
+    artifact_names = []
+    kinds = set()
+    for artifact in artifacts:
+        if not isinstance(artifact, dict) or set(artifact) != {
+            "name",
+            "sha256",
+            "packageManifestSha256",
+        }:
+            raise ReleaseError("release-set audit report has an invalid artifact record")
+        name = artifact.get("name")
+        if not isinstance(name, str):
+            raise ReleaseError("release-set audit report has an invalid artifact name")
+        kind, artifact_version, artifact_platform = artifact_identity(name)
+        if artifact_version != version or artifact_platform != platform or kind in kinds:
+            raise ReleaseError("release-set audit report mixes artifact identities")
+        kinds.add(kind)
+        artifact_names.append(name)
+        for field in ("sha256", "packageManifestSha256"):
+            value = artifact.get(field)
+            if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+                raise ReleaseError("release-set audit report has an invalid digest")
+    if artifact_names != sorted(artifact_names) or kinds != {"rust", "vscode", "sublime"}:
+        raise ReleaseError("release-set audit report artifacts are not unique and sorted")
+    for field in ("cargoComponentCount", "licenseTextCount"):
+        value = report.get(field)
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise ReleaseError("release-set audit report has an invalid dependency count")
+    for field in ("sharedLicenseInventorySha256", "sharedSidecarSha256"):
+        value = report.get(field)
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise ReleaseError("release-set audit report has an invalid shared digest")
+
+
+def encode_release_set_report(report: dict[str, object]) -> bytes:
+    validate_release_set_report(report)
+    return (json.dumps(report, ensure_ascii=True, indent=2, sort_keys=True) + "\n").encode(
+        "utf-8"
+    )
+
+
+def audit_directory(
+    directory: Path, *, require_clean_source: bool = True
+) -> dict[str, object]:
     try:
         resolved = directory.resolve(strict=True)
     except OSError as error:
@@ -837,10 +1110,14 @@ def audit_directory(directory: Path, *, require_clean_source: bool = True) -> li
     if set(checksums) != {path.name for path in artifact_paths}:
         raise ReleaseError("SHA256SUMS and release artifact names differ")
 
-    validated = []
+    artifact_records = []
     kinds = set()
     release_identity: tuple[str, str] | None = None
-    release_source_identity: tuple[str, bool, str] | None = None
+    release_source: dict[str, object] | None = None
+    shared_inventory: bytes | None = None
+    shared_sidecar_digest: str | None = None
+    cargo_component_count: int | None = None
+    license_text_count: int | None = None
     for path in artifact_paths:
         kind, version, platform = artifact_identity(path.name)
         if kind in kinds:
@@ -867,29 +1144,107 @@ def audit_directory(directory: Path, *, require_clean_source: bool = True) -> li
             "vscode": "extension/PACKAGE-MANIFEST.json",
             "sublime": "Inex/PACKAGE-MANIFEST.json",
         }[kind]
-        manifest = json.loads(require_entry(entries, manifest_name)[0])
+        manifest_data = require_entry(entries, manifest_name)[0]
+        manifest = _parse_canonical_release_json(manifest_data, "package manifest")
         source = manifest["source"]
-        source_identity = (
-            source["commit"],
-            source["dirtySourceTree"],
-            source["repository"],
-        )
-        if release_source_identity is None:
-            release_source_identity = source_identity
-        elif release_source_identity != source_identity:
+        if not isinstance(source, dict):
+            raise ReleaseError("release directory contains invalid source provenance")
+        if release_source is None:
+            release_source = source
+        elif release_source != source:
             raise ReleaseError("release directory mixes package source revisions")
-        validated.append(path.name)
+        inventory_name = {
+            "rust": f"inex-{version}-{platform}/THIRD_PARTY_LICENSES.json",
+            "vscode": "extension/THIRD_PARTY_LICENSES.json",
+            "sublime": "Inex/THIRD_PARTY_LICENSES.json",
+        }[kind]
+        inventory_data = require_entry(entries, inventory_name)[0]
+        inventory = _parse_canonical_release_json(
+            inventory_data, "third-party license inventory"
+        )
+        root_prefix = inventory_name.removesuffix("THIRD_PARTY_LICENSES.json")
+        current_license_text_count = sum(
+            name.startswith(root_prefix + "THIRD_PARTY_LICENSE_TEXTS/") for name in entries
+        )
+        components = inventory.get("components")
+        if not isinstance(components, list):
+            raise ReleaseError("release directory contains an invalid license inventory")
+        if shared_inventory is None:
+            shared_inventory = inventory_data
+            cargo_component_count = len(components)
+            license_text_count = current_license_text_count
+        elif (
+            inventory_data != shared_inventory
+            or len(components) != cargo_component_count
+            or current_license_text_count != license_text_count
+        ):
+            raise ReleaseError("release artifacts do not share one license inventory")
+        sidecar_names = {
+            "rust": [
+                name
+                for name in entries
+                if name.endswith(("/bin/inexd", "/bin/inexd.exe"))
+            ],
+            "vscode": [
+                name
+                for name in entries
+                if name.startswith("extension/bin/")
+                and name.endswith(("/inexd", "/inexd.exe"))
+            ],
+            "sublime": [name for name in entries if name in {"Inex/bin/inexd", "Inex/bin/inexd.exe"}],
+        }[kind]
+        if len(sidecar_names) != 1:
+            raise ReleaseError("release artifact does not contain exactly one sidecar")
+        sidecar_digest = sha256_bytes(entries[sidecar_names[0]][0])
+        if shared_sidecar_digest is None:
+            shared_sidecar_digest = sidecar_digest
+        elif sidecar_digest != shared_sidecar_digest:
+            raise ReleaseError("release artifacts do not contain one identical sidecar")
+        artifact_records.append(
+            {
+                "name": path.name,
+                "sha256": checksums[path.name],
+                "packageManifestSha256": sha256_bytes(manifest_data),
+            }
+        )
     if kinds != {"rust", "vscode", "sublime"}:
         raise ReleaseError("release directory does not contain all artifact kinds")
-    return validated
+    if (
+        release_identity is None
+        or release_source is None
+        or shared_inventory is None
+        or shared_sidecar_digest is None
+        or cargo_component_count is None
+        or license_text_count is None
+    ):
+        raise ReleaseError("release directory audit did not produce complete evidence")
+    version, platform = release_identity
+    report: dict[str, object] = {
+        "schemaVersion": 1,
+        "reportType": "inex-release-set-audit",
+        "reportScope": "artifact-structure-cross-package-consistency-not-release-approval",
+        "releaseVersion": version,
+        "platform": platform,
+        "source": release_source,
+        "artifactCount": len(artifact_records),
+        "artifacts": artifact_records,
+        "cargoComponentCount": cargo_component_count,
+        "licenseTextCount": license_text_count,
+        "sharedLicenseInventorySha256": sha256_bytes(shared_inventory),
+        "sharedSidecarSha256": shared_sidecar_digest,
+        "notCovered": list(RELEASE_SET_NOT_COVERED),
+        "trustAssumptions": list(RELEASE_SET_TRUST_ASSUMPTIONS),
+    }
+    validate_release_set_report(report)
+    return report
 
 
 def main() -> int:
     arguments = parse_arguments()
-    validated = audit_directory(
+    report = audit_directory(
         arguments.directory, require_clean_source=not arguments.allow_dirty_source
     )
-    print(json.dumps({"auditedArtifacts": validated}, sort_keys=True))
+    sys.stdout.buffer.write(encode_release_set_report(report))
     return 0
 
 

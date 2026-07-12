@@ -97,9 +97,10 @@ these commands describe the intended MSVC build shape, not a supported binary.
 
 The implemented release tooling creates `inex-rust-<version>-<platform>.zip`
 with `bin/inex[.exe]`, `bin/inexd[.exe]`, bundled documentation, manifests,
-checksums, a resolved license inventory, and complete collected license/NOTICE
-texts. Release-tool tests pass 49/49, and independent release-tool code review
-is GO. A final clean-source system-GCC Linux x64 pair is byte-for-byte
+checksums, a target-bound resolved license inventory, the canonical engineering
+license policy, and complete collected license/NOTICE texts. Current strict
+release-tool source tests pass 59/59. A final clean-source system-GCC Linux x64
+pair from the earlier checkpoint is byte-for-byte
 identical and passes strict archive/native-dependency audit plus executable and
 VSIX/bundled-sidecar smoke; its manifest records the canonical repository,
 exact commit, and `dirtySourceTree=false`. That source identity is provenance
@@ -110,13 +111,28 @@ A clean standalone Linux x64 lifecycle run at harness commit `1e01842` has also
 authenticated all five synthetic bodies after copy import, password rewrap,
 Git-bundle restore and clean regular-file tree-copy restore, with zero sensitive
 residue hits outside the intentionally retained plaintext source. This remains
-a Linux normal-path checkpoint, not native multi-platform or signing evidence.
+a historical Linux normal-path checkpoint: those artifacts predate strict
+release-set evidence v1 and must be rebuilt before promotion. It is not native
+multi-platform, signing, or legal evidence.
 For a development candidate,
 verify `SHA256SUMS` through a separate trusted channel, inspect the package
 manifest/source revision, extract the complete directory, and keep both
 binaries together. There are no official signatures yet, and native
 multi-platform/editor-profile gates remain incomplete, so no candidate is
 currently supported.
+
+After extraction, the following fixed commands report the reviewed cryptographic
+runtime without prompting for a password or starting the daemon protocol:
+
+```sh
+./bin/inex runtime-info
+./bin/inexd --runtime-info
+```
+
+The package smoke requires the platform's fixed Rust target triple,
+`rust-debug-assertions: false`, libsodium `1.0.22`, ABI `26.4`, and
+`libsodium-minimal: false` from every embedded executable copy. This prevents a
+Windows GNU/debug binary from being mislabeled as the MSVC release package.
 
 ## Create a disposable vault
 

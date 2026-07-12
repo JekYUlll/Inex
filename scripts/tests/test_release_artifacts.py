@@ -14,17 +14,29 @@ import zipfile
 import release_common as release_common_module
 
 from audit_release_artifacts import (
+    LIBSODIUM_LICENSE_SHA256,
+    audit_directory,
+    encode_release_set_report,
     read_zip_entries,
     read_zip_entries_from_bytes,
     validate_member_name,
+    validate_license_inventory,
     validate_package_manifest,
+    validate_release_set_report,
     validate_vsix_metadata,
     validate_vscode,
 )
-from package_release import project_version
+from package_release import (
+    encode_package_report,
+    package_report,
+    packaged_root_readme,
+    project_version,
+    validate_package_report,
+)
 from release_common import (
     MAX_ARCHIVE_MEMBERS,
     ReleaseError,
+    generate_license_materials,
     portable_archive_key,
     safe_archive_name,
     sha256_bytes,
@@ -32,10 +44,29 @@ from release_common import (
     validate_native_binary,
     write_reproducible_zip,
 )
+from smoke_release_artifacts import expected_runtime_info
 from verify_release_tag import validate_release_tag
 
 
 class ReleaseArchiveTests(unittest.TestCase):
+    @staticmethod
+    def canonical_json(value: object) -> bytes:
+        return (json.dumps(value, ensure_ascii=True, indent=2, sort_keys=True) + "\n").encode(
+            "utf-8"
+        )
+
+    @classmethod
+    def locked_license_fixture(
+        cls, platform: str = "linux-x64"
+    ) -> tuple[bytes, dict[str, tuple[bytes, int]]]:
+        repository_root = Path(__file__).resolve().parents[2]
+        inventory, materials = generate_license_materials(
+            repository_root, "0.1.0", platform
+        )
+        entries = {f"root/{name}": value for name, value in materials.items()}
+        entries["root/THIRD_PARTY_LICENSES.json"] = (inventory, 0o644)
+        return inventory, entries
+
     @staticmethod
     def minimal_pe(machine: int, import_name: str = "KERNEL32.dll") -> bytes:
         data = bytearray(0x600)
@@ -453,6 +484,379 @@ class ReleaseArchiveTests(unittest.TestCase):
                 expected_platform="linux-x64",
                 expected_version="0.1.0",
             )
+
+    def test_locked_license_inventory_is_target_bound_complete_and_reviewed(self) -> None:
+        inventory, entries = self.locked_license_fixture()
+        validate_license_inventory(
+            inventory, entries, "root/", "0.1.0", "linux-x64"
+        )
+        decoded = json.loads(inventory)
+        self.assertEqual(decoded["target"]["rustTriple"], "x86_64-unknown-linux-gnu")
+        self.assertEqual(len(decoded["components"]), 77)
+        self.assertEqual(
+            len(
+                [
+                    name
+                    for name in entries
+                    if name.startswith("root/THIRD_PARTY_LICENSE_TEXTS/")
+                ]
+            ),
+            147,
+        )
+        sodium_path = "root/THIRD_PARTY_LICENSE_TEXTS/native/libsodium-1.0.22/LICENSE"
+        self.assertEqual(
+            release_common_module.sha256_bytes(entries[sodium_path][0]),
+            LIBSODIUM_LICENSE_SHA256,
+        )
+
+        windows_inventory, _ = self.locked_license_fixture("windows-x64")
+        windows = json.loads(windows_inventory)
+        linux_components = {(item["name"], item["version"]) for item in decoded["components"]}
+        windows_components = {(item["name"], item["version"]) for item in windows["components"]}
+        self.assertEqual(windows["target"]["rustTriple"], "x86_64-pc-windows-msvc")
+        self.assertNotEqual(linux_components, windows_components)
+        self.assertIn(("rustix", "1.1.4"), linux_components - windows_components)
+        self.assertIn(("windows-targets", "0.52.6"), windows_components - linux_components)
+
+    def test_license_graph_rejects_non_workspace_path_dependencies(self) -> None:
+        repository_root = Path(__file__).resolve().parents[2]
+        first_party = [
+            {
+                "id": name,
+                "name": name,
+                "source": None,
+                "manifest_path": str(repository_root / relative),
+            }
+            for name, relative in release_common_module.EXPECTED_WORKSPACE_PACKAGES
+        ]
+        metadata = {
+            "workspace_root": str(repository_root),
+            "workspace_members": [package["id"] for package in first_party],
+            "resolve": {
+                "nodes": [
+                    {
+                        "id": "inex-cli",
+                        "deps": [
+                            {
+                                "pkg": "local-path",
+                                "dep_kinds": [{"kind": None}],
+                            }
+                        ],
+                    },
+                    {"id": "local-path", "deps": []},
+                    *[
+                        {"id": package["id"], "deps": []}
+                        for package in first_party
+                        if package["id"] != "inex-cli"
+                    ],
+                ]
+            },
+            "packages": [
+                *first_party,
+                {
+                    "id": "local-path",
+                    "name": "local-path",
+                    "source": None,
+                    "manifest_path": str(repository_root / "vendor/local-path/Cargo.toml"),
+                },
+            ],
+        }
+        with self.assertRaisesRegex(ReleaseError, "non-workspace path dependency"):
+            release_common_module._native_resolved_packages(metadata, repository_root)
+
+        auto_member = json.loads(json.dumps(metadata))
+        auto_member["workspace_members"].append("local-path")
+        with self.assertRaisesRegex(ReleaseError, "workspace member set"):
+            release_common_module._native_resolved_packages(auto_member, repository_root)
+
+    def test_license_inventory_rejects_noncanonical_or_unreviewed_metadata(self) -> None:
+        inventory, entries = self.locked_license_fixture()
+        baseline = json.loads(inventory)
+        mutations = []
+
+        unknown_root = json.loads(inventory)
+        unknown_root["unexpected"] = True
+        mutations.append(("root schema", unknown_root))
+        bool_schema = json.loads(inventory)
+        bool_schema["schemaVersion"] = True
+        mutations.append(("schema version", bool_schema))
+        missing_checksum = json.loads(inventory)
+        missing_checksum["components"][0].pop("checksum")
+        mutations.append(("Cargo component", missing_checksum))
+        fake_source = json.loads(inventory)
+        fake_source["components"][0]["source"] = "git+https://example.invalid/repository"
+        mutations.append(("license policy", fake_source))
+        unknown_license = json.loads(inventory)
+        unknown_license["components"][0]["license"] = "Proprietary"
+        mutations.append(("license policy", unknown_license))
+        repeated_component = json.loads(inventory)
+        repeated_component["components"].append(
+            dict(repeated_component["components"][0])
+        )
+        mutations.append(("repeats a license path", repeated_component))
+        reversed_components = json.loads(inventory)
+        reversed_components["components"].reverse()
+        mutations.append(("unique and sorted", reversed_components))
+        repeated_path = json.loads(inventory)
+        repeated_path["components"][0]["licenseFiles"].append(
+            dict(repeated_path["components"][0]["licenseFiles"][0])
+        )
+        mutations.append(("paths", repeated_path))
+        wrong_target = json.loads(inventory)
+        wrong_target["target"]["platform"] = "windows-x64"
+        mutations.append(("target graph", wrong_target))
+
+        for message, mutation in mutations:
+            with self.subTest(message=message), self.assertRaisesRegex(ReleaseError, message):
+                validate_license_inventory(
+                    self.canonical_json(mutation),
+                    entries,
+                    "root/",
+                    "0.1.0",
+                    "linux-x64",
+                )
+
+        text = inventory.decode("utf-8")
+        duplicate = text.replace(
+            '  "schemaVersion": 1,',
+            '  "schemaVersion": 1,\n  "schemaVersion": 1,',
+            1,
+        ).encode("utf-8")
+        with self.assertRaisesRegex(ReleaseError, "repeats a JSON key"):
+            validate_license_inventory(
+                duplicate, entries, "root/", "0.1.0", "linux-x64"
+            )
+        with self.assertRaisesRegex(ReleaseError, "strict UTF-8"):
+            validate_license_inventory(
+                json.dumps(baseline).encode("utf-16"),
+                entries,
+                "root/",
+                "0.1.0",
+                "linux-x64",
+            )
+
+    def test_license_inventory_rejects_policy_and_license_text_tampering(self) -> None:
+        inventory, entries = self.locked_license_fixture()
+        policy_name = "root/DEPENDENCY_LICENSE_POLICY.json"
+        policy = json.loads(entries[policy_name][0])
+        policy["acceptedCargoLicenseExpressions"].append("Proprietary")
+        tampered_policy_entries = dict(entries)
+        tampered_policy_entries[policy_name] = (self.canonical_json(policy), 0o644)
+        with self.assertRaises(ReleaseError):
+            validate_license_inventory(
+                inventory,
+                tampered_policy_entries,
+                "root/",
+                "0.1.0",
+                "linux-x64",
+            )
+
+        repository_root = Path(__file__).resolve().parents[2]
+        policy_path = repository_root / "packaging/dependency-license-policy.json"
+        wrong_sodium = json.loads(policy_path.read_bytes())
+        wrong_sodium["bundledNativeLibraries"][0]["licenseSha256"] = "0" * 64
+        with tempfile.TemporaryDirectory() as directory:
+            staged_root = Path(directory)
+            (staged_root / "packaging").mkdir()
+            (staged_root / "packaging" / policy_path.name).write_bytes(
+                self.canonical_json(wrong_sodium)
+            )
+            with self.assertRaisesRegex(ReleaseError, "libsodium metadata"):
+                release_common_module._load_dependency_license_policy(staged_root)
+
+        sodium_name = "root/THIRD_PARTY_LICENSE_TEXTS/native/libsodium-1.0.22/LICENSE"
+        tampered_license_entries = dict(entries)
+        tampered_license_entries[sodium_name] = (b"not the reviewed ISC text", 0o644)
+        with self.assertRaisesRegex(ReleaseError, "wrong digest"):
+            validate_license_inventory(
+                inventory,
+                tampered_license_entries,
+                "root/",
+                "0.1.0",
+                "linux-x64",
+            )
+
+        cargo_record = json.loads(inventory)["components"][0]["licenseFiles"][0]
+        cargo_name = "root/" + cargo_record["path"]
+        tampered_cargo_entries = dict(entries)
+        tampered_cargo_entries[cargo_name] = (b"not the collected Cargo license", 0o644)
+        with self.assertRaisesRegex(ReleaseError, "Cargo license text has the wrong digest"):
+            validate_license_inventory(
+                inventory,
+                tampered_cargo_entries,
+                "root/",
+                "0.1.0",
+                "linux-x64",
+            )
+
+    def test_release_set_requires_shared_inventory_and_sidecar(self) -> None:
+        version = "0.1.0"
+        platform = "linux-x64"
+        source = {
+            "commit": "1" * 40,
+            "dirtySourceTree": False,
+            "repository": "https://github.com/JekYUlll/Inex",
+        }
+        manifest = self.canonical_json({"source": source})
+        inventory = self.canonical_json({"components": [{"name": "component"}]})
+        sidecar = b"one-identical-sidecar"
+        artifact_names = {
+            "rust": f"inex-rust-{version}-{platform}.zip",
+            "vscode": f"inex-vscode-{version}-{platform}.vsix",
+            "sublime": f"inex-sublime-{version}-{platform}.zip",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for kind, name in artifact_names.items():
+                (root / name).write_bytes(f"{kind}-archive".encode("ascii"))
+            sums = "".join(
+                f"{release_common_module.sha256_file(root / name)}  {name}\n"
+                for name in sorted(artifact_names.values())
+            )
+            (root / "SHA256SUMS").write_text(sums, encoding="ascii")
+            rust_prefix = f"inex-{version}-{platform}/"
+            entries_by_name = {
+                artifact_names["rust"]: {
+                    rust_prefix + "PACKAGE-MANIFEST.json": (manifest, 0o644),
+                    rust_prefix + "THIRD_PARTY_LICENSES.json": (inventory, 0o644),
+                    rust_prefix + "bin/inexd": (sidecar, 0o755),
+                    rust_prefix + "THIRD_PARTY_LICENSE_TEXTS/license": (b"license", 0o644),
+                },
+                artifact_names["vscode"]: {
+                    "extension/PACKAGE-MANIFEST.json": (manifest, 0o644),
+                    "extension/THIRD_PARTY_LICENSES.json": (inventory, 0o644),
+                    "extension/bin/linux-x64/inexd": (sidecar, 0o755),
+                    "extension/THIRD_PARTY_LICENSE_TEXTS/license": (b"license", 0o644),
+                },
+                artifact_names["sublime"]: {
+                    "Inex/PACKAGE-MANIFEST.json": (manifest, 0o644),
+                    "Inex/THIRD_PARTY_LICENSES.json": (inventory, 0o644),
+                    "Inex/bin/inexd": (sidecar, 0o755),
+                    "Inex/THIRD_PARTY_LICENSE_TEXTS/license": (b"license", 0o644),
+                },
+            }
+
+            def run_audit() -> dict[str, object]:
+                with (
+                    mock.patch("audit_release_artifacts.validate_rust"),
+                    mock.patch("audit_release_artifacts.validate_vscode"),
+                    mock.patch("audit_release_artifacts.validate_sublime"),
+                    mock.patch(
+                        "audit_release_artifacts.read_zip_entries",
+                        side_effect=lambda path: entries_by_name[path.name],
+                    ),
+                ):
+                    return audit_directory(root)
+
+            report = run_audit()
+            validate_release_set_report(report)
+            encoded = encode_release_set_report(report)
+            self.assertEqual(json.loads(encoded), report)
+            self.assertEqual(report["artifactCount"], 3)
+            self.assertEqual(report["cargoComponentCount"], 1)
+            self.assertEqual(report["licenseTextCount"], 1)
+
+            vscode_inventory_name = "extension/THIRD_PARTY_LICENSES.json"
+            original_inventory = entries_by_name[artifact_names["vscode"]][
+                vscode_inventory_name
+            ]
+            entries_by_name[artifact_names["vscode"]][vscode_inventory_name] = (
+                self.canonical_json({"components": [{"name": "different"}]}),
+                0o644,
+            )
+            with self.assertRaisesRegex(ReleaseError, "one license inventory"):
+                run_audit()
+            entries_by_name[artifact_names["vscode"]][
+                vscode_inventory_name
+            ] = original_inventory
+
+            sidecar_name = "extension/bin/linux-x64/inexd"
+            original_sidecar = entries_by_name[artifact_names["vscode"]][sidecar_name]
+            entries_by_name[artifact_names["vscode"]][sidecar_name] = (
+                b"different-sidecar",
+                0o755,
+            )
+            with self.assertRaisesRegex(ReleaseError, "identical sidecar"):
+                run_audit()
+            entries_by_name[artifact_names["vscode"]][sidecar_name] = original_sidecar
+
+            invalid_report = dict(report)
+            invalid_report["schemaVersion"] = True
+            with self.assertRaisesRegex(ReleaseError, "schema version"):
+                validate_release_set_report(invalid_report)
+            invalid_report = dict(report)
+            invalid_report["unexpected"] = True
+            with self.assertRaisesRegex(ReleaseError, "root schema"):
+                validate_release_set_report(invalid_report)
+            invalid_report = dict(report)
+            invalid_report["notCovered"] = []
+            with self.assertRaisesRegex(ReleaseError, "scope metadata"):
+                validate_release_set_report(invalid_report)
+
+            report["notCovered"].append("caller-mutation")
+            with self.assertRaisesRegex(ReleaseError, "scope metadata"):
+                validate_release_set_report(report)
+            self.assertNotIn("caller-mutation", run_audit()["notCovered"])
+
+    def test_package_report_is_canonical_exact_and_non_approving(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifacts = []
+            for kind, extension in (("rust", "zip"), ("sublime", "zip"), ("vscode", "vsix")):
+                path = root / f"inex-{kind}-0.1.0-linux-x64.{extension}"
+                path.write_bytes(kind.encode("ascii"))
+                artifacts.append(path)
+            checksum = root / "SHA256SUMS"
+            checksum.write_text(
+                "".join(
+                    f"{release_common_module.sha256_file(path)}  {path.name}\n"
+                    for path in sorted(artifacts, key=lambda path: path.name)
+                ),
+                encoding="ascii",
+            )
+            report = package_report("linux-x64", "0.1.0", artifacts, checksum)
+            validate_package_report(report)
+            self.assertEqual(json.loads(encode_package_report(report)), report)
+            self.assertIn("independent-legal-review", report["notCovered"])
+            self.assertEqual(
+                report["trustAssumptions"],
+                ["package-inputs-and-toolchain-are-trusted-and-stable"],
+            )
+
+            for field, value, message in (
+                ("schemaVersion", True, "schema version"),
+                ("artifactCount", 2, "artifact count"),
+                ("notCovered", [], "fixed release metadata"),
+            ):
+                invalid = dict(report)
+                invalid[field] = value
+                with self.subTest(field=field), self.assertRaisesRegex(ReleaseError, message):
+                    validate_package_report(invalid)
+
+            report["notCovered"].append("caller-mutation")
+            with self.assertRaisesRegex(ReleaseError, "fixed release metadata"):
+                validate_package_report(report)
+            fresh = package_report("linux-x64", "0.1.0", artifacts, checksum)
+            self.assertNotIn("caller-mutation", fresh["notCovered"])
+
+            checksum.write_text("not valid checksums\n", encoding="ascii")
+            with self.assertRaisesRegex(ReleaseError, "exactly bind"):
+                package_report("linux-x64", "0.1.0", artifacts, checksum)
+
+    def test_packaged_root_readme_links_the_bundled_license_policy(self) -> None:
+        repository_root = Path(__file__).resolve().parents[2]
+        readme = packaged_root_readme(repository_root).decode("utf-8")
+        self.assertIn(
+            "[`dependency-license-policy.json`](DEPENDENCY_LICENSE_POLICY.json)",
+            readme,
+        )
+        self.assertNotIn("(packaging/dependency-license-policy.json)", readme)
+
+    def test_package_smoke_binds_release_target_and_profile(self) -> None:
+        report = expected_runtime_info("inex", "0.1.0", "windows-x64")
+        self.assertIn("rust-target: x86_64-pc-windows-msvc", report)
+        self.assertIn("rust-debug-assertions: false", report)
+        self.assertNotIn("x86_64-pc-windows-gnu", report)
 
     def test_windows_pe_architecture_and_dynamic_sodium_are_checked(self) -> None:
         validate_native_binary(self.minimal_pe(0x8664), "windows-x64", "test")

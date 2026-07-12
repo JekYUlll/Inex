@@ -53,12 +53,14 @@ operations limit 3. Readers validate a resource ceiling before calling sodium.
   artifacts/source paths supplied and verified by the pinned sys crate.
 - Linux/Windows x64 are the first blocking matrix; Linux/Windows arm64 join
   before GA. Format fixtures must be byte-identical on every target.
-- The release-tool suite passes 49/49, `actionlint` and pedantic/all-features
-  Clippy pass, and independent code review is GO. A local system-GCC Linux x64
-  clean-source double build is byte-identical and passes strict
+- The current strict release-tool source suite passes 59/59; `actionlint`,
+  pedantic/all-features Clippy, warnings-as-errors rustdoc, and the Windows GNU
+  cross-check pass. A previous local system-GCC Linux x64 clean-source double
+  build is byte-identical and passes the then-current strict
   ELF/archive/native-dependency audit plus executable/VSIX sidecar smoke with
-  `dirtySourceTree=false`. The xlings-default local ELF embeds its build-home
-  interpreter/RUNPATH and is correctly rejected as non-portable.
+  `dirtySourceTree=false`, but those artifacts predate strict release-set
+  evidence v1 and are historical only. The xlings-default local ELF embeds its
+  build-home interpreter/RUNPATH and is correctly rejected as non-portable.
 - A clean standalone lifecycle run at harness commit `1e01842` re-audits the
   final Linux x64 packages, authenticates five imported/restored bodies and
   reports zero sensitive-residue hits outside the designated plaintext source.
@@ -105,15 +107,32 @@ release process.
 | `typescript` | 7.0.2 | Apache-2.0 | no |
 | `@vscode/vsce` | 3.9.2 | MIT | no; packaging process only |
 
-The packaging helper generates `THIRD_PARTY_LICENSES.json` from locked offline
-native-target Cargo metadata, including names, versions, license expressions,
-source, available registry checksums, and per-component archive paths. It also
-collects the referenced complete license/NOTICE files into
+The packaging helper generates canonical `THIRD_PARTY_LICENSES.json` from
+locked offline Cargo metadata filtered by the package platform's fixed Rust
+target triple, rather than the build host. Every crates.io component must have
+its exact Cargo.lock checksum and an expression present in the committed
+`packaging/dependency-license-policy.json`; a new source, expression, missing
+checksum, duplicate component/path, or noncanonical schema fails closed. Only
+the four fixed `crates/inex-*` manifests are first-party: auto-promoted or other
+path/workspace dependencies are rejected. That policy is explicitly
+engineering collection metadata, not legal approval. The helper also collects
+the referenced complete license/NOTICE files and their SHA-256 digests into
 `THIRD_PARTY_LICENSE_TEXTS/` and fails if a resolved component has no acceptable
-text. The verified Linux x64 candidate contains 77 Cargo components, 146 Cargo
+text. The Linux x64 graph currently contains 77 Cargo components, 146 Cargo
 license/NOTICE files, and the bundled libsodium 1.0.22 ISC file: 147 collected
-texts total. The Rust ZIP, VSIX, and unpacked Sublime ZIP all passed the archive
-license-reference audit.
+texts total. The policy separately pins that ISC text's SHA-256. Strict
+release-set audit additionally requires all three artifacts to contain the
+same inventory bytes and the same `inexd` bytes.
+
+`inex runtime-info` and `inexd --runtime-info` expose a fixed machine-readable
+report. Package smoke requires the platform's fixed Rust target triple,
+`rust-debug-assertions: false`, exact libsodium `1.0.22`, ABI `26.4`, and a
+non-minimal build; a GNU Windows binary cannot satisfy an MSVC package, and a
+merely nonempty or `1.0.x` version string is not accepted. Package construction,
+release-set audit, and lifecycle evidence
+emit canonical schema-v1 reports with explicit `notCovered` and trust
+assumptions. Lifecycle evidence serializes its final report and scans those
+bytes with the same dynamic password/session/canary variants before output.
 
 Automated collection is not legal approval. Before public distribution, the
 release owner must still:

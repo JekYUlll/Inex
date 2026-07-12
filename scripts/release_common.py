@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
+import re
 import signal
 import shutil
 import stat
@@ -41,25 +42,60 @@ WINDOWS_REPARSE_POINT = 0x0400
 PLATFORMS: dict[str, dict[str, str]] = {
     "linux-x64": {
         "binary_suffix": "",
+        "rust_target": "x86_64-unknown-linux-gnu",
         "vscode_target": "linux-x64",
         "vscode_runtime": "linux-x64",
     },
     "linux-arm64": {
         "binary_suffix": "",
+        "rust_target": "aarch64-unknown-linux-gnu",
         "vscode_target": "linux-arm64",
         "vscode_runtime": "linux-arm64",
     },
     "windows-x64": {
         "binary_suffix": ".exe",
+        "rust_target": "x86_64-pc-windows-msvc",
         "vscode_target": "win32-x64",
         "vscode_runtime": "win32-x64",
     },
     "windows-arm64": {
         "binary_suffix": ".exe",
+        "rust_target": "aarch64-pc-windows-msvc",
         "vscode_target": "win32-arm64",
         "vscode_runtime": "win32-arm64",
     },
 }
+
+DEPENDENCY_LICENSE_POLICY_RELATIVE = Path("packaging/dependency-license-policy.json")
+LICENSE_POLICY_TYPE = "engineering-collection-not-legal-approval"
+LICENSE_POLICY_REQUIRED_REVIEW = "independent-legal-review-pending"
+LICENSE_POLICY_ARCHIVE_PATH = "DEPENDENCY_LICENSE_POLICY.json"
+LICENSE_INVENTORY_POLICY_STATUS = (
+    "engineering-collection-only-independent-legal-review-pending"
+)
+LIBSODIUM_LICENSE_SHA256 = (
+    "508a76d186356c0dd807a670ef510964f8724557024796a2c426c6c0e19ab683"
+)
+ACCEPTED_CARGO_LICENSE_EXPRESSIONS = (
+    "(MIT OR Apache-2.0) AND Unicode-3.0",
+    "Apache-2.0",
+    "Apache-2.0 OR MIT",
+    "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+    "BlueOak-1.0.0",
+    "MIT",
+    "MIT OR Apache-2.0",
+    "MIT OR Apache-2.0 OR Zlib",
+    "MIT/Apache-2.0",
+    "Unlicense OR MIT",
+    "Zlib",
+    "Zlib OR Apache-2.0 OR MIT",
+)
+EXPECTED_WORKSPACE_PACKAGES = (
+    ("inex-cli", Path("crates/inex-cli/Cargo.toml")),
+    ("inex-core", Path("crates/inex-core/Cargo.toml")),
+    ("inex-daemon", Path("crates/inex-daemon/Cargo.toml")),
+    ("inex-git", Path("crates/inex-git/Cargo.toml")),
+)
 
 
 class ReleaseError(RuntimeError):
@@ -1378,27 +1414,14 @@ def package_manifest(
     )
 
 
-def _native_locked_metadata(repository_root: Path) -> dict[str, Any]:
+def _target_locked_metadata(repository_root: Path, platform: str) -> dict[str, Any]:
+    configuration = PLATFORMS.get(platform)
+    if configuration is None:
+        raise ReleaseError(f"unsupported license-inventory platform: {platform}")
+    rust_target = configuration["rust_target"]
     environment = os.environ.copy()
     environment["CARGO_NET_OFFLINE"] = "true"
     try:
-        version_result = subprocess.run(
-            ["rustc", "-vV"],
-            cwd=repository_root,
-            env=environment,
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-        )
-        host_lines = [
-            line.removeprefix("host: ")
-            for line in version_result.stdout.splitlines()
-            if line.startswith("host: ")
-        ]
-        if len(host_lines) != 1 or not host_lines[0]:
-            raise ReleaseError("rustc did not report one native host target")
         result = subprocess.run(
             [
                 "cargo",
@@ -1408,7 +1431,7 @@ def _native_locked_metadata(repository_root: Path) -> dict[str, Any]:
                 "--locked",
                 "--offline",
                 "--filter-platform",
-                host_lines[0],
+                rust_target,
             ],
             cwd=repository_root,
             env=environment,
@@ -1418,21 +1441,66 @@ def _native_locked_metadata(repository_root: Path) -> dict[str, Any]:
         )
         metadata = json.loads(result.stdout)
     except (OSError, UnicodeError, json.JSONDecodeError, subprocess.CalledProcessError) as error:
-        raise ReleaseError("could not resolve the native locked Cargo graph") from error
+        raise ReleaseError("could not resolve the target-bound locked Cargo graph") from error
     if not isinstance(metadata, dict) or not isinstance(metadata.get("resolve"), dict):
         raise ReleaseError("Cargo metadata omitted its resolved native graph")
     return metadata
 
 
-def _native_resolved_packages(metadata: dict[str, Any]) -> list[dict[str, Any]]:
+def _native_resolved_packages(
+    metadata: dict[str, Any], repository_root: Path
+) -> list[dict[str, Any]]:
     resolve = metadata["resolve"]
-    nodes = {
-        node.get("id"): node
-        for node in resolve.get("nodes", [])
-        if isinstance(node, dict) and isinstance(node.get("id"), str)
-    }
+    nodes: dict[str, dict[str, Any]] = {}
+    for node in resolve.get("nodes", []):
+        if not isinstance(node, dict) or not isinstance(node.get("id"), str):
+            raise ReleaseError("resolved Cargo graph contains an invalid node")
+        if node["id"] in nodes:
+            raise ReleaseError("resolved Cargo graph repeats a node")
+        nodes[node["id"]] = node
+
+    packages_by_id: dict[str, dict[str, Any]] = {}
+    for package in metadata.get("packages", []):
+        if not isinstance(package, dict) or not isinstance(package.get("id"), str):
+            raise ReleaseError("Cargo metadata contains an invalid package")
+        if package["id"] in packages_by_id:
+            raise ReleaseError("Cargo metadata repeats a package")
+        packages_by_id[package["id"]] = package
+
+    root = repository_root.resolve(strict=True)
+    try:
+        metadata_root = Path(metadata["workspace_root"]).resolve(strict=True)
+    except (KeyError, OSError, TypeError) as error:
+        raise ReleaseError("Cargo metadata has an invalid workspace root") from error
+    if metadata_root != root:
+        raise ReleaseError("Cargo metadata resolved a different workspace root")
+
+    expected_workspace_ids: set[str] = set()
+    for expected_name, relative_manifest in EXPECTED_WORKSPACE_PACKAGES:
+        expected_manifest = root / relative_manifest
+        matches = [
+            package
+            for package in packages_by_id.values()
+            if package.get("name") == expected_name
+            and package.get("source") is None
+            and isinstance(package.get("manifest_path"), str)
+            and Path(package["manifest_path"]) == expected_manifest
+        ]
+        if len(matches) != 1:
+            raise ReleaseError("Cargo metadata omits an expected first-party package")
+        expected_workspace_ids.add(matches[0]["id"])
+
+    workspace_members = metadata.get("workspace_members")
+    if (
+        not isinstance(workspace_members, list)
+        or any(not isinstance(value, str) for value in workspace_members)
+        or len(workspace_members) != len(set(workspace_members))
+        or set(workspace_members) != expected_workspace_ids
+    ):
+        raise ReleaseError("Cargo metadata workspace member set differs from the reviewed set")
+
     reachable = set()
-    pending = list(metadata.get("workspace_members", []))
+    pending = list(workspace_members)
     while pending:
         package_id = pending.pop()
         if package_id in reachable:
@@ -1457,17 +1525,98 @@ def _native_resolved_packages(metadata: dict[str, Any]) -> list[dict[str, Any]]:
             pending.append(dependency_id)
 
     packages = []
+    missing_packages = reachable - packages_by_id.keys()
+    if missing_packages:
+        raise ReleaseError("resolved Cargo graph omits package metadata")
     for package in metadata.get("packages", []):
-        if (
-            isinstance(package, dict)
-            and package.get("id") in reachable
-            and package.get("source") is not None
-        ):
-            packages.append(package)
+        if not isinstance(package, dict) or package.get("id") not in reachable:
+            continue
+        if package.get("id") in expected_workspace_ids:
+            continue
+        if package.get("source") is None:
+            raise ReleaseError(
+                "resolved Cargo graph contains an unreviewed non-workspace path dependency"
+            )
+        packages.append(package)
     return packages
 
 
-def generate_license_inventory(repository_root: Path, version: str) -> bytes:
+def _strict_license_policy_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ReleaseError(f"dependency license policy repeats a JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _load_dependency_license_policy(
+    repository_root: Path,
+) -> tuple[bytes, dict[str, Any]]:
+    path = require_regular_file(
+        repository_root / DEPENDENCY_LICENSE_POLICY_RELATIVE,
+        "dependency license policy",
+    )
+    try:
+        data = path.read_bytes()
+        text = data.decode("utf-8", "strict")
+        policy = json.loads(text, object_pairs_hook=_strict_license_policy_object)
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ReleaseError("dependency license policy is not strict UTF-8 JSON") from error
+    if not isinstance(policy, dict) or set(policy) != {
+        "schemaVersion",
+        "policyType",
+        "requiredReview",
+        "cargoRegistrySource",
+        "acceptedCargoLicenseExpressions",
+        "bundledNativeLibraries",
+    }:
+        raise ReleaseError("dependency license policy has an invalid root schema")
+    schema = policy.get("schemaVersion")
+    if not isinstance(schema, int) or isinstance(schema, bool) or schema != 1:
+        raise ReleaseError("dependency license policy has an invalid schema version")
+    if (
+        policy.get("policyType") != LICENSE_POLICY_TYPE
+        or policy.get("requiredReview") != LICENSE_POLICY_REQUIRED_REVIEW
+        or policy.get("cargoRegistrySource")
+        != "registry+https://github.com/rust-lang/crates.io-index"
+    ):
+        raise ReleaseError("dependency license policy has invalid fixed metadata")
+    expressions = policy.get("acceptedCargoLicenseExpressions")
+    if (
+        not isinstance(expressions, list)
+        or expressions != list(ACCEPTED_CARGO_LICENSE_EXPRESSIONS)
+    ):
+        raise ReleaseError("dependency license policy expressions differ from the reviewed set")
+    native = policy.get("bundledNativeLibraries")
+    if not isinstance(native, list) or len(native) != 1:
+        raise ReleaseError("dependency license policy has invalid native metadata")
+    sodium = native[0]
+    if not isinstance(sodium, dict) or set(sodium) != {
+        "name",
+        "version",
+        "license",
+        "source",
+        "licenseSha256",
+    }:
+        raise ReleaseError("dependency license policy has invalid libsodium schema")
+    if (
+        sodium.get("name") != "libsodium"
+        or sodium.get("version") != "1.0.22"
+        or sodium.get("license") != "ISC"
+        or sodium.get("source") != "bundled by libsodium-sys-stable 1.24.0"
+        or sodium.get("licenseSha256") != LIBSODIUM_LICENSE_SHA256
+    ):
+        raise ReleaseError("dependency license policy has invalid libsodium metadata")
+    canonical = (
+        json.dumps(policy, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    if data != canonical:
+        raise ReleaseError("dependency license policy is not canonical JSON")
+    return data, policy
+
+
+def generate_license_inventory(repository_root: Path, version: str, platform: str) -> bytes:
     """Generate a deterministic resolved-Cargo license inventory.
 
     The VS Code bundle has no shipped npm runtime dependency: Node built-ins and
@@ -1476,8 +1625,9 @@ def generate_license_inventory(repository_root: Path, version: str) -> bytes:
     """
 
     try:
-        metadata = _native_locked_metadata(repository_root)
+        metadata = _target_locked_metadata(repository_root, platform)
         lock = tomllib.loads((repository_root / "Cargo.lock").read_text(encoding="utf-8"))
+        policy_bytes, policy = _load_dependency_license_policy(repository_root)
     except (
         OSError,
         UnicodeError,
@@ -1485,14 +1635,24 @@ def generate_license_inventory(repository_root: Path, version: str) -> bytes:
     ) as error:
         raise ReleaseError("could not build the locked dependency license inventory") from error
 
-    checksums: dict[tuple[str, str], str] = {}
+    registry_source = policy["cargoRegistrySource"]
+    checksums: dict[tuple[str, str, str], str] = {}
     for package in lock.get("package", []):
         checksum = package.get("checksum")
         if isinstance(checksum, str):
-            checksums[(str(package.get("name")), str(package.get("version")))] = checksum
+            key = (
+                str(package.get("name")),
+                str(package.get("version")),
+                str(package.get("source")),
+            )
+            if key in checksums:
+                raise ReleaseError("Cargo.lock repeats a checksummed package")
+            checksums[key] = checksum
 
     components = []
-    for package in _native_resolved_packages(metadata):
+    accepted_expressions = set(policy["acceptedCargoLicenseExpressions"])
+    component_keys: set[tuple[str, str]] = set()
+    for package in _native_resolved_packages(metadata, repository_root):
         name = package.get("name")
         package_version = package.get("version")
         license_expression = package.get("license")
@@ -1500,16 +1660,27 @@ def generate_license_inventory(repository_root: Path, version: str) -> bytes:
             raise ReleaseError("Cargo metadata contains an invalid package identity")
         if not isinstance(license_expression, str) or not license_expression:
             raise ReleaseError(f"dependency has no declared license: {name} {package_version}")
+        if license_expression not in accepted_expressions:
+            raise ReleaseError(
+                f"dependency has an unreviewed license expression: {name} {package_version}"
+            )
+        if package.get("source") != registry_source:
+            raise ReleaseError(f"dependency is not from the reviewed registry: {name} {package_version}")
+        key = (name, package_version)
+        if key in component_keys:
+            raise ReleaseError(f"resolved Cargo graph repeats a dependency: {name} {package_version}")
+        component_keys.add(key)
+        checksum = checksums.get((name, package_version, registry_source))
+        if not isinstance(checksum, str) or re.fullmatch(r"[0-9a-f]{64}", checksum) is None:
+            raise ReleaseError(f"dependency has no canonical locked checksum: {name} {package_version}")
         component = {
             "ecosystem": "cargo",
             "name": name,
             "version": package_version,
             "license": license_expression,
-            "source": "crates.io",
+            "source": registry_source,
+            "checksum": f"sha256:{checksum}",
         }
-        checksum = checksums.get((name, package_version))
-        if checksum is not None:
-            component["checksum"] = f"sha256:{checksum}"
         components.append(component)
     components.sort(key=lambda item: (item["name"], item["version"]))
 
@@ -1521,6 +1692,15 @@ def generate_license_inventory(repository_root: Path, version: str) -> bytes:
             "license": "GPL-3.0-only",
             "repository": "https://github.com/JekYUlll/Inex",
         },
+        "target": {
+            "platform": platform,
+            "rustTriple": PLATFORMS[platform]["rust_target"],
+        },
+        "licensePolicy": {
+            "path": LICENSE_POLICY_ARCHIVE_PATH,
+            "sha256": sha256_bytes(policy_bytes),
+            "status": LICENSE_INVENTORY_POLICY_STATUS,
+        },
         "scope": {
             "rust": "locked normal/build Cargo packages reachable for the native package target",
             "vscodeRuntime": "no shipped npm runtime dependencies; vscode and Node built-ins are host-provided",
@@ -1528,14 +1708,7 @@ def generate_license_inventory(repository_root: Path, version: str) -> bytes:
             "buildTools": "not shipped and intentionally excluded",
         },
         "components": components,
-        "bundledNativeLibraries": [
-            {
-                "name": "libsodium",
-                "version": "1.0.22",
-                "license": "ISC",
-                "source": "bundled by libsodium-sys-stable 1.24.0",
-            }
-        ],
+        "bundledNativeLibraries": policy["bundledNativeLibraries"],
     }
     return (json.dumps(inventory, ensure_ascii=True, indent=2, sort_keys=True) + "\n").encode(
         "utf-8"
@@ -1551,17 +1724,20 @@ def _is_license_filename(name: str) -> bool:
 
 
 def generate_license_materials(
-    repository_root: Path, version: str
+    repository_root: Path, version: str, platform: str
 ) -> tuple[bytes, dict[str, tuple[bytes, int]]]:
     """Return the inventory and complete dependency license/notice files."""
 
-    inventory = json.loads(generate_license_inventory(repository_root, version))
-    metadata = _native_locked_metadata(repository_root)
+    inventory = json.loads(generate_license_inventory(repository_root, version, platform))
+    metadata = _target_locked_metadata(repository_root, platform)
+    policy_bytes, policy = _load_dependency_license_policy(repository_root)
 
-    texts: dict[str, tuple[bytes, int]] = {}
-    references: dict[tuple[str, str], list[str]] = {}
+    texts: dict[str, tuple[bytes, int]] = {
+        LICENSE_POLICY_ARCHIVE_PATH: (policy_bytes, 0o644)
+    }
+    references: dict[tuple[str, str], list[dict[str, str]]] = {}
     libsodium_package_directory: Path | None = None
-    for package in _native_resolved_packages(metadata):
+    for package in _native_resolved_packages(metadata, repository_root):
         name = package.get("name")
         package_version = package.get("version")
         manifest_path = package.get("manifest_path")
@@ -1593,9 +1769,10 @@ def generate_license_materials(
             if archive_name in texts:
                 raise ReleaseError(f"duplicate dependency license destination: {archive_name}")
             texts[archive_name] = (data, 0o644)
-            selected.append(archive_name)
+            selected.append({"path": archive_name, "sha256": sha256_bytes(data)})
         if not selected:
             raise ReleaseError(f"dependency has no distributable license text: {name} {package_version}")
+        selected.sort(key=lambda record: record["path"])
         references[(name, package_version)] = selected
 
     native_license_path = "THIRD_PARTY_LICENSE_TEXTS/native/libsodium-1.0.22/LICENSE"
@@ -1615,7 +1792,11 @@ def generate_license_materials(
             extracted = archive.extractfile(matches[0])
             if extracted is None:
                 raise ReleaseError("bundled libsodium license could not be read")
-            texts[native_license_path] = (extracted.read(), 0o644)
+            native_license = extracted.read()
+            expected_native_digest = policy["bundledNativeLibraries"][0]["licenseSha256"]
+            if sha256_bytes(native_license) != expected_native_digest:
+                raise ReleaseError("bundled libsodium license does not match the reviewed policy")
+            texts[native_license_path] = (native_license, 0o644)
     except (OSError, tarfile.TarError) as error:
         raise ReleaseError("could not read bundled libsodium license text") from error
 
@@ -1630,7 +1811,12 @@ def generate_license_materials(
     native = inventory.get("bundledNativeLibraries")
     if not isinstance(native, list) or len(native) != 1:
         raise ReleaseError("generated native license inventory is invalid")
-    native[0]["licenseFiles"] = [native_license_path]
+    native[0]["licenseFiles"] = [
+        {
+            "path": native_license_path,
+            "sha256": sha256_bytes(native_license),
+        }
+    ]
 
     encoded = (
         json.dumps(inventory, ensure_ascii=True, indent=2, sort_keys=True) + "\n"

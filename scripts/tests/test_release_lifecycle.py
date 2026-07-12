@@ -14,6 +14,7 @@ import time
 import unittest
 from unittest import mock
 
+import audit_release_artifacts as artifact_audit
 import drill_release_lifecycle as lifecycle
 
 from drill_release_lifecycle import (
@@ -51,11 +52,147 @@ from drill_release_lifecycle import (
 
 
 class ReleaseLifecycleTests(unittest.TestCase):
+    @staticmethod
+    def valid_lifecycle_report() -> dict[str, object]:
+        source = {
+            "commit": "1" * 40,
+            "dirtySourceTree": False,
+            "repository": "https://github.com/JekYUlll/Inex",
+        }
+        artifacts = [
+            {
+                "name": f"inex-{kind}-0.1.0-linux-x64.{extension}",
+                "sha256": str(index) * 64,
+            }
+            for index, (kind, extension) in enumerate(
+                (("rust", "zip"), ("sublime", "zip"), ("vscode", "vsix")), start=2
+            )
+        ]
+        release_set_audit = {
+            "schemaVersion": 1,
+            "reportType": "inex-release-set-audit",
+            "reportScope": (
+                "artifact-structure-cross-package-consistency-not-release-approval"
+            ),
+            "releaseVersion": "0.1.0",
+            "platform": "linux-x64",
+            "source": dict(source),
+            "artifactCount": 3,
+            "artifacts": [
+                {
+                    "name": record["name"],
+                    "sha256": record["sha256"],
+                    "packageManifestSha256": "b" * 64,
+                }
+                for record in artifacts
+            ],
+            "cargoComponentCount": 77,
+            "licenseTextCount": 147,
+            "sharedLicenseInventorySha256": "c" * 64,
+            "sharedSidecarSha256": "d" * 64,
+            "notCovered": list(artifact_audit.RELEASE_SET_NOT_COVERED),
+            "trustAssumptions": list(artifact_audit.RELEASE_SET_TRUST_ASSUMPTIONS),
+        }
+        return {
+            "schemaVersion": 1,
+            "reportType": "inex-release-lifecycle",
+            "artifactSource": dict(source),
+            "auditedArtifactCount": 3,
+            "auditedArtifacts": artifacts,
+            "authenticatedExpectedBodies": 5,
+            "cleanRegularFileTreeCopyRestoreVerified": True,
+            "covered": list(lifecycle.LIFECYCLE_REPORT_COVERED),
+            "sensitiveResidueHitsOutsideDesignatedPlaintextSource": 0,
+            "residueContentScanExcludedRoots": ["plaintext-source"],
+            "designatedPlaintextSourcePathComponentsScanned": True,
+            "driverRelocationVerified": True,
+            "fixtureFiles": [
+                {"name": name, "sha256": lifecycle.FROZEN_V1_HASHES[name]}
+                for name in sorted(lifecycle.FROZEN_V1_HASHES)
+            ],
+            "frozenV1CompatibilityRead": True,
+            "frozenV1ProductBytesUnchanged": True,
+            "filesystemType": "ext2/ext3",
+            "gitBundleVerified": True,
+            "gitVersion": "git version 2.43.0",
+            "linuxDescendantControl": "subreaper-procfs-pidfd",
+            "harnessFiles": [
+                {"name": name, "sha256": "a" * 64}
+                for name in lifecycle.LIFECYCLE_HARNESS_FILES
+            ],
+            "harnessSource": dict(source),
+            "markdownFiles": 5,
+            "maxMarkdownBytes": lifecycle.MAX_MARKDOWN_BYTES,
+            "nativePlatform": "linux-x64",
+            "nativeRuntime": {
+                "machine": "x86_64",
+                "release": "test-kernel",
+                "system": "Linux",
+            },
+            "notCovered": list(lifecycle.LIFECYCLE_REPORT_NOT_COVERED),
+            "importedVaultPhysicalAllowlistVerified": True,
+            "pythonVersion": "3.13.14",
+            "releaseLifecycleDrill": "passed",
+            "reportScope": "lifecycle-only-non-release-approval",
+            "releaseVersion": "0.1.0",
+            "releaseSetAudit": release_set_audit,
+            "restoredDriverReinstalled": True,
+            "sourceHashesUnchanged": True,
+            "sourceDirectorySetUnchanged": True,
+            "historicalPasswordScopeVerified": True,
+            "trustAssumptions": list(lifecycle.LIFECYCLE_REPORT_TRUST_ASSUMPTIONS),
+        }
+
     def test_strict_base64url_requires_unpadded_canonical_input(self) -> None:
         self.assertEqual(strict_base64url_decode("YmluYXJ5AA", "test"), b"binary\0")
         for value in ("YmluYXJ5AA==", "YmluYXJ5AA%", "A"):
             with self.subTest(value=value), self.assertRaises(ReleaseError):
                 strict_base64url_decode(value, "test")
+
+    def test_lifecycle_report_is_exact_canonical_and_scans_itself(self) -> None:
+        report = self.valid_lifecycle_report()
+        lifecycle.validate_lifecycle_report(report)
+        encoded = lifecycle.encode_lifecycle_report(report)
+        self.assertEqual(json.loads(encoded), report)
+
+        for field, value, message in (
+            ("schemaVersion", True, "schema version"),
+            ("covered", [], "scope metadata"),
+            ("notCovered", [], "scope metadata"),
+            ("auditedArtifactCount", 2, "artifact count"),
+        ):
+            invalid = dict(report)
+            invalid[field] = value
+            with self.subTest(field=field), self.assertRaisesRegex(ReleaseError, message):
+                lifecycle.validate_lifecycle_report(invalid)
+        unknown = dict(report)
+        unknown["unexpected"] = True
+        with self.assertRaisesRegex(ReleaseError, "root schema"):
+            lifecycle.validate_lifecycle_report(unknown)
+
+        mismatched_digest = json.loads(json.dumps(report))
+        mismatched_digest["auditedArtifacts"][0]["sha256"] = "e" * 64
+        with self.assertRaisesRegex(ReleaseError, "artifact hashes differ"):
+            lifecycle.validate_lifecycle_report(mismatched_digest)
+
+        bool_zero = dict(report)
+        bool_zero["sensitiveResidueHitsOutsideDesignatedPlaintextSource"] = False
+        with self.assertRaisesRegex(ReleaseError, "counts or exclusions"):
+            lifecycle.validate_lifecycle_report(bool_zero)
+
+        wrong_harness = json.loads(json.dumps(report))
+        wrong_harness["harnessFiles"][0]["name"] = "scripts/not-the-harness.py"
+        wrong_harness["harnessFiles"].sort(key=lambda record: record["name"])
+        with self.assertRaisesRegex(ReleaseError, "harness file set"):
+            lifecycle.validate_lifecycle_report(wrong_harness)
+
+        secret = b"dynamic-report-secret-0123456789"
+        secret_report = dict(report)
+        secret_report["filesystemType"] = secret.decode("ascii")
+        with self.assertRaisesRegex(ReleaseError, "lifecycle evidence report"):
+            lifecycle.encode_lifecycle_report(
+                secret_report, sensitive_variants((secret,))
+            )
 
     def test_sensitive_scan_covers_chunk_boundaries_and_utf16(self) -> None:
         secret = b"dynamic-lifecycle-secret"
@@ -68,6 +205,13 @@ class ReleaseLifecycleTests(unittest.TestCase):
             crossing.write_bytes("dynamic-lifecycle-secret".encode("utf-16-le"))
             with self.assertRaisesRegex(ReleaseError, "audited disk root"):
                 scan_for_sensitive_data((root,), needles)
+
+    def test_sensitive_variants_cover_ensure_ascii_json_escaping(self) -> None:
+        secret = "非秘密\"\\换行\n".encode("utf-8")
+        encoded = json.dumps(
+            {"value": secret.decode("utf-8")}, ensure_ascii=True, sort_keys=True
+        ).encode("ascii")
+        self.assertTrue(any(needle in encoded for needle in sensitive_variants((secret,))))
 
     def test_sensitive_scan_covers_base64_stream_alignments_and_path_names(self) -> None:
         secret = b"alignment-sensitive-secret-0123456789"

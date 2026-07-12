@@ -22,6 +22,7 @@ Usage:
   inex git merge <vault> [--slot <uuid>]
   inex git recover <vault> [--slot <uuid>]
   inex serve
+  inex runtime-info
   inex --help
   inex --version
 
@@ -108,6 +109,7 @@ pub(crate) enum Command {
     },
     Git(GitCommand),
     Serve,
+    RuntimeInfo,
     Help,
     Version,
 }
@@ -127,6 +129,7 @@ impl Command {
             Self::Git(GitCommand::Merge { .. }) => "git merge",
             Self::Git(GitCommand::Recover { .. }) => "git recover",
             Self::Serve => "serve",
+            Self::RuntimeInfo => "runtime-info",
             Self::Help => "help",
             Self::Version => "version",
         }
@@ -231,6 +234,7 @@ impl Cli {
             "merge-driver" => parse_merge_driver(&mut arguments)?,
             "git" => Command::Git(parse_git(&mut arguments)?),
             "serve" => Command::Serve,
+            "runtime-info" | "--runtime-info" => Command::RuntimeInfo,
             "help" | "--help" | "-h" => Command::Help,
             "--version" | "-V" => Command::Version,
             "--password" | "--passphrase" => {
@@ -500,6 +504,12 @@ mod tests {
             Cli::parse(["serve"]),
             Ok(Cli {
                 command: Command::Serve
+            })
+        ));
+        assert!(matches!(
+            Cli::parse(["runtime-info"]),
+            Ok(Cli {
+                command: Command::RuntimeInfo
             })
         ));
         assert!(matches!(
