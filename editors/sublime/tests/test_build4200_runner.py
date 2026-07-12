@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import copy
 import importlib.util
+import json
 import os
 from pathlib import Path
 import stat
@@ -22,6 +24,314 @@ if SPEC is None or SPEC.loader is None:
 runner = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = runner
 SPEC.loader.exec_module(runner)
+
+
+def _digest(character: str) -> str:
+    return character * 64
+
+
+def _seal(name: str, digest: str, *, size: int, mode: int) -> dict:
+    return {
+        "name": name,
+        "device": 1,
+        "inode": len(name) + 100,
+        "mode": mode,
+        "linkCount": 1,
+        "size": size,
+        "mtimeNs": 10,
+        "ctimeNs": 11,
+        "sha256": digest,
+    }
+
+
+def _helper_observations(scenario: str) -> list[dict]:
+    common = [
+        {"event": "loaded", "build": "4200", "gate_ok": True, "issue_count": 0},
+        {
+            "event": "unlock_dispatched",
+            "plugin_active": True,
+            "in_progress": True,
+        },
+        {"event": "password_prompt_answered", "masked": True},
+        {"event": "ui", "action": "select_tree"},
+        {
+            "event": "opened",
+            "scratch": True,
+            "unnamed": True,
+            "initial_ok": True,
+            "initial_clean": True,
+            "byte_count": 10,
+            "content_sha256": _digest("a"),
+        },
+        {
+            "event": "saved",
+            "persisted_shape": True,
+            "scratch": True,
+            "unnamed": True,
+            "byte_count": 20,
+            "content_sha256": _digest("b"),
+        },
+    ]
+    if scenario == "plugin-host-crash":
+        return common + [
+            {
+                "event": "plugin_host_crash_ready",
+                "view_id": 7,
+                "byte_count": 20,
+                "content_sha256": _digest("b"),
+                "marker": True,
+            },
+            {
+                "event": "plugin_host_dead_clipboard_checked",
+                "byte_count": 10,
+                "content_sha256": _digest("a"),
+                "same_length_and_hash": True,
+                "host_dead_plaintext_copyable": True,
+                "clipboard_read_ok": True,
+                "selection_channel": "primary",
+            },
+            {
+                "event": "plugin_host_restart_required",
+                "documented_platform_boundary": True,
+            },
+        ]
+    return common + [
+        {"event": "ui", "action": "crud_new_folder"},
+        {"event": "crud_folder_created", "exists": True},
+        {"event": "ui", "action": "crud_new_markdown"},
+        {
+            "event": "crud_markdown_created",
+            "clean": True,
+            "scratch": True,
+            "unnamed": True,
+            "empty": True,
+        },
+        {"event": "ui", "action": "crud_rename"},
+        {"event": "crud_markdown_renamed", "clean": True},
+        {"event": "ui", "action": "crud_delete_confirm"},
+        {"event": "crud_markdown_deleted", "absent": True},
+        {"event": "minimal_complete", "managed_count": 0, "crud_complete": True},
+        {"event": "complete", "managed_count": 0, "crud_complete": True},
+    ]
+
+
+def _valid_report(scenario: str = "normal") -> dict:
+    artifact_source = {
+        "commit": "1" * 40,
+        "dirtySourceTree": False,
+        "repository": "https://github.com/JekYUlll/Inex",
+    }
+    harness_source = {
+        "commit": "2" * 40,
+        "dirtySourceTree": False,
+        "repository": "https://github.com/JekYUlll/Inex",
+    }
+    artifact_records = [
+        {
+            "name": "inex-rust-0.1.0-linux-x64.zip",
+            "sha256": _digest("3"),
+            "packageManifestSha256": _digest("6"),
+        },
+        {
+            "name": "inex-sublime-0.1.0-linux-x64.zip",
+            "sha256": _digest("4"),
+            "packageManifestSha256": _digest("7"),
+        },
+        {
+            "name": "inex-vscode-0.1.0-linux-x64.vsix",
+            "sha256": _digest("5"),
+            "packageManifestSha256": _digest("8"),
+        },
+    ]
+    release_audit = {
+        "schemaVersion": 1,
+        "reportType": "inex-release-set-audit",
+        "reportScope": "artifact-structure-cross-package-consistency-not-release-approval",
+        "releaseVersion": "0.1.0",
+        "platform": "linux-x64",
+        "source": artifact_source,
+        "artifactCount": 3,
+        "artifacts": artifact_records,
+        "cargoComponentCount": 1,
+        "licenseTextCount": 1,
+        "sharedLicenseInventorySha256": _digest("e"),
+        "sharedSidecarSha256": _digest("d"),
+        "notCovered": [
+            "artifact-signing-and-publication",
+            "independent-legal-review",
+            "native-runtime-install-and-editor-behavior",
+        ],
+        "trustAssumptions": [
+            "artifact-directory-remains-stable-during-audit",
+            "auditor-source-and-runtime-are-trusted",
+        ],
+    }
+    materialized = [
+        {
+            "archiveKind": "rust",
+            "memberName": "inex-0.1.0-linux-x64/bin/inex",
+            "mode": 0o555,
+            "size": 3,
+            "sha256": _digest("c"),
+        },
+        {
+            "archiveKind": "sublime",
+            "memberName": "Inex/bin/inexd",
+            "mode": 0o555,
+            "size": 4,
+            "sha256": _digest("d"),
+        },
+    ]
+    tree_files = [_seal("bin/inexd", _digest("d"), size=4, mode=0o555)]
+    tree_digest = runner.sha256_bytes(
+        json.dumps(
+            tree_files,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    )
+    normalized = _helper_observations(scenario)
+    normalized_bytes = json.dumps(
+        normalized,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    events = [record["event"] for record in normalized]
+    event_counts = {event: events.count(event) for event in sorted(set(events))}
+    result_value = "PASS" if scenario == "normal" else "PASS_WITH_DOCUMENTED_BOUNDARY"
+    tool_names = sorted(
+        {"sublime-text", "zenity", "xdotool", "Xvfb", "dbus-daemon", "metacity", "xauth"}
+        | ({"xclip"} if scenario == "plugin-host-crash" else set())
+    )
+    tools = [
+        {
+            "name": name,
+            "path": "/opt/sublime_text/sublime_text"
+            if name == "sublime-text"
+            else "/usr/bin/" + name,
+            "version": "Sublime Text Build 4200"
+            if name == "sublime-text"
+            else ("xdotool version 1" if name == "xdotool" else None),
+            "seal": _seal(name, _digest("f"), size=5, mode=0o755),
+        }
+        for name in tool_names
+    ]
+    sidecar_seal = _seal("inexd", _digest("d"), size=4, mode=0o555)
+    report = {
+        "schemaVersion": 1,
+        "reportType": "inex-sublime-build4200-evidence",
+        "reportScope": runner.ARTIFACT_REPORT_SCOPE,
+        "artifactSource": artifact_source,
+        "harnessSource": harness_source,
+        "harnessFiles": [
+            {"name": name, "sha256": _digest("f")}
+            for name in runner.ARTIFACT_HARNESS_FILES
+        ],
+        "helperReport": {
+            "seal": _seal("control/report.jsonl", _digest("f"), size=100, mode=0o600),
+            "recordCount": len(normalized),
+            "eventCounts": event_counts,
+            "normalizedSha256": runner.sha256_bytes(normalized_bytes),
+            "normalizedObservations": normalized,
+        },
+        "releaseSetAudit": release_audit,
+        "releaseVersion": "0.1.0",
+        "nativePlatform": "linux-x64",
+        "scenario": scenario,
+        "importProcess": {
+            "exitStatus": 0,
+            "stdoutBytes": 10,
+            "stdoutSha256": _digest("a"),
+            "stderrBytes": 0,
+            "stderrSha256": runner.sha256_bytes(b""),
+            "dynamicSensitiveOutput": False,
+        },
+        "build4200": {
+            "build": "4200",
+            "path": "/opt/sublime_text/sublime_text",
+            "version": "Sublime Text Build 4200",
+            "seal": next(tool["seal"] for tool in tools if tool["name"] == "sublime-text"),
+        },
+        "artifactSetFiles": [
+            _seal("SHA256SUMS", _digest("9"), size=9, mode=0o644),
+            *[
+                _seal(record["name"], record["sha256"], size=10, mode=0o644)
+                for record in artifact_records
+            ],
+        ],
+        "materializedMembers": materialized,
+        "installedInexTree": {
+            "directoryCount": 2,
+            "fileCount": 1,
+            "treeSha256": tree_digest,
+            "files": tree_files,
+        },
+        "packagedExecutables": [
+            {
+                "product": "inex",
+                "memberName": "inex-0.1.0-linux-x64/bin/inex",
+                "productionResolution": "rust-portable-package",
+                "seal": _seal("inex", _digest("c"), size=3, mode=0o555),
+            },
+            {
+                "product": "inexd",
+                "memberName": "Inex/bin/inexd",
+                "productionResolution": "package-owned-default-empty-setting",
+                "seal": sidecar_seal,
+            },
+        ],
+        "tools": tools,
+        "harnessRuntime": {"implementation": "CPython", "pythonVersion": "3.13.14"},
+        "childEnvironmentPolicy": {
+            "policy": "fixed-allowlist",
+            "allowedVariables": sorted(runner.fixed_child_environment(Path("/unused"))),
+            "explicitScenarioVariables": [
+                "DBUS_SESSION_BUS_ADDRESS",
+                "DISPLAY",
+                "INEX_PASSWORD_STDIN",
+                "XAUTHORITY",
+            ],
+            "removedCategories": ["GIT", "INEX-nonessential", "LD", "proxy", "PYTHON"],
+        },
+        "x11Isolation": {
+            "authentication": "isolated-root-xauthority-cookie",
+            "tcpListening": False,
+            "dbusAddress": "isolated-root-runtime-path",
+        },
+        "residueScan": {
+            "roots": ["isolated-root"],
+            "excludedRoots": [],
+            "pathScope": "all-relative-path-components",
+            "contentScope": "all-nonlink-regular-files-fail-closed",
+            "encodings": list(runner.SCAN_ENCODINGS),
+            "randomFilenameCanaryScanned": True,
+            "entropyFragmentsScanned": True,
+            "entropyFragmentMinimumCharacters": 16,
+            "hits": 0,
+        },
+        "scenarioResult": {
+            "scenario": scenario,
+            "result": result_value,
+            "events": events,
+            "rootScanHits": 0,
+            "vaultEnvelope": "EDRY",
+            "crudComplete": scenario == "normal",
+            "pluginHostRestarted": None if scenario == "normal" else False,
+            "sublimeRestartRequired": None if scenario == "normal" else True,
+            "hostDeadPlaintextCopyable": None if scenario == "normal" else True,
+            "hostDeadClipboardReadOk": None if scenario == "normal" else True,
+            "packagedSidecarObserved": True,
+            "packagedSidecarMatchCount": 1,
+            "packagedSidecarExeSeal": sidecar_seal,
+        },
+        "reportProtection": "create-new-posix-mode-0600",
+        "rootDeletionVerified": True,
+        "notCovered": runner.report_not_covered(scenario, result_value),
+        "trustAssumptions": list(runner.REPORT_TRUST_ASSUMPTIONS),
+    }
+    return report
 
 
 class Build4200RunnerFoundationTests(unittest.TestCase):
@@ -186,6 +496,88 @@ class Build4200RunnerFoundationTests(unittest.TestCase):
             (root / "link").symlink_to(target)
             with self.assertRaisesRegex(runner.QaFailure, "non-regular|link-like"):
                 runner.scan_for_tokens((root,), [token])
+
+    def test_report_validator_accepts_distinct_clean_sources_and_both_scenarios(self) -> None:
+        for scenario in ("normal", "plugin-host-crash"):
+            with self.subTest(scenario=scenario):
+                report = _valid_report(scenario)
+                self.assertNotEqual(
+                    report["artifactSource"]["commit"],
+                    report["harnessSource"]["commit"],
+                )
+                encoded = runner.encode_artifact_report(report)
+                self.assertEqual(json.loads(encoded), report)
+
+    def test_report_validator_rejects_cross_binding_and_schema_mutations(self) -> None:
+        def duplicate_member(report: dict) -> None:
+            report["materializedMembers"].append(
+                copy.deepcopy(report["materializedMembers"][0])
+            )
+
+        def reverse_members(report: dict) -> None:
+            report["materializedMembers"].reverse()
+
+        def wrong_tree_digest(report: dict) -> None:
+            report["installedInexTree"]["treeSha256"] = _digest("0")
+
+        def wrong_sidecar_digest(report: dict) -> None:
+            report["releaseSetAudit"]["sharedSidecarSha256"] = _digest("0")
+
+        def missing_tool(report: dict) -> None:
+            report["tools"].pop()
+
+        def wrong_helper_digest(report: dict) -> None:
+            report["helperReport"]["normalizedSha256"] = _digest("0")
+
+        def extra_residue_field(report: dict) -> None:
+            report["residueScan"]["unexpected"] = True
+
+        def wrong_archive_digest(report: dict) -> None:
+            report["artifactSetFiles"][1]["sha256"] = _digest("0")
+
+        def extra_root_field(report: dict) -> None:
+            report["unexpected"] = True
+
+        mutations = (
+            duplicate_member,
+            reverse_members,
+            wrong_tree_digest,
+            wrong_sidecar_digest,
+            missing_tool,
+            wrong_helper_digest,
+            extra_residue_field,
+            wrong_archive_digest,
+            extra_root_field,
+        )
+        baseline = _valid_report()
+        runner.validate_artifact_report(baseline)
+        for mutation in mutations:
+            with self.subTest(mutation=mutation.__name__):
+                candidate = copy.deepcopy(baseline)
+                mutation(candidate)
+                with self.assertRaises(runner.QaFailure):
+                    runner.validate_artifact_report(candidate)
+
+    def test_report_validator_rejects_false_crash_boundary(self) -> None:
+        baseline = _valid_report("plugin-host-crash")
+        runner.validate_artifact_report(baseline)
+        for field, value in (
+            ("result", "PASS"),
+            ("pluginHostRestarted", True),
+            ("sublimeRestartRequired", False),
+            ("hostDeadPlaintextCopyable", False),
+            ("hostDeadClipboardReadOk", False),
+            ("packagedSidecarMatchCount", 0),
+        ):
+            with self.subTest(field=field):
+                candidate = copy.deepcopy(baseline)
+                candidate["scenarioResult"][field] = value
+                if field == "result":
+                    candidate["notCovered"] = runner.report_not_covered(
+                        "plugin-host-crash", value
+                    )
+                with self.assertRaises(runner.QaFailure):
+                    runner.validate_artifact_report(candidate)
 
 
 if __name__ == "__main__":
