@@ -398,9 +398,9 @@ def directory_binding(path: Path) -> Dict[str, object]:
     if (
         release_lifecycle.is_link_like(path, metadata)
         or not stat.S_ISDIR(metadata.st_mode)
-        or stat.S_IMODE(metadata.st_mode) & 0o022
+        or stat.S_IMODE(metadata.st_mode) & 0o700 != 0o700
     ):
-        raise QaFailure("restart profile directory is not private and physical")
+        raise QaFailure("restart profile directory is not owner-accessible and physical")
     return {
         "device": metadata.st_dev,
         "inode": metadata.st_ino,
@@ -2666,7 +2666,7 @@ def validate_artifact_report(report: Dict[str, object]) -> None:
                 item = binding.get(field)
                 if not isinstance(item, int) or isinstance(item, bool) or item < 0:
                     raise QaFailure("artifact report has invalid profile metadata")
-            if binding["mode"] & 0o022 or not _valid_digest(
+            if binding["mode"] & 0o700 != 0o700 or not _valid_digest(
                 binding.get("pathSha256")
             ):
                 raise QaFailure("artifact report has an unsafe profile identity")
