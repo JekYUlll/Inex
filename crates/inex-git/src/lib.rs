@@ -40,6 +40,8 @@ use thiserror::Error;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+mod candidate_bundle_v5;
+
 /// Exact repository attribute installed for encrypted Markdown objects.
 pub const ATTRIBUTES_RULE: &str = "*.md.enc -text -diff merge=inex";
 
@@ -96,6 +98,15 @@ pub struct MergeReport {
 pub struct RecoveryReport {
     /// Number of pending transactions completed (zero or one per invocation).
     pub recovered_transactions: usize,
+}
+
+/// Locked-safe summary of recoverable Git state and retained v5 scratch data.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RecoveryStatus {
+    /// Whether one legacy or immutable-bundle transaction is pending.
+    pub pending_transaction: bool,
+    /// Number of exact-name unpublished v5 scratch entries retained in place.
+    pub retained_candidate_scratch_count: usize,
 }
 
 /// A scrubbed Git integration failure.
@@ -325,19 +336,55 @@ pub fn recover(vault: &Vault) -> Result<RecoveryReport, GitError> {
     })
 }
 
-/// Inspect whether a structurally valid encrypted merge journal is pending.
+/// Inspect locked-safe Git recovery state without mutating it.
 ///
-/// This locked-safe status check reads only bounded path/OID/ciphertext-digest
-/// metadata. It does not start Git, unlock a vault, or mutate recovery state.
-/// A `true` result still requires [`recover`] with an authenticated vault.
+/// This check reads only bounded path/OID/ciphertext-digest metadata. It does
+/// not start Git, unlock a vault, remove retained v5 scratch entries, or mutate
+/// recovery state. A pending result still requires [`recover`] with an
+/// authenticated vault once the corresponding recovery writer is available.
 ///
 /// # Errors
 ///
-/// Returns [`GitError`] when the journal entry is link-like, hard-linked,
-/// oversized, truncated, or fails the strict versioned schema.
-pub fn has_pending_recovery(vault_root: &Path) -> Result<bool, GitError> {
+/// Returns [`GitError`] when active state is ambiguous, link-like,
+/// hard-linked, oversized, truncated, or fails its strict versioned schema.
+pub fn recovery_status(vault_root: &Path) -> Result<RecoveryStatus, GitError> {
     let _guard = VaultMutationGuard::acquire(vault_root).map_err(map_atomic_error)?;
-    let reserved_names = exact_reserved_private_names(vault_root)?;
+    let v5 = candidate_bundle_v5::inspect_candidate_bundle_namespace_v5(vault_root)?;
+    let legacy_pending =
+        legacy_has_pending_recovery(vault_root, v5.stable_bundle_basename.as_deref())?;
+    if v5.stable_bundle_basename.is_some() && legacy_pending {
+        return Err(GitError::RecoveryConflict);
+    }
+    Ok(RecoveryStatus {
+        pending_transaction: legacy_pending || v5.stable_bundle_basename.is_some(),
+        retained_candidate_scratch_count: v5.retained_scratch_count,
+    })
+}
+
+/// Inspect whether a structurally valid encrypted merge transaction is pending.
+///
+/// This compatibility wrapper preserves the pre-v5 boolean API. Retained
+/// unpublished v5 scratch entries are reported by [`recovery_status`] but do
+/// not themselves count as pending recovery.
+///
+/// # Errors
+///
+/// Returns [`GitError`] under the same fail-closed conditions as
+/// [`recovery_status`].
+pub fn has_pending_recovery(vault_root: &Path) -> Result<bool, GitError> {
+    Ok(recovery_status(vault_root)?.pending_transaction)
+}
+
+fn legacy_has_pending_recovery(
+    vault_root: &Path,
+    ignored_v5_stable_basename: Option<&str>,
+) -> Result<bool, GitError> {
+    let mut reserved_names = exact_reserved_private_names(vault_root)?;
+    if let Some(basename) = ignored_v5_stable_basename
+        && !reserved_names.remove(basename)
+    {
+        return Err(GitError::RecoveryConflict);
+    }
     let pending = read_journal(vault_root)?;
     let prelock = read_prelock_reservation(vault_root)?;
     if let Some(pending) = &pending {
