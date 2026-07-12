@@ -21,12 +21,14 @@ from audit_release_artifacts import (
     read_zip_entries_from_bytes,
     validate_member_name,
     validate_license_inventory,
+    validate_documentation,
     validate_package_manifest,
     validate_release_set_report,
     validate_vsix_metadata,
     validate_vscode,
 )
 from package_release import (
+    add_documentation_entries,
     encode_package_report,
     package_report,
     packaged_root_readme,
@@ -851,6 +853,23 @@ class ReleaseArchiveTests(unittest.TestCase):
             readme,
         )
         self.assertNotIn("(packaging/dependency-license-policy.json)", readme)
+
+    def test_packaged_root_documentation_links_are_closed(self) -> None:
+        repository_root = Path(__file__).resolve().parents[2]
+        entries = {
+            "root/README.md": (packaged_root_readme(repository_root), 0o644),
+            "root/SECURITY.md": (
+                (repository_root / "SECURITY.md").read_bytes(),
+                0o644,
+            ),
+            "root/LICENSE": ((repository_root / "LICENSE").read_bytes(), 0o644),
+            "root/DEPENDENCY_LICENSE_POLICY.json": (
+                (repository_root / "packaging/dependency-license-policy.json").read_bytes(),
+                0o644,
+            ),
+        }
+        add_documentation_entries(entries, repository_root, "root/")
+        validate_documentation(entries, "root/")
 
     def test_package_smoke_binds_release_target_and_profile(self) -> None:
         report = expected_runtime_info("inex", "0.1.0", "windows-x64")

@@ -99,7 +99,7 @@ The implemented release tooling creates `inex-rust-<version>-<platform>.zip`
 with `bin/inex[.exe]`, `bin/inexd[.exe]`, bundled documentation, manifests,
 checksums, a target-bound resolved license inventory, the canonical engineering
 license policy, and complete collected license/NOTICE texts. Current strict
-release-tool source tests pass 59/59. Two clean-source system-GCC Linux x64
+release-tool source tests pass 60/60. Two clean-source system-GCC Linux x64
 builds from artifact commit `40ff728` are byte-for-byte identical across both
 binaries and all four output files. Both pass strict release-set/native audit,
 VS Code 1.125.0 install, and executable/bundled-sidecar smoke; their manifests

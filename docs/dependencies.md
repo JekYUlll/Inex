@@ -59,7 +59,7 @@ strong-slot rewrap. Native timing/resource evidence remains a release gate.
   artifacts/source paths supplied and verified by the pinned sys crate.
 - Linux/Windows x64 are the first blocking matrix; Linux/Windows arm64 join
   before GA. Format fixtures must be byte-identical on every target.
-- The current strict release-tool source suite passes 59/59; `actionlint`,
+- The current strict release-tool source suite passes 60/60; `actionlint`,
   pedantic/all-features Clippy, warnings-as-errors rustdoc, and the Windows GNU
   cross-check pass. Two local system-GCC Linux x64 clean-source builds from
   `40ff728` are byte-identical and pass strict release-set/ELF/native-dependency

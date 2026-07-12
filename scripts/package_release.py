@@ -52,6 +52,7 @@ DOCUMENTATION_FILES = (
     "installation.md",
     "operations-and-recovery.md",
     "release-checklist.md",
+    "release-notes-0.1.0-pre-alpha.md",
     "troubleshooting.md",
     "user-guide.md",
     "spec/edry-v1.md",

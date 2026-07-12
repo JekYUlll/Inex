@@ -24,7 +24,7 @@ In particular:
   plugin host still leaves the visible buffer actively copyable and requires a
   full Sublime restart; the client therefore remains experimental until the
   complete package canary matrix passes; and
-- release-tool tests pass 59/59, `actionlint` and pedantic/all-features Clippy
+- release-tool tests pass 60/60, `actionlint` and pedantic/all-features Clippy
   pass, and independent release-tool code review is GO. A system-GCC Linux x64
   double build from historical artifact source `40ff728` is byte-identical and passes strict
   archive/native-dependency audit plus VS Code 1.125.0 CLI

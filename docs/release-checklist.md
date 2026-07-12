@@ -319,7 +319,7 @@ PYTHONPATH=scripts python3.13 scripts/smoke_release_artifacts.py \
   "target/release-artifacts/$PLATFORM" --vscode-cli "$VSCODE_CLI"
 ```
 
-On the current Linux x64 host, strict release-tool source tests pass 59/59.
+On the current Linux x64 host, strict release-tool source tests pass 60/60.
 Two clean-source system-GCC builds from `40ff728` are byte-identical across both
 binaries and all four package outputs; both pass strict release-set/native audit
 and VS Code 1.125.0 CLI install/bundled-sidecar smoke. Current validation covers VSIX control metadata,
