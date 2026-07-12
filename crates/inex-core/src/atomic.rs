@@ -81,8 +81,9 @@ pub enum WriteCondition {
 /// Result of the platform namespace-durability checkpoint.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ParentSyncStatus {
-    /// Linux synchronized the parent directory, or Windows completed a
-    /// write-through namespace move.
+    /// Linux synchronized the parent directory; Windows either completed a
+    /// write-through namespace move or flushed the parent directory after a
+    /// verified deletion.
     Synced,
     /// The platform or filesystem did not confirm namespace durability.
     NotSynced,
@@ -134,6 +135,50 @@ pub enum AtomicDirectoryPublishError {
 impl AtomicDirectoryPublishError {
     fn io(source: io::Error) -> Self {
         Self::Io { source }
+    }
+}
+
+/// Failure to remove one exact, identity-verified filesystem entry.
+///
+/// The variants deliberately describe only the physical outcome. Callers
+/// retain their own recovery receipt and decide whether a later invocation
+/// may resume from the pre-remove or post-remove state.
+#[derive(Debug, Error)]
+pub enum AtomicVerifiedRemoveError {
+    /// The path, parent, source type, or expected identity is outside the
+    /// supported local direct-child profile.
+    #[error("verified removal path is invalid")]
+    InvalidPath,
+    /// An errored removal provably left the exact verified source in place.
+    #[error("verified removal did not remove the source")]
+    NotRemoved,
+    /// The source path no longer proves either the exact old or absent state.
+    #[error("verified removal outcome is indeterminate")]
+    Indeterminate,
+    /// A scrubbed filesystem operation failed before a physical outcome was
+    /// available.
+    #[error("verified removal I/O failed")]
+    Io {
+        /// Original error without caller path data in the display text.
+        #[source]
+        source: io::Error,
+    },
+}
+
+impl AtomicVerifiedRemoveError {
+    fn io(source: io::Error) -> Self {
+        Self::Io { source }
+    }
+
+    fn initial(source: io::Error) -> Self {
+        if matches!(
+            source.kind(),
+            io::ErrorKind::InvalidInput | io::ErrorKind::NotFound | io::ErrorKind::Unsupported
+        ) {
+            Self::InvalidPath
+        } else {
+            Self::io(source)
+        }
     }
 }
 
@@ -1415,6 +1460,53 @@ pub fn open_file_matches_path_and_is_single_link(path: &Path, file: &File) -> io
     platform::open_file_matches_path_and_is_single_link(path, file)
 }
 
+/// Stable identity of one single-link regular file.
+///
+/// The fields are deliberately opaque. The value can be retained after a
+/// Windows namespace operation forces every open file handle to be closed,
+/// then compared with a freshly opened path using
+/// [`path_matches_file_identity_and_is_single_link`].
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct FilesystemFileIdentity {
+    volume: u64,
+    identifier: [u8; 16],
+}
+
+/// Captures the physical identity of one held single-link regular file.
+///
+/// # Errors
+///
+/// Returns an I/O error when the handle is not a regular file, has multiple
+/// hard links, is a Windows reparse point, or lacks a stable platform file ID.
+pub fn filesystem_file_identity(file: &File) -> io::Result<FilesystemFileIdentity> {
+    platform::filesystem_file_identity(file)
+}
+
+/// Reopens `path` and compares it with one captured physical file identity.
+///
+/// This function never follows a final symlink/reparse point as an accepted
+/// match and requires the current file to have exactly one hard link. Missing
+/// paths return their normal `NotFound` I/O error so callers can classify
+/// `Absent` separately from `Foreign`.
+///
+/// # Errors
+///
+/// Returns an I/O error when the path cannot be inspected or reopened.
+pub fn path_matches_file_identity_and_is_single_link(
+    path: &Path,
+    expected: &FilesystemFileIdentity,
+) -> io::Result<bool> {
+    let metadata = fs::symlink_metadata(path)?;
+    if is_link_or_reparse_point(&metadata) || !metadata.file_type().is_file() {
+        return Ok(false);
+    }
+    let file = File::open(path)?;
+    if !open_file_matches_path_and_is_single_link(path, &file)? {
+        return Ok(false);
+    }
+    filesystem_file_identity(&file).map(|identity| identity == *expected)
+}
+
 /// Atomically moves one verified regular file to a previously absent name.
 ///
 /// `source_file` must remain open for the call and must identify the exact
@@ -1511,6 +1603,347 @@ pub fn atomic_replace_verified_file(
     drop(source_file);
     platform::namespace_move(&paths.source, &paths.destination, true)?;
     Ok(paths.sync_parents())
+}
+
+/// Removes the exact single-link regular file identified by `held_file`.
+///
+/// `path` must be an absolute, lexically normal direct child of a canonical,
+/// link-free directory on a supported local filesystem. The parent binding
+/// and held file identity are checked when the operation is prepared and
+/// again immediately before removal. An errored platform removal is reconciled
+/// as either exact removed, exact not removed, or indeterminate; a foreign
+/// rebound path is never removed.
+///
+/// The final namespace operation remains path based. As with the verified
+/// move primitives, callers must exclude a non-cooperating process running as
+/// the same OS user from rebinding the child name after the final identity
+/// check. Post-state reconciliation detects but cannot prevent that race.
+/// `held_file` is consumed so Windows can close the handle before the path is
+/// deleted; its opaque [`FilesystemFileIdentity`] remains available for the
+/// post-state comparison.
+///
+/// # Errors
+///
+/// Returns [`AtomicVerifiedRemoveError::InvalidPath`] for an unsafe path or
+/// source, [`AtomicVerifiedRemoveError::NotRemoved`] when the exact old file
+/// remains after an error, and [`AtomicVerifiedRemoveError::Indeterminate`]
+/// when neither the exact old nor absent state can be proved.
+pub fn atomic_remove_verified_file(
+    path: &Path,
+    held_file: File,
+) -> Result<AtomicDeleteOutcome, AtomicVerifiedRemoveError> {
+    atomic_remove_verified_file_impl(
+        path,
+        held_file,
+        |_| Ok(()),
+        |_| Ok(()),
+        VerifiedRemoveFault::None,
+    )
+}
+
+/// Removes the exact empty directory identified by `expected_identity`.
+///
+/// The directory must be an absolute, lexically normal direct child of one
+/// canonical, link-free parent on a supported local filesystem. Its parent,
+/// physical identity, and empty inventory are checked twice before the path-
+/// based removal. An errored removal is reconciled without ever deleting a
+/// foreign rebound directory.
+///
+/// The same-user path-race boundary is identical to
+/// [`atomic_move_verified_directory_no_replace_checked`]: this is a
+/// cooperative-filesystem primitive, not a kernel-level directory CAS.
+///
+/// # Errors
+///
+/// Returns [`AtomicVerifiedRemoveError`] when the path is unsafe or nonempty,
+/// when the exact old directory remains after an error, or when the physical
+/// result is ambiguous.
+pub fn atomic_remove_verified_empty_directory(
+    path: &Path,
+    expected_identity: &FilesystemDirectoryIdentity,
+) -> Result<AtomicDeleteOutcome, AtomicVerifiedRemoveError> {
+    atomic_remove_verified_empty_directory_impl(
+        path,
+        expected_identity,
+        |_| Ok(()),
+        |_| Ok(()),
+        VerifiedRemoveFault::None,
+    )
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum VerifiedRemoveFault {
+    #[default]
+    None,
+    ErrorBeforeRemove,
+    RemoveThenError,
+    ParentSync,
+}
+
+#[cfg(test)]
+fn atomic_remove_verified_file_with_faults<F, G>(
+    path: &Path,
+    held_file: File,
+    before_remove: F,
+    after_remove: G,
+    fault: VerifiedRemoveFault,
+) -> Result<AtomicDeleteOutcome, AtomicVerifiedRemoveError>
+where
+    F: FnOnce(&Path) -> io::Result<()>,
+    G: FnOnce(&Path) -> io::Result<()>,
+{
+    atomic_remove_verified_file_impl(path, held_file, before_remove, after_remove, fault)
+}
+
+fn atomic_remove_verified_file_impl<F, G>(
+    path: &Path,
+    held_file: File,
+    before_remove: F,
+    after_remove: G,
+    fault: VerifiedRemoveFault,
+) -> Result<AtomicDeleteOutcome, AtomicVerifiedRemoveError>
+where
+    F: FnOnce(&Path) -> io::Result<()>,
+    G: FnOnce(&Path) -> io::Result<()>,
+{
+    let verified = VerifiedRemovePath::resolve(path)?;
+    verified.verify_file(&held_file)?;
+    let expected_identity =
+        filesystem_file_identity(&held_file).map_err(AtomicVerifiedRemoveError::initial)?;
+    before_remove(&verified.path).map_err(AtomicVerifiedRemoveError::io)?;
+    if !verified.parent_matches() || !verified.file_matches(&held_file) {
+        return Err(AtomicVerifiedRemoveError::Indeterminate);
+    }
+    drop(held_file);
+
+    let mut remove_result = if fault == VerifiedRemoveFault::ErrorBeforeRemove {
+        Err(io::Error::other(
+            "injected error before verified file removal",
+        ))
+    } else {
+        fs::remove_file(&verified.path)
+    };
+    if fault == VerifiedRemoveFault::RemoveThenError && remove_result.is_ok() {
+        remove_result = Err(io::Error::other(
+            "injected error after verified file removal",
+        ));
+    }
+    after_remove(&verified.path).map_err(AtomicVerifiedRemoveError::io)?;
+
+    match verified.file_state(&expected_identity) {
+        VerifiedRemoveState::Absent if verified.parent_matches() => Ok(AtomicDeleteOutcome {
+            parent_sync: verified.parent_sync(fault),
+        }),
+        VerifiedRemoveState::Exact if verified.parent_matches() && remove_result.is_err() => {
+            Err(AtomicVerifiedRemoveError::NotRemoved)
+        }
+        VerifiedRemoveState::Absent | VerifiedRemoveState::Exact | VerifiedRemoveState::Foreign => {
+            Err(AtomicVerifiedRemoveError::Indeterminate)
+        }
+    }
+}
+
+#[cfg(test)]
+fn atomic_remove_verified_empty_directory_with_faults<F, G>(
+    path: &Path,
+    expected_identity: &FilesystemDirectoryIdentity,
+    before_remove: F,
+    after_remove: G,
+    fault: VerifiedRemoveFault,
+) -> Result<AtomicDeleteOutcome, AtomicVerifiedRemoveError>
+where
+    F: FnOnce(&Path) -> io::Result<()>,
+    G: FnOnce(&Path) -> io::Result<()>,
+{
+    atomic_remove_verified_empty_directory_impl(
+        path,
+        expected_identity,
+        before_remove,
+        after_remove,
+        fault,
+    )
+}
+
+fn atomic_remove_verified_empty_directory_impl<F, G>(
+    path: &Path,
+    expected_identity: &FilesystemDirectoryIdentity,
+    before_remove: F,
+    after_remove: G,
+    fault: VerifiedRemoveFault,
+) -> Result<AtomicDeleteOutcome, AtomicVerifiedRemoveError>
+where
+    F: FnOnce(&Path) -> io::Result<()>,
+    G: FnOnce(&Path) -> io::Result<()>,
+{
+    let verified = VerifiedRemovePath::resolve(path)?;
+    verified.verify_empty_directory(expected_identity)?;
+    before_remove(&verified.path).map_err(AtomicVerifiedRemoveError::io)?;
+    if !verified.parent_matches()
+        || !verified.directory_matches(expected_identity)
+        || !verified.directory_is_empty()
+    {
+        return Err(AtomicVerifiedRemoveError::Indeterminate);
+    }
+
+    let mut remove_result = if fault == VerifiedRemoveFault::ErrorBeforeRemove {
+        Err(io::Error::other(
+            "injected error before verified directory removal",
+        ))
+    } else {
+        fs::remove_dir(&verified.path)
+    };
+    if fault == VerifiedRemoveFault::RemoveThenError && remove_result.is_ok() {
+        remove_result = Err(io::Error::other(
+            "injected error after verified directory removal",
+        ));
+    }
+    after_remove(&verified.path).map_err(AtomicVerifiedRemoveError::io)?;
+
+    match verified.directory_state(expected_identity) {
+        VerifiedRemoveState::Absent if verified.parent_matches() => Ok(AtomicDeleteOutcome {
+            parent_sync: verified.parent_sync(fault),
+        }),
+        VerifiedRemoveState::Exact if verified.parent_matches() && remove_result.is_err() => {
+            Err(AtomicVerifiedRemoveError::NotRemoved)
+        }
+        VerifiedRemoveState::Absent | VerifiedRemoveState::Exact | VerifiedRemoveState::Foreign => {
+            Err(AtomicVerifiedRemoveError::Indeterminate)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VerifiedRemoveState {
+    Absent,
+    Exact,
+    Foreign,
+}
+
+#[derive(Debug)]
+struct VerifiedRemovePath {
+    path: PathBuf,
+    parent: PathBuf,
+    parent_identity: FilesystemDirectoryIdentity,
+}
+
+impl VerifiedRemovePath {
+    fn resolve(path: &Path) -> Result<Self, AtomicVerifiedRemoveError> {
+        if !path.is_absolute() || !path_is_lexically_normal(path) || path.file_name().is_none() {
+            return Err(AtomicVerifiedRemoveError::InvalidPath);
+        }
+        let parent = path
+            .parent()
+            .ok_or(AtomicVerifiedRemoveError::InvalidPath)?;
+        if !path_ancestors_are_non_link_directories(parent)
+            .map_err(AtomicVerifiedRemoveError::initial)?
+        {
+            return Err(AtomicVerifiedRemoveError::InvalidPath);
+        }
+        let input_parent_identity =
+            filesystem_directory_identity(parent).map_err(AtomicVerifiedRemoveError::initial)?;
+        let parent = fs::canonicalize(parent).map_err(AtomicVerifiedRemoveError::initial)?;
+        let parent_identity =
+            filesystem_directory_identity(&parent).map_err(AtomicVerifiedRemoveError::initial)?;
+        let path = parent.join(
+            path.file_name()
+                .ok_or(AtomicVerifiedRemoveError::InvalidPath)?,
+        );
+        if input_parent_identity != parent_identity
+            || !path_is_supported_local_filesystem(&parent)
+                .map_err(AtomicVerifiedRemoveError::initial)?
+            || !path_is_supported_local_filesystem(&path)
+                .map_err(AtomicVerifiedRemoveError::initial)?
+            || !paths_share_mount(&parent, &path).map_err(AtomicVerifiedRemoveError::initial)?
+        {
+            return Err(AtomicVerifiedRemoveError::InvalidPath);
+        }
+        let verified = Self {
+            path,
+            parent,
+            parent_identity,
+        };
+        if !verified.parent_matches() {
+            return Err(AtomicVerifiedRemoveError::InvalidPath);
+        }
+        Ok(verified)
+    }
+
+    fn parent_matches(&self) -> bool {
+        filesystem_directory_identity(&self.parent)
+            .is_ok_and(|identity| identity == self.parent_identity)
+    }
+
+    fn verify_file(&self, held_file: &File) -> Result<(), AtomicVerifiedRemoveError> {
+        if self.file_matches(held_file) {
+            Ok(())
+        } else {
+            Err(AtomicVerifiedRemoveError::InvalidPath)
+        }
+    }
+
+    fn file_matches(&self, held_file: &File) -> bool {
+        open_file_matches_path_and_is_single_link(&self.path, held_file).unwrap_or(false)
+            && paths_share_mount(&self.parent, &self.path).unwrap_or(false)
+    }
+
+    fn file_state(&self, expected_identity: &FilesystemFileIdentity) -> VerifiedRemoveState {
+        match fs::symlink_metadata(&self.path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => VerifiedRemoveState::Absent,
+            Ok(_)
+                if path_matches_file_identity_and_is_single_link(&self.path, expected_identity)
+                    .unwrap_or(false) =>
+            {
+                VerifiedRemoveState::Exact
+            }
+            Ok(_) | Err(_) => VerifiedRemoveState::Foreign,
+        }
+    }
+
+    fn verify_empty_directory(
+        &self,
+        expected_identity: &FilesystemDirectoryIdentity,
+    ) -> Result<(), AtomicVerifiedRemoveError> {
+        if self.directory_matches(expected_identity) && self.directory_is_empty() {
+            Ok(())
+        } else {
+            Err(AtomicVerifiedRemoveError::InvalidPath)
+        }
+    }
+
+    fn directory_matches(&self, expected_identity: &FilesystemDirectoryIdentity) -> bool {
+        filesystem_directory_identity(&self.path)
+            .is_ok_and(|identity| identity == *expected_identity)
+            && paths_share_mount(&self.parent, &self.path).unwrap_or(false)
+    }
+
+    fn directory_is_empty(&self) -> bool {
+        fs::read_dir(&self.path).is_ok_and(|mut entries| entries.next().is_none())
+    }
+
+    fn directory_state(
+        &self,
+        expected_identity: &FilesystemDirectoryIdentity,
+    ) -> VerifiedRemoveState {
+        match inspect_directory_state(&self.path) {
+            Ok(DirectoryState::Absent) => VerifiedRemoveState::Absent,
+            Ok(DirectoryState::Directory(identity)) if identity == *expected_identity => {
+                VerifiedRemoveState::Exact
+            }
+            Ok(DirectoryState::Directory(_) | DirectoryState::Other) | Err(_) => {
+                VerifiedRemoveState::Foreign
+            }
+        }
+    }
+
+    fn parent_sync(&self, fault: VerifiedRemoveFault) -> ParentSyncStatus {
+        if fault == VerifiedRemoveFault::ParentSync {
+            ParentSyncStatus::NotSynced
+        } else if platform::sync_directory(&self.parent).is_ok() {
+            ParentSyncStatus::Synced
+        } else {
+            ParentSyncStatus::NotSynced
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -2952,6 +3385,26 @@ mod platform {
         })
     }
 
+    #[allow(clippy::unnecessary_wraps)]
+    pub(super) fn filesystem_file_identity(
+        file: &File,
+    ) -> io::Result<super::FilesystemFileIdentity> {
+        let metadata = file.metadata()?;
+        if !metadata.file_type().is_file() || metadata.nlink() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "file identity requires a single-link regular file",
+            ));
+        }
+        let mut identifier = [0_u8; 16];
+        identifier[..8].copy_from_slice(&metadata.ino().to_le_bytes());
+        identifier[15] = 2;
+        Ok(super::FilesystemFileIdentity {
+            volume: metadata.dev(),
+            identifier,
+        })
+    }
+
     pub(super) fn paths_share_mount(first: &Path, second: &Path) -> io::Result<bool> {
         let mountinfo = std::fs::read_to_string("/proc/self/mountinfo")?;
         let first = std::fs::canonicalize(first)?;
@@ -3358,6 +3811,40 @@ mod platform {
         })
     }
 
+    pub(super) fn filesystem_file_identity(
+        file: &File,
+    ) -> io::Result<super::FilesystemFileIdentity> {
+        let metadata = file.metadata()?;
+        let legacy = handle_information(file)?;
+        if !metadata.file_type().is_file()
+            || legacy.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || legacy.number_of_links != 1
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "file identity requires a non-reparse single-link regular file",
+            ));
+        }
+        let modern = file_id_information(file)?;
+        if modern.file_id.identifier.iter().any(|byte| *byte != 0) {
+            return Ok(super::FilesystemFileIdentity {
+                volume: modern.volume_serial_number,
+                identifier: modern.file_id.identifier,
+            });
+        }
+        let file_index = u64::from(legacy.file_index_high) << 32 | u64::from(legacy.file_index_low);
+        if file_index == 0 {
+            return Err(io::Error::other("file identity is unavailable"));
+        }
+        let mut identifier = [0_u8; 16];
+        identifier[..8].copy_from_slice(&file_index.to_le_bytes());
+        identifier[15] = 2;
+        Ok(super::FilesystemFileIdentity {
+            volume: u64::from(legacy.volume_serial_number),
+            identifier,
+        })
+    }
+
     #[allow(clippy::unnecessary_wraps)]
     pub(super) fn paths_share_mount(_first: &Path, _second: &Path) -> io::Result<bool> {
         // Traversed mount points are reparse points and fail before this check.
@@ -3748,6 +4235,15 @@ mod platform {
         ))
     }
 
+    pub(super) fn filesystem_file_identity(
+        _file: &File,
+    ) -> io::Result<super::FilesystemFileIdentity> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "file identity is supported only on Linux and Windows",
+        ))
+    }
+
     #[allow(clippy::unnecessary_wraps)]
     pub(super) fn paths_share_mount(_first: &Path, _second: &Path) -> io::Result<bool> {
         Ok(false)
@@ -3828,6 +4324,17 @@ mod tests {
 
     const OLD_CIPHERTEXT: &[u8] = b"EDRY-old-authenticated-ciphertext";
     const NEW_CIPHERTEXT: &[u8] = b"EDRY-new-authenticated-ciphertext";
+
+    #[cfg(any(target_os = "linux", windows))]
+    fn assert_verified_remove_sync_status(status: ParentSyncStatus) {
+        #[cfg(target_os = "linux")]
+        assert_eq!(status, ParentSyncStatus::Synced);
+        #[cfg(windows)]
+        assert!(matches!(
+            status,
+            ParentSyncStatus::Synced | ParentSyncStatus::NotSynced
+        ));
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -4255,6 +4762,50 @@ mod tests {
 
     #[cfg(any(target_os = "linux", windows))]
     #[test]
+    fn opaque_file_identity_distinguishes_bytes_and_survives_rename() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        let first = fixture.root().join("identity-first");
+        let second = fixture.root().join("identity-second");
+        let renamed = fixture.root().join("identity-renamed");
+        fs::write(&first, b"byte-identical")?;
+        fs::write(&second, b"byte-identical")?;
+        let first_file = fs::File::open(&first)?;
+        let second_file = fs::File::open(&second)?;
+        let first_identity = super::filesystem_file_identity(&first_file)?;
+        let second_identity = super::filesystem_file_identity(&second_file)?;
+        assert_ne!(first_identity, second_identity);
+        assert!(super::path_matches_file_identity_and_is_single_link(
+            &first,
+            &first_identity,
+        )?);
+        assert!(!super::path_matches_file_identity_and_is_single_link(
+            &second,
+            &first_identity,
+        )?);
+
+        drop(first_file);
+        fs::rename(&first, &renamed)?;
+        assert!(super::path_matches_file_identity_and_is_single_link(
+            &renamed,
+            &first_identity,
+        )?);
+        assert!(matches!(
+            super::path_matches_file_identity_and_is_single_link(&first, &first_identity),
+            Err(error) if error.kind() == io::ErrorKind::NotFound
+        ));
+
+        let alias = fixture.root().join("identity-hardlink");
+        fs::hard_link(&renamed, &alias)?;
+        assert!(!super::path_matches_file_identity_and_is_single_link(
+            &renamed,
+            &first_identity,
+        )?);
+        assert!(super::filesystem_file_identity(&fs::File::open(&renamed)?).is_err());
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
     fn verified_file_move_no_replace_publishes_absent_destination() -> io::Result<()> {
         let fixture = TestVault::new()?;
         let source = fixture.root().join("index.lock");
@@ -4359,6 +4910,360 @@ mod tests {
         assert_eq!(fs::read(&destination)?, b"candidate-index");
         assert_eq!(outcome.source_parent_sync, ParentSyncStatus::Synced);
         assert_eq!(outcome.destination_parent_sync, ParentSyncStatus::Synced);
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn verified_file_remove_deletes_only_the_held_single_link_file() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        let path = fixture.root().join("cleanup-receipt");
+        fs::write(&path, b"canonical receipt")?;
+        let held = fs::File::open(&path)?;
+
+        let outcome = super::atomic_remove_verified_file(&path, held).map_err(io::Error::other)?;
+
+        assert!(!path.exists());
+        assert_verified_remove_sync_status(outcome.parent_sync);
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn verified_file_remove_reconciles_removed_not_removed_and_unsynced() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+
+        let not_removed = fixture.root().join("not-removed");
+        fs::write(&not_removed, b"receipt")?;
+        let not_removed_file = fs::File::open(&not_removed)?;
+        assert!(matches!(
+            super::atomic_remove_verified_file_with_faults(
+                &not_removed,
+                not_removed_file,
+                |_| Ok(()),
+                |_| Ok(()),
+                super::VerifiedRemoveFault::ErrorBeforeRemove,
+            ),
+            Err(super::AtomicVerifiedRemoveError::NotRemoved)
+        ));
+        assert_eq!(fs::read(&not_removed)?, b"receipt");
+
+        let removed = fixture.root().join("removed-then-error");
+        fs::write(&removed, b"receipt")?;
+        let removed_file = fs::File::open(&removed)?;
+        let outcome = super::atomic_remove_verified_file_with_faults(
+            &removed,
+            removed_file,
+            |_| Ok(()),
+            |_| Ok(()),
+            super::VerifiedRemoveFault::RemoveThenError,
+        )
+        .map_err(io::Error::other)?;
+        assert!(!removed.exists());
+        assert_verified_remove_sync_status(outcome.parent_sync);
+
+        let unsynced = fixture.root().join("removed-unsynced");
+        fs::write(&unsynced, b"receipt")?;
+        let unsynced_file = fs::File::open(&unsynced)?;
+        let outcome = super::atomic_remove_verified_file_with_faults(
+            &unsynced,
+            unsynced_file,
+            |_| Ok(()),
+            |_| Ok(()),
+            super::VerifiedRemoveFault::ParentSync,
+        )
+        .map_err(io::Error::other)?;
+        assert!(!unsynced.exists());
+        assert_eq!(outcome.parent_sync, ParentSyncStatus::NotSynced);
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn verified_file_remove_preserves_foreign_rebinds() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        let path = fixture.root().join("receipt");
+        let retained = fixture.root().join("retained-receipt");
+        fs::write(&path, b"owned receipt")?;
+        let held = fs::File::open(&path)?;
+
+        assert!(matches!(
+            super::atomic_remove_verified_file_with_faults(
+                &path,
+                held,
+                |current| {
+                    fs::rename(current, &retained)?;
+                    fs::write(current, b"foreign receipt")
+                },
+                |_| Ok(()),
+                super::VerifiedRemoveFault::None,
+            ),
+            Err(super::AtomicVerifiedRemoveError::Indeterminate)
+        ));
+        assert_eq!(fs::read(&path)?, b"foreign receipt");
+        assert_eq!(fs::read(&retained)?, b"owned receipt");
+
+        let after_path = fixture.root().join("receipt-after-remove");
+        fs::write(&after_path, b"owned receipt")?;
+        let after_held = fs::File::open(&after_path)?;
+        assert!(matches!(
+            super::atomic_remove_verified_file_with_faults(
+                &after_path,
+                after_held,
+                |_| Ok(()),
+                |current| fs::write(current, b"foreign after remove"),
+                super::VerifiedRemoveFault::None,
+            ),
+            Err(super::AtomicVerifiedRemoveError::Indeterminate)
+        ));
+        assert_eq!(fs::read(&after_path)?, b"foreign after remove");
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn verified_file_remove_detects_parent_identity_rebind() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        let parent = fixture.root().join("cleanup-parent");
+        let retired_parent = fixture.root().join("retired-cleanup-parent");
+        fs::create_dir(&parent)?;
+        let path = parent.join("receipt");
+        fs::write(&path, b"owned receipt")?;
+        let held = fs::File::open(&path)?;
+
+        assert!(matches!(
+            super::atomic_remove_verified_file_with_faults(
+                &path,
+                held,
+                |_| {
+                    fs::rename(&parent, &retired_parent)?;
+                    fs::create_dir(&parent)?;
+                    fs::write(parent.join("receipt"), b"foreign receipt")
+                },
+                |_| Ok(()),
+                super::VerifiedRemoveFault::None,
+            ),
+            Err(super::AtomicVerifiedRemoveError::Indeterminate)
+        ));
+        assert_eq!(fs::read(parent.join("receipt"))?, b"foreign receipt");
+        assert_eq!(fs::read(retired_parent.join("receipt"))?, b"owned receipt");
+
+        let after_parent = fixture.root().join("cleanup-parent-after");
+        let after_retired = fixture.root().join("retired-cleanup-parent-after");
+        fs::create_dir(&after_parent)?;
+        let after_path = after_parent.join("receipt");
+        fs::write(&after_path, b"owned receipt")?;
+        let after_held = fs::File::open(&after_path)?;
+        assert!(matches!(
+            super::atomic_remove_verified_file_with_faults(
+                &after_path,
+                after_held,
+                |_| Ok(()),
+                |_| {
+                    fs::rename(&after_parent, &after_retired)?;
+                    fs::create_dir(&after_parent)?;
+                    fs::write(after_parent.join("receipt"), b"foreign after remove")
+                },
+                super::VerifiedRemoveFault::None,
+            ),
+            Err(super::AtomicVerifiedRemoveError::Indeterminate)
+        ));
+        assert_eq!(
+            fs::read(after_parent.join("receipt"))?,
+            b"foreign after remove"
+        );
+        assert!(after_retired.is_dir());
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn verified_empty_directory_remove_reconciles_all_durable_outcomes() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+
+        let removed = fixture.root().join("cleanup-empty");
+        fs::create_dir(&removed)?;
+        let removed_identity = super::filesystem_directory_identity(&removed)?;
+        let outcome = super::atomic_remove_verified_empty_directory(&removed, &removed_identity)
+            .map_err(io::Error::other)?;
+        assert!(!removed.exists());
+        assert_verified_remove_sync_status(outcome.parent_sync);
+
+        let not_removed = fixture.root().join("cleanup-not-removed");
+        fs::create_dir(&not_removed)?;
+        let not_removed_identity = super::filesystem_directory_identity(&not_removed)?;
+        assert!(matches!(
+            super::atomic_remove_verified_empty_directory_with_faults(
+                &not_removed,
+                &not_removed_identity,
+                |_| Ok(()),
+                |_| Ok(()),
+                super::VerifiedRemoveFault::ErrorBeforeRemove,
+            ),
+            Err(super::AtomicVerifiedRemoveError::NotRemoved)
+        ));
+        assert!(not_removed.is_dir());
+
+        let after_error = fixture.root().join("cleanup-removed-then-error");
+        fs::create_dir(&after_error)?;
+        let after_error_identity = super::filesystem_directory_identity(&after_error)?;
+        let outcome = super::atomic_remove_verified_empty_directory_with_faults(
+            &after_error,
+            &after_error_identity,
+            |_| Ok(()),
+            |_| Ok(()),
+            super::VerifiedRemoveFault::RemoveThenError,
+        )
+        .map_err(io::Error::other)?;
+        assert!(!after_error.exists());
+        assert_verified_remove_sync_status(outcome.parent_sync);
+
+        let unsynced = fixture.root().join("cleanup-removed-unsynced");
+        fs::create_dir(&unsynced)?;
+        let unsynced_identity = super::filesystem_directory_identity(&unsynced)?;
+        let outcome = super::atomic_remove_verified_empty_directory_with_faults(
+            &unsynced,
+            &unsynced_identity,
+            |_| Ok(()),
+            |_| Ok(()),
+            super::VerifiedRemoveFault::ParentSync,
+        )
+        .map_err(io::Error::other)?;
+        assert!(!unsynced.exists());
+        assert_eq!(outcome.parent_sync, ParentSyncStatus::NotSynced);
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn verified_empty_directory_remove_rejects_nonempty_and_foreign_rebinds() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+
+        let nonempty = fixture.root().join("cleanup-nonempty");
+        fs::create_dir(&nonempty)?;
+        fs::write(nonempty.join("manifest"), b"owned manifest")?;
+        let nonempty_identity = super::filesystem_directory_identity(&nonempty)?;
+        assert!(matches!(
+            super::atomic_remove_verified_empty_directory(&nonempty, &nonempty_identity),
+            Err(super::AtomicVerifiedRemoveError::InvalidPath)
+        ));
+        assert_eq!(fs::read(nonempty.join("manifest"))?, b"owned manifest");
+
+        let rebound = fixture.root().join("cleanup-rebound");
+        let retained = fixture.root().join("retained-cleanup");
+        fs::create_dir(&rebound)?;
+        let rebound_identity = super::filesystem_directory_identity(&rebound)?;
+        assert!(matches!(
+            super::atomic_remove_verified_empty_directory_with_faults(
+                &rebound,
+                &rebound_identity,
+                |current| {
+                    fs::rename(current, &retained)?;
+                    fs::create_dir(current)?;
+                    fs::write(current.join("foreign"), b"foreign directory")
+                },
+                |_| Ok(()),
+                super::VerifiedRemoveFault::None,
+            ),
+            Err(super::AtomicVerifiedRemoveError::Indeterminate)
+        ));
+        assert_eq!(fs::read(rebound.join("foreign"))?, b"foreign directory");
+        assert!(retained.is_dir());
+
+        let after_rebound = fixture.root().join("cleanup-after-remove");
+        fs::create_dir(&after_rebound)?;
+        let after_identity = super::filesystem_directory_identity(&after_rebound)?;
+        assert!(matches!(
+            super::atomic_remove_verified_empty_directory_with_faults(
+                &after_rebound,
+                &after_identity,
+                |_| Ok(()),
+                |current| {
+                    fs::create_dir(current)?;
+                    fs::write(current.join("foreign"), b"foreign after remove")
+                },
+                super::VerifiedRemoveFault::None,
+            ),
+            Err(super::AtomicVerifiedRemoveError::Indeterminate)
+        ));
+        assert_eq!(
+            fs::read(after_rebound.join("foreign"))?,
+            b"foreign after remove"
+        );
+
+        let parent = fixture.root().join("directory-parent-after-remove");
+        let retired_parent = fixture.root().join("retired-directory-parent-after-remove");
+        fs::create_dir(&parent)?;
+        let directory = parent.join("cleanup");
+        fs::create_dir(&directory)?;
+        let directory_identity = super::filesystem_directory_identity(&directory)?;
+        assert!(matches!(
+            super::atomic_remove_verified_empty_directory_with_faults(
+                &directory,
+                &directory_identity,
+                |_| Ok(()),
+                |_| {
+                    fs::rename(&parent, &retired_parent)?;
+                    fs::create_dir(&parent)?;
+                    fs::create_dir(parent.join("cleanup"))?;
+                    fs::write(parent.join("cleanup/foreign"), b"foreign parent")
+                },
+                super::VerifiedRemoveFault::None,
+            ),
+            Err(super::AtomicVerifiedRemoveError::Indeterminate)
+        ));
+        assert_eq!(fs::read(parent.join("cleanup/foreign"))?, b"foreign parent");
+        assert!(retired_parent.is_dir());
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn verified_remove_rejects_hardlinked_file() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        let file = fixture.root().join("receipt");
+        let alias = fixture.root().join("receipt-alias");
+        fs::write(&file, b"receipt")?;
+        fs::hard_link(&file, &alias)?;
+        let held = fs::File::open(&file)?;
+        assert!(matches!(
+            super::atomic_remove_verified_file(&file, held),
+            Err(super::AtomicVerifiedRemoveError::InvalidPath)
+        ));
+        assert_eq!(fs::read(&file)?, b"receipt");
+        assert_eq!(fs::read(&alias)?, b"receipt");
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_remove_rejects_file_and_directory_symlinks() -> io::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let fixture = TestVault::new()?;
+        let symlink_target = fixture.root().join("receipt-symlink-target");
+        let symlink_file = fixture.root().join("receipt-symlink");
+        fs::write(&symlink_target, b"receipt")?;
+        symlink(&symlink_target, &symlink_file)?;
+        let symlink_held = fs::File::open(&symlink_file)?;
+        assert!(matches!(
+            super::atomic_remove_verified_file(&symlink_file, symlink_held),
+            Err(super::AtomicVerifiedRemoveError::InvalidPath)
+        ));
+        assert!(symlink_file.is_symlink());
+        assert_eq!(fs::read(&symlink_target)?, b"receipt");
+
+        let real_directory = fixture.root().join("real-cleanup");
+        let linked_directory = fixture.root().join("linked-cleanup");
+        fs::create_dir(&real_directory)?;
+        symlink(&real_directory, &linked_directory)?;
+        let identity = super::filesystem_directory_identity(&real_directory)?;
+        assert!(matches!(
+            super::atomic_remove_verified_empty_directory(&linked_directory, &identity),
+            Err(super::AtomicVerifiedRemoveError::InvalidPath)
+        ));
+        assert!(linked_directory.is_symlink());
+        assert!(real_directory.is_dir());
         Ok(())
     }
 
