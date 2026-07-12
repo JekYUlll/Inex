@@ -859,6 +859,20 @@ time.sleep(60)
                 process.terminate()
                 process.wait(timeout=5)
 
+    @unittest.skipUnless(sys.platform == "linux", "Linux procfs regression")
+    def test_procfs_permission_denial_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with mock.patch.object(
+                runner.os, "readlink", side_effect=PermissionError("denied")
+            ):
+                with self.assertRaisesRegex(
+                    runner.QaFailure, "path binding is unavailable"
+                ):
+                    runner.capture_root_binding_observation(
+                        os.getpid(), root, runner.expected_root_environment(root)
+                    )
+
     def test_artifact_directory_and_output_are_required_together(self) -> None:
         self.assertIsNone(runner.parse_arguments([]).artifact_directory)
         paired = runner.parse_arguments(

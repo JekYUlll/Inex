@@ -145,6 +145,10 @@ class QaFailure(RuntimeError):
     pass
 
 
+class ProcessDisappeared(QaFailure):
+    pass
+
+
 _ACTIVE_ARTIFACT_ROOT: Optional[Tuple[Path, os.stat_result]] = None
 
 
@@ -840,6 +844,8 @@ def process_cmdline(pid: int) -> List[str]:
 def process_snapshot(pid: int) -> ProcessSnapshot:
     try:
         raw = (Path("/proc") / str(pid) / "stat").read_text()
+    except FileNotFoundError as error:
+        raise ProcessDisappeared("process disappeared during identity capture") from error
     except (OSError, UnicodeError) as error:
         raise QaFailure("process stat identity is unavailable") from error
     close = raw.rfind(")")
@@ -1035,8 +1041,8 @@ def _path_target_within_root(target: str, root: Path) -> bool:
 def _read_proc_link(pid: int, name: str) -> str:
     try:
         return os.readlink(Path("/proc") / str(pid) / name)
-    except (FileNotFoundError, PermissionError) as error:
-        raise ProcessLookupError(pid) from error
+    except FileNotFoundError as error:
+        raise ProcessDisappeared("process path disappeared during census") from error
     except OSError as error:
         raise QaFailure("procfs process path binding is unavailable") from error
 
@@ -1046,8 +1052,8 @@ def _process_environment_root_keys(
 ) -> Tuple[str, ...]:
     try:
         raw = (Path("/proc") / str(pid) / "environ").read_bytes()
-    except (FileNotFoundError, PermissionError) as error:
-        raise ProcessLookupError(pid) from error
+    except FileNotFoundError as error:
+        raise ProcessDisappeared("process environment disappeared during census") from error
     except OSError as error:
         raise QaFailure("procfs process environment census is unavailable") from error
     matches = set()
@@ -1068,15 +1074,15 @@ def _process_fd_targets(pid: int) -> Tuple[str, ...]:
     directory = Path("/proc") / str(pid) / "fd"
     try:
         before = sorted(entry.name for entry in directory.iterdir())
-    except (FileNotFoundError, PermissionError) as error:
-        raise ProcessLookupError(pid) from error
+    except FileNotFoundError as error:
+        raise ProcessDisappeared("process descriptors disappeared during census") from error
     except OSError as error:
         raise QaFailure("procfs process descriptor census is unavailable") from error
     targets = []
     for descriptor_name in before:
         try:
             targets.append(os.readlink(directory / descriptor_name))
-        except (FileNotFoundError, PermissionError):
+        except FileNotFoundError:
             # A descriptor closed during the walk is no longer a surviving
             # binding. Two complete process censuses below still have to
             # agree before the result is accepted.
@@ -1092,7 +1098,7 @@ def capture_root_binding_observation(
     try:
         owner = (Path("/proc") / str(pid)).stat().st_uid
     except FileNotFoundError as error:
-        raise ProcessLookupError(pid) from error
+        raise ProcessDisappeared("process ownership disappeared during census") from error
     except OSError as error:
         raise QaFailure("procfs process ownership is unavailable") from error
     if owner != os.geteuid():
@@ -1118,7 +1124,7 @@ def capture_root_binding_observation(
     )
     after = process_snapshot(pid)
     if after != before:
-        raise ProcessLookupError(pid)
+        raise ProcessDisappeared("process identity changed during census")
     if not sources:
         return None
     return RootBindingObservation(
@@ -1133,8 +1139,11 @@ def _root_binding_census_once(
     root: Path,
     expected_environment: Mapping[str, str],
     excluded_pids: Iterable[int],
+    minimum_start_time_ticks: int,
+    strict_candidate_pids: Iterable[int],
 ) -> Tuple[RootBindingObservation, ...]:
     excluded = set(excluded_pids)
+    strict_candidates = set(strict_candidate_pids)
     observations = []
     try:
         entries = sorted(
@@ -1148,10 +1157,31 @@ def _root_binding_census_once(
         if pid in excluded:
             continue
         try:
+            owner = entry.stat().st_uid
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise QaFailure("procfs process ownership census is unavailable") from error
+        if owner != os.geteuid():
+            continue
+        try:
+            snapshot = process_snapshot(pid)
+        except ProcessDisappeared:
+            continue
+        if (
+            snapshot.state == "Z"
+            or snapshot.start_time_ticks < minimum_start_time_ticks
+        ):
+            continue
+        try:
             observation = capture_root_binding_observation(
                 pid, root, expected_environment
             )
-        except ProcessLookupError:
+        except ProcessDisappeared:
+            continue
+        except QaFailure:
+            if pid in strict_candidates:
+                raise
             continue
         if observation is not None:
             observations.append(observation)
@@ -1163,12 +1193,28 @@ def stable_root_binding_census(
     expected_environment: Mapping[str, str],
     *,
     excluded_pids: Iterable[int] = (),
+    minimum_start_time_ticks: Optional[int] = None,
+    strict_candidate_pids: Iterable[int] = (),
 ) -> Tuple[RootBindingObservation, ...]:
     excluded = {os.getpid(), *ancestor_pids(os.getpid()), *excluded_pids}
+    if minimum_start_time_ticks is None:
+        minimum_start_time_ticks = process_snapshot(os.getpid()).start_time_ticks
     for _attempt in range(20):
-        first = _root_binding_census_once(root, expected_environment, excluded)
+        first = _root_binding_census_once(
+            root,
+            expected_environment,
+            excluded,
+            minimum_start_time_ticks,
+            strict_candidate_pids,
+        )
         time.sleep(0.01)
-        second = _root_binding_census_once(root, expected_environment, excluded)
+        second = _root_binding_census_once(
+            root,
+            expected_environment,
+            excluded,
+            minimum_start_time_ticks,
+            strict_candidate_pids,
+        )
         if first == second:
             return second
     raise QaFailure("procfs root-binding census did not stabilize")
@@ -1415,10 +1461,21 @@ def capture_stable_launch_closure(
     infrastructure = set(excluded_infrastructure_pids)
     for _attempt in range(20):
         first_table = process_table()
+        first_session_closure = _launch_closure_snapshots(
+            first_table, session_id, ()
+        )
+        first_strict_candidates = set(first_session_closure) | {
+            snapshot.pid
+            for snapshot in first_table.values()
+            if snapshot.parent_pid == os.getpid()
+            and snapshot.start_time_ticks >= launcher_snapshot.start_time_ticks
+            and snapshot.pid not in infrastructure
+        }
         first_bindings = stable_root_binding_census(
             root,
             expected_environment,
             excluded_pids=infrastructure,
+            strict_candidate_pids=first_strict_candidates,
         )
         adopted = {
             observation.snapshot.pid
@@ -1437,10 +1494,21 @@ def capture_stable_launch_closure(
                 for pid, snapshot in sorted(first.items())
             ]
             second_table = process_table()
+            second_session_closure = _launch_closure_snapshots(
+                second_table, session_id, ()
+            )
+            second_strict_candidates = set(second_session_closure) | {
+                snapshot.pid
+                for snapshot in second_table.values()
+                if snapshot.parent_pid == os.getpid()
+                and snapshot.start_time_ticks >= launcher_snapshot.start_time_ticks
+                and snapshot.pid not in infrastructure
+            }
             second_bindings = stable_root_binding_census(
                 root,
                 expected_environment,
                 excluded_pids=infrastructure,
+                strict_candidate_pids=second_strict_candidates,
             )
             adopted_second = {
                 observation.snapshot.pid
@@ -1533,10 +1601,19 @@ def kill_verified_application_session(
         else:
             raise QaFailure("subreaper-adopted application descendants did not drain")
 
+        survivor_table = process_table()
+        strict_survivor_pids = {
+            snapshot.pid
+            for snapshot in survivor_table.values()
+            if snapshot.parent_pid == os.getpid()
+            and snapshot.start_time_ticks >= launcher_snapshot.start_time_ticks
+            and snapshot.pid not in infrastructure
+        }
         survivors = stable_root_binding_census(
             root,
             expected_environment,
             excluded_pids=infrastructure,
+            strict_candidate_pids=strict_survivor_pids,
         )
         if survivors:
             raise QaFailure("unverified root-bound process survived application SIGKILL")
@@ -1650,7 +1727,7 @@ def _capture_cleanup_closure(
                 binding = capture_root_binding_observation(
                     main_pid, root, expected_environment
                 )
-            except ProcessLookupError:
+            except ProcessDisappeared:
                 time.sleep(0.02)
                 continue
             if binding is None:
