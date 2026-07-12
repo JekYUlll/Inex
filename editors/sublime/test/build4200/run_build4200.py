@@ -1841,7 +1841,6 @@ def main() -> int:
         }
         helper_versions = {
             "sublime-text": version.strip(),
-            "zenity": bounded_tool_version(resolved_helpers["zenity"], ("--version",)),
             "xdotool": bounded_tool_version(resolved_helpers["xdotool"], ("version",)),
         }
 
