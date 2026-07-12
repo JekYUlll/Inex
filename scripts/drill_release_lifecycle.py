@@ -70,6 +70,9 @@ _LINUX_SUBREAPER_ENABLED = False
 LIFECYCLE_REPORT_COVERED = (
     "copy-import-normal-path",
     "password-rewrap-and-historical-metadata-scope",
+    "cli-auth-failure-secret-nondisclosure",
+    "rpc-auth-failure-secret-nondisclosure",
+    "locked-git-merge-driver-secret-nondisclosure",
     "authenticated-expected-tree-and-body-comparison",
     "git-bundle-clone-and-fsck",
     "clean-regular-file-tree-copy-restore",
@@ -716,7 +719,10 @@ def create_plaintext_source(
         if canonical in expected:
             raise ReleaseError("lifecycle source has a normalized path collision")
         expected[canonical] = content
-    _write_regular(root / "skipped-attachment.bin", b"public skipped attachment\n")
+    _write_regular(
+        root / "skipped-attachment.bin",
+        b"public skipped attachment with canary=" + canary + b"\n",
+    )
     return expected
 
 
@@ -1130,6 +1136,73 @@ def verify_locked_structure(
         != b"result: locked structure valid; unlock is required for authenticity"
     ):
         raise ReleaseError("locked structural verification output is not exact")
+
+
+def verify_locked_merge_driver_failure(
+    executable: Path,
+    protected_input: Path,
+    *,
+    environment: Mapping[str, str],
+    needles: Sequence[bytes],
+) -> None:
+    before_content = read_bounded_regular_file(protected_input, MAX_MARKDOWN_BYTES)
+    before = protected_input.lstat()
+    result = run_process(
+        [
+            executable,
+            "merge-driver",
+            protected_input,
+            protected_input,
+            protected_input,
+            "negative.md.enc",
+        ],
+        environment=environment,
+        needles=needles,
+        expected_statuses=frozenset({1}),
+    )
+    expected_stderr = (
+        b"inex: locked merge driver preserved all inputs; run `inex git merge <vault>` "
+        b"after explicit unlock\n"
+    )
+    if result.stdout or result.stderr != expected_stderr:
+        raise ReleaseError("locked merge-driver failure output is not exact")
+    after_content = read_bounded_regular_file(protected_input, MAX_MARKDOWN_BYTES)
+    after = protected_input.lstat()
+    if (
+        after_content != before_content
+        or not os.path.samestat(before, after)
+        or before.st_mode != after.st_mode
+        or before.st_nlink != after.st_nlink
+        or before.st_size != after.st_size
+        or before.st_mtime_ns != after.st_mtime_ns
+        or before.st_ctime_ns != after.st_ctime_ns
+    ):
+        raise ReleaseError("locked merge-driver changed its protected input")
+
+
+def verify_cli_auth_failure(
+    executable: Path,
+    vault: Path,
+    wrong_password: bytes,
+    secret_query: bytes,
+    *,
+    environment: Mapping[str, str],
+    needles: Sequence[bytes],
+) -> None:
+    if b"\n" in wrong_password or b"\n" in secret_query:
+        raise ReleaseError("CLI negative-path secrets must be single lines")
+    command_environment = dict(environment)
+    command_environment["INEX_PASSWORD_STDIN"] = "1"
+    command_environment["INEX_QUERY_STDIN"] = "1"
+    result = run_process(
+        [executable, "search", vault],
+        environment=command_environment,
+        needles=needles,
+        input_data=wrong_password + b"\n" + secret_query + b"\n",
+        expected_statuses=frozenset({1}),
+    )
+    if result.stdout or result.stderr != b"inex: vault password authentication failed\n":
+        raise ReleaseError("CLI authentication failure output is not exact")
 
 
 def capture_audited_artifacts(
@@ -2153,6 +2226,7 @@ def validate_lifecycle_report(report: dict[str, object]) -> None:
         "auditedArtifactCount",
         "auditedArtifacts",
         "authenticatedExpectedBodies",
+        "cliAuthFailureSecretNondisclosure",
         "cleanRegularFileTreeCopyRestoreVerified",
         "covered",
         "sensitiveResidueHitsOutsideDesignatedPlaintextSource",
@@ -2166,6 +2240,7 @@ def validate_lifecycle_report(report: dict[str, object]) -> None:
         "gitBundleVerified",
         "gitVersion",
         "linuxDescendantControl",
+        "lockedGitMergeDriverSecretNondisclosure",
         "harnessFiles",
         "harnessSource",
         "markdownFiles",
@@ -2179,6 +2254,7 @@ def validate_lifecycle_report(report: dict[str, object]) -> None:
         "reportScope",
         "releaseVersion",
         "releaseSetAudit",
+        "rpcAuthFailureSecretNondisclosure",
         "restoredDriverReinstalled",
         "sourceHashesUnchanged",
         "sourceDirectorySetUnchanged",
@@ -2263,12 +2339,15 @@ def validate_lifecycle_report(report: dict[str, object]) -> None:
         raise ReleaseError("lifecycle report has an invalid harness file set")
     for field in (
         "cleanRegularFileTreeCopyRestoreVerified",
+        "cliAuthFailureSecretNondisclosure",
         "designatedPlaintextSourcePathComponentsScanned",
         "driverRelocationVerified",
         "frozenV1CompatibilityRead",
         "frozenV1ProductBytesUnchanged",
         "gitBundleVerified",
         "importedVaultPhysicalAllowlistVerified",
+        "lockedGitMergeDriverSecretNondisclosure",
+        "rpcAuthFailureSecretNondisclosure",
         "restoredDriverReinstalled",
         "sourceHashesUnchanged",
         "sourceDirectorySetUnchanged",
@@ -2373,6 +2452,12 @@ def run_lifecycle_drill(
         expected = create_plaintext_source(source, canary)
         source_before = snapshot_regular_tree(source)
         source_directories_before = directory_manifest(source)
+        verify_locked_merge_driver_failure(
+            cli,
+            source / "skipped-attachment.bin",
+            environment=environment,
+            needles=needles,
+        )
         vault = temporary / "imported-vault"
 
         dry_run = run_cli(
@@ -2455,6 +2540,14 @@ def run_lifecycle_drill(
             raise ReleaseError("password change rewrote an EDRY document")
         if (vault / "vault.json").read_bytes() == metadata_before_password_change:
             raise ReleaseError("password change did not replace vault metadata")
+        verify_cli_auth_failure(
+            cli,
+            vault,
+            old_password,
+            canary,
+            environment=environment,
+            needles=needles,
+        )
         rpc_require_unlock_failure(
             daemon,
             vault,
@@ -2638,6 +2731,7 @@ def run_lifecycle_drill(
                 for name in sorted(artifact_hashes)
             ],
             "authenticatedExpectedBodies": len(expected),
+            "cliAuthFailureSecretNondisclosure": True,
             "cleanRegularFileTreeCopyRestoreVerified": True,
             "covered": list(LIFECYCLE_REPORT_COVERED),
             "sensitiveResidueHitsOutsideDesignatedPlaintextSource": 0,
@@ -2654,6 +2748,7 @@ def run_lifecycle_drill(
             "gitBundleVerified": True,
             "gitVersion": git_version_value,
             "linuxDescendantControl": "subreaper-procfs-pidfd",
+            "lockedGitMergeDriverSecretNondisclosure": True,
             "harnessFiles": [
                 {"name": name, "sha256": harness_hashes[name]}
                 for name in sorted(harness_hashes)
@@ -2674,6 +2769,7 @@ def run_lifecycle_drill(
             "reportScope": "lifecycle-only-non-release-approval",
             "releaseVersion": release_version,
             "releaseSetAudit": release_set_audit,
+            "rpcAuthFailureSecretNondisclosure": True,
             "restoredDriverReinstalled": True,
             "sourceHashesUnchanged": True,
             "sourceDirectorySetUnchanged": True,

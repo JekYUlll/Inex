@@ -100,6 +100,7 @@ class ReleaseLifecycleTests(unittest.TestCase):
             "auditedArtifactCount": 3,
             "auditedArtifacts": artifacts,
             "authenticatedExpectedBodies": 5,
+            "cliAuthFailureSecretNondisclosure": True,
             "cleanRegularFileTreeCopyRestoreVerified": True,
             "covered": list(lifecycle.LIFECYCLE_REPORT_COVERED),
             "sensitiveResidueHitsOutsideDesignatedPlaintextSource": 0,
@@ -116,6 +117,7 @@ class ReleaseLifecycleTests(unittest.TestCase):
             "gitBundleVerified": True,
             "gitVersion": "git version 2.43.0",
             "linuxDescendantControl": "subreaper-procfs-pidfd",
+            "lockedGitMergeDriverSecretNondisclosure": True,
             "harnessFiles": [
                 {"name": name, "sha256": "a" * 64}
                 for name in lifecycle.LIFECYCLE_HARNESS_FILES
@@ -136,6 +138,7 @@ class ReleaseLifecycleTests(unittest.TestCase):
             "reportScope": "lifecycle-only-non-release-approval",
             "releaseVersion": "0.1.0",
             "releaseSetAudit": release_set_audit,
+            "rpcAuthFailureSecretNondisclosure": True,
             "restoredDriverReinstalled": True,
             "sourceHashesUnchanged": True,
             "sourceDirectorySetUnchanged": True,
