@@ -104,26 +104,26 @@ pub struct AtomicDirectoryPublishOutcome {
     pub parent_sync: ParentSyncStatus,
 }
 
-/// Failure to atomically publish a complete staged vault without replacement.
+/// Failure to atomically move a verified directory without replacement.
 #[derive(Debug, Error)]
 pub enum AtomicDirectoryPublishError {
-    /// The staging/final paths are not distinct direct children of one parent.
-    #[error("staged-vault publication paths are invalid")]
+    /// The source/destination paths are not safe distinct sibling entries.
+    #[error("verified directory-move paths are invalid")]
     InvalidPaths,
-    /// The final destination already has a filesystem entry.
-    #[error("staged-vault destination already exists")]
+    /// The destination already has a filesystem entry.
+    #[error("verified directory-move destination already exists")]
     DestinationExists,
-    /// The no-replace move left the exact complete staging tree in place.
-    #[error("staged-vault namespace publication did not move the staging directory")]
+    /// The no-replace operation left the exact source directory in place.
+    #[error("verified directory namespace operation did not move the source")]
     NotMoved,
-    /// The platform cannot prove whether the complete staging directory moved.
-    #[error("staged-vault namespace publication outcome is indeterminate")]
+    /// Physical identities cannot prove one complete namespace outcome.
+    #[error("verified directory namespace-move outcome is indeterminate")]
     Indeterminate,
-    /// The complete staging tree was published, but its private marker remains.
-    #[error("staged vault was published but private marker cleanup failed")]
+    /// An import tree moved, but its caller-managed private marker remains.
+    #[error("verified directory moved but caller-managed marker cleanup failed")]
     PublishedCleanupFailed,
-    /// A scrubbed filesystem operation failed before publication.
-    #[error("staged-vault publication I/O failed")]
+    /// A scrubbed filesystem operation failed before the outcome was known.
+    #[error("verified directory move I/O failed")]
     Io {
         /// Original error without caller data in this error's display text.
         #[source]
@@ -520,11 +520,16 @@ pub fn atomic_write_ciphertext(
 /// This primitive deliberately knows nothing about import staging names,
 /// vault-private directories, or publication markers. Callers that require a
 /// stronger tree-content invariant must enforce it in `critical_audit` and
-/// hold their own mutation exclusion for the duration of the call.
+/// hold their own mutation guard or equivalent exclusive protocol for the
+/// duration of the call. `critical_audit` runs exactly once after the physical
+/// source identity is captured and receives the exact `source` path supplied
+/// by the caller, including its platform-specific path spelling; internal
+/// canonical or Windows verbatim paths are never substituted into the callback.
 /// Callers must also exclude a non-cooperating process running as the same OS
 /// user from rebinding either child name between the final identity check and
 /// the namespace operation; post-state reconciliation detects but cannot
-/// prevent that path-based race.
+/// prevent that path-based race. This API is not an operating-system-level
+/// compare-and-exchange over directory identity.
 ///
 /// # Errors
 ///
@@ -532,19 +537,20 @@ pub fn atomic_write_ciphertext(
 /// unrelated destination is present, [`AtomicDirectoryPublishError::NotMoved`]
 /// when an errored namespace operation provably left the exact source in
 /// place, and [`AtomicDirectoryPublishError::Indeterminate`] when physical
-/// identities do not prove one complete outcome.
-pub(crate) fn atomic_move_verified_directory_no_replace_checked<F>(
+/// identities do not prove one complete outcome. An audit failure is returned
+/// as a scrubbed [`AtomicDirectoryPublishError::Io`].
+pub fn atomic_move_verified_directory_no_replace_checked<F>(
     source: &Path,
     destination: &Path,
     critical_audit: F,
 ) -> Result<AtomicDirectoryPublishOutcome, AtomicDirectoryPublishError>
 where
-    F: FnOnce(&Path) -> Result<(), AtomicDirectoryPublishError>,
+    F: FnOnce(&Path) -> io::Result<()>,
 {
     atomic_move_verified_directory_no_replace_checked_with_faults(
         source,
         destination,
-        critical_audit,
+        |current| critical_audit(current).map_err(AtomicDirectoryPublishError::io),
         DirectoryMoveFault::None,
     )
 }
@@ -569,7 +575,7 @@ where
     F: FnOnce(&Path) -> Result<(), AtomicDirectoryPublishError>,
 {
     let paths = VerifiedDirectoryMovePaths::resolve(source, destination)?;
-    critical_audit(&paths.source)?;
+    critical_audit(source)?;
     if !paths.parent_and_source_match() {
         return Err(AtomicDirectoryPublishError::Indeterminate);
     }
@@ -1014,20 +1020,12 @@ where
     } else {
         DirectoryMoveFault::None
     };
-    let directory_move_result = if skip_move || inject_error_after_move {
-        atomic_move_verified_directory_no_replace_checked_with_faults(
-            &resolved_staging,
-            &resolved_destination,
-            import_audit,
-            move_fault,
-        )
-    } else {
-        atomic_move_verified_directory_no_replace_checked(
-            &resolved_staging,
-            &resolved_destination,
-            import_audit,
-        )
-    };
+    let directory_move_result = atomic_move_verified_directory_no_replace_checked_with_faults(
+        &resolved_staging,
+        &resolved_destination,
+        import_audit,
+        move_fault,
+    );
     let exact_import_source = || {
         filesystem_directory_identity(&resolved_parent)
             .is_ok_and(|identity| identity == parent_identity)
@@ -3828,7 +3826,7 @@ mod tests {
 
     #[cfg(any(target_os = "linux", windows))]
     #[test]
-    fn verified_directory_move_is_independent_of_import_layout() -> io::Result<()> {
+    fn verified_directory_move_audit_receives_exact_caller_source_path() -> io::Result<()> {
         let fixture = TestVault::new()?;
         let source = fixture.root().join("candidate-bundle");
         let destination = fixture.root().join("stable-bundle");
@@ -3889,7 +3887,7 @@ mod tests {
 
         assert!(matches!(
             super::atomic_move_verified_directory_no_replace_checked(&source, &destination, |_| {
-                fs::create_dir(&destination).map_err(AtomicDirectoryPublishError::io)?;
+                fs::create_dir(&destination)?;
                 Ok(())
             }),
             Err(AtomicDirectoryPublishError::DestinationExists)
@@ -3913,9 +3911,7 @@ mod tests {
                 &source,
                 &destination,
                 |current| {
-                    fs::rename(current, &retired)
-                        .and_then(|()| fs::create_dir(current))
-                        .map_err(AtomicDirectoryPublishError::io)?;
+                    fs::rename(current, &retired).and_then(|()| fs::create_dir(current))?;
                     Ok(())
                 }
             ),
@@ -3939,9 +3935,7 @@ mod tests {
 
         assert!(matches!(
             super::atomic_move_verified_directory_no_replace_checked(&source, &destination, |_| {
-                fs::rename(&parent, &retired)
-                    .and_then(|()| fs::create_dir(&parent))
-                    .map_err(AtomicDirectoryPublishError::io)?;
+                fs::rename(&parent, &retired).and_then(|()| fs::create_dir(&parent))?;
                 Ok(())
             }),
             Err(AtomicDirectoryPublishError::Indeterminate)
