@@ -80,6 +80,10 @@ Phase 7 — 跨平台验证、打包与发布准备
   - [x] 提供无参数、CLI-only 的 `inex kdf-calibration-info`，从 production `OnceLock` 投影选中参数、决策观测、测量数与 outcome；确定性测试覆盖窗口边界、五类 outcome（含四类 fallback）、噪声/未测候选，真实进程测试证明不解析 password/query 且不写持久 product state
   - [x] 实现 Linux 原生 package evidence harness 与 CI 路径：严格四文件 snapshot/audit、CLI/daemon digest 和两次 runtime-info probe、三次无重试 fresh calibration attempt、外部资源观测、零普通文件残留与 canonical JSON；Windows 在 suspended-before-Job、Job-empty barrier 与 NTFS ADS 闭合前 fail closed
   - [ ] 从严格审计的最终 package 在 Linux x64、Linux arm64、Windows x64 MSVC、Windows arm64 MSVC 原生宿主各采集三次外部 canonical evidence；Wine、交叉编译与仿真不计入原生门禁
+    - [x] Linux x64：clean `eeca0bc` A/B artifact 逐字节一致；外部 0600 report 固定三次 fresh-process `target-window`，均选择 ops 16/64 MiB/parallelism 1，canonical validator 通过
+    - [ ] Linux arm64 原生宿主
+    - [ ] Windows x64 MSVC 原生宿主；先闭合 suspended-before-Job、Job-empty barrier 与 NTFS ADS
+    - [ ] Windows arm64 MSVC 原生宿主；先闭合 suspended-before-Job、Job-empty barrier 与 NTFS ADS
 - [x] 闭合 binding Git rename/modify 源码契约：detected 形态、split 两侧 rename、精确 tree provenance、v2/v3 journal 与恢复负测均通过
 - [ ] 在原生支持平台复验 Git rename/power-loss，并在 GA 前保留“禁止并行 Git porcelain”边界或实现真正的 index CAS
   - [x] 实现 alternate-index candidate、Inex 自持真实 `.git/index.lock`、old/candidate digest 绑定与 create-only journal v4
@@ -101,6 +105,8 @@ Phase 7 — 跨平台验证、打包与发布准备
 - [x] 从独立 standalone clean clone 对 `40ff728` 历史 artifact 完成 import/password/Git-bundle/tree-copy restore/frozen-v1/residue lifecycle drill
 - [x] 从包含通用非自指包内文档的最终 source checkpoint 重建三包并重跑 strict audit/native smoke/lifecycle；当前 Linux x64 artifacts 绑定 `5aa0b8c`，`fd543f4` 只保留为前一工程证据
 - [x] 将最终 commit/hash/lifecycle 只写入不参与 package input 的外部 evidence 与 planning successor；artifact source 保持 `5aa0b8c`，不 relabel 为后续证据提交
+- [x] 从 clean `eeca0bc` 以 Node 22.23.1/Rust 1.97.0/system GCC 完成两次逐字节一致的 Linux x64 package/audit/native-dependency/exact VS Code 1.125.0 smoke，并采集三次原生 KDF external evidence
+- [x] 从第三个 standalone clean `eeca0bc` harness clone 对同一最终 artifact 重跑完整 lifecycle；旧 `5aa0b8c` lifecycle 不继承到新 CLI/package checkpoint
 - **Status:** in_progress
 
 ## Key Questions

@@ -247,3 +247,13 @@
 - 一个有效外部报告运行五个 packaged processes：`inex runtime-info`、`inexd --runtime-info` 两个 probe，加上恰好三次新的 `inex kdf-calibration-info` attempt。`attemptCount=3`/`retryCount=0` 只约束 calibration attempts；每次 CLI 都是新进程，不能证明后来 init/import/daemon 的同进程缓存会选相同 ops。
 - 执行前哈希不足以把 runtime output 绑定到 packaged binary：同用户可执行文件可在 probe/attempt 中自改。Linux harness 必须去除提取副本 write bits，并在每个边界以物理 identity、不可回设的 ctime、metadata 和 digest 同时复验 executable 与 artifact snapshot；这仍依赖无同主体 harness writer 的显式信任边界。
 - Windows 零 residue 不能由普通 `os.walk` 推断，因为 NTFS named streams 可挂在文件或目录且不出现在默认 tree；同样，先运行再 Assign Job Object 存在后代逃逸窗口。Windows evidence 必须在 suspended-before-Job、Job-empty confirmation、完整 ADS enumeration 和原生测试存在前 fail closed；Wine、交叉编译或仅有 JSON schema 测试都不能替代。
+
+## 2026-07-12 Linux x64 native KDF evidence result
+
+- 可复现性门禁必须比较原生二进制本身和四文件发布集，而不只比较 `SHA256SUMS`。clean `eeca0bc` A/B 在 system GCC 下六项都由 `cmp` 证明 byte-identical；两路 strict audit 还共同绑定 clean canonical source、77 个 Cargo component、147 份 license text、inventory `228bfeb7…` 与 sidecar `ec27ba2…`。
+- 默认宿主 PATH 会把 `gcc`/`ld` 指向 xlings；该路线在候选链接完成前被主动中止，最终 A/B 都在新 target 中显式固定 `/usr/bin/gcc`、`ar`、`ranlib`。性能/发布证据必须记录并隔离这种宿主工具链漂移，不能因 Cargo 命令成功就视为 native gate 通过。
+- 三次 packaged fresh process 在 16 logical CPU、29217185792 bytes physical memory 的本机都选择 ops 16，单次公开 dummy 决策观测为 277.26–290.94 ms，处于 inclusive 250–750 ms 首选窗口；这只证明该时点的 selector 输出与资源范围，不证明 unlock/create/import 的端到端耗时。
+- 每次 attempt 的 Linux `/proc` 观测峰值 VmHWM 为约 70.1 MB、VmPeak 72204288 bytes；这与固定 64 MiB KDF memory 加进程开销相容，但 VmHWM 不是 libsodium allocation 的独占测量，不能从差值反推精确 KDF RSS。
+- 报告 `attemptCount=3`、`retryCount=0`、三个 ordinal 都被保留，canonical re-encode 与原 bytes 相等，外部文件为 create-new 0600。其 SHA-256 `8d8a9adf…` 只绑定本次 Linux x64 运行；Linux arm64 与两个 Windows MSVC 原生 row 仍保持 open。
+- 当前 artifact 的 normal-path lifecycle 不能从旧 `5aa0b8c` 继承；第三 clean `eeca0bc` harness clone 的新报告将 artifact/harness source 同时绑定到 clean `eeca0bc`，并在运行后再次验证四文件集合与 `SHA256SUMS`。报告 SHA-256 为 `30904006…`，14 个必需布尔项全真且零 sensitive residue hit。
+- 该 lifecycle 的 `notCovered` 仍精确包含同主体 release-host writer、签名/发布、fault-state/power-loss、hosted CI、独立法务、two-version upgrade/rollback、其他原生平台、editor persistent-profile residue 与 generated-input independent build attestation；Linux x64 normal-path PASS 不得升级成这些结论。
