@@ -6524,7 +6524,8 @@ fn verify_authenticated_payload_original_v5(
             )? {
                 return Err(GitError::IndexChanged);
             }
-            verify_active_rename_provenance(git, &journal.provenance)?;
+            verify_active_rename_provenance(git, &journal.provenance)
+                .map_err(|_| GitError::IndexChanged)?;
             verify_merge_identity_owners(
                 vault,
                 git,
@@ -6566,7 +6567,8 @@ fn verify_authenticated_payload_original_v5(
             if !split_index_is_original(git, &authenticated.source, &authenticated.destination)? {
                 return Err(GitError::IndexChanged);
             }
-            verify_active_rename_provenance(git, &journal.provenance)?;
+            verify_active_rename_provenance(git, &journal.provenance)
+                .map_err(|_| GitError::IndexChanged)?;
             verify_merge_identity_owners(
                 vault,
                 git,
@@ -6623,6 +6625,9 @@ fn authorize_payload_before_v5_journal(
     guard: &VaultMutationGuard,
     payload: &MergeJournalPayload,
 ) -> Result<(), GitError> {
+    if vault.root() != git.root || !guard.is_for_root(vault.root()) {
+        return Err(GitError::RecoveryConflict);
+    }
     let authenticated = authenticate_merge_payload_v5(vault, git, payload)?;
     verify_authenticated_payload_original_v5(vault, git, guard, &authenticated)?;
     match payload {
@@ -7778,8 +7783,14 @@ mod tests {
     }
 
     fn create_rename_recovery_fixture() -> RenameRecoveryFixture {
+        create_rename_recovery_fixture_with_format(GitObjectFormat::Sha1)
+    }
+
+    fn create_rename_recovery_fixture_with_format(
+        object_format: GitObjectFormat,
+    ) -> RenameRecoveryFixture {
         let (directory, vault, source_path, destination_path, _) =
-            create_rename_modify_repository(false);
+            create_rename_modify_repository_with_format(false, object_format);
         let git = Git::open(directory.path()).expect("Git repository opens");
         let conflicts = git.unmerged_entries().expect("split conflict enumerates");
         let source = conflicts
@@ -8490,8 +8501,14 @@ mod tests {
     }
 
     fn create_detected_rename_recovery_fixture() -> DetectedRenameRecoveryFixture {
+        create_detected_rename_recovery_fixture_with_format(GitObjectFormat::Sha1)
+    }
+
+    fn create_detected_rename_recovery_fixture_with_format(
+        object_format: GitObjectFormat,
+    ) -> DetectedRenameRecoveryFixture {
         let (directory, vault, source_path, destination_path, _) =
-            create_rename_modify_repository(true);
+            create_rename_modify_repository_with_format(true, object_format);
         let git = Git::open(directory.path()).expect("Git repository opens");
         let conflicts = git
             .unmerged_entries()
@@ -10498,60 +10515,63 @@ mod tests {
 
     #[test]
     fn v5_payload_authorization_accepts_original_rename_variants_read_only() {
-        let split = create_rename_recovery_fixture();
-        let split_source = fs::read(&split.source_target).expect("split source snapshots");
-        let split_destination =
-            fs::read(&split.destination_target).expect("split destination snapshots");
-        let split_index = fs::read(index_path(split.vault.root())).expect("split index snapshots");
-        let split_guard =
-            VaultMutationGuard::acquire(split.vault.root()).expect("split auth guard acquires");
-        authorize_payload_before_v5_journal(
-            &split.vault,
-            &split.git,
-            &split_guard,
-            &MergeJournalPayload::Rename(split.journal.clone()),
-        )
-        .expect("original split rename authorizes");
-        split.assert_original_index();
-        assert_eq!(
-            fs::read(&split.source_target).expect("split source re-reads"),
-            split_source
-        );
-        assert_eq!(
-            fs::read(&split.destination_target).expect("split destination re-reads"),
-            split_destination
-        );
-        assert_eq!(
-            fs::read(index_path(split.vault.root())).expect("split index re-reads"),
-            split_index
-        );
-        assert!(!journal_path(split.vault.root()).exists());
+        for object_format in [GitObjectFormat::Sha1, GitObjectFormat::Sha256] {
+            let split = create_rename_recovery_fixture_with_format(object_format);
+            let split_source = fs::read(&split.source_target).expect("split source snapshots");
+            let split_destination =
+                fs::read(&split.destination_target).expect("split destination snapshots");
+            let split_index =
+                fs::read(index_path(split.vault.root())).expect("split index snapshots");
+            let split_guard =
+                VaultMutationGuard::acquire(split.vault.root()).expect("split auth guard acquires");
+            authorize_payload_before_v5_journal(
+                &split.vault,
+                &split.git,
+                &split_guard,
+                &MergeJournalPayload::Rename(split.journal.clone()),
+            )
+            .expect("original split rename authorizes");
+            split.assert_original_index();
+            assert_eq!(
+                fs::read(&split.source_target).expect("split source re-reads"),
+                split_source
+            );
+            assert_eq!(
+                fs::read(&split.destination_target).expect("split destination re-reads"),
+                split_destination
+            );
+            assert_eq!(
+                fs::read(index_path(split.vault.root())).expect("split index re-reads"),
+                split_index
+            );
+            assert!(!journal_path(split.vault.root()).exists());
 
-        let detected = create_detected_rename_recovery_fixture();
-        let detected_destination =
-            fs::read(&detected.destination_target).expect("detected destination snapshots");
-        let detected_index =
-            fs::read(index_path(detected.vault.root())).expect("detected index snapshots");
-        let detected_guard = VaultMutationGuard::acquire(detected.vault.root())
-            .expect("detected auth guard acquires");
-        authorize_payload_before_v5_journal(
-            &detected.vault,
-            &detected.git,
-            &detected_guard,
-            &MergeJournalPayload::DetectedRename(detected.journal.clone()),
-        )
-        .expect("original detected rename authorizes");
-        detected.assert_original_index();
-        assert!(!detected.source_target.exists());
-        assert_eq!(
-            fs::read(&detected.destination_target).expect("detected destination re-reads"),
-            detected_destination
-        );
-        assert_eq!(
-            fs::read(index_path(detected.vault.root())).expect("detected index re-reads"),
-            detected_index
-        );
-        assert!(!journal_path(detected.vault.root()).exists());
+            let detected = create_detected_rename_recovery_fixture_with_format(object_format);
+            let detected_destination =
+                fs::read(&detected.destination_target).expect("detected destination snapshots");
+            let detected_index =
+                fs::read(index_path(detected.vault.root())).expect("detected index snapshots");
+            let detected_guard = VaultMutationGuard::acquire(detected.vault.root())
+                .expect("detected auth guard acquires");
+            authorize_payload_before_v5_journal(
+                &detected.vault,
+                &detected.git,
+                &detected_guard,
+                &MergeJournalPayload::DetectedRename(detected.journal.clone()),
+            )
+            .expect("original detected rename authorizes");
+            detected.assert_original_index();
+            assert!(!detected.source_target.exists());
+            assert_eq!(
+                fs::read(&detected.destination_target).expect("detected destination re-reads"),
+                detected_destination
+            );
+            assert_eq!(
+                fs::read(index_path(detected.vault.root())).expect("detected index re-reads"),
+                detected_index
+            );
+            assert!(!journal_path(detected.vault.root()).exists());
+        }
     }
 
     #[test]
@@ -10606,6 +10626,479 @@ mod tests {
             fs::read(root.join("entry.md.enc")).expect("worktree remains"),
             original_worktree
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the table proves affected-index drift for every payload and object format"
+    )]
+    fn v5_payload_authorization_rejects_related_index_drift_sha1_and_sha256() {
+        for object_format in [GitObjectFormat::Sha1, GitObjectFormat::Sha256] {
+            let in_place = create_candidate_bundle_preparation_fixture(object_format);
+            let in_place_root = in_place.vault.root();
+            let in_place_worktree =
+                fs::read(in_place_root.join("entry.md.enc")).expect("in-place worktree snapshots");
+            let MergeJournalPayload::InPlace(journal) = &in_place.transaction else {
+                panic!("fixture carries in-place payload");
+            };
+            in_place
+                .git
+                .update_index_direct(
+                    &journal.physical_path,
+                    &journal.result_mode,
+                    &journal.result_oid,
+                )
+                .expect("in-place related index drifts");
+            let injected_index =
+                fs::read(index_path(in_place_root)).expect("in-place drift snapshots");
+            let guard = VaultMutationGuard::acquire(in_place_root)
+                .expect("in-place authorization guard acquires");
+            assert!(matches!(
+                authorize_payload_before_v5_journal(
+                    &in_place.vault,
+                    &in_place.git,
+                    &guard,
+                    &in_place.transaction,
+                ),
+                Err(GitError::IndexChanged)
+            ));
+            assert_eq!(
+                fs::read(index_path(in_place_root)).expect("in-place drift remains"),
+                injected_index
+            );
+            assert_eq!(
+                fs::read(in_place_root.join("entry.md.enc")).expect("in-place worktree remains"),
+                in_place_worktree
+            );
+            assert!(!journal_path(in_place_root).exists());
+            assert!(!index_lock_path(in_place_root).exists());
+
+            let split = create_rename_recovery_fixture_with_format(object_format);
+            let split_source = fs::read(&split.source_target).expect("split source snapshots");
+            let split_destination =
+                fs::read(&split.destination_target).expect("split destination snapshots");
+            split.update_index();
+            let injected_index =
+                fs::read(index_path(split.vault.root())).expect("split drift snapshots");
+            let guard = VaultMutationGuard::acquire(split.vault.root())
+                .expect("split authorization guard acquires");
+            assert!(matches!(
+                authorize_payload_before_v5_journal(
+                    &split.vault,
+                    &split.git,
+                    &guard,
+                    &MergeJournalPayload::Rename(split.journal.clone()),
+                ),
+                Err(GitError::IndexChanged)
+            ));
+            assert_eq!(
+                fs::read(index_path(split.vault.root())).expect("split drift remains"),
+                injected_index
+            );
+            assert_eq!(
+                fs::read(&split.source_target).expect("split source remains"),
+                split_source
+            );
+            assert_eq!(
+                fs::read(&split.destination_target).expect("split destination remains"),
+                split_destination
+            );
+            assert!(!journal_path(split.vault.root()).exists());
+            assert!(!index_lock_path(split.vault.root()).exists());
+
+            let detected = create_detected_rename_recovery_fixture_with_format(object_format);
+            let detected_destination =
+                fs::read(&detected.destination_target).expect("detected destination snapshots");
+            detected.update_index();
+            let injected_index =
+                fs::read(index_path(detected.vault.root())).expect("detected drift snapshots");
+            let guard = VaultMutationGuard::acquire(detected.vault.root())
+                .expect("detected authorization guard acquires");
+            assert!(matches!(
+                authorize_payload_before_v5_journal(
+                    &detected.vault,
+                    &detected.git,
+                    &guard,
+                    &MergeJournalPayload::DetectedRename(detected.journal.clone()),
+                ),
+                Err(GitError::IndexChanged)
+            ));
+            assert_eq!(
+                fs::read(index_path(detected.vault.root())).expect("detected drift remains"),
+                injected_index
+            );
+            assert!(!detected.source_target.exists());
+            assert_eq!(
+                fs::read(&detected.destination_target).expect("detected destination remains"),
+                detected_destination
+            );
+            assert!(!journal_path(detected.vault.root()).exists());
+            assert!(!index_lock_path(detected.vault.root()).exists());
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the table preserves each injected source/destination drift for both rename forms"
+    )]
+    fn v5_rename_payload_authorization_rejects_source_and_destination_drift() {
+        for object_format in [GitObjectFormat::Sha1, GitObjectFormat::Sha256] {
+            let split_source = create_rename_recovery_fixture_with_format(object_format);
+            let root = split_source.vault.root();
+            let index = fs::read(index_path(root)).expect("split-source index snapshots");
+            let destination = fs::read(&split_source.destination_target)
+                .expect("split-source destination snapshots");
+            let foreign_source = b"foreign split source owner";
+            fs::write(&split_source.source_target, foreign_source).expect("split source drifts");
+            let guard = VaultMutationGuard::acquire(root).expect("split-source guard acquires");
+            assert!(matches!(
+                authorize_payload_before_v5_journal(
+                    &split_source.vault,
+                    &split_source.git,
+                    &guard,
+                    &MergeJournalPayload::Rename(split_source.journal.clone()),
+                ),
+                Err(GitError::WorktreeChanged)
+            ));
+            assert_eq!(
+                fs::read(&split_source.source_target).expect("split source drift remains"),
+                foreign_source
+            );
+            assert_eq!(
+                fs::read(&split_source.destination_target).expect("split destination remains"),
+                destination
+            );
+            assert_eq!(
+                fs::read(index_path(root)).expect("split-source index remains"),
+                index
+            );
+            assert!(!journal_path(root).exists());
+
+            let split_destination = create_rename_recovery_fixture_with_format(object_format);
+            let root = split_destination.vault.root();
+            let index = fs::read(index_path(root)).expect("split-destination index snapshots");
+            let source =
+                fs::read(&split_destination.source_target).expect("split source snapshots");
+            let foreign_destination = b"foreign split destination owner";
+            fs::write(&split_destination.destination_target, foreign_destination)
+                .expect("split destination drifts");
+            let guard =
+                VaultMutationGuard::acquire(root).expect("split-destination guard acquires");
+            assert!(matches!(
+                authorize_payload_before_v5_journal(
+                    &split_destination.vault,
+                    &split_destination.git,
+                    &guard,
+                    &MergeJournalPayload::Rename(split_destination.journal.clone()),
+                ),
+                Err(GitError::WorktreeChanged)
+            ));
+            assert_eq!(
+                fs::read(&split_destination.source_target).expect("split source remains"),
+                source
+            );
+            assert_eq!(
+                fs::read(&split_destination.destination_target)
+                    .expect("split destination drift remains"),
+                foreign_destination
+            );
+            assert_eq!(
+                fs::read(index_path(root)).expect("split-destination index remains"),
+                index
+            );
+            assert!(!journal_path(root).exists());
+
+            let detected_source =
+                create_detected_rename_recovery_fixture_with_format(object_format);
+            let root = detected_source.vault.root();
+            let index = fs::read(index_path(root)).expect("detected-source index snapshots");
+            let destination = fs::read(&detected_source.destination_target)
+                .expect("detected destination snapshots");
+            fs::write(
+                &detected_source.source_target,
+                &detected_source.source_ciphertext,
+            )
+            .expect("detected source is restored concurrently");
+            let guard = VaultMutationGuard::acquire(root).expect("detected-source guard acquires");
+            assert!(matches!(
+                authorize_payload_before_v5_journal(
+                    &detected_source.vault,
+                    &detected_source.git,
+                    &guard,
+                    &MergeJournalPayload::DetectedRename(detected_source.journal.clone()),
+                ),
+                Err(GitError::WorktreeChanged)
+            ));
+            assert_eq!(
+                fs::read(&detected_source.source_target).expect("restored detected source remains"),
+                detected_source.source_ciphertext
+            );
+            assert_eq!(
+                fs::read(&detected_source.destination_target)
+                    .expect("detected destination remains"),
+                destination
+            );
+            assert_eq!(
+                fs::read(index_path(root)).expect("detected-source index remains"),
+                index
+            );
+            assert!(!journal_path(root).exists());
+
+            let detected_destination =
+                create_detected_rename_recovery_fixture_with_format(object_format);
+            let root = detected_destination.vault.root();
+            let index = fs::read(index_path(root)).expect("detected-destination index snapshots");
+            let foreign_destination = b"foreign detected destination owner";
+            fs::write(
+                &detected_destination.destination_target,
+                foreign_destination,
+            )
+            .expect("detected destination drifts");
+            let guard =
+                VaultMutationGuard::acquire(root).expect("detected-destination guard acquires");
+            assert!(matches!(
+                authorize_payload_before_v5_journal(
+                    &detected_destination.vault,
+                    &detected_destination.git,
+                    &guard,
+                    &MergeJournalPayload::DetectedRename(detected_destination.journal.clone()),
+                ),
+                Err(GitError::WorktreeChanged)
+            ));
+            assert!(!detected_destination.source_target.exists());
+            assert_eq!(
+                fs::read(&detected_destination.destination_target)
+                    .expect("detected destination drift remains"),
+                foreign_destination
+            );
+            assert_eq!(
+                fs::read(index_path(root)).expect("detected-destination index remains"),
+                index
+            );
+            assert!(!journal_path(root).exists());
+        }
+    }
+
+    #[test]
+    fn v5_payload_authorization_rejects_ineffective_attributes_for_every_variant() {
+        let in_place = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+        let in_place_root = in_place.vault.root();
+        let in_place_index = fs::read(index_path(in_place_root)).expect("in-place index snapshots");
+        let in_place_worktree =
+            fs::read(in_place_root.join("entry.md.enc")).expect("in-place worktree snapshots");
+        fs::write(in_place_root.join(".gitattributes"), b"").expect("in-place attributes drift");
+        let guard = VaultMutationGuard::acquire(in_place_root).expect("in-place guard acquires");
+        assert!(matches!(
+            authorize_payload_before_v5_journal(
+                &in_place.vault,
+                &in_place.git,
+                &guard,
+                &in_place.transaction,
+            ),
+            Err(GitError::IneffectiveAttributes)
+        ));
+        assert_eq!(
+            fs::read(index_path(in_place_root)).expect("in-place index remains"),
+            in_place_index
+        );
+        assert_eq!(
+            fs::read(in_place_root.join("entry.md.enc")).expect("in-place worktree remains"),
+            in_place_worktree
+        );
+        assert!(!journal_path(in_place_root).exists());
+
+        let split = create_rename_recovery_fixture();
+        let split_root = split.vault.root();
+        let split_index = fs::read(index_path(split_root)).expect("split index snapshots");
+        let split_source = fs::read(&split.source_target).expect("split source snapshots");
+        let split_destination =
+            fs::read(&split.destination_target).expect("split destination snapshots");
+        fs::write(split_root.join(".gitattributes"), b"").expect("split attributes drift");
+        let guard = VaultMutationGuard::acquire(split_root).expect("split guard acquires");
+        assert!(matches!(
+            authorize_payload_before_v5_journal(
+                &split.vault,
+                &split.git,
+                &guard,
+                &MergeJournalPayload::Rename(split.journal.clone()),
+            ),
+            Err(GitError::IneffectiveAttributes)
+        ));
+        assert_eq!(
+            fs::read(index_path(split_root)).expect("split index remains"),
+            split_index
+        );
+        assert_eq!(
+            fs::read(&split.source_target).expect("split source remains"),
+            split_source
+        );
+        assert_eq!(
+            fs::read(&split.destination_target).expect("split destination remains"),
+            split_destination
+        );
+        assert!(!journal_path(split_root).exists());
+
+        let detected = create_detected_rename_recovery_fixture();
+        let detected_root = detected.vault.root();
+        let detected_index = fs::read(index_path(detected_root)).expect("detected index snapshots");
+        let detected_destination =
+            fs::read(&detected.destination_target).expect("detected destination snapshots");
+        fs::write(detected_root.join(".gitattributes"), b"").expect("detected attributes drift");
+        let guard = VaultMutationGuard::acquire(detected_root).expect("detected guard acquires");
+        assert!(matches!(
+            authorize_payload_before_v5_journal(
+                &detected.vault,
+                &detected.git,
+                &guard,
+                &MergeJournalPayload::DetectedRename(detected.journal.clone()),
+            ),
+            Err(GitError::IneffectiveAttributes)
+        ));
+        assert_eq!(
+            fs::read(index_path(detected_root)).expect("detected index remains"),
+            detected_index
+        );
+        assert!(!detected.source_target.exists());
+        assert_eq!(
+            fs::read(&detected.destination_target).expect("detected destination remains"),
+            detected_destination
+        );
+        assert!(!journal_path(detected_root).exists());
+    }
+
+    #[test]
+    fn v5_payload_authorization_rejects_active_and_tree_provenance_drift() {
+        let split = create_rename_recovery_fixture();
+        let split_root = split.vault.root();
+        let split_index = fs::read(index_path(split_root)).expect("split index snapshots");
+        let split_source = fs::read(&split.source_target).expect("split source snapshots");
+        let split_destination =
+            fs::read(&split.destination_target).expect("split destination snapshots");
+        fs::remove_file(split_root.join(".git").join("MERGE_HEAD"))
+            .expect("split active provenance drifts");
+        let guard = VaultMutationGuard::acquire(split_root).expect("split guard acquires");
+        assert!(matches!(
+            authorize_payload_before_v5_journal(
+                &split.vault,
+                &split.git,
+                &guard,
+                &MergeJournalPayload::Rename(split.journal.clone()),
+            ),
+            Err(GitError::IndexChanged)
+        ));
+        assert_eq!(
+            fs::read(index_path(split_root)).expect("split index remains"),
+            split_index
+        );
+        assert_eq!(
+            fs::read(&split.source_target).expect("split source remains"),
+            split_source
+        );
+        assert_eq!(
+            fs::read(&split.destination_target).expect("split destination remains"),
+            split_destination
+        );
+        assert!(!journal_path(split_root).exists());
+
+        let detected = create_detected_rename_recovery_fixture();
+        let detected_root = detected.vault.root();
+        let detected_index = fs::read(index_path(detected_root)).expect("detected index snapshots");
+        let detected_destination =
+            fs::read(&detected.destination_target).expect("detected destination snapshots");
+        let mut tampered = detected.journal.clone();
+        tampered.provenance.base_commit = tampered.provenance.ours_commit.clone();
+        let guard = VaultMutationGuard::acquire(detected_root).expect("detected guard acquires");
+        assert!(matches!(
+            authorize_payload_before_v5_journal(
+                &detected.vault,
+                &detected.git,
+                &guard,
+                &MergeJournalPayload::DetectedRename(tampered),
+            ),
+            Err(GitError::InvalidJournal | GitError::RecoveryConflict)
+        ));
+        assert_eq!(
+            fs::read(index_path(detected_root)).expect("detected index remains"),
+            detected_index
+        );
+        assert!(!detected.source_target.exists());
+        assert_eq!(
+            fs::read(&detected.destination_target).expect("detected destination remains"),
+            detected_destination
+        );
+        assert!(!journal_path(detected_root).exists());
+    }
+
+    #[test]
+    fn v5_payload_authorization_rejects_duplicate_owner_and_wrong_guard() {
+        let split = create_rename_recovery_fixture();
+        let root = split.vault.root();
+        let index = fs::read(index_path(root)).expect("split index snapshots");
+        let source = fs::read(&split.source_target).expect("split source snapshots");
+        let destination = fs::read(&split.destination_target).expect("split destination snapshots");
+        let third = LogicalPath::parse_canonical("third-owner.md")
+            .expect("third owner logical path validates");
+        let third_target = root.join(third.to_ciphertext_relative_path());
+        let third_ciphertext = split.ciphertext_for_third_owner(&third);
+        fs::write(&third_target, &third_ciphertext).expect("duplicate worktree owner writes");
+        let guard = VaultMutationGuard::acquire(root).expect("split guard acquires");
+        assert!(matches!(
+            authorize_payload_before_v5_journal(
+                &split.vault,
+                &split.git,
+                &guard,
+                &MergeJournalPayload::Rename(split.journal.clone()),
+            ),
+            Err(GitError::WorktreeChanged | GitError::IndexChanged)
+        ));
+        assert_eq!(
+            fs::read(&third_target).expect("duplicate owner remains"),
+            third_ciphertext
+        );
+        assert_eq!(
+            fs::read(index_path(root)).expect("split index remains"),
+            index
+        );
+        assert_eq!(
+            fs::read(&split.source_target).expect("split source remains"),
+            source
+        );
+        assert_eq!(
+            fs::read(&split.destination_target).expect("split destination remains"),
+            destination
+        );
+        assert!(!journal_path(root).exists());
+
+        let in_place = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+        let other = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+        let in_place_index =
+            fs::read(index_path(in_place.vault.root())).expect("in-place index snapshots");
+        let in_place_worktree = fs::read(in_place.vault.root().join("entry.md.enc"))
+            .expect("in-place worktree snapshots");
+        let wrong_guard =
+            VaultMutationGuard::acquire(other.vault.root()).expect("foreign guard acquires");
+        assert!(matches!(
+            authorize_payload_before_v5_journal(
+                &in_place.vault,
+                &in_place.git,
+                &wrong_guard,
+                &in_place.transaction,
+            ),
+            Err(GitError::RecoveryConflict)
+        ));
+        assert_eq!(
+            fs::read(index_path(in_place.vault.root())).expect("in-place index remains"),
+            in_place_index
+        );
+        assert_eq!(
+            fs::read(in_place.vault.root().join("entry.md.enc"))
+                .expect("in-place worktree remains"),
+            in_place_worktree
+        );
+        assert!(!journal_path(in_place.vault.root()).exists());
+        assert!(!index_lock_path(in_place.vault.root()).exists());
     }
 
     #[test]
