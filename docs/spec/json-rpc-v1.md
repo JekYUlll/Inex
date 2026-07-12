@@ -95,14 +95,22 @@ unpadded base64url.
 
 When `vault.create.kdf` is absent, the daemon uses the process-cached v1
 ops-only calibration: fixed 64 MiB, parallelism one, and operations selected
-within 3–20 toward a 250–750 ms single-KDF measurement. An explicit object must
-use `opsLimit` 3–20 and `memLimitBytes` exactly 67108864. Nonnegative
+within 3–20 toward a 250–750 ms public-dummy selector observation. The
+observation includes validation, possible libsodium initialization, secure
+allocation, and Argon2id; it is neither pure KDF latency nor an end-to-end RPC
+SLA. An explicit object must use `opsLimit` 3–20 and `memLimitBytes` exactly
+67108864. Nonnegative
 u64-shaped integer values outside that independent creation cap return
 `KDF_POLICY`; negative numbers, fractions, strings, missing/unknown members, and
 other malformed values return `INVALID_PARAMS`. The broader 1 GiB reader
 ceiling is never an RPC creation allowance. If host calibration for an absent
 `kdf` fails, the method returns standard `INTERNAL_ERROR` and creates no vault
 root.
+
+`kdf-calibration-info` is deliberately not an RPC method. It is a fixed
+no-argument `inex` CLI diagnostic with no vault, password, or policy input. Its
+fresh process does not initialize or predict the daemon's independent once
+cell.
 
 `vault.listTree` applies a conservative serialized-response budget while
 building results. A legal but exceptionally large tree returns

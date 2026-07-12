@@ -174,11 +174,42 @@ must opt into bounded stdin with `INEX_PASSWORD_STDIN=1`; protect the supplying
 process, pipe, and logs.
 
 `init`, real copy import, and password add/change may pause while Inex performs
-or reuses a process-local Argon2id calibration. The 250–750 ms target is for one
-dummy-input KDF measurement; the complete command also performs the real KDF,
-atomic metadata commit, and authenticated reopen and can take longer. v1 keeps
-creation memory at 64 MiB. Password add/change will not lower either work-factor
-component of the slot used to authenticate the command.
+or reuses a process-local Argon2id calibration. The 250–750 ms target is for the
+public-dummy selector observation, which includes validation, possible
+libsodium initialization, secure allocation, and Argon2id. It is not pure KDF
+latency. The complete command also performs the real KDF, atomic metadata
+commit, and authenticated reopen and can take longer. v1 keeps creation memory
+at 64 MiB. Password add/change will not lower either work-factor component of
+the slot used to authenticate the command.
+
+### KDF calibration diagnostic
+
+```sh
+"$INEX" kdf-calibration-info
+```
+
+This command accepts no further arguments. It takes no vault path, password,
+query, or policy override and runs before password/query input setup. It writes
+one strict 20-line ASCII report to stdout and no persistent Inex product state.
+It is still active cryptographic work: it may initialize libsodium and performs
+one sample for each candidate the selector visits, using CPU, secure allocation,
+and the fixed 64 MiB Argon2id memory setting.
+
+`selected-observed-ns` is the monotonic observation used for the selected
+decision, ending before the derived-key allocation is dropped; it is neither a
+pure-Argon2 benchmark nor an end-to-end command SLA. The report can name only
+`target-window`, `minimum-above-window`, `interior-above-window`,
+`maximum-above-window`, or `maximum-below-window`. A fallback name means the
+bounded selector returned that documented branch. It does not establish that
+every operations value would miss the window, because measurements can be
+noisy/non-monotonic and some candidates are not measured.
+
+Default vault creation in one long-lived process reuses the same cached
+calibration evidence. This diagnostic exits immediately, so every invocation
+starts a fresh process and does not pre-calibrate a later `init`, `import`, or
+daemon. Release maintainers must use the fixed three-process native evidence
+procedure in the [release checklist](release-checklist.md), not manually rerun
+until a preferred result appears.
 
 ### Locked structural verification
 

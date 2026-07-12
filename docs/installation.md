@@ -100,7 +100,7 @@ The implemented release tooling creates `inex-rust-<version>-<platform>.zip`
 with `bin/inex[.exe]`, `bin/inexd[.exe]`, bundled documentation, manifests,
 checksums, a target-bound resolved license inventory, the canonical engineering
 license policy, and complete collected license/NOTICE texts. Current strict
-release-tool source tests pass 60/60. Two clean-source system-GCC Linux x64
+release-tool source tests pass 76/76. Two clean-source system-GCC Linux x64
 builds are required to be byte-for-byte identical across both binaries and all
 four output files. Both must pass strict release-set/native audit, isolated VS
 Code install, and executable/bundled-sidecar smoke; their manifests must record
@@ -131,6 +131,19 @@ runtime without prompting for a password or starting the daemon protocol:
 ./bin/inex runtime-info
 ./bin/inexd --runtime-info
 ```
+
+The packaged CLI also exposes its public-dummy KDF selector observation:
+
+```sh
+./bin/inex kdf-calibration-info
+```
+
+This is a strict no-argument command: do not append a vault, password, query, or
+policy override. It runs before password/query input setup and writes no
+persistent Inex product state, but it may initialize libsodium and consumes CPU,
+secure allocation, and the fixed 64 MiB Argon2id memory setting. A manual run is
+diagnostic only; it is a fresh process and does not warm a later `init`,
+`import`, or daemon calibration.
 
 The package smoke requires the platform's fixed Rust target triple,
 `rust-debug-assertions: false`, libsodium `1.0.22`, ABI `26.4`, and
@@ -182,10 +195,48 @@ file-management limits are documented in [the user guide](user-guide.md).
 
 The real import and `init` perform an ops-only Argon2id calibration before
 reading the new password. v1 fixes memory at 64 MiB and parallelism at one and
-selects operations 3–20 toward a 250–750 ms single-KDF measurement. The full
-command takes longer because it then derives the real KEK, commits metadata,
-and reopens the vault for authentication. Native-platform timing and resource
-availability remain part of the release matrix.
+selects operations 3–20 toward a 250–750 ms public-dummy selector observation.
+That observation includes validation, possible libsodium initialization,
+secure allocation, and Argon2id and ends before the derived-key allocation is
+dropped; it is not pure KDF or end-to-end command latency. The full command
+takes longer because it then derives the real KEK, commits metadata, and reopens
+the vault for authentication. Native-platform timing and resource availability
+remain part of the release matrix.
+
+For each final native artifact set, run the reviewed
+`scripts/drill_kdf_calibration.py` harness exactly once. It launches two
+separate exact runtime-info probes for the packaged CLI/daemon plus exactly
+three fresh packaged-CLI calibration attempts, preserves attempts 1–3 in order,
+permits no retry or cherry-picking, and creates a new canonical JSON outside the
+artifact/package directory. On POSIX, pre-create the private output directory
+with mode `0700`:
+
+```sh
+ARTIFACT_DIR=/absolute/path/to/final/native-platform
+EVIDENCE_DIR=/absolute/private/external-evidence
+install -d -m 700 "$EVIDENCE_DIR"
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=scripts \
+  python3.13 scripts/drill_kdf_calibration.py \
+  "$ARTIFACT_DIR" --output "$EVIDENCE_DIR/kdf-calibration.json"
+```
+
+The output path itself must be absent, and POSIX verifies mode `0600`.
+Run from the exact clean reviewed harness checkout. During the bounded artifact
+snapshot, the four-file artifact directory must be exclusive and quiescent;
+through evidence capture no same-principal writer may modify the harness. The
+native host, monotonic clock, kernel, exact Python, and reviewed harness remain
+explicit trust assumptions rather than independently attested inputs.
+
+The current harness runs on native Linux x64/arm64. It deliberately fails closed
+on Windows before artifact use until suspended-before-Job assignment, a
+Job-empty cleanup barrier, and NTFS ADS residue enumeration are implemented and
+verified. Windows x64/arm64 MSVC remain required rows; cross builds, Wine, and
+emulation do not satisfy them. The report binds
+the clean artifact and harness sources, harness/runtime identity, audited
+artifact and packaged CLI/daemon, native host/resource observations, and all three
+strict reports. Do not copy the dynamic JSON into any package input. Peak
+resource observations and the 120-second harness termination timeout are
+capture controls, not product performance or latency SLAs.
 
 ## Initialize Git in each clone
 

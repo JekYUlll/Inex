@@ -59,13 +59,21 @@ The KEK is the 32-byte result of libsodium `crypto_pwhash` with the explicit
 Argon2id13 algorithm, slot salt, `opsLimit`, and `memLimitBytes`. Production v1
 creation fixes memory at 64 MiB and parallelism at one, then process-caches an
 ops-only calibration over 3–20 operations using a public dummy password and
-salt. It prefers a measured point in the 250–750 ms window. If that is not
-observed, it selects the minimum when the floor is already slow, the maximum
-when the complete range is too fast, or a measured above-window point when a
-discrete step skips the window. The selected values are stored in the slot.
-This window describes one calibration KDF measurement, not
-the end-to-end duration of create/import, which also wraps, commits, and
+salt. It prefers a selected observation in the inclusive 250–750 ms window. The
+observation starts before parameter validation and possible libsodium
+initialization, includes secure allocation and Argon2id, and ends before the
+derived-key allocation is dropped. It is not pure KDF latency. The selected
+values are stored in the slot. This window is not the end-to-end duration of
+create/import, which also derives from the real password, wraps, commits, and
 re-authenticates metadata.
+
+Diagnostic evidence classifies the selector result as exactly one of
+`target-window`, `minimum-above-window`, `interior-above-window`,
+`maximum-above-window`, or `maximum-below-window`. A fallback classification
+means only that the bounded selector returned its documented fallback. Because
+timing can be noisy/non-monotonic and the search does not measure every
+candidate, it must not be interpreted as proof that all permitted operations
+values are incapable of meeting the window.
 
 Under the default production policy, direct and RPC new-vault parameters have
 a separate creation cap: 3–20 operations and exactly 64 MiB. Readers remain broader for compatibility

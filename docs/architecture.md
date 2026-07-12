@@ -75,12 +75,58 @@ rotation increments the epoch and explicitly rewrites all files.
 
 Production creation calibrates only Argon2id `opsLimit`, once per process,
 against a public dummy input. v1 fixes memory at 64 MiB and parallelism at one,
-searches operations 3–20 toward a 250–750 ms single-KDF measurement, and stores
-the selected parameters in the new slot. Explicit new-vault APIs use that same
-independent cap, while readers accept the broader compatibility ceiling.
-Password add/change takes the componentwise maximum of the calibrated baseline
-and the slot that authenticated the session, so rewrapping cannot silently
-weaken a stronger slot.
+searches operations 3–20 toward a 250–750 ms selector observation, and stores the
+selected parameters in the new slot. The measured scope starts before parameter
+validation and possible libsodium initialization, includes secure allocation
+and Argon2id, and ends before the derived-key allocation is dropped. It is not a
+pure-KDF benchmark or an end-to-end operation SLA. Explicit new-vault APIs use
+that same independent cap, while readers accept the broader compatibility
+ceiling. Password add/change takes the componentwise maximum of the calibrated
+baseline and the slot that authenticated the session, so rewrapping cannot
+silently weaken a stronger slot.
+
+The default calibration once cell stores the selected parameters, selected
+monotonic observation, measurement count, outcome, or failure. Production
+creation in that same process projects parameters from that evidence rather
+than recalibrating. `inex kdf-calibration-info` is handled before password/query
+input setup and projects the same evidence to a fixed, CLI-only report. It
+accepts no arguments, vault, password, query, or policy override and has no RPC
+equivalent. Each CLI invocation is nevertheless a new process and cannot warm
+or stand in for a later `init`, `import`, or daemon process.
+
+The report is exactly 20 LF-terminated ASCII lines in this order. Uppercase
+tokens below describe per-build or per-observation values; they are not literal
+output:
+
+```text
+kdf-calibration-info-schema: inex-kdf-calibration-v1
+product: inex
+version: PRODUCT_VERSION
+rust-target: RUST_TARGET
+rust-debug-assertions: RUST_DEBUG_ASSERTIONS
+algorithm: argon2id13
+measurement-input: inex-public-dummy-v1
+cache-scope: process
+sample-mode: single-per-candidate
+min-ops-limit: 3
+max-ops-limit: 20
+selected-ops-limit: SELECTED_OPS_LIMIT
+mem-limit-bytes: 67108864
+parallelism: 1
+target-min-ns: 250000000
+target-max-ns: 750000000
+selected-observed-ns: SELECTED_OBSERVED_NS
+measurement-count: MEASUREMENT_COUNT
+outcome: OUTCOME
+end-to-end-sla: false
+```
+
+`OUTCOME` is exactly one of `target-window`, `minimum-above-window`,
+`interior-above-window`, `maximum-above-window`, or
+`maximum-below-window`. A fallback outcome reports the documented selector
+branch only. It does not prove every permitted operations value would miss the
+window: a bounded search leaves candidates unmeasured, and host timing may be
+noisy or non-monotonic.
 
 ## Save transaction
 

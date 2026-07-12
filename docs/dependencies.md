@@ -39,13 +39,32 @@ health warning under the documented social threat model; strict mode may fail.
 Libsodium's explicit Argon2id13 API is used, never `ALG_DEFAULT`. Its current
 parallelism is fixed at one and the JSON does not promise configurable lanes.
 Normal creation now fixes memory at 64 MiB and process-caches an ops-only
-selection over 3–20 operations toward a 250–750 ms dummy-input KDF measurement.
+selection over 3–20 operations toward a 250–750 ms public-dummy selector
+observation. The selected monotonic observation includes parameter validation,
+possible process-wide libsodium initialization, secure allocation, and the KDF,
+and ends before the derived-key allocation is dropped. It is not a pure KDF
+benchmark or end-to-end SLA.
 Explicit RPC creation is independently capped to the same operations range and
 exact memory value; it cannot consume the broader 1 GiB reader allowance.
 Password add/change retains the componentwise stronger values from the
 authenticated slot within reader limits. Synthetic selection tests avoid wall-
 clock flakiness, and real Linux CLI processes cover calibrated init/import plus
-strong-slot rewrap. Native timing/resource evidence remains a release gate.
+strong-slot rewrap. The CLI-only `inex kdf-calibration-info` command reports the
+cached evidence under schema `inex-kdf-calibration-v1`; it has no RPC equivalent
+and accepts no policy override. Every invocation is a new process, so it does
+not populate another CLI or daemon's once cell.
+
+Release evidence must run separate exact runtime-info probes for the audited
+packaged CLI/daemon, then use the CLI for exactly three fresh calibration-
+attempt processes on each of Linux x64/arm64 and Windows x64/arm64 MSVC, with
+zero retries and all ordinal reports retained. Cross compilation, Wine, and
+emulation are supplemental. The external canonical JSON binds clean source,
+artifact, harness, runtime, native host, and resource observations; it remains
+outside all package inputs. Harness peak-resource observations and its
+120-second timeout are operational controls, not product SLAs.
+The current harness accepts native Linux only and fails closed on Windows until
+suspended-before-Job assignment, a Job-empty barrier, and NTFS ADS residue
+enumeration are implemented and verified; both Windows rows remain required.
 
 ## Build and supply-chain checks
 
@@ -59,7 +78,7 @@ strong-slot rewrap. Native timing/resource evidence remains a release gate.
   artifacts/source paths supplied and verified by the pinned sys crate.
 - Linux/Windows x64 are the first blocking matrix; Linux/Windows arm64 join
   before GA. Format fixtures must be byte-identical on every target.
-- The current strict release-tool source suite passes 60/60; `actionlint`,
+- The current strict release-tool source suite passes 76/76; `actionlint`,
   pedantic/all-features Clippy, warnings-as-errors rustdoc, and the Windows GNU
   cross-check pass. A binding Linux x64 candidate requires two standalone clean
   system-GCC builds to be byte-identical and pass strict

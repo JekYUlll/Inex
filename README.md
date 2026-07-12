@@ -22,7 +22,7 @@ Code extension identifier continues to use publisher `horeb`.
 | Rust core, CLI, daemon, import, and Git | Linux tests and strict static gates pass, including authenticated detected/split rename/modify, legacy v1/v2/v3 recovery, and v4 alternate-index CAS with durable pre-lock reservation plus initial/final ownership receipts for SHA-1/SHA-256; Windows GNU compiles and selected Wine API tests pass | Receipt-gap abrupt exits are preserved as `RecoveryConflict` but are not automatically recovered. Native Windows/MSVC NTFS/ReFS abrupt-kill and power-loss evidence remains pending. Deliberate parallel Git remains outside supported use until native evidence and ref-mutation/legacy-recovery boundaries are closed |
 | VS Code | 23 unit tests pass; the current local build and VS Code 1.125.0 Extension Hosts directly exercise the production CRUD actions plus encrypted backup/recovery and isolated-root residue scan | UI InputBox/QuickPick mouse interaction, persistent-profile cross-process Hot Exit/Local History/crash restore, and native Windows residue tests are pending |
 | Sublime Text | 61/61 pure-Python tests pass. An exact Build 4200 normal E2E drives unlock/open/edit/save/close plus New Folder, New Markdown, rename, and etag-bound delete through registered commands and real panels; authenticated tree checks pass and `root_scan_hits=0` | The plugin-host SIGKILL probe still leaves the visible buffer copyable, cannot restart the host in-process, and requires a full Sublime restart. That is boundary evidence, not plaintext-erasure success; the complete exact-package matrix remains pending |
-| Packaging | Strict release-tool tests pass 60/60. The binding workflow requires two standalone clean builds, byte-identical binaries/packages, target-bound license and native audits, isolated editor smoke, and a third clean-clone lifecycle drill with dynamic secret scanning | Bundled documentation is intentionally non-self-attesting: accept an archive only when an external evidence record matches its `PACKAGE-MANIFEST.json` and `SHA256SUMS`. Native Windows/arm64, injected failure/two-version drills, persistent editor profiles, signatures, publication, hosted CI, and independent legal review remain pending |
+| Packaging | Strict release-tool tests pass 76/76. The binding workflow requires two standalone clean builds, byte-identical binaries/packages, target-bound license and native audits, isolated editor smoke, and a third clean-clone lifecycle drill with dynamic secret scanning | Bundled documentation is intentionally non-self-attesting: accept an archive only when an external evidence record matches its `PACKAGE-MANIFEST.json` and `SHA256SUMS`. Native Windows/arm64, injected failure/two-version drills, persistent editor profiles, signatures, publication, hosted CI, and independent legal review remain pending |
 
 The editor clients browse, create and edit encrypted Markdown, create folders,
 search, and navigate. VS Code can rename/delete files from its encrypted tree;
@@ -83,6 +83,14 @@ publishes only to an absent destination after authenticating the complete
 staging vault. Review skipped-file counts before treating the import as
 complete. Do not put a password in argv, a shell variable, or an environment
 value.
+
+`inex kdf-calibration-info` exposes the fixed public-dummy Argon2id selection
+observation for release diagnostics. It accepts no arguments, vault, password,
+or policy override and does not warm the cache of a later process. Although it
+writes no persistent Inex product state, it initializes cryptographic runtime
+state as needed and consumes CPU and fixed 64 MiB Argon2id work memory. See the
+[user guide](docs/user-guide.md) and [release checklist](docs/release-checklist.md)
+for the exact output and native-evidence boundary.
 
 Next follow the [installation guide](docs/installation.md) and
 [user guide](docs/user-guide.md) for a development VS Code or experimental

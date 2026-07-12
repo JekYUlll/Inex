@@ -24,7 +24,7 @@ In particular:
   plugin host still leaves the visible buffer actively copyable and requires a
   full Sublime restart; the client therefore remains experimental until the
   complete package canary matrix passes; and
-- release-tool tests pass 60/60, `actionlint` and pedantic/all-features Clippy
+- release-tool tests pass 76/76, `actionlint` and pedantic/all-features Clippy
   pass, and independent release-tool code review is GO. The binding artifact
   workflow requires two standalone clean system-GCC builds to be byte-identical
   and pass strict archive/native-dependency plus isolated VS Code
@@ -178,13 +178,55 @@ survive an abrupt exit.
   normalized logical path, is associated data.
 
 Normal creation now process-caches a public-dummy-input, ops-only calibration
-over 3–20 operations at fixed 64 MiB, targeting a 250–750 ms single KDF
-measurement. Explicit RPC creation has the same independent cap rather than the
+over 3–20 operations at fixed 64 MiB, targeting a 250–750 ms selector
+observation. Explicit RPC creation has the same independent cap rather than the
 broader reader ceiling. Password add/change preserves the componentwise
 stronger values of the authenticated slot within reader limits. Deterministic
 core/handler tests plus real Linux CLI and daemon process tests cover these
 paths; native platform timing and resource behavior remain release evidence
 gates.
+
+### Calibration diagnostic boundary
+
+`inex kdf-calibration-info` is a CLI-only, no-argument diagnostic. It accepts no
+vault path, password, query, or KDF-policy override and is dispatched before
+password/query input setup. It does not create persistent Inex product state,
+but it is not completely side-effect-free: it may initialize libsodium and each
+candidate performs CPU-intensive Argon2id13 work with a 64 MiB memory setting
+and secure allocation.
+
+The strict 20-line ASCII report contains only the fixed public dummy-input
+selection evidence. `selected-observed-ns` is the monotonic observation used for
+the selected decision point. Its timed scope includes parameter validation,
+possible libsodium initialization, secure allocation, and Argon2id, ending
+before the derived-key allocation is dropped. It is neither pure KDF latency
+nor an end-to-end create/import/unlock service level. Default creation in the
+same process projects parameters from the same process-wide once cell. Every
+diagnostic invocation is a fresh process, however, so it neither warms nor
+predicts a later CLI or daemon process.
+
+The exhaustive outcome spellings are `target-window`,
+`minimum-above-window`, `interior-above-window`, `maximum-above-window`, and
+`maximum-below-window`. The last four describe documented selector branches.
+Because timing can be noisy or non-monotonic and the bounded search does not
+measure every candidate, a fallback means only that the selector returned that
+documented fallback; it does not prove that no operations value could meet the
+window.
+
+Binding release evidence runs exactly three ordinal attempts as fresh processes
+from each audited native packaged CLI: Linux x64, Linux arm64, Windows x64 MSVC,
+and Windows arm64 MSVC. There are no retries and no result selection. A Wine,
+cross-compiled, or emulated run is supplemental only. The canonical external
+JSON must bind the clean artifact source, clean harness source and files,
+audited artifact/package identity, CLI/runtime identity, native host and
+resource observations, and all three reports. Keep it outside package inputs.
+Any peak-resource observation and the harness's 120-second process timeout are
+operational evidence bounds, not product SLAs.
+
+The current harness accepts only native Linux. Windows evidence fails closed
+before artifact use until suspended-before-Job assignment, a Job-empty cleanup
+barrier, and NTFS ADS residue enumeration are implemented and natively verified;
+the Windows rows therefore remain open rather than emitting a misleading PASS.
 
 Changing a password rewraps the stable master key and does not rewrite journal
 files. Master-key rotation is represented by a key epoch and is a distinct,

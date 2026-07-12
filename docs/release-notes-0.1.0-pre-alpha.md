@@ -27,9 +27,17 @@
   rewrite EDRY bodies and is not master-key rotation. This describes the key
   hierarchy only; old metadata plus an old password still defeats revocation.
 - New-vault creation process-caches an ops-only Argon2id calibration over 3–20
-  operations at fixed 64 MiB toward a 250–750 ms dummy-input KDF measurement.
+  operations at fixed 64 MiB toward a 250–750 ms public-dummy selector
+  observation. Its timing includes validation, possible libsodium initialization,
+  secure allocation, and Argon2id; it is not pure KDF or end-to-end latency.
   Explicit RPC creation uses the same independent cap, and password add/change
   preserves stronger authenticated slot parameters within reader limits.
+- `inex kdf-calibration-info` adds a CLI-only, no-argument, strict 20-line ASCII
+  diagnostic for that cached public evidence. It runs before password/query
+  setup, takes no vault/password/policy input, and writes no persistent Inex
+  product state, but still initializes cryptographic runtime state as needed and
+  consumes CPU plus the fixed 64 MiB work-memory setting. Each invocation is a
+  fresh process and does not warm later creation or daemon work.
 - Logical paths are canonicalized and authenticated. File rename therefore
   decrypts and re-encrypts under the new authenticated path instead of moving
   ciphertext blindly.
@@ -61,6 +69,17 @@
   CLI/RPC/locked-Git secret drills with zero sensitive hits outside the
   controlled plaintext source. Exact results belong in an external evidence
   record; this bundled note cannot attest its own archive.
+- Native KDF evidence additionally requires exactly three ordinal fresh-process
+  reports from each audited packaged CLI on Linux x64/arm64 and Windows
+  x64/arm64 MSVC, with no retries or preferred-result selection. Its canonical
+  JSON stays outside package inputs and binds clean source/artifact/harness,
+  runtime, host, and resource observations. Wine, cross builds, and emulation
+  are non-binding; recorded peak resources and the 120-second harness timeout
+  are not product SLAs.
+- The current KDF evidence harness is Linux-only and fails closed on Windows
+  before artifact use. Suspended-before-Job assignment, a Job-empty barrier,
+  and NTFS ADS residue enumeration remain required before either Windows row
+  can emit evidence.
 
 These are engineering checkpoints, not evidence for native Windows, arm64,
 ReFS, physical power loss, signed distribution, or independent legal review.
@@ -70,6 +89,11 @@ ReFS, physical power loss, signed distribution, or independent legal review.
 - Native Windows x64/arm64 and Linux arm64 artifact lifecycle evidence remains
   pending. Cross-compilation and Wine are not substitutes for MSVC/NTFS/ReFS
   execution.
+- The four-target, three-fresh-process Argon2id diagnostic matrix remains
+  pending. A fallback outcome says only that the selector returned its
+  documented branch; noise, non-monotonic measurements, and unmeasured
+  candidates prohibit claiming that every operations value would miss the
+  window.
 - Persistent packaged VS Code Hot Exit/Local History/crash recovery and the
   real InputBox/QuickPick UI matrix remain release gates on Linux and Windows.
 - Sublime remains experimental until its exact-package, persistent-profile,

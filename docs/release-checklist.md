@@ -27,10 +27,10 @@ Status terms in this document mean:
 
 | Area | Status | Evidence and exact boundary |
 |------|--------|-----------------------------|
-| Linux Rust workspace | verified source checkpoint | 325/325 workspace tests pass with calibrated Argon2id creation/rewrap, index-CAS v4, native force-kill atomic-write, pre-lock ownership, and exact runtime-info regressions, plus rustfmt, all-target/all-feature pedantic Clippy with warnings denied, rustdoc warnings denied, and whitespace checks |
+| Linux Rust workspace | verified source checkpoint | 333/333 workspace tests pass with calibrated Argon2id creation/rewrap and its CLI evidence path, index-CAS v4, native force-kill atomic-write, pre-lock ownership, and exact runtime-info regressions, plus rustfmt, all-target/all-feature pedantic Clippy with warnings denied, rustdoc warnings denied, and whitespace checks |
 | EDRY/vault compatibility | checkpoint | Frozen v1 fixture rebuild/unlock/decrypt and broad format/path/tamper tests pass on Linux; Windows GNU compiles and earlier Wine suites pass, but this is not native Windows evidence |
 | Import | verified source checkpoint; artifact evidence external | Copy-only absent-destination staging, re-open/seal/allowlist/publication, source-preservation, and failure-class tests pass. A binding artifact report must additionally import a five-document synthetic tree including exact 16 MiB content, preserve every source hash, and produce no plaintext Markdown in the vault; publication ambiguity and native-platform fault cases remain pending |
-| Argon2id creation policy | verified Linux source checkpoint | Default create/init/import process-cache an ops-only 3–20 calibration at fixed 64 MiB toward a 250–750 ms dummy-input KDF measurement. Explicit RPC creation uses the independent 3–20/exact-64-MiB cap and fails before root creation; reader compatibility remains 20/1 GiB. Core and real CLI process tests prove password add/change retains both stronger authenticated components. Native host timing/resource behavior remains pending |
+| Argon2id creation policy and diagnostic | verified Linux source checkpoint; native packaged evidence pending | Default create/init/import process-cache an ops-only 3–20 calibration at fixed 64 MiB toward a 250–750 ms public-dummy selector observation. Deterministic injected tests cover all five outcomes and are authoritative for search semantics. The CLI-only, no-argument `kdf-calibration-info` path runs before password/query setup and emits the exact 20-line `inex-kdf-calibration-v1` report without persistent product state. Explicit RPC creation uses the independent 3–20/exact-64-MiB cap and fails before root creation; reader compatibility remains 20/1 GiB. Core and real CLI process tests prove password add/change retains both stronger authenticated components. Three-attempt native packaged timing/resource evidence on all four targets remains pending |
 | Git | verified Linux fail-closed source checkpoint | Locked-safe driver, local installer, encrypted diff3, fixed tree provenance, full-width SHA-1/SHA-256, detected/split rename/modify, and legacy v1/v2/v3 recovery pass. New v4 transactions publish a canonical pre-lock reservation plus initial/final ownership receipts before holding the real `.git/index.lock`; Linux regressions cover orphan/partial/wrong-case/link/foreign state, pre-lock winner, lock-held Git failure, marker/candidate/published recovery, target drift, and foreign-lock preservation. A kill between candidate mutation and its matching receipt is detected and preserved as `RecoveryConflict`, not automatically recovered. Native Windows abrupt-kill/power-loss, ref-only concurrency, and legacy recovery CAS remain pending |
 | VS Code unit/bundle | verified checkpoint | Strict TypeScript, 23/23 Node tests, production bundle, and integration bundle pass |
 | VS Code Extension Host | partial | The current local build and 1.125.0 directly drive the production create/folder-create/file-rename/file-delete actions plus encrypted backup/recovery against the daemon/custom editor. Close refusal, rename collision, Unix delete-I/O failure recovery, command registration, and isolated-root residue pass. InputBox/QuickPick mouse interaction is not automated, and test-mode workbench storage is in-memory, so persistent cross-process restore/Local History is unproven |
@@ -38,7 +38,7 @@ Status terms in this document mean:
 | Linux x64 packaging | binding evidence must be external | Two independent standalone system-GCC release builds must bind one clean source commit and produce byte-identical binaries, Rust ZIP, VSIX, Sublime ZIP, and SHA256SUMS. Both must pass strict release-set/native audit and isolated VS Code install/bundled-sidecar smoke; runtime must report GNU x64, release profile, and reviewed libsodium version/ABI/non-minimal status. Exact hashes cannot be self-attested by this bundled document |
 | Linux x64 artifact lifecycle | binding evidence must be external | A third standalone clean clone must re-audit the exact artifact hashes and same product commit. Five expected bodies including exact 16 MiB content must authenticate after import, password rewrap, single-ref/single-commit Git bundle and clean tree-copy restores. CLI wrong-password, RPC auth-failure, locked merge-driver, driver relocation, frozen-v1, physical allowlist and descendant cleanup must pass with all three nondisclosure flags true and outside-source sensitive hits zero. Scope remains lifecycle-only, not release approval, independent build attestation, native fault-state, or two-version evidence |
 | License collection | verified mechanism; artifact digest external | Strict audit requires all three packages to share one target-bound Cargo inventory, complete hashed license/NOTICE texts, and one sidecar digest. Exact counts and hashes must come from the external report matching the package manifests. Independent all-native artifact runs, legal review, and license-choice/signature policy remain pending |
-| CI configuration | source-only, non-binding | Linux x64, Windows x64, Linux arm64, and Windows arm64 labels are configured; actions are immutable-SHA pinned and local `actionlint` passes. Push/manual tag refs bind the exact version; the required job runs binding source-quality gates; package targets rerun x64 native tests or ARM no-run compilation, enforce canonical provenance, and install/smoke each platform VSIX. The workflows have not been pushed or run remotely, so every matrix result remains unproven |
+| CI configuration | source-only, non-binding | Linux x64, Windows x64, Linux arm64, and Windows arm64 labels are configured; actions are immutable-SHA pinned and local `actionlint` passes. Push/manual tag refs bind the exact version; the required job runs binding source-quality gates; package targets rerun x64 native tests or ARM no-run compilation, enforce canonical provenance, and install/smoke each platform VSIX. Linux package jobs additionally capture external KDF evidence; Windows KDF capture is intentionally disabled until its ADS/Job boundary closes. The workflows have not been pushed or run remotely, so every matrix result remains unproven |
 | Native Windows | pending | No native MSVC/NTFS/ReFS/FAT/exFAT release host result is available; GNU cross-check and Wine are non-binding |
 | arm64 | pending | Linux arm64 and Windows arm64 native build/package/runtime matrices are not available |
 
@@ -70,10 +70,13 @@ These are not documentation polish items; each changes the release decision:
    operational rule that other Git is stopped until those cases have binding
    evidence.
 5. Repeat the bounded Argon2id creation/explicit-cap/no-downgrade matrix on each
-   native release target, recording hosts that select the 3/20 operation bounds
-   or an interior above-window fallback because the preferred single-KDF window
-   cannot be observed. Do not describe 250–750 ms as an end-to-end command
-   latency SLA.
+   native release target. For each final packaged CLI, retain exactly three
+   fresh-process `kdf-calibration-info` attempts in ordinal order, with no
+   retries or preferred-result selection. A fallback says only that the
+   selector returned its documented branch; noise, non-monotonic observations,
+   and unmeasured candidates prevent claiming that every operations value would
+   miss the window. Do not describe `selected-observed-ns`, peak-resource
+   observations, or the 120-second harness timeout as a KDF or end-to-end SLA.
 6. Build and smoke all four intended platform artifacts on their native target:
    Linux x64/arm64 and Windows x64/arm64. Verify executable architecture and
    dynamic/static native-library expectations, not only archive names.
@@ -133,6 +136,84 @@ target/tools/actionlint .github/workflows/*.yml
       recovery after injected interruption.
 - [ ] A release build reports the reviewed libsodium version and is rebuilt
       offline from a populated, locked dependency cache.
+- [ ] The final packaged CLI emits the exact 20-line ASCII
+      `inex-kdf-calibration-v1` report for `kdf-calibration-info`; any extra
+      argument fails before calibration and before password/query input setup.
+
+## Native KDF calibration evidence gate
+
+The diagnostic is deliberately narrower than vault creation. It accepts no
+arguments, vault path, password, query, or policy override and has no JSON-RPC
+form. It writes no persistent Inex product state, but each invocation may
+initialize libsodium and performs CPU-intensive Argon2id work with a 64 MiB
+memory setting and secure allocation. Treat it as an active workload, not a
+side-effect-free metadata query.
+
+`selected-observed-ns` is the monotonic observation used by the selected
+decision. Its scope starts before parameter validation and possible libsodium
+initialization, includes secure allocation and Argon2id, and ends before the
+derived-key allocation is dropped. It is neither pure KDF latency nor an
+end-to-end create/import/unlock SLA. Default production creation in that same
+process projects parameters from the same once cell, but every diagnostic
+invocation exits as a fresh process and cannot warm a later CLI or daemon.
+
+For each final artifact set, run the reviewed harness exactly once on its
+matching native host. On POSIX, create the private evidence parent first:
+
+```sh
+ARTIFACT_DIR=/absolute/path/to/final/native-platform
+EVIDENCE_DIR=/absolute/private/external-evidence
+install -d -m 700 "$EVIDENCE_DIR"
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=scripts \
+  python3.13 scripts/drill_kdf_calibration.py \
+  "$ARTIFACT_DIR" --output "$EVIDENCE_DIR/kdf-calibration.json"
+```
+
+The output must be absent, and POSIX verifies mode `0600`.
+Use the exact clean reviewed harness checkout. Keep the four-file artifact
+directory exclusive and quiescent during its bounded snapshot, and permit no
+same-principal harness writer through evidence capture. The native host,
+monotonic clock, kernel, exact Python, and reviewed harness are explicit trust
+assumptions, not independent attestation.
+
+The required rows are Linux x64, Linux arm64, Windows x64 MSVC, and Windows
+arm64 MSVC. The current harness accepts only native Linux and fails closed on
+Windows before artifact use until suspended-before-Job assignment, a Job-empty
+cleanup barrier, and NTFS ADS residue enumeration are implemented and verified.
+Cross compilation, Wine, and emulation may supplement but never replace a row.
+The Linux harness must audit and boundedly snapshot into its temporary root the strict
+four-file artifact set, extract the packaged CLI and daemon, run their two
+separate exact runtime-info probes, and launch exactly three fresh calibration-
+attempt processes. It retains attempts 1, 2, and 3 in order; every attempt must
+validate, and retrying, discarding, or cherry-picking an observation invalidates
+the run.
+
+The fixed report outcome set is `target-window`, `minimum-above-window`,
+`interior-above-window`, `maximum-above-window`, and
+`maximum-below-window`. A fallback outcome means only that the production
+selector returned its documented fallback. It does not prove that no permitted
+operations value could meet the window because timing may be noisy or
+non-monotonic and the bounded selector does not measure every candidate.
+Deterministic injected tests are the authority for search semantics; the native
+drill validates the packaged binary's emitted selected observation and outcome.
+
+The new canonical JSON must bind the clean artifact source, clean harness source
+and reviewed harness files, strict artifact/package and packaged-CLI identity,
+runtime identity, native host/resource observations, and all three ordinal
+reports. Create it outside the artifact directory, never add it to package
+inputs, and match it externally to the candidate manifests and checksums. Any
+recorded peak-resource values and the 120-second process termination timeout are
+harness operating bounds, not product resource or latency SLAs.
+
+- [ ] Exactly three valid ordinal attempts, `retryCount=0`, and one fresh process
+      per attempt are present for every native target.
+- [ ] Every report uses the exact 20-line ASCII field order documented in
+      [the architecture](architecture.md), fixed public input, 3–20 operations,
+      64 MiB, parallelism one, and `end-to-end-sla: false`.
+- [ ] The external JSON binds clean source/artifact/harness/runtime/host/resource
+      identities and is absent from every package input and artifact directory.
+- [ ] No report or review claims that a fallback exhausts all candidates or that
+      observation time, resource peaks, or timeout is a product SLA.
 
 ## CLI, import, and backup gate
 
@@ -328,7 +409,7 @@ PYTHONPATH=scripts python3.13 scripts/smoke_release_artifacts.py \
   "target/release-artifacts/$PLATFORM" --vscode-cli "$VSCODE_CLI"
 ```
 
-On the current Linux x64 host, strict release-tool source tests pass 60/60.
+On the current Linux x64 host, strict release-tool source tests pass 76/76.
 The binding workflow requires two standalone clean-source system-GCC builds to
 be byte-identical across both binaries and all four package outputs; both must
 pass strict release-set/native audit and isolated VS Code CLI
