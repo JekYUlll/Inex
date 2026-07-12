@@ -6791,6 +6791,7 @@ fn restrict_file_permissions_best_effort(_file: &File) {}
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::process::Command as TestCommand;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -7306,6 +7307,319 @@ mod tests {
             result_digest,
             journal,
         }
+    }
+
+    struct CandidateBundlePreparationFixture {
+        _directory: TestDirectory,
+        vault: Vault,
+        git: Git,
+        transaction: MergeJournalPayload,
+    }
+
+    fn create_candidate_bundle_preparation_fixture(
+        object_format: GitObjectFormat,
+    ) -> CandidateBundlePreparationFixture {
+        let (directory, vault) = create_conflicted_repository_with_format(object_format);
+        let git = Git::open(directory.path()).expect("candidate bundle Git repository opens");
+        let conflict = git
+            .unmerged_entries()
+            .expect("candidate bundle conflict enumerates")
+            .into_values()
+            .next()
+            .expect("candidate bundle has one conflict");
+        let identities =
+            tracked_identity_index(&vault, &git).expect("candidate bundle identities inspect");
+        let prepared = prepare_result(&vault, &git, &conflict, &identities, 1_783_699_204_000)
+            .expect("candidate bundle merge result prepares");
+        let expected = expected_worktree_digest(&prepared).expect("worktree stage exists");
+        let result_digest = digest(&prepared.encrypted.bytes);
+        let transaction = MergeJournalPayload::InPlace(MergeJournal {
+            version: 1,
+            physical_path: conflict.physical_path.clone(),
+            result_mode: result_mode(&conflict)
+                .expect("result mode exists")
+                .to_owned(),
+            stages: conflict.stages.clone(),
+            expected_worktree_sha256: hex_digest(expected),
+            result_oid: prepared.result_oid.clone(),
+            result_sha256: hex_digest(result_digest),
+        });
+        CandidateBundlePreparationFixture {
+            _directory: directory,
+            vault,
+            git,
+            transaction,
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum CandidateBundleTestAction {
+        FailAt(candidate_bundle_v5::CandidateBundlePrepareCheckpointV5),
+        PartialCandidate,
+        CandidateLock,
+        PartialManifest,
+        CandidateTamper,
+        ManifestTamper,
+        SourceSwap,
+        ParentSwap,
+        StableCollision,
+        StableCloneSwap,
+        LiveIndexDrift,
+    }
+
+    #[derive(Debug)]
+    enum CandidateBundleRelocation {
+        Source { held: PathBuf, replacement: PathBuf },
+        Parent { held: PathBuf, replacement: PathBuf },
+        StableClone { held: PathBuf, replacement: PathBuf },
+    }
+
+    #[derive(Debug)]
+    struct CandidateBundleTestHooks {
+        tokens: VecDeque<String>,
+        action: Option<CandidateBundleTestAction>,
+        action_fired: bool,
+        scratch_identity: Option<inex_core::atomic::FilesystemDirectoryIdentity>,
+        relocation: Option<CandidateBundleRelocation>,
+    }
+
+    impl CandidateBundleTestHooks {
+        fn new(action: Option<CandidateBundleTestAction>) -> Self {
+            Self {
+                tokens: VecDeque::new(),
+                action,
+                action_fired: false,
+                scratch_identity: None,
+                relocation: None,
+            }
+        }
+
+        fn with_tokens(tokens: impl IntoIterator<Item = &'static str>) -> Self {
+            Self {
+                tokens: tokens.into_iter().map(str::to_owned).collect(),
+                ..Self::new(None)
+            }
+        }
+
+        fn restore_relocation(&mut self) {
+            match self.relocation.take() {
+                Some(CandidateBundleRelocation::Source { held, replacement }) => {
+                    fs::remove_dir(&replacement).expect("source-swap replacement removes");
+                    fs::rename(held, replacement).expect("source-swap scratch restores");
+                }
+                Some(CandidateBundleRelocation::Parent { held, replacement }) => {
+                    fs::remove_dir(&replacement).expect("parent-swap replacement removes");
+                    fs::rename(held, replacement).expect("parent-swap local directory restores");
+                }
+                Some(CandidateBundleRelocation::StableClone { held, replacement }) => {
+                    fs::remove_file(
+                        replacement.join(candidate_bundle_v5::CANDIDATE_BUNDLE_INDEX_V5),
+                    )
+                    .expect("stable-clone candidate removes");
+                    fs::remove_file(
+                        replacement.join(candidate_bundle_v5::CANDIDATE_BUNDLE_MANIFEST_V5),
+                    )
+                    .expect("stable-clone manifest removes");
+                    fs::remove_dir(&replacement).expect("stable-clone directory removes");
+                    fs::rename(held, replacement).expect("original stable directory restores");
+                }
+                None => {}
+            }
+        }
+    }
+
+    impl candidate_bundle_v5::CandidateBundlePrepareHooksV5 for CandidateBundleTestHooks {
+        fn next_token(&mut self) -> String {
+            self.tokens
+                .pop_front()
+                .unwrap_or_else(|| Uuid::new_v4().simple().to_string())
+        }
+
+        #[allow(
+            clippy::too_many_lines,
+            reason = "keep the fault actions adjacent so every retained-state mutation is auditable"
+        )]
+        fn checkpoint(
+            &mut self,
+            checkpoint: candidate_bundle_v5::CandidateBundlePrepareCheckpointV5,
+            context: &candidate_bundle_v5::CandidateBundlePrepareContextV5<'_>,
+        ) -> Result<(), GitError> {
+            if checkpoint == candidate_bundle_v5::CandidateBundlePrepareCheckpointV5::ScratchCreated
+                && self.scratch_identity.is_none()
+            {
+                self.scratch_identity = Some(
+                    inex_core::atomic::filesystem_directory_identity(context.scratch_path)
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?,
+                );
+            }
+            let Some(action) = self.action else {
+                return Ok(());
+            };
+            if self.action_fired {
+                return Ok(());
+            }
+            let matches = match action {
+                CandidateBundleTestAction::FailAt(expected) => checkpoint == expected,
+                CandidateBundleTestAction::PartialCandidate => {
+                    checkpoint
+                        == candidate_bundle_v5::CandidateBundlePrepareCheckpointV5::ScratchCreated
+                }
+                CandidateBundleTestAction::CandidateLock => {
+                    checkpoint
+                        == candidate_bundle_v5::CandidateBundlePrepareCheckpointV5::CandidateCopied
+                }
+                CandidateBundleTestAction::PartialManifest => {
+                    checkpoint
+                        == candidate_bundle_v5::CandidateBundlePrepareCheckpointV5::CandidateMutated
+                }
+                CandidateBundleTestAction::CandidateTamper
+                | CandidateBundleTestAction::ManifestTamper
+                | CandidateBundleTestAction::SourceSwap
+                | CandidateBundleTestAction::ParentSwap => {
+                    checkpoint
+                        == candidate_bundle_v5::CandidateBundlePrepareCheckpointV5::CriticalAudit
+                }
+                CandidateBundleTestAction::StableCollision
+                | CandidateBundleTestAction::LiveIndexDrift => {
+                    checkpoint
+                        == candidate_bundle_v5::CandidateBundlePrepareCheckpointV5::BeforePublish
+                }
+                CandidateBundleTestAction::StableCloneSwap => {
+                    checkpoint
+                        == candidate_bundle_v5::CandidateBundlePrepareCheckpointV5::AfterPublish
+                }
+            };
+            if !matches {
+                return Ok(());
+            }
+            self.action_fired = true;
+            match action {
+                CandidateBundleTestAction::FailAt(_) => {
+                    return Err(GitError::DurabilityNotConfirmed);
+                }
+                CandidateBundleTestAction::PartialCandidate => {
+                    fs::write(context.candidate_path, b"partial candidate index")
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                }
+                CandidateBundleTestAction::CandidateLock => {
+                    fs::write(
+                        appended_lock_path(context.candidate_path),
+                        b"foreign candidate lock",
+                    )
+                    .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                }
+                CandidateBundleTestAction::PartialManifest => {
+                    fs::write(context.manifest_path, b"{\"version\":5")
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                }
+                CandidateBundleTestAction::CandidateTamper => {
+                    let mut bytes = fs::read(context.candidate_path)
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    bytes[0] ^= 1;
+                    fs::write(context.candidate_path, bytes)
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                }
+                CandidateBundleTestAction::ManifestTamper => {
+                    let mut bytes = fs::read(context.manifest_path)
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    bytes[0] ^= 1;
+                    fs::write(context.manifest_path, bytes)
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                }
+                CandidateBundleTestAction::SourceSwap => {
+                    let held = context
+                        .root
+                        .join(format!("held-v5-source-{}", Uuid::new_v4().simple()));
+                    fs::rename(context.scratch_path, &held)
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    fs::create_dir(context.scratch_path)
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    self.relocation = Some(CandidateBundleRelocation::Source {
+                        held,
+                        replacement: context.scratch_path.to_path_buf(),
+                    });
+                }
+                CandidateBundleTestAction::ParentSwap => {
+                    let held = context
+                        .root
+                        .join(format!("held-v5-parent-{}", Uuid::new_v4().simple()));
+                    fs::rename(context.local, &held)
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    fs::create_dir(context.local).map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    self.relocation = Some(CandidateBundleRelocation::Parent {
+                        held,
+                        replacement: context.local.to_path_buf(),
+                    });
+                }
+                CandidateBundleTestAction::StableCollision => {
+                    fs::create_dir(context.stable_path)
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    fs::write(context.stable_path.join("foreign"), b"foreign stable owner")
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                }
+                CandidateBundleTestAction::StableCloneSwap => {
+                    let clone = context
+                        .root
+                        .join(format!("foreign-v5-clone-{}", Uuid::new_v4().simple()));
+                    let held = context
+                        .root
+                        .join(format!("held-v5-stable-{}", Uuid::new_v4().simple()));
+                    fs::create_dir(&clone).map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    for member in [
+                        candidate_bundle_v5::CANDIDATE_BUNDLE_INDEX_V5,
+                        candidate_bundle_v5::CANDIDATE_BUNDLE_MANIFEST_V5,
+                    ] {
+                        fs::copy(context.stable_path.join(member), clone.join(member))
+                            .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    }
+                    fs::rename(context.stable_path, &held)
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    fs::rename(&clone, context.stable_path)
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    self.relocation = Some(CandidateBundleRelocation::StableClone {
+                        held,
+                        replacement: context.stable_path.to_path_buf(),
+                    });
+                }
+                CandidateBundleTestAction::LiveIndexDrift => {
+                    fs::write(
+                        context.root.join("external-index-owner.bin"),
+                        b"ciphertext-only external index owner",
+                    )
+                    .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    if !test_git(context.root, ["add", "external-index-owner.bin"]) {
+                        return Err(GitError::DurabilityNotConfirmed);
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn candidate_bundle_scratch_paths(root: &Path) -> Vec<PathBuf> {
+        fs::read_dir(root.join(VAULT_LOCAL_DIRECTORY))
+            .expect("candidate namespace enumerates")
+            .map(|entry| entry.expect("candidate namespace entry reads"))
+            .filter_map(|entry| {
+                let name = entry.file_name().into_string().ok()?;
+                name.starts_with(candidate_bundle_v5::CANDIDATE_BUNDLE_SCRATCH_PREFIX_V5)
+                    .then(|| entry.path())
+            })
+            .collect()
+    }
+
+    fn prepare_test_candidate_bundle(
+        fixture: &CandidateBundlePreparationFixture,
+        hooks: &mut CandidateBundleTestHooks,
+    ) -> Result<candidate_bundle_v5::PreparedCandidateBundleV5, GitError> {
+        let guard = VaultMutationGuard::acquire(fixture.vault.root())
+            .expect("candidate bundle mutation guard acquires");
+        candidate_bundle_v5::prepare_candidate_bundle_v5_with_hooks(
+            &guard,
+            &fixture.git,
+            &fixture.transaction,
+            hooks,
+        )
     }
 
     struct DetectedRenameRecoveryFixture {
@@ -9368,6 +9682,375 @@ mod tests {
         assert!(recover_pending(&vault, &git).expect("SHA-256 orphan staging recovers"));
         assert!(!path.exists());
         assert_no_cas_private_files(directory.path());
+    }
+
+    #[test]
+    fn v5_candidate_bundle_preparation_binds_real_sha1_and_sha256_stage_maps() {
+        for object_format in [GitObjectFormat::Sha1, GitObjectFormat::Sha256] {
+            let fixture = create_candidate_bundle_preparation_fixture(object_format);
+            let root = fixture.vault.root();
+            let old = read_index_snapshot(&index_path(root)).expect("live old index snapshots");
+            let old_map = index_entry_map(&fixture.git).expect("live old stage map snapshots");
+            let worktree = fs::read(root.join("entry.md.enc")).expect("worktree snapshots");
+            let mut hooks = CandidateBundleTestHooks::new(None);
+
+            let prepared = prepare_test_candidate_bundle(&fixture, &mut hooks)
+                .expect("v5 candidate bundle prepares");
+            let stable_path = candidate_bundle_v5::candidate_bundle_stable_path_v5(
+                root,
+                &prepared.bundle_basename,
+            )
+            .expect("stable candidate path validates");
+            assert_eq!(
+                hooks.scratch_identity.as_ref(),
+                Some(
+                    &inex_core::atomic::filesystem_directory_identity(&stable_path)
+                        .expect("stable directory identity reads")
+                )
+            );
+            candidate_bundle_v5::revalidate_prepared_candidate_bundle_v5(root, &prepared)
+                .expect("held stable inventory revalidates");
+            assert_eq!(prepared.inventory.manifest.object_format, object_format);
+            assert_eq!(prepared.inventory.manifest.transaction, fixture.transaction);
+            assert_eq!(prepared.inventory.manifest.old_index.size, old.size);
+            assert_eq!(prepared.inventory.manifest.old_index.sha256, old.sha256);
+            assert_eq!(
+                prepared.inventory.manifest.final_index,
+                candidate_bundle_v5::CandidateIndexMetadataV5 {
+                    size: prepared.inventory.manifest.candidate_member.size,
+                    sha256: prepared.inventory.manifest.candidate_member.sha256.clone(),
+                }
+            );
+            candidate_bundle_v5::validate_manifest_reference_v5(
+                &prepared.inventory.manifest_reference,
+            )
+            .expect("manifest reference validates");
+            let candidate_git = fixture
+                .git
+                .with_index_file(stable_path.join(candidate_bundle_v5::CANDIDATE_BUNDLE_INDEX_V5))
+                .expect("stable alternate index constructs");
+            verify_candidate_index(&candidate_git, &fixture.transaction, &old_map)
+                .expect("stable stage map matches the transaction exactly");
+            let candidate = read_index_snapshot(&candidate_git.index_path())
+                .expect("stable candidate snapshots");
+            assert_eq!(candidate.size, prepared.inventory.manifest.final_index.size);
+            assert_eq!(
+                candidate.sha256,
+                prepared.inventory.manifest.final_index.sha256
+            );
+            let live = read_index_snapshot(&index_path(root)).expect("live index re-reads");
+            assert_eq!((live.size, live.sha256), (old.size, old.sha256));
+            assert_eq!(
+                index_entry_map(&fixture.git).expect("live stage map re-reads"),
+                old_map
+            );
+            assert_eq!(
+                fs::read(root.join("entry.md.enc")).expect("worktree re-reads"),
+                worktree
+            );
+            assert!(!index_lock_path(root).exists());
+            assert!(!journal_path(root).exists());
+            assert!(!prelock_reservation_path(root).exists());
+            assert!(candidate_bundle_scratch_paths(root).is_empty());
+            assert_eq!(
+                exact_reserved_private_names(root).expect("reserved namespace inspects"),
+                BTreeSet::from([prepared.bundle_basename.clone()])
+            );
+            assert_eq!(
+                recovery_status(root).expect("stable bundle status inspects"),
+                RecoveryStatus {
+                    pending_transaction: true,
+                    retained_candidate_scratch_count: 0,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn v5_candidate_bundle_rejects_a_guard_from_another_vault_root() {
+        let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+        let unrelated = TestDirectory::new();
+        let wrong_guard = VaultMutationGuard::acquire(unrelated.path())
+            .expect("unrelated mutation guard acquires");
+        let mut hooks = CandidateBundleTestHooks::new(None);
+
+        assert!(matches!(
+            candidate_bundle_v5::prepare_candidate_bundle_v5_with_hooks(
+                &wrong_guard,
+                &fixture.git,
+                &fixture.transaction,
+                &mut hooks,
+            ),
+            Err(GitError::RecoveryConflict)
+        ));
+        assert!(candidate_bundle_scratch_paths(fixture.vault.root()).is_empty());
+        assert!(
+            !recovery_status(fixture.vault.root())
+                .expect("target root remains clean")
+                .pending_transaction
+        );
+    }
+
+    #[test]
+    fn v5_prepublish_checkpoint_failures_retain_nonblocking_scratch() {
+        use candidate_bundle_v5::CandidateBundlePrepareCheckpointV5 as Point;
+
+        for point in [
+            Point::ScratchCreated,
+            Point::CandidateCopied,
+            Point::CandidateMutated,
+            Point::ManifestWritten,
+            Point::BeforePublish,
+        ] {
+            let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+            let root = fixture.vault.root();
+            let mut fault =
+                CandidateBundleTestHooks::new(Some(CandidateBundleTestAction::FailAt(point)));
+            assert!(prepare_test_candidate_bundle(&fixture, &mut fault).is_err());
+            let retained = candidate_bundle_scratch_paths(root);
+            assert_eq!(retained.len(), 1, "{point:?} must retain its scratch");
+            assert_eq!(
+                recovery_status(root).expect("scratch-only status inspects"),
+                RecoveryStatus {
+                    pending_transaction: false,
+                    retained_candidate_scratch_count: 1,
+                },
+                "{point:?} must not block as an active transaction"
+            );
+            assert!(
+                exact_reserved_private_names(root)
+                    .expect("legacy namespace remains clear")
+                    .is_empty()
+            );
+
+            let mut next = CandidateBundleTestHooks::new(None);
+            let prepared = prepare_test_candidate_bundle(&fixture, &mut next)
+                .expect("a later token prepares despite retained scratch");
+            assert_eq!(candidate_bundle_scratch_paths(root), retained);
+            assert_eq!(
+                recovery_status(root).expect("successor status inspects"),
+                RecoveryStatus {
+                    pending_transaction: true,
+                    retained_candidate_scratch_count: 1,
+                }
+            );
+            candidate_bundle_v5::revalidate_prepared_candidate_bundle_v5(root, &prepared)
+                .expect("successor stable bundle revalidates");
+        }
+    }
+
+    #[test]
+    fn v5_partial_candidate_lock_and_manifest_are_retained_and_do_not_block_next_token() {
+        for action in [
+            CandidateBundleTestAction::PartialCandidate,
+            CandidateBundleTestAction::CandidateLock,
+            CandidateBundleTestAction::PartialManifest,
+        ] {
+            let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+            let root = fixture.vault.root();
+            let mut fault = CandidateBundleTestHooks::new(Some(action));
+            assert!(prepare_test_candidate_bundle(&fixture, &mut fault).is_err());
+            let retained = candidate_bundle_scratch_paths(root);
+            assert_eq!(retained.len(), 1, "{action:?} retains one scratch");
+            let scratch = &retained[0];
+            match action {
+                CandidateBundleTestAction::PartialCandidate => assert_eq!(
+                    fs::read(scratch.join(candidate_bundle_v5::CANDIDATE_BUNDLE_INDEX_V5))
+                        .expect("partial candidate reads"),
+                    b"partial candidate index"
+                ),
+                CandidateBundleTestAction::CandidateLock => assert_eq!(
+                    fs::read(appended_lock_path(
+                        &scratch.join(candidate_bundle_v5::CANDIDATE_BUNDLE_INDEX_V5)
+                    ))
+                    .expect("candidate lock reads"),
+                    b"foreign candidate lock"
+                ),
+                CandidateBundleTestAction::PartialManifest => assert_eq!(
+                    fs::read(scratch.join(candidate_bundle_v5::CANDIDATE_BUNDLE_MANIFEST_V5))
+                        .expect("partial manifest reads"),
+                    b"{\"version\":5"
+                ),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                recovery_status(root).expect("partial scratch status inspects"),
+                RecoveryStatus {
+                    pending_transaction: false,
+                    retained_candidate_scratch_count: 1,
+                }
+            );
+            let mut next = CandidateBundleTestHooks::new(None);
+            prepare_test_candidate_bundle(&fixture, &mut next)
+                .expect("next token publishes beside retained partial scratch");
+            assert_eq!(candidate_bundle_scratch_paths(root), retained);
+        }
+    }
+
+    #[test]
+    fn v5_critical_inventory_and_directory_identity_swaps_fail_closed() {
+        for action in [
+            CandidateBundleTestAction::CandidateTamper,
+            CandidateBundleTestAction::ManifestTamper,
+            CandidateBundleTestAction::SourceSwap,
+            CandidateBundleTestAction::ParentSwap,
+        ] {
+            let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+            let root = fixture.vault.root();
+            let mut fault = CandidateBundleTestHooks::new(Some(action));
+            assert!(prepare_test_candidate_bundle(&fixture, &mut fault).is_err());
+            fault.restore_relocation();
+            assert!(
+                candidate_bundle_v5::inspect_candidate_bundle_namespace_v5(root)
+                    .expect("restored scratch namespace inspects")
+                    .stable_bundle_basename
+                    .is_none(),
+                "{action:?} must not publish a stable bundle"
+            );
+            assert_eq!(candidate_bundle_scratch_paths(root).len(), 1);
+            assert_eq!(
+                recovery_status(root).expect("failed critical audit status inspects"),
+                RecoveryStatus {
+                    pending_transaction: false,
+                    retained_candidate_scratch_count: 1,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn v5_foreign_stable_collision_is_preserved_without_replacement() {
+        let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+        let root = fixture.vault.root();
+        let mut fault =
+            CandidateBundleTestHooks::new(Some(CandidateBundleTestAction::StableCollision));
+        assert!(prepare_test_candidate_bundle(&fixture, &mut fault).is_err());
+        assert_eq!(candidate_bundle_scratch_paths(root).len(), 1);
+        let stable = fs::read_dir(root.join(VAULT_LOCAL_DIRECTORY))
+            .expect("candidate namespace enumerates")
+            .map(|entry| entry.expect("candidate namespace entry reads"))
+            .find(|entry| {
+                entry.file_name().to_str().is_some_and(|name| {
+                    name.starts_with(candidate_bundle_v5::CANDIDATE_BUNDLE_STABLE_PREFIX_V5)
+                })
+            })
+            .expect("foreign stable collision remains")
+            .path();
+        assert_eq!(
+            fs::read(stable.join("foreign")).expect("foreign stable bytes read"),
+            b"foreign stable owner"
+        );
+        assert!(recovery_status(root).is_err());
+    }
+
+    #[test]
+    fn v5_external_live_index_drift_is_preserved_and_rejected_before_publish() {
+        let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+        let root = fixture.vault.root();
+        let mut fault =
+            CandidateBundleTestHooks::new(Some(CandidateBundleTestAction::LiveIndexDrift));
+        assert!(prepare_test_candidate_bundle(&fixture, &mut fault).is_err());
+        assert!(
+            index_entry_map(&fixture.git)
+                .expect("external stage map inspects")
+                .contains_key(&("external-index-owner.bin".to_owned(), 0))
+        );
+        assert_eq!(candidate_bundle_scratch_paths(root).len(), 1);
+        assert!(
+            !recovery_status(root)
+                .expect("live-drift scratch status inspects")
+                .pending_transaction
+        );
+
+        let mut next = CandidateBundleTestHooks::new(None);
+        prepare_test_candidate_bundle(&fixture, &mut next)
+            .expect("next preparation includes and preserves the external stage");
+        assert!(
+            index_entry_map(&fixture.git)
+                .expect("external stage map re-inspects")
+                .contains_key(&("external-index-owner.bin".to_owned(), 0))
+        );
+    }
+
+    #[test]
+    fn v5_token_collision_retries_without_touching_existing_scratch() {
+        const COLLISION: &str = "11111111111111111111111111111111";
+        const SUCCESSOR: &str = "22222222222222222222222222222222";
+
+        let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+        let root = fixture.vault.root();
+        let existing_basename =
+            candidate_bundle_v5::candidate_bundle_scratch_basename_v5(COLLISION)
+                .expect("collision basename validates");
+        let existing = root.join(VAULT_LOCAL_DIRECTORY).join(existing_basename);
+        fs::create_dir(&existing).expect("collision scratch creates");
+        fs::write(existing.join("sentinel"), b"foreign retained scratch")
+            .expect("collision sentinel writes");
+        let mut hooks = CandidateBundleTestHooks::with_tokens([COLLISION, SUCCESSOR]);
+        let prepared = prepare_test_candidate_bundle(&fixture, &mut hooks)
+            .expect("token collision retries with a new token");
+        assert_eq!(prepared.inventory.manifest.token, SUCCESSOR);
+        assert_eq!(
+            fs::read(existing.join("sentinel")).expect("collision sentinel re-reads"),
+            b"foreign retained scratch"
+        );
+        assert_eq!(candidate_bundle_scratch_paths(root).len(), 1);
+        assert_eq!(
+            recovery_status(root).expect("collision successor status inspects"),
+            RecoveryStatus {
+                pending_transaction: true,
+                retained_candidate_scratch_count: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn v5_after_publish_error_retains_a_complete_pending_stable_bundle() {
+        let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+        let root = fixture.vault.root();
+        let mut hooks = CandidateBundleTestHooks::new(Some(CandidateBundleTestAction::FailAt(
+            candidate_bundle_v5::CandidateBundlePrepareCheckpointV5::AfterPublish,
+        )));
+        assert!(prepare_test_candidate_bundle(&fixture, &mut hooks).is_err());
+        assert!(candidate_bundle_scratch_paths(root).is_empty());
+        let namespace = candidate_bundle_v5::inspect_candidate_bundle_namespace_v5(root)
+            .expect("post-publish stable namespace validates");
+        let stable = namespace
+            .stable_bundle_basename
+            .expect("post-publish stable remains pending");
+        candidate_bundle_v5::validate_candidate_bundle_inventory_v5(root, &stable, None)
+            .expect("post-publish stable inventory remains complete");
+        assert_eq!(
+            recovery_status(root).expect("post-publish status inspects"),
+            RecoveryStatus {
+                pending_transaction: true,
+                retained_candidate_scratch_count: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn v5_postpublish_byte_identical_clone_cannot_replace_the_held_identity() {
+        let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+        let root = fixture.vault.root();
+        let mut hooks =
+            CandidateBundleTestHooks::new(Some(CandidateBundleTestAction::StableCloneSwap));
+        assert!(prepare_test_candidate_bundle(&fixture, &mut hooks).is_err());
+        hooks.restore_relocation();
+
+        let namespace = candidate_bundle_v5::inspect_candidate_bundle_namespace_v5(root)
+            .expect("restored original stable namespace validates");
+        let stable = namespace
+            .stable_bundle_basename
+            .expect("the original moved scratch remains stable");
+        candidate_bundle_v5::validate_candidate_bundle_inventory_v5(root, &stable, None)
+            .expect("restored original stable inventory validates");
+        assert!(candidate_bundle_scratch_paths(root).is_empty());
+        assert!(
+            recovery_status(root)
+                .expect("restored stable status inspects")
+                .pending_transaction
+        );
     }
 
     #[test]
