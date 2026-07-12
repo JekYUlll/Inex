@@ -230,6 +230,8 @@
 - 该 checkpoint 只闭合当前 Linux x64 package/audit/smoke/normal lifecycle。Lifecycle 不记录 Argon2 单次校准计时/所选 ops，也不覆盖 Git v4 receipt-gap 强杀恢复或 packaged persistent editor profile；原生 Windows/arm64、fault/two-version、签名/发布/法务与独立 build attestation 继续保持 open。
 - Artifact manifest 精确绑定 `fd543f4`，但包内文档是该提交的构建时快照，仍只陈述较早的 `40ff728` artifact 证据；新的 `fd543f4` 结果只能记录在后置 planning/docs 与外部 lifecycle report 中。故本轮包是 current-product engineering checkpoint，不是可直接发布的 candidate；真正候选必须在 evidence/docs 冻结后从 successor commit 重建并完整复验，且仍不能把 source identity 当作独立 build attestation。
 - 可闭合的 successor 设计不是把新 archive SHA 写回会进入同一 archive 的 Markdown，而是让所有 package-bundled docs 只描述验证条件，并明确自身不作 attestation；精确 source/artifact/manifest/inventory/sidecar/lifecycle 结果仅进入外部 ignored report 与不参与 package contents 的 planning successor。这样下一次 clean build 不存在自引用哈希，且证据提交不会被误称为 artifact source。
+- Superseding package source 为 clean `5aa0b8c773a018f23082ffeca853e971e47064bc`。实际三包枚举确认 bundled docs 中精确 checkpoint、旧 artifact digest 与任意 40–64 位 hex identity 均为零；剩余 PASS 语言只属于 source/editor/tooling 证据或候选条件。A/B 的 Rust binaries 仍与前一 code checkpoint 一致，但包含 generic docs 的三包哈希更新为 Rust `a0be5e6f…`、Sublime `bb504221…`、VSIX `dcfde351…`、SHA256SUMS `14c14b9c…`，四者在两次独立构建间逐字节一致。
+- 最终外部 lifecycle ledger 为 `target/strict-release-5aa0b8c-lifecycle/evidence/linux-x64-5aa0b8c.json`，权限 0600，canonical/schema validation 通过，SHA-256 `22916a1f95ade1bb5a04a568db27c850022d710a2d9ab4c1f87aefd734ca10b4`。它绑定 clean artifact/harness source `5aa0b8c`、三项 nondisclosure=true、5 个正文/精确 16 MiB、outside-source hits=0、bundle/tree-copy/driver/frozen/allowlist/descendant cleanup=true；planning successor 只记录该结果，不改变 artifact provenance。
 
 ## Visual/Browser Findings
 

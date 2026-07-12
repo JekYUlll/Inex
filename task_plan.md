@@ -96,8 +96,8 @@ Phase 7 — 跨平台验证、打包与发布准备
   - [ ] 在所有原生目标重复许可/残留证据并完成独立法务、签名与发布渠道审查
 - [x] 在 clean `40ff728` checkpoint 上用 system GCC 完成两次逐字节一致的 Linux x64 package/audit/native-dependency/VSIX-install smoke
 - [x] 从独立 standalone clean clone 对 `40ff728` 历史 artifact 完成 import/password/Git-bundle/tree-copy restore/frozen-v1/residue lifecycle drill
-- [ ] 从包含通用非自指包内文档的最终 source checkpoint 重建三包并重跑 strict audit/native smoke/lifecycle；`fd543f4` 只保留为前一工程证据
-- [ ] 将最终 commit/hash/lifecycle 只写入不参与 package input 的外部 evidence 与 planning successor，禁止把现有包 relabel 为后续提交产物
+- [x] 从包含通用非自指包内文档的最终 source checkpoint 重建三包并重跑 strict audit/native smoke/lifecycle；当前 Linux x64 artifacts 绑定 `5aa0b8c`，`fd543f4` 只保留为前一工程证据
+- [x] 将最终 commit/hash/lifecycle 只写入不参与 package input 的外部 evidence 与 planning successor；artifact source 保持 `5aa0b8c`，不 relabel 为后续证据提交
 - **Status:** in_progress
 
 ## Key Questions
