@@ -343,9 +343,14 @@ The following values must be set in the application-global
 {
   "hot_exit": "disabled",
   "hot_exit_projects": false,
+  "remember_open_files": false,
   "update_system_recent_files": false
 }
 ```
+
+Build 4200 still recognizes the hidden `remember_open_files` preference. Set it
+explicitly to Boolean `false`; disabling Hot Exit alone does not close that
+independent open-view restoration path.
 
 Then configure the package:
 

@@ -131,9 +131,14 @@ Before inserting any plaintext, the plugin verifies application-global:
 {
   "hot_exit": "disabled",
   "hot_exit_projects": false,
+  "remember_open_files": false,
   "update_system_recent_files": false
 }
 ```
+
+Build 4200 still recognizes `remember_open_files` even though it is absent from
+the shipped default settings file. The gate requires Boolean `false` because
+that setting can restore open views independently when Hot Exit is disabled.
 
 Any mismatch blocks writable mode. A project/view setting is not an acceptable
 substitute. Existing recent/session data is outside the plugin's ability to

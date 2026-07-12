@@ -39,12 +39,14 @@ class SecurityGateTests(unittest.TestCase):
         secure = {
             "hot_exit": "disabled",
             "hot_exit_projects": False,
+            "remember_open_files": False,
             "update_system_recent_files": False,
         }
         self.assertEqual(check_security_preferences(secure), [])
         for key, unsafe in (
             ("hot_exit", False),
             ("hot_exit_projects", 0),
+            ("remember_open_files", 0),
             ("update_system_recent_files", None),
         ):
             values = dict(secure)

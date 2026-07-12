@@ -18,16 +18,19 @@ Set these values in the application-wide `Preferences.sublime-settings`:
 {
   "hot_exit": "disabled",
   "hot_exit_projects": false,
+  "remember_open_files": false,
   "update_system_recent_files": false
 }
 ```
 
 The values are checked by exact value and type before any plaintext is inserted
 and again while a managed view is active. Project or view settings do not
-satisfy this gate. If one value changes, Inex drops its models and replaces the
-managed buffers with a fixed locked message. Existing session, recent-file,
-cache, and index data predating the change remain the profile owner's
-responsibility.
+satisfy this gate. Build 4200 still recognizes `remember_open_files` even though
+it is not shown in the default settings file; it must be explicitly false so it
+cannot restore open views independently of Hot Exit. If one value changes, Inex
+drops its models and replaces the managed buffers with a fixed locked message.
+Existing session, recent-file, cache, and index data predating the change remain
+the profile owner's responsibility.
 
 The package also refuses writable mode when `sublime.version()` is not exactly
 `4200`; newer APIs are not assumed to preserve the tested behavior.

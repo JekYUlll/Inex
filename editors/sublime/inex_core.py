@@ -35,6 +35,7 @@ except ImportError:  # Direct pure-Python test execution.
 SECURITY_REQUIRED = {
     "hot_exit": "disabled",
     "hot_exit_projects": False,
+    "remember_open_files": False,
     "update_system_recent_files": False,
 }
 
@@ -293,6 +294,8 @@ def check_security_preferences(preferences: Mapping[str, Any]) -> List[str]:
         issues.append('"hot_exit" must be exactly "disabled"')
     if preferences.get("hot_exit_projects") is not False:
         issues.append('"hot_exit_projects" must be exactly false')
+    if preferences.get("remember_open_files") is not False:
+        issues.append('"remember_open_files" must be exactly false')
     if preferences.get("update_system_recent_files") is not False:
         issues.append('"update_system_recent_files" must be exactly false')
     return issues

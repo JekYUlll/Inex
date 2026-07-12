@@ -123,6 +123,7 @@ def _preference_values() -> Dict[str, Any]:
     return {
         "hot_exit": preferences.get("hot_exit"),
         "hot_exit_projects": preferences.get("hot_exit_projects"),
+        "remember_open_files": preferences.get("remember_open_files"),
         "update_system_recent_files": preferences.get("update_system_recent_files"),
     }
 

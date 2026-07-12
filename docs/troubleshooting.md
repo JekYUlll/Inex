@@ -173,13 +173,15 @@ The application-global preferences must be exact, including types:
 {
   "hot_exit": "disabled",
   "hot_exit_projects": false,
+  "remember_open_files": false,
   "update_system_recent_files": false
 }
 ```
 
-The string `"disabled"` is not Boolean `false`. Project or view overrides do
-not satisfy the gate. The package also requires exact Build 4200. Restart the
-isolated profile after correcting global settings and re-run
+The string `"disabled"` is not Boolean `false`, and Build 4200's hidden
+`remember_open_files` value must be explicitly Boolean `false`. Project or view
+overrides do not satisfy the gate. The package also requires exact Build 4200.
+Restart the isolated profile after correcting global settings and re-run
 **Inex: Show Security Status**.
 
 ### The password dialog does not open
