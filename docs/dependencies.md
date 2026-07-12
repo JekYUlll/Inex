@@ -61,16 +61,18 @@ strong-slot rewrap. Native timing/resource evidence remains a release gate.
   before GA. Format fixtures must be byte-identical on every target.
 - The current strict release-tool source suite passes 60/60; `actionlint`,
   pedantic/all-features Clippy, warnings-as-errors rustdoc, and the Windows GNU
-  cross-check pass. Two local system-GCC Linux x64 clean-source builds from
-  `40ff728` are byte-identical and pass strict release-set/ELF/native-dependency
-  audit plus executable/VSIX sidecar smoke with `dirtySourceTree=false`. The
+  cross-check pass. A binding Linux x64 candidate requires two standalone clean
+  system-GCC builds to be byte-identical and pass strict
+  release-set/ELF/native-dependency audit plus executable/VSIX sidecar smoke
+  with `dirtySourceTree=false`. The
   xlings-default local ELF embeds its build-home interpreter/RUNPATH and is
   correctly rejected as non-portable.
-- A clean no-hardlinks standalone clone at harness commit `d44ead9` re-audits those
-  packages, authenticates five imported/restored bodies, exercises CLI/RPC/Git
-  failure nondisclosure, and reports zero sensitive-residue hits outside the
-  designated plaintext source. This does not attest generated inputs or replace
-  native/signing/legal gates.
+- A third standalone clean clone must re-audit the exact packages, authenticate
+  five imported/restored bodies, exercise CLI/RPC/Git failure nondisclosure,
+  and report zero sensitive-residue hits outside the designated plaintext
+  source. Exact component counts, inventory/sidecar digests, and artifact hashes
+  belong in the external report matching the package manifests. This does not
+  attest generated inputs or replace native/signing/legal gates.
 
 ## License inventory and distribution obligations
 

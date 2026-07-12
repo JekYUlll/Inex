@@ -25,15 +25,17 @@ In particular:
   full Sublime restart; the client therefore remains experimental until the
   complete package canary matrix passes; and
 - release-tool tests pass 60/60, `actionlint` and pedantic/all-features Clippy
-  pass, and independent release-tool code review is GO. A system-GCC Linux x64
-  double build from historical artifact source `40ff728` is byte-identical and passes strict
-  archive/native-dependency audit plus VS Code 1.125.0 CLI
-  install/bundled-sidecar smoke. A standalone clean-checkout lifecycle run at
-  harness commit `d44ead9` also passes authenticated import/password/restore,
-  Git bundle, frozen-v1 compatibility, exact body and bounded residue checks.
-  These packages predate later core/Git source changes and must be rebuilt from
-  the eventual final feature commit. This local result is not native
-  Windows/arm64, persistent-profile, signed, or independent release evidence.
+  pass, and independent release-tool code review is GO. The binding artifact
+  workflow requires two standalone clean system-GCC builds to be byte-identical
+  and pass strict archive/native-dependency plus isolated VS Code
+  install/bundled-sidecar smoke. A third standalone clean clone must bind the
+  exact artifact hashes while checking authenticated import/password/restore,
+  Git bundle, frozen-v1 compatibility, CLI/RPC/locked-Git negative
+  nondisclosure, exact body comparison, and bounded residue. This bundled
+  document does not attest its own archive; require a separately preserved
+  evidence record matching `PACKAGE-MANIFEST.json` and `SHA256SUMS`. Such a
+  local result is still not native Windows/arm64, persistent-profile, signed,
+  published, independently built, or independently reviewed legal evidence.
 
 The current evidence and blockers are maintained in
 [`docs/release-checklist.md`](docs/release-checklist.md). Do not use Inex as the

@@ -29,18 +29,25 @@ Status terms in this document mean:
 |------|--------|-----------------------------|
 | Linux Rust workspace | verified source checkpoint | 325/325 workspace tests pass with calibrated Argon2id creation/rewrap, index-CAS v4, native force-kill atomic-write, pre-lock ownership, and exact runtime-info regressions, plus rustfmt, all-target/all-feature pedantic Clippy with warnings denied, rustdoc warnings denied, and whitespace checks |
 | EDRY/vault compatibility | checkpoint | Frozen v1 fixture rebuild/unlock/decrypt and broad format/path/tamper tests pass on Linux; Windows GNU compiles and earlier Wine suites pass, but this is not native Windows evidence |
-| Import | verified checkpoint | Copy-only absent-destination staging, re-open/seal/allowlist/publication, source-preservation, and failure-class tests pass. The historical strict-v1 artifact from `40ff728` also imports a five-document synthetic tree including exact 16 MiB content, preserves every source hash, and produces no plaintext Markdown in the vault; it predates later core/Git changes, while publication ambiguity and native-platform fault cases remain pending |
+| Import | verified source checkpoint; artifact evidence external | Copy-only absent-destination staging, re-open/seal/allowlist/publication, source-preservation, and failure-class tests pass. A binding artifact report must additionally import a five-document synthetic tree including exact 16 MiB content, preserve every source hash, and produce no plaintext Markdown in the vault; publication ambiguity and native-platform fault cases remain pending |
 | Argon2id creation policy | verified Linux source checkpoint | Default create/init/import process-cache an ops-only 3–20 calibration at fixed 64 MiB toward a 250–750 ms dummy-input KDF measurement. Explicit RPC creation uses the independent 3–20/exact-64-MiB cap and fails before root creation; reader compatibility remains 20/1 GiB. Core and real CLI process tests prove password add/change retains both stronger authenticated components. Native host timing/resource behavior remains pending |
 | Git | verified Linux fail-closed source checkpoint | Locked-safe driver, local installer, encrypted diff3, fixed tree provenance, full-width SHA-1/SHA-256, detected/split rename/modify, and legacy v1/v2/v3 recovery pass. New v4 transactions publish a canonical pre-lock reservation plus initial/final ownership receipts before holding the real `.git/index.lock`; Linux regressions cover orphan/partial/wrong-case/link/foreign state, pre-lock winner, lock-held Git failure, marker/candidate/published recovery, target drift, and foreign-lock preservation. A kill between candidate mutation and its matching receipt is detected and preserved as `RecoveryConflict`, not automatically recovered. Native Windows abrupt-kill/power-loss, ref-only concurrency, and legacy recovery CAS remain pending |
 | VS Code unit/bundle | verified checkpoint | Strict TypeScript, 23/23 Node tests, production bundle, and integration bundle pass |
 | VS Code Extension Host | partial | The current local build and 1.125.0 directly drive the production create/folder-create/file-rename/file-delete actions plus encrypted backup/recovery against the daemon/custom editor. Close refusal, rename collision, Unix delete-I/O failure recovery, command registration, and isolated-root residue pass. InputBox/QuickPick mouse interaction is not automated, and test-mode workbench storage is in-memory, so persistent cross-process restore/Local History is unproven |
 | Sublime current source | partial | Pure-Python tests pass 61/61. An exact Build 4200 normal E2E drives unlock/open/edit/save/close and real-panel New Folder/New Markdown/rename/etag-delete through registered commands. `xdotool type --file -` reads the random password from its stdin and injects X11 keyboard events into the real absolute zenity masked entry; that password then joins the encoded full-root residue scan. Authenticated tree checks pass after each mutation; `folder_created`, `markdown_created`, `renamed`, and `deleted` are present, `crud_complete=true`, `vault_envelope=EDRY`, and `root_scan_hits=0`. The plugin-host SIGKILL probe remains `PASS_WITH_DOCUMENTED_BOUNDARY`: the visible buffer is copyable, the host does not restart in-process, a full Sublime restart is required, `vault_envelope=EDRY`, and roots scanned after application exit remain clean. Its `crud_complete=false` is intentional because the crash branch kills after open/edit/save; this is not crash-time plaintext erasure. The full packaged matrix is pending |
-| Linux x64 packaging | verified strict-v1 local checkpoint | Artifact source `40ff7288879b27cc2e3b956b029fdb10e99ab25c` is clean. Two independent system-GCC release builds produce identical binaries and identical Rust ZIP, VSIX, Sublime ZIP, and SHA256SUMS. Both pass strict release-set/native audit and VS Code 1.125.0 install/bundled-sidecar smoke; runtime reports GNU x64, release profile, libsodium 1.0.22/ABI 26.4/non-minimal |
-| Linux x64 artifact lifecycle | verified independent clean-clone checkpoint | An independent `git clone --no-hardlinks` at clean harness `d44ead9bff35252577118441f8f575ed7e7b8d12` re-audits artifact source `40ff728`. SHA-256: Rust ZIP `b6b69bd9a9827e7d5915a64714f3d41faddc6d38552dfa5559b8be6c213a3775`; Sublime ZIP `aaf2cd8f652a5eca66dea429d30080cebadd17edbe4135820925aec6d51aa321`; VSIX `468886d49250b0f04e408d5f1c23a0dc4a47c2c28ded7adb101661d1e7b1b93d`. Five expected bodies including exact 16 MiB content authenticate after import, password rewrap, single-ref/single-commit Git bundle and clean tree-copy restores. CLI wrong-password, RPC auth-failure, locked merge-driver, driver relocation, frozen-v1, physical allowlist and descendant cleanup pass; outside-source sensitive hits are zero. Scope remains lifecycle-only, not release approval or native/fault-state/two-version evidence |
-| License collection | verified Linux engineering checkpoint | All three strict-v1 packages share inventory SHA-256 `228bfeb70f96146623ab31146c58bcd5c51434cbb14f4e35ce04525d12dbfc89`, 77 target-bound Cargo components, 147 hashed license/NOTICE texts, and sidecar SHA-256 `5bacbda459d7a3627377271bc2b03d20c8456076b7ccc347fab577216a66149e`. Independent all-native artifact runs, legal review, and license-choice/signature policy remain pending |
+| Linux x64 packaging | binding evidence must be external | Two independent standalone system-GCC release builds must bind one clean source commit and produce byte-identical binaries, Rust ZIP, VSIX, Sublime ZIP, and SHA256SUMS. Both must pass strict release-set/native audit and isolated VS Code install/bundled-sidecar smoke; runtime must report GNU x64, release profile, and reviewed libsodium version/ABI/non-minimal status. Exact hashes cannot be self-attested by this bundled document |
+| Linux x64 artifact lifecycle | binding evidence must be external | A third standalone clean clone must re-audit the exact artifact hashes and same product commit. Five expected bodies including exact 16 MiB content must authenticate after import, password rewrap, single-ref/single-commit Git bundle and clean tree-copy restores. CLI wrong-password, RPC auth-failure, locked merge-driver, driver relocation, frozen-v1, physical allowlist and descendant cleanup must pass with all three nondisclosure flags true and outside-source sensitive hits zero. Scope remains lifecycle-only, not release approval, independent build attestation, native fault-state, or two-version evidence |
+| License collection | verified mechanism; artifact digest external | Strict audit requires all three packages to share one target-bound Cargo inventory, complete hashed license/NOTICE texts, and one sidecar digest. Exact counts and hashes must come from the external report matching the package manifests. Independent all-native artifact runs, legal review, and license-choice/signature policy remain pending |
 | CI configuration | source-only, non-binding | Linux x64, Windows x64, Linux arm64, and Windows arm64 labels are configured; actions are immutable-SHA pinned and local `actionlint` passes. Push/manual tag refs bind the exact version; the required job runs binding source-quality gates; package targets rerun x64 native tests or ARM no-run compilation, enforce canonical provenance, and install/smoke each platform VSIX. The workflows have not been pushed or run remotely, so every matrix result remains unproven |
 | Native Windows | pending | No native MSVC/NTFS/ReFS/FAT/exFAT release host result is available; GNU cross-check and Wine are non-binding |
 | arm64 | pending | Linux arm64 and Windows arm64 native build/package/runtime matrices are not available |
+
+Bundled documentation is a package input and cannot contain a binding hash of
+the archive that contains it. Exact source, artifact, manifest, inventory,
+sidecar, smoke, and lifecycle results therefore belong in a separately
+preserved evidence record. Match that record to `PACKAGE-MANIFEST.json` and
+`SHA256SUMS`; never relabel an existing package as an artifact of a later
+documentation or evidence commit.
 
 ## Known release blockers
 
@@ -176,7 +183,7 @@ directory explicitly after triage.
       destination, disk faults, publication ambiguity, and marker cleanup
       failure.
 - [ ] Source hashes remain unchanged in every import result.
-- [x] From an independent no-hardlinks clone of harness `d44ead9`, rerun the strict clean Linux x64
+- [ ] For the exact candidate under review, use a third standalone clean clone to rerun the strict Linux x64
       artifact lifecycle with `dirtySourceTree=false`: import to one Git commit,
       require only `refs/heads/main` and no unreachable objects, create and
       verify both a Git bundle and clean regular-file tree copy, restore to
@@ -320,16 +327,18 @@ PYTHONPATH=scripts python3.13 scripts/smoke_release_artifacts.py \
 ```
 
 On the current Linux x64 host, strict release-tool source tests pass 60/60.
-Two clean-source system-GCC builds from `40ff728` are byte-identical across both
-binaries and all four package outputs; both pass strict release-set/native audit
-and VS Code 1.125.0 CLI install/bundled-sidecar smoke. Current validation covers VSIX control metadata,
+The binding workflow requires two standalone clean-source system-GCC builds to
+be byte-identical across both binaries and all four package outputs; both must
+pass strict release-set/native audit and isolated VS Code CLI
+install/bundled-sidecar smoke. Current validation covers VSIX control metadata,
 bounded regular ZIP members and Windows-portable path/mode collisions, exact
 workspace/tag parsing, canonical provenance, and PE32+ structure/import ranges;
 the original malformed-VSIX and ZIP bypass samples are rejected. Independent
 release-tool code review is GO. The same helper rejects the xlings-default ELF
 because its interpreter/RUNPATH refers to the build user's xlings home. This is
-valuable local evidence, not a signed, current-source, native multi-platform
-release.
+valuable tooling evidence, not a signed, independently attested, native
+multi-platform release. Exact artifact results must be read from the external
+record matching the package manifests.
 
 - [ ] The helper scripts and pinned `@vscode/vsce` lockfile are committed,
       reviewed, and tested on each native host.

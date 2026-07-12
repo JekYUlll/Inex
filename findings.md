@@ -221,6 +221,16 @@
 - no-downgrade 需要绑定 authenticated slot，而不是只在 CLI 选一次参数。首轮组合审计发现“已继承的 >64 MiB 参数再被 Vault 当作 new-vault candidate”会二次拒绝，修正为 Vault add/change 对最终参数按分量取 max 并只受 password-slot floor/reader ceiling。随后独立复审又发现公开低层 `crypto::add_password_slot` 可绕过 authenticated binding，现已收窄为 `pub(crate)`；公共写槽入口仅剩 Vault。
 - Frozen v1 fixture 与显式 `create_with_params` 保持确定性。真实 CLI `init` 与 `password add` 进程测试分别绑定 3..20/64 MiB 创建和 stronger-slot 继承，daemon unit/stdio 绑定 absent/explicit/error mapping 与 root 无副作用；安全与文档复核最终均为 GO。
 
+## 2026-07-12 current-product Linux x64 release checkpoint
+
+- 首次从 `cb6ccbb` 重建时，严格 artifact audit 按设计拒绝缺少 `docs/release-notes-0.1.0-pre-alpha.md` 的包。根因是 README 新增该链接后，producer `DOCUMENTATION_FILES` 未同步，而 auditor 会解析所有包内 Markdown 链接。修复把 release notes 同时加入三包构建 allowlist 和 auditor 独立 required set，并用真实 README + 全文档集合回归闭合链接；发布工具套件从 59 增至 60 项且全绿。被拒绝的 `cb6ccbb` 包不作证据。
+- 主 checkout 的 repo-local `diff.algorithm=histogram` 不在严格 provenance allowlist 内，因此 binding build 必须来自 standalone clone。最终使用三个 `--no-local --no-hardlinks` clone，固定 canonical origin、`core.autocrlf=false`、`gc.auto=0`，并把 native target/artifact/TMP 放在 checkout 外；三者均由 `source_revision()` 绑定 clean `fd543f494669b8e82e9b7c6dabf071b17954be28`。
+- 两套独立 system-GCC/offline release build 逐字节一致：`inex` `392ab0ed…`、`inexd` `e210525b…`、Rust ZIP `4479350f…`、Sublime ZIP `411944bb…`、VSIX `f573721d…`、SHA256SUMS `398ee5e8…`。两轮 strict audit 绑定 77 个 Cargo component、147 份 license/NOTICE、inventory `228bfeb7…` 与相同 sidecar；两套隔离 VS Code 1.125.0 install/bundled-sidecar smoke 均通过。
+- 第三个 clean clone 对只读 artifact 连续两次完成 lifecycle PASS：5 个正文（含精确 16 MiB）、password rewrap、CLI/RPC/locked-Git 三项 nondisclosure、Git bundle 与 clean tree-copy restore、driver relocation、frozen-v1、physical allowlist、Linux descendant cleanup 均成立，`plaintext-source` 外动态秘密命中为 0。第二次 canonical report 保存在私有 ignored 路径 `target/strict-release-fd543f4-lifecycle/evidence/linux-x64-fd543f4.json`，SHA-256 `989cff808665de168fa5f76b3ca47107cae9879fc96b916b72e65d91c1c49d11`。
+- 该 checkpoint 只闭合当前 Linux x64 package/audit/smoke/normal lifecycle。Lifecycle 不记录 Argon2 单次校准计时/所选 ops，也不覆盖 Git v4 receipt-gap 强杀恢复或 packaged persistent editor profile；原生 Windows/arm64、fault/two-version、签名/发布/法务与独立 build attestation 继续保持 open。
+- Artifact manifest 精确绑定 `fd543f4`，但包内文档是该提交的构建时快照，仍只陈述较早的 `40ff728` artifact 证据；新的 `fd543f4` 结果只能记录在后置 planning/docs 与外部 lifecycle report 中。故本轮包是 current-product engineering checkpoint，不是可直接发布的 candidate；真正候选必须在 evidence/docs 冻结后从 successor commit 重建并完整复验，且仍不能把 source identity 当作独立 build attestation。
+- 可闭合的 successor 设计不是把新 archive SHA 写回会进入同一 archive 的 Markdown，而是让所有 package-bundled docs 只描述验证条件，并明确自身不作 attestation；精确 source/artifact/manifest/inventory/sidecar/lifecycle 结果仅进入外部 ignored report 与不参与 package contents 的 planning successor。这样下一次 clean build 不存在自引用哈希，且证据提交不会被误称为 artifact source。
+
 ## Visual/Browser Findings
 
 - 2026-07-10 官方 VS Code 文档明确区分 `CustomTextEditorProvider`（标准 TextDocument，VS Code 管 save/backup）与 `CustomEditorProvider`（扩展自管 document model/save/backup）；Inex 必须使用后者。

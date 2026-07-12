@@ -60,12 +60,14 @@ retains it and prints its path for explicit inspection and cleanup; an early
 dirty-source, Windows, or input-path rejection creates no root. A successful
 run removes its evidence root.
 
-The strict Linux x64 artifact set from `40ff728` has passed this drill from
-an independent no-hardlinks clone of clean harness commit `d44ead9`: all five bodies authenticated
-byte-for-byte, both restore paths and driver relocation passed, frozen-v1
-product bytes remained unchanged, CLI/RPC/locked-Git failure paths disclosed no
-dynamic secret, and the sensitive scan found zero hits outside
-`plaintext-source`. The report is lifecycle-only and is not release approval.
+For a binding Linux x64 artifact checkpoint, a third standalone clean clone must
+re-audit the exact package hashes, authenticate all five bodies byte-for-byte,
+pass both restore paths and driver relocation, keep frozen-v1 product bytes
+unchanged, disclose no dynamic secret on CLI/RPC/locked-Git failure paths, and
+find zero sensitive hits outside `plaintext-source`. Preserve the canonical
+external report and match its source/artifact hashes to the package manifests;
+this bundled document does not attest its own archive. The report remains
+lifecycle-only and is not release approval or independent build attestation.
 
 Treat that result as binding only from a dedicated standalone, exclusive and
 quiescent release checkout. From interpreter startup through artifact/report

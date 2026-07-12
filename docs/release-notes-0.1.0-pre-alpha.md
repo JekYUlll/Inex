@@ -52,13 +52,15 @@
   a complete old or new target at four commit boundaries. Git pre-lock tests
   prove ambiguous/foreign/partial/link states are detected and preserved
   rather than silently cleaned; receipt-gap automatic recovery remains open.
-- Two clean system-GCC Linux x64 release builds from artifact source `40ff728`
-  are byte-identical and pass strict release-set, native-dependency, package,
-  VSIX installation, and bundled-sidecar smoke checks.
-- An independent no-hardlinks harness clone at `d44ead9` passes the Linux x64
-  artifact lifecycle, restore, frozen-v1, and negative CLI/RPC/locked-Git
-  secret drill with zero sensitive hits outside the controlled plaintext
-  source.
+- The Linux x64 binding workflow requires two standalone clean system-GCC
+  release builds to be byte-identical and pass strict release-set,
+  native-dependency, package, VSIX installation, and bundled-sidecar smoke
+  checks.
+- A third standalone clean harness clone must bind the exact source and artifact
+  hashes while passing lifecycle, restore, frozen-v1, and negative
+  CLI/RPC/locked-Git secret drills with zero sensitive hits outside the
+  controlled plaintext source. Exact results belong in an external evidence
+  record; this bundled note cannot attest its own archive.
 
 These are engineering checkpoints, not evidence for native Windows, arm64,
 ReFS, physical power loss, signed distribution, or independent legal review.
