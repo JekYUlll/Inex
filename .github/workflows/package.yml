@@ -236,6 +236,25 @@ jobs:
           python scripts/smoke_release_artifacts.py
           target/release-artifacts/${{ matrix.platform }}
           --vscode-cli "$VSCODE_CLI"
+      - name: Record native KDF calibration evidence
+        if: startsWith(matrix.platform, 'linux-')
+        shell: bash
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          PYTHONPATH: scripts
+        run: >-
+          python scripts/drill_kdf_calibration.py
+          target/release-artifacts/${{ matrix.platform }}
+          --output "$RUNNER_TEMP/inex-kdf-calibration-${{ matrix.platform }}.json"
+      - name: Upload native KDF calibration evidence
+        if: startsWith(matrix.platform, 'linux-')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: inex-kdf-calibration-evidence-${{ matrix.platform }}
+          path: ${{ runner.temp }}/inex-kdf-calibration-${{ matrix.platform }}.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
       - name: Upload audited artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
