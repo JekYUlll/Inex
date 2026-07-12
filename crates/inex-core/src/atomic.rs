@@ -295,7 +295,7 @@ impl AtomicWriteError {
 ///
 /// Dropping this value closes the underlying file, which releases the lock.
 pub struct VaultMutationLock {
-    _file: File,
+    file: File,
 }
 
 impl fmt::Debug for VaultMutationLock {
@@ -313,8 +313,10 @@ impl fmt::Debug for VaultMutationLock {
 /// domain in between.
 pub struct VaultMutationGuard {
     root: PathBuf,
+    root_identity: FilesystemDirectoryIdentity,
+    local_identity: FilesystemDirectoryIdentity,
     recovery_changed_repository: bool,
-    _lock: VaultMutationLock,
+    lock: VaultMutationLock,
 }
 
 impl fmt::Debug for VaultMutationGuard {
@@ -331,13 +333,58 @@ impl VaultMutationGuard {
     /// Returns a scrubbed lock or recovery error. A conflicting recovery state
     /// is left untouched for explicit user inspection.
     pub fn acquire(vault_root: &Path) -> Result<Self, AtomicWriteError> {
+        let root_identity = filesystem_directory_identity(vault_root)
+            .map_err(|source| AtomicWriteError::io(AtomicWriteStage::PrepareLock, source))?;
         let lock = VaultMutationLock::acquire(vault_root)?;
+        let locked_root_identity = filesystem_directory_identity(vault_root)
+            .map_err(|source| AtomicWriteError::io(AtomicWriteStage::PrepareLock, source))?;
+        if locked_root_identity != root_identity {
+            return Err(AtomicWriteError::io(
+                AtomicWriteStage::PrepareLock,
+                io::Error::other("vault root identity changed while acquiring its mutation lock"),
+            ));
+        }
+        let local = vault_root.join(VAULT_LOCAL_DIRECTORY);
+        let local_identity = filesystem_directory_identity(&local)
+            .map_err(|source| AtomicWriteError::io(AtomicWriteStage::PrepareLock, source))?;
+        let lock_path = local.join(VAULT_MUTATION_LOCK_FILE);
+        if !open_file_matches_path_and_is_single_link(&lock_path, &lock.file)
+            .map_err(|source| AtomicWriteError::io(AtomicWriteStage::PrepareLock, source))?
+        {
+            return Err(AtomicWriteError::UnsafeLockPath);
+        }
         let recovery_changed_repository = recover_pending_rebind_locked(vault_root)?;
         Ok(Self {
             root: vault_root.to_path_buf(),
+            root_identity,
+            local_identity,
             recovery_changed_repository,
-            _lock: lock,
+            lock,
         })
+    }
+
+    /// Whether this live guard still protects the exact physical vault root.
+    ///
+    /// The check fails closed when either the path used to acquire the guard
+    /// or `candidate_root` is missing, unreadable, or rebound to another
+    /// directory identity.
+    #[must_use]
+    pub fn is_for_root(&self, candidate_root: &Path) -> bool {
+        let local = self.root.join(VAULT_LOCAL_DIRECTORY);
+        let candidate_local = candidate_root.join(VAULT_LOCAL_DIRECTORY);
+        let lock_path = local.join(VAULT_MUTATION_LOCK_FILE);
+        let candidate_lock_path = candidate_local.join(VAULT_MUTATION_LOCK_FILE);
+        filesystem_directory_identity(&self.root).is_ok_and(|current| current == self.root_identity)
+            && filesystem_directory_identity(candidate_root)
+                .is_ok_and(|candidate| candidate == self.root_identity)
+            && filesystem_directory_identity(&local)
+                .is_ok_and(|current| current == self.local_identity)
+            && filesystem_directory_identity(&candidate_local)
+                .is_ok_and(|candidate| candidate == self.local_identity)
+            && open_file_matches_path_and_is_single_link(&lock_path, &self.lock.file)
+                .unwrap_or(false)
+            && open_file_matches_path_and_is_single_link(&candidate_lock_path, &self.lock.file)
+                .unwrap_or(false)
     }
 
     /// Whether acquiring this guard reconciled a pending rebind journal.
@@ -478,7 +525,7 @@ impl VaultMutationLock {
         platform::lock_exclusive(&file)
             .map_err(|source| AtomicWriteError::io(AtomicWriteStage::AcquireLock, source))?;
 
-        Ok(Self { _file: file })
+        Ok(Self { file })
     }
 }
 
@@ -5000,6 +5047,42 @@ mod tests {
             Err(AtomicWriteError::InvalidTarget)
         ));
         assert!(lock.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn mutation_guard_binds_the_exact_physical_vault_root() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        let other = TestVault::new()?;
+        let guard = VaultMutationGuard::acquire(fixture.root()).map_err(io::Error::other)?;
+        assert!(guard.is_for_root(fixture.root()));
+        assert!(!guard.is_for_root(other.root()));
+
+        let retired = fixture.root().with_extension("retired-root");
+        fs::rename(fixture.root(), &retired)?;
+        fs::create_dir(fixture.root())?;
+        assert!(!guard.is_for_root(fixture.root()));
+        fs::remove_dir(fixture.root())?;
+        fs::rename(&retired, fixture.root())?;
+        assert!(guard.is_for_root(fixture.root()));
+
+        let local = fixture.root().join(VAULT_LOCAL_DIRECTORY);
+        let retired_local = fixture.root().join("retired-vault-local");
+        fs::rename(&local, &retired_local)?;
+        fs::create_dir(&local)?;
+        assert!(!guard.is_for_root(fixture.root()));
+        fs::remove_dir(&local)?;
+        fs::rename(&retired_local, &local)?;
+        assert!(guard.is_for_root(fixture.root()));
+
+        let lock = local.join(VAULT_MUTATION_LOCK_FILE);
+        let retired_lock = local.join("retired-mutation-lock");
+        fs::rename(&lock, &retired_lock)?;
+        fs::write(&lock, b"foreign lock inode")?;
+        assert!(!guard.is_for_root(fixture.root()));
+        fs::remove_file(&lock)?;
+        fs::rename(&retired_lock, &lock)?;
+        assert!(guard.is_for_root(fixture.root()));
         Ok(())
     }
 
