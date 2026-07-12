@@ -108,7 +108,7 @@ That source identity is provenance
 metadata, not an independent attestation that generated binaries or editor
 bundles were built from the commit; reproducible builds, artifact hashes and
 native audits remain separate evidence.
-A clean standalone Linux x64 lifecycle run at harness commit `7f83dd6` has also
+A clean no-hardlinks standalone clone at harness commit `d44ead9` has also
 authenticated all five synthetic bodies after copy import, password rewrap,
 Git-bundle restore and clean regular-file tree-copy restore. CLI wrong-password,
 RPC authentication-failure, and locked merge-driver negative paths disclose no

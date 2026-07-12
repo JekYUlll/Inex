@@ -61,7 +61,7 @@ dirty-source, Windows, or input-path rejection creates no root. A successful
 run removes its evidence root.
 
 The strict Linux x64 artifact set from `40ff728` has passed this drill from
-standalone clean harness commit `7f83dd6`: all five bodies authenticated
+an independent no-hardlinks clone of clean harness commit `d44ead9`: all five bodies authenticated
 byte-for-byte, both restore paths and driver relocation passed, frozen-v1
 product bytes remained unchanged, CLI/RPC/locked-Git failure paths disclosed no
 dynamic secret, and the sensitive scan found zero hits outside

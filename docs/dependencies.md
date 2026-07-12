@@ -60,7 +60,7 @@ operations limit 3. Readers validate a resource ceiling before calling sodium.
   audit plus executable/VSIX sidecar smoke with `dirtySourceTree=false`. The
   xlings-default local ELF embeds its build-home interpreter/RUNPATH and is
   correctly rejected as non-portable.
-- A clean standalone lifecycle run at harness commit `7f83dd6` re-audits those
+- A clean no-hardlinks standalone clone at harness commit `d44ead9` re-audits those
   packages, authenticates five imported/restored bodies, exercises CLI/RPC/Git
   failure nondisclosure, and reports zero sensitive-residue hits outside the
   designated plaintext source. This does not attest generated inputs or replace
