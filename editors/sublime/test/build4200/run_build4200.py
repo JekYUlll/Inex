@@ -212,8 +212,8 @@ def capture_physical_file_seal(
             if strip_posix_write_bits:
                 os.fchmod(descriptor, stat.S_IMODE(opened.st_mode) & ~0o222)
                 opened = os.fstat(descriptor)
-            if stat.S_IMODE(opened.st_mode) & 0o222:
-                raise QaFailure(label + " retains a POSIX write bit")
+                if stat.S_IMODE(opened.st_mode) & 0o222:
+                    raise QaFailure(label + " retains a POSIX write bit")
         digest = hashlib.sha256()
         while True:
             chunk = os.read(descriptor, 1024 * 1024)
