@@ -238,3 +238,12 @@
 - 2026-07-10 官方 VS Code 文档明确区分 `CustomTextEditorProvider`（标准 TextDocument，VS Code 管 save/backup）与 `CustomEditorProvider`（扩展自管 document model/save/backup）；Inex 必须使用后者。
 - 当前官方 Custom Editor 文档说明 dirty 通过 `onDidChangeCustomDocument` 事件表达，undo/redo 由扩展提供回调；custom document 在最后一个 editor 关闭后 `dispose`，可触发 `document.close`/缓存清理。
 - 官方 libsodium bindings 页面当前列出维护者的 `libsodium-sys-stable` Rust binding；GitHub 1.24.0 release 显示签名发布。
+
+## 2026-07-12 Argon2id diagnostic evidence boundary
+
+- Production calibration 的稳定证据不是完整 measurement trace，而是同一缓存对象中的 selected params、selected monotonic observation、measurement count、outcome 或 failure。Creation API 只能投影该对象，不能把 evidence 当作输入；这样减少性能指纹面并防止诊断与实际默认参数分叉。
+- `selected-observed-ns` 计时从 `derive_kek_argon2id13` 前开始，包含参数/limits validation、首次可能的 libsodium 初始化、secure output allocation 与 pwhash，结束于 derived key drop 前。因此字段不能叫纯 KDF latency，250–750 ms 只是一次公开 dummy 决策观测的 inclusive 首选窗口。
+- 有界二分在噪声或非单调时不测完 ops 3–20；甚至未测 ops 可以位于窗口而已测路径返回 `maximum-below-window`。原生报告只能验证 packaged selector 发出的选中点与五类 outcome 不变量，搜索语义权威仍是 injected deterministic tests。
+- 一个有效外部报告运行五个 packaged processes：`inex runtime-info`、`inexd --runtime-info` 两个 probe，加上恰好三次新的 `inex kdf-calibration-info` attempt。`attemptCount=3`/`retryCount=0` 只约束 calibration attempts；每次 CLI 都是新进程，不能证明后来 init/import/daemon 的同进程缓存会选相同 ops。
+- 执行前哈希不足以把 runtime output 绑定到 packaged binary：同用户可执行文件可在 probe/attempt 中自改。Linux harness 必须去除提取副本 write bits，并在每个边界以物理 identity、不可回设的 ctime、metadata 和 digest 同时复验 executable 与 artifact snapshot；这仍依赖无同主体 harness writer 的显式信任边界。
+- Windows 零 residue 不能由普通 `os.walk` 推断，因为 NTFS named streams 可挂在文件或目录且不出现在默认 tree；同样，先运行再 Assign Job Object 存在后代逃逸窗口。Windows evidence 必须在 suspended-before-Job、Job-empty confirmation、完整 ADS enumeration 和原生测试存在前 fail closed；Wine、交叉编译或仅有 JSON schema 测试都不能替代。

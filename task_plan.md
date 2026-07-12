@@ -76,7 +76,10 @@ Phase 7 — 跨平台验证、打包与发布准备
 
 - [ ] 跑通格式、性质、RPC、编辑器、Git、Unicode/长路径/换行的验证矩阵
 - [x] 闭合 init plan 的 creation-time Argon2id 校准：v1 固定 64 MiB/parallelism 1，有界选择 ops 以目标 250–750 ms；显式 fixture 参数不漂移，RPC creation cap 与 password rewrap 不降级
-- [ ] 在所有原生发布目标复验 Argon2id 计时/资源行为，记录落在 ops 3/20 或 interior above-window fallback 的主机；不得把单次测量窗口表述为端到端 SLA
+- [ ] 在所有原生发布目标复验 Argon2id 计时/资源行为；每个平台固定保留三次 fresh-process observation，不重试或挑选结果，并按 `target-window`、`minimum-above-window`、`interior-above-window`、`maximum-above-window`、`maximum-below-window` 五类 outcome 精确记录 selector 返回值；不得把单次测量窗口表述为端到端 SLA，也不得由 fallback 推断未测 ops 不可能进入窗口
+  - [x] 提供无参数、CLI-only 的 `inex kdf-calibration-info`，从 production `OnceLock` 投影选中参数、决策观测、测量数与 outcome；确定性测试覆盖窗口边界、五类 outcome（含四类 fallback）、噪声/未测候选，真实进程测试证明不解析 password/query 且不写持久 product state
+  - [x] 实现 Linux 原生 package evidence harness 与 CI 路径：严格四文件 snapshot/audit、CLI/daemon digest 和两次 runtime-info probe、三次无重试 fresh calibration attempt、外部资源观测、零普通文件残留与 canonical JSON；Windows 在 suspended-before-Job、Job-empty barrier 与 NTFS ADS 闭合前 fail closed
+  - [ ] 从严格审计的最终 package 在 Linux x64、Linux arm64、Windows x64 MSVC、Windows arm64 MSVC 原生宿主各采集三次外部 canonical evidence；Wine、交叉编译与仿真不计入原生门禁
 - [x] 闭合 binding Git rename/modify 源码契约：detected 形态、split 两侧 rename、精确 tree provenance、v2/v3 journal 与恢复负测均通过
 - [ ] 在原生支持平台复验 Git rename/power-loss，并在 GA 前保留“禁止并行 Git porcelain”边界或实现真正的 index CAS
   - [x] 实现 alternate-index candidate、Inex 自持真实 `.git/index.lock`、old/candidate digest 绑定与 create-only journal v4
@@ -114,6 +117,7 @@ Phase 7 — 跨平台验证、打包与发布准备
 |----------|-----------|
 | 采用单一 Rust workspace + 独立编辑器客户端 | 与 init plan 的“一个引擎、两个客户端”一致，核心安全逻辑只实现一次 |
 | 正式运行时以 Rust sidecar 为唯一主路径 | 可被 TypeScript/Python 共用，并隔离高成本 KDF、索引和敏感缓存 |
+| v1 Argon2id 校准固定 64 MiB、parallelism 1，只在 ops 3–20 内选择 | parallelism 1 位于 init plan 建议的 1–4 范围；250–750 ms 被落实为固定公开 dummy 输入的一次 monotonic-clock 决策观测首选窗口，而不是 unlock/init/import/RPC/password 操作或完整命令的 SLA |
 | MVP 首先实现 Content-Length framed stdio JSON-RPC，协议预留 socket transport | 最快形成可测试的跨平台契约，同时避免 NDJSON 边界歧义并不阻碍后续 Unix socket/named pipe |
 | 规划文件放在仓库根目录 | 仓库已有明确 workspace，符合 planning-with-files 约定 |
 | EDRY 正文绑定 master-key epoch，不绑定 password key slot | 支持添加/删除 slot 和换密码而不重写正文；每个 slot 自带 KDF/wrap 参数 |
@@ -237,6 +241,9 @@ Phase 7 — 跨平台验证、打包与发布准备
 | A read-only Phase 7 inventory command queried the obsolete `clients/vscode/package.json` path | 1 | The command made no writes; use the repository's actual `editors/vscode/package.json` path and record the inspection miss before implementation |
 | First strict-license test run passed 52/53; the duplicate-component fixture correctly failed earlier on its repeated license path than the asserted component-order message | 1 | Keep the earlier fail-closed validation, assert its actual repeated-path error, and rerun the complete release-tool suite |
 | Initial exact-libsodium patch assumed the salt constant was derived inline rather than frozen as `16` | 1 | No partial edit occurred; inspect the actual sodium constant/error/version blocks and apply the exact-version patch against current context |
+| KDF diagnostic real-process regression passed but pedantic Clippy rejected its 143-line test function | 1 | Split static schema and dynamic outcome validation into focused helpers, keep every assertion, and rerun the CLI/core Clippy and process gates |
+| Initial cross-platform KDF harness could emit a Windows PASS despite pre-Job process execution and NTFS ADS being absent from ordinary tree snapshots | 1 | Fail closed before artifact use in Windows run/main/report validation, restrict CI evidence to Linux, and keep the two Windows native rows explicitly open until suspended Job, Job-empty, ADS enumeration, and native tests exist |
+| Independent KDF harness probe modified an extracted executable after its initial hash while the report still bound the old digest | 1 | Seal both executables and all four artifact snapshot files by physical identity, metadata, and SHA-256; remove POSIX write bits and revalidate before/after every probe/attempt and before report creation |
 
 ## Notes
 
