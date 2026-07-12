@@ -222,6 +222,15 @@ path did not exercise same-process reload. Preserve isolated evidence and keep
 Sublime classified experimental. The host-dead window remains part of the
 editor-memory/active-clipboard exclusion and complete crash release gate.
 
+A separate exact-packaged schema v3 flow has passed one full-application
+SIGKILL/restart against the same isolated profile and package. It observed all
+views for two continuous seconds before the second unlock with no known
+content/token fingerprint or Inex state, then reopened the same encrypted
+saved-content fingerprint. That result does not make the plugin-host-dead
+window safe, represent a real-user persistent profile, or close the remaining
+keyboard/menu, kill-variant, Hot Exit/history/sync, platform, and signing
+matrix.
+
 ### Sublime rename/delete is refused
 
 Only the active clean writable managed Markdown file can be renamed or deleted.

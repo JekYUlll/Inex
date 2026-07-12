@@ -96,8 +96,13 @@ ReFS, physical power loss, signed distribution, or independent legal review.
   window.
 - Persistent packaged VS Code Hot Exit/Local History/crash recovery and the
   real InputBox/QuickPick UI matrix remain release gates on Linux and Windows.
-- Sublime remains experimental until its exact-package, persistent-profile,
-  export/macro/clipboard/draft/crash matrix passes on every advertised OS.
+- One exact-packaged Build 4200 Linux full-application SIGKILL/restart path has
+  passed against the same isolated profile and package, including a continuous
+  two-second all-view pre-unlock scan and encrypted saved-content fingerprint
+  reopen. Sublime remains experimental until the keyboard/menu, real-user
+  persistent-profile, Hot Exit/history/sync,
+  export/macro/clipboard/draft/additional-kill, platform, and signing matrix
+  passes.
 - Directory rename/delete, attachment streaming, filename encryption,
   master-key rotation, in-place plaintext conversion, shared daemon sessions,
   and native Search-sidebar integration are not supported in v1.

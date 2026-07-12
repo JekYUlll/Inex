@@ -387,26 +387,35 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=editors/sublime \
   python3 -m unittest discover -s editors/sublime/tests -v
 ```
 
-The suite passes 72/72: 61 product tests plus 11 runner/evidence tests. It does
+The suite passes 76/76: 61 product tests plus 15 runner/evidence tests. It does
 not by itself replace exact-package black-box evidence. On Linux, separately
-preserved canonical reports bind one exact packaged Build 4200 normal scenario
-and one exact packaged plugin-host-crash scenario. The normal scenario passed
-unlock/open/edit/save/close and used registered WindowCommands plus real
-InputPanel/QuickPanel interaction for New Folder, New Markdown, rename, and
-etag-bound delete. Authenticated `listTree` checks passed after each step,
-`crud_complete=true`, events record `folder_created`, `markdown_created`,
-`renamed`, and `deleted`, `vault_envelope=EDRY`, and `root_scan_hits=0`. Its
-plugin-host SIGKILL probe is classified
-`PASS_WITH_DOCUMENTED_BOUNDARY`: the host did not restart,
-the visible plaintext could still be copied, a full Sublime restart was
-required, `vault_envelope=EDRY`, and the roots scanned after application exit
-reported zero disk hits. Its `crud_complete=false` is intentional: the crash
-branch kills the host after open/edit/save, while the normal branch separately
-covers CRUD. That reproduces the editor-memory/active-clipboard boundary; it is
-not a crash-erasure pass. These are isolated single-scenario baselines, not a
-same-profile restart result. The package remains experimental until the same
-installed persistent profile and the complete matrix pass for every advertised
-platform.
+preserved canonical reports bind three exact packaged Build 4200 scenarios:
+normal schema v2, plugin-host-crash schema v2, and full-application
+SIGKILL/restart schema v3 (`PASS`) against the same isolated profile and
+installed package. The normal scenario passed unlock/open/edit/save/close and
+used registered WindowCommands plus real InputPanel/QuickPanel interaction for
+New Folder, New Markdown, rename, and etag-bound delete. Authenticated `listTree`
+checks passed after each step, `crud_complete=true`, events record
+`folder_created`, `markdown_created`, `renamed`, and `deleted`,
+`vault_envelope=EDRY`, and `root_scan_hits=0`.
+
+The plugin-host SIGKILL probe is classified
+`PASS_WITH_DOCUMENTED_BOUNDARY`: the host did not restart, the visible
+plaintext could still be copied, a full Sublime restart was required,
+`vault_envelope=EDRY`, and the roots scanned after application exit reported
+zero disk hits. Its `crud_complete=false` is intentional: the crash branch
+kills the host after open/edit/save, while the normal branch separately covers
+CRUD. That reproduces the editor-memory/active-clipboard boundary; it is not a
+crash-erasure pass.
+
+The schema v3 flow then kills the complete first launch and restarts the same
+isolated profile and package. Before the second unlock, it scans every view
+continuously for two seconds with no known content/token fingerprint or Inex
+state; after unlock it reopens the same encrypted saved-content fingerprint.
+This passes one isolated harness path, not a real-user persistent-profile
+matrix. Keyboard/menu Save, other kill variants, real-user Hot Exit/history/sync
+behavior, other platforms, and signing remain pending. The package therefore
+remains experimental.
 
 ### Candidate Sublime archive shape
 

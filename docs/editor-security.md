@@ -187,9 +187,11 @@ binding crash matrix.
 
 ### Experimental release gate
 
-The current Python suite passes 72/72: 61 product tests plus 11 runner/evidence
-tests. On Linux, separately preserved canonical reports bind one exact packaged
-Build 4200 normal scenario and one exact packaged plugin-host-crash scenario.
+The current Python suite passes 76/76: 61 product tests plus 15 runner/evidence
+tests. On Linux, separately preserved canonical reports bind three exact
+packaged Build 4200 scenarios: normal schema v2, plugin-host-crash schema v2,
+and full-application SIGKILL/restart schema v3 (`PASS`) against the same
+isolated profile and installed package.
 The normal scenario drives unlock/open/edit/save/close and registered
 WindowCommands with real InputPanel/QuickPanel interaction for New Folder, New
 Markdown, rename, and etag-bound delete. Authenticated tree checks pass after
@@ -205,13 +207,23 @@ scanned after application exit report `root_scan_hits=0` and
 branch above covers CRUD independently. This proves the boundary was
 reproduced, not that crash-time plaintext was erased.
 
-The remaining gate starts with a same-profile full-application restart and then
-covers keyboard/menu Save, Save As, Save All, tab/window/application close,
-project/non-project windows, export/macro routes, additional crash/forced-kill
-states, and every advertised platform. It scans session/workspace files, Cache,
-Index, temp roots, logs, and the vault for a canary. No Sublime build is called
-supported until this complete persistent-profile matrix passes; APIs marked for
-builds newer than the tested baseline are not used.
+The schema v3 flow keeps that same isolated profile and package for two
+application launches. After the first encrypted save it kills the complete
+profile-bound launch session. Before the runner may answer the second password
+prompt, every window and view must remain free of known content/token
+fingerprints and Inex client/session/view state continuously for two seconds.
+After unlock, reopening the same encrypted document must match the first
+saved-content fingerprint. This passes one isolated full-application
+SIGKILL/restart path; it is not evidence from a real-user persistent profile.
+
+The remaining gate covers keyboard/menu Save, Save As, Save All,
+tab/window/application close, project/non-project windows, export/macro routes,
+additional daemon/plugin-host/full-application kill variants, real-user profile
+Hot Exit/history/sync behavior, every advertised platform, and signing. It
+scans session/workspace files, Cache, Index, temp roots, logs, and the vault for
+a canary. No Sublime build is called supported until this complete
+persistent-profile matrix passes; APIs marked for builds newer than the tested
+baseline are not used.
 
 ## Shared client rules
 

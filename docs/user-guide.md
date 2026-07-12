@@ -147,25 +147,33 @@ be restarted to end that editor-process plaintext lifetime. The fixed marker
 is therefore not observed same-process crash recovery or instantaneous
 fail-safe containment.
 
-Current checkpoint evidence is deliberately split: 72/72 Python tests pass
-(61 product tests plus 11 runner/evidence tests), and separately preserved
-canonical reports bind one exact packaged Build 4200 Linux normal scenario and
-one exact packaged plugin-host-crash scenario. The normal scenario passed
-unlock/open/edit/save/close plus real InputPanel/QuickPanel New Folder, New
-Markdown, rename, and etag-bound delete. Authenticated tree state was checked
-after every mutation; the report records all four CRUD events,
+Current checkpoint evidence is deliberately split: 76/76 Python tests pass
+(61 product tests plus 15 runner/evidence tests), and separately preserved
+canonical reports bind three exact packaged Build 4200 Linux scenarios: normal
+schema v2, plugin-host-crash schema v2, and full-application SIGKILL/restart
+schema v3 (`PASS`) against the same isolated profile and installed package. The
+normal scenario passed unlock/open/edit/save/close plus real InputPanel/QuickPanel New
+Folder, New Markdown, rename, and etag-bound delete. Authenticated tree state
+was checked after every mutation; the report records all four CRUD events,
 `crud_complete=true`, `vault_envelope=EDRY`, and zero scanned disk residue. The
-plugin-host SIGKILL scenario reproduced the copyable-buffer/restart boundary and
-is recorded as
-`PASS_WITH_DOCUMENTED_BOUNDARY`, not as a crash-erasure pass. That boundary is
-within the existing editor-memory/active-clipboard exclusion, but is a binding
-reason to keep Sublime experimental.
+plugin-host SIGKILL scenario reproduced the copyable-buffer/restart boundary
+and is recorded as `PASS_WITH_DOCUMENTED_BOUNDARY`, not as a crash-erasure
+pass. That boundary is within the existing editor-memory/active-clipboard
+exclusion, but is a binding reason to keep Sublime experimental.
+
+The schema v3 flow kills the complete first application launch and starts the
+same isolated profile and package again. Before the second unlock, every view
+is scanned continuously for two seconds with no known content/token
+fingerprint or Inex state. After unlock, reopening the encrypted document must
+match the first saved-content fingerprint. This is one controlled harness path,
+not a test of a real user's persistent profile.
 
 Sublime cannot veto every application-exit path. A final edit may be lost on an
 abrupt exit rather than written as plaintext. This is an intentional
-security-over-availability choice. The two isolated scenarios do not prove a
-restart against the same installed persistent profile. That restart and the
-complete crash/export/macro/project/full-platform residue matrix remain pending.
+security-over-availability choice. Keyboard/menu Save variants, the remaining
+crash/export/macro/project and forced-kill paths, real-user profile Hot
+Exit/history/sync behavior, other platforms, and signing remain pending. The
+complete matrix must pass before the experimental label can be removed.
 
 ## CLI administration
 
