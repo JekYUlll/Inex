@@ -269,6 +269,7 @@ Phase 7 — 跨平台验证、打包与发布准备
 | Isolated v5 reference/marker loader passed 19 tests but non-test Clippy rejected 20 intentionally unwired items as dead code | 1 | Keep the codec slice real: return the reference and marker seals from production bundle preparation, remove premature cleanup/path helpers, and narrowly annotate only parser/loader entry points until the immediately following writer/recovery slice consumes them |
 | Cleanup-helper removal patch missed rustfmt's single-line test bindings | 1 | No partial test edit occurred; inspect the exact formatted block, remove only the premature cleanup/path assertions, and retain the token-derived publish basename assertion |
 | v5 journal review found locked-safe status accepted matching bundle+journal beside unrelated reserved v4 files | 1 | Require the post-stable reserved namespace to be exactly the stable journal in this schema slice; add foreign marker-staging coexistence regression, then let the later publisher replace this narrow rule with a transaction-specific physical-state inspector |
+| A second read-only v5 authorization audit could not be spawned or resumed because the four-agent thread limit was already occupied | 2 | Keep the existing publish/classifier agents running; perform the bounded source audit on the main thread and do not retry until an agent slot is released |
 
 ## Notes
 
