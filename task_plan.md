@@ -91,6 +91,7 @@ Phase 7 — 跨平台验证、打包与发布准备
   - [x] 用真实 Linux 子 test + OS force-kill 覆盖 core atomic verified-stage/lock/replace/post-commit 四个边界，只接受完整 old/new ciphertext
   - [x] 修复并复审 Git v4 candidate 创建前的 durable pre-lock intent：orphan staging、foreign ownership、Windows exact-name 与 link/reparse 全部 fail closed
   - [ ] 闭合 candidate/initial/final ownership receipt 之间的强杀自动恢复，或在 GA scope 中明确这些可见状态只能保留并人工处置
+    - [ ] 设计并实现 v5 immutable candidate bundle：只在未发布 scratch 完成 Git mutation、final digest 与完整 payload，再以 verified no-replace directory move 一次性发布；partial scratch 保留但不阻塞，active namespace 不再暴露多文件 receipt gap
   - [ ] 原生 Windows NTFS/ReFS 复验 replace/write-through/power-loss，并由绑定证据决定是否取消 no-parallel-Git 边界
 - [x] 配置 Linux/Windows x64/arm64 CI、Rust 二进制、VSIX 与 Sublime 包产物；远端 hosted jobs 尚待执行
 - [x] 完成 threat model、用户指南、安全配置、迁移/升级与故障恢复文档
@@ -99,6 +100,9 @@ Phase 7 — 跨平台验证、打包与发布准备
   - [x] 严格验证三包共享 inventory/sidecar，并为 package/lifecycle evidence 定义 canonical report v1 与动态秘密自扫描
   - [x] 从 clean `40ff728` checkpoint 重建 Linux x64 三包，复验 audit/smoke/lifecycle 并另做 RPC/CLI/Git 负路径秘密 drill；该历史包不含后续 core/Git 变更
   - [x] Sublime Build 4200 residue runner 改用真实 masked zenity，口令仅从 stdin 注入并纳入全根动态扫描；正常与 plugin-host kill 两路均零磁盘命中
+  - [x] 将 Sublime Build 4200 runner 从 source/debug smoke 升级为 strict packaged baseline：私有四文件 snapshot/seal、包内 CLI/daemon、原样 package tree、normal/crash 两路与外部 canonical evidence；该增量不得被表述为完整 persistent-profile matrix
+    - [x] 经独立 mutation 复核补齐 canonical Rust/Sublime manifest、完整 installed inventory、`SHA256SUMS` 与 crash fingerprint 交叉绑定，并从 clean successor harness 重跑两路证据
+  - [ ] 在同一已安装 Build 4200 profile 上补 application restart/full-process kill，再覆盖 keyboard/menu Save/Save As/Save All、export/clipboard/macro、draft matching/stale/corrupt、project/non-project、idle/daemon kill 与 CRUD 负路径
   - [ ] VS Code persistent-profile UI 自动化仍缺可靠可观测 driver；已撤销无法触发 extension activation 的 X11 原型，不以坐标猜测形成证据
   - [ ] 在所有原生目标重复许可/残留证据并完成独立法务、签名与发布渠道审查
 - [x] 在 clean `40ff728` checkpoint 上用 system GCC 完成两次逐字节一致的 Linux x64 package/audit/native-dependency/VSIX-install smoke

@@ -257,3 +257,20 @@
 - 报告 `attemptCount=3`、`retryCount=0`、三个 ordinal 都被保留，canonical re-encode 与原 bytes 相等，外部文件为 create-new 0600。其 SHA-256 `8d8a9adf…` 只绑定本次 Linux x64 运行；Linux arm64 与两个 Windows MSVC 原生 row 仍保持 open。
 - 当前 artifact 的 normal-path lifecycle 不能从旧 `5aa0b8c` 继承；第三 clean `eeca0bc` harness clone 的新报告将 artifact/harness source 同时绑定到 clean `eeca0bc`，并在运行后再次验证四文件集合与 `SHA256SUMS`。报告 SHA-256 为 `30904006…`，14 个必需布尔项全真且零 sensitive residue hit。
 - 该 lifecycle 的 `notCovered` 仍精确包含同主体 release-host writer、签名/发布、fault-state/power-loss、hosted CI、独立法务、two-version upgrade/rollback、其他原生平台、editor persistent-profile residue 与 generated-input independent build attestation；Linux x64 normal-path PASS 不得升级成这些结论。
+
+## 2026-07-13 exact packaged Sublime evidence boundary
+
+- 对 live artifact 先 audit、再按路径重读 ZIP 仍有 rebind 窗；Build 4200 binding runner 必须先把四文件封存到私有 snapshot，审计同一 snapshot，并从审计捕获的内存 member bytes 物化 package。包内 daemon 与完整 installed tree 都必须跨 GUI 运行复验，不能用 source copy 或 `target/debug` 替代。
+- Artifact source 与 harness source 可以是两个不同 clean commit，只要各自 provenance、文件 digest 和前后 identity 独立绑定；强制二者相等会让后置 evidence harness 永远无法审计既有包。当前 v2 reports 精确记录 artifact `eeca0bc` 与 harness `5967c8f`，不 relabel 任一方；旧 `50b84b8` 与中间 `ba35a80` v1 reports 保留为 predecessor，不原地补写新 schema。
+- `root_scan_hits=0` 只能描述本轮隔离根与本轮严格 scanner。旧 runner 曾在失败时保留带随机口令的 fake zenity 文件，故不能从单次零命中推导全局主机无 residue；本轮已定向删除 28 个 proven legacy roots，未知/不同结构目录继续保留。
+- Plugin host 死亡后的 PRIMARY 可以返回完整 earlier-opened 137-byte plaintext，而当前 saved view 为 183 bytes；这不是“不匹配所以无泄漏”，而是宿主仍暴露本轮已观测的另一份完整 managed plaintext。边界验证应接受与任一已绑定 opened/saved fingerprint 的精确长度+SHA 匹配，同时拒绝部分 token、未知字节或不可读 channel 形成 PASS。
+- 外部报告若只保存 `events` 名称仍不足以复审。有效报告要绑定 bounded helper JSONL raw seal、record count/event counts、去时间 normalized observations/digest，并把它们与 scenario result 逐项相等；packaged import stdout/stderr、实际 `/proc` sidecar、所有 executed helper 和 installed tree 也需进入交叉绑定。
+- “materialized members 与 installed tree 彼此相等”仍可能同时漏掉产品文件；current validator 必须嵌入由 audited archive digest 绑定的 canonical Rust/Sublime `PACKAGE-MANIFEST.json`，要求 Rust CLI 精确命中 manifest，并让 Sublime manifest 的 177 项 payload 加 manifest 自身与 178-file installed tree 完全相等。第四个 `SHA256SUMS` seal 也必须从三包 audit records 重建 size/SHA，而不能只检查三个 archive seals。
+- 新增必需 manifest 字段与固定 exclusions 后，外层 Build 4200 evidence 不得继续复用 schema v1；否则同一 reportType/version 会指向两套互不兼容 root schema。Current normal/crash 使用严格 v2，旧 v1 只保留为历史证据；嵌套 release-set audit 与 package manifests 仍按自身 v1 validator 解释。
+- 本轮两路只闭合 exact-package baseline，不是 persistent-profile matrix。Same-profile restart、application kill、真实 keyboard/menu Save variants、export/clipboard/macro、draft stale/corrupt、project/non-project、idle/daemon fault、CRUD 负路径、Windows 与发布签名仍在 `notCovered`；Sublime 的 experimental 标签不得取消。
+
+## 2026-07-13 Git receipt-gap design audit
+
+- v4 prelock 只绑定 old index/token/candidate basename；initial receipt 前无法区分 Inex candidate 与同-token foreign regular file，initial 后 Git 可留下 candidate.lock/partial/final candidate，而 final receipt 前没有最终 digest 或完整 transaction payload。Partial receipt 同样无法区分 torn publication 与 foreign bytes，因此猜测删除会降低现有 foreign-preservation 标准。
+- 可保持 fail-closed 的 v5 方向是 immutable bundle：在非 active scratch 内完成 alternate-index mutation、stage-map 验证、old/final digest、完整 merge payload、exact inventory 与 file identity，fsync 后以 verified no-replace directory move 一次性发布 stable token directory；稳定 bundle 不再原地修改，marker/journal 只引用 manifest digest。
+- 未发布 partial scratch 默认保留、报告但不阻塞新事务，就无需把未知对象当作 Inex 所有而删除；若产品要求自动删除所有 partial scratch 或零残片，则仍需要新的信任/scope 决策。原生 NTFS/ReFS directory move、file-ID 与 power-loss 证据仍不可由 Linux SIGKILL 替代。
