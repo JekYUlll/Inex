@@ -38,13 +38,14 @@ health warning under the documented social threat model; strict mode may fail.
 
 Libsodium's explicit Argon2id13 API is used, never `ALG_DEFAULT`. Its current
 parallelism is fixed at one and the JSON does not promise configurable lanes.
-Normal CLI/core creation currently uses the fixed floor of 64 MiB and
-operations limit 3. An explicit RPC `kdf` still shares the broader reader
-ceiling of 20 operations and 1 GiB, and CLI password add/change currently
-returns to the fixed default even when the authenticated slot is stronger.
-Bounded creation-time ops calibration toward 250–750 ms, an independent RPC
-creation cap, and no-downgrade rewrap selection remain explicit pre-alpha
-release gates. Readers validate a resource ceiling before calling sodium.
+Normal creation now fixes memory at 64 MiB and process-caches an ops-only
+selection over 3–20 operations toward a 250–750 ms dummy-input KDF measurement.
+Explicit RPC creation is independently capped to the same operations range and
+exact memory value; it cannot consume the broader 1 GiB reader allowance.
+Password add/change retains the componentwise stronger values from the
+authenticated slot within reader limits. Synthetic selection tests avoid wall-
+clock flakiness, and real Linux CLI processes cover calibrated init/import plus
+strong-slot rewrap. Native timing/resource evidence remains a release gate.
 
 ## Build and supply-chain checks
 

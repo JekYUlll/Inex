@@ -172,6 +172,13 @@ found through `PATH`. Passwords are never accepted as arguments or environment
 must opt into bounded stdin with `INEX_PASSWORD_STDIN=1`; protect the supplying
 process, pipe, and logs.
 
+`init`, real copy import, and password add/change may pause while Inex performs
+or reuses a process-local Argon2id calibration. The 250–750 ms target is for one
+dummy-input KDF measurement; the complete command also performs the real KDF,
+atomic metadata commit, and authenticated reopen and can take longer. v1 keeps
+creation memory at 64 MiB. Password add/change will not lower either work-factor
+component of the slot used to authenticate the command.
+
 ### Locked structural verification
 
 ```sh
@@ -213,6 +220,11 @@ terminal. A password change never rewrites EDRY document blobs. If output says
 the new slot was committed but old-slot retirement was deferred, do not repeat
 the whole change blindly: retain the printed new-slot UUID, prove it unlocks,
 then remove the old slot explicitly.
+
+The new slot uses at least the calibrated v1 baseline and at least the
+operations and memory costs of the authenticated old slot. A stronger
+reader-compatible slot can therefore make add/change slower than fresh vault
+creation; Inex preserves that cost instead of silently downgrading it.
 
 Changing or removing a password slot is **not revocation**. The master key stays
 the same, so an old password plus an old `vault.json` from Git history or backup

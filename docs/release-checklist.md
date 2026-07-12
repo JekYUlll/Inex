@@ -27,10 +27,10 @@ Status terms in this document mean:
 
 | Area | Status | Evidence and exact boundary |
 |------|--------|-----------------------------|
-| Linux Rust workspace | verified source checkpoint | 307/307 workspace tests pass with index-CAS v4, native force-kill atomic-write, pre-lock ownership, and exact runtime-info regressions, plus rustfmt, all-target/all-feature pedantic Clippy with warnings denied, rustdoc warnings denied, and whitespace checks |
+| Linux Rust workspace | verified source checkpoint | 325/325 workspace tests pass with calibrated Argon2id creation/rewrap, index-CAS v4, native force-kill atomic-write, pre-lock ownership, and exact runtime-info regressions, plus rustfmt, all-target/all-feature pedantic Clippy with warnings denied, rustdoc warnings denied, and whitespace checks |
 | EDRY/vault compatibility | checkpoint | Frozen v1 fixture rebuild/unlock/decrypt and broad format/path/tamper tests pass on Linux; Windows GNU compiles and earlier Wine suites pass, but this is not native Windows evidence |
 | Import | verified checkpoint | Copy-only absent-destination staging, re-open/seal/allowlist/publication, source-preservation, and failure-class tests pass. The historical strict-v1 artifact from `40ff728` also imports a five-document synthetic tree including exact 16 MiB content, preserves every source hash, and produces no plaintext Markdown in the vault; it predates later core/Git changes, while publication ambiguity and native-platform fault cases remain pending |
-| Argon2id creation policy | incomplete | Normal CLI/core creation is still fixed at 3 operations and 64 MiB rather than calibrated toward 250–750 ms. Explicit RPC creation shares the broader reader ceiling, and CLI password add/change can select weaker parameters than a stronger authenticated slot. Bounded calibration, a separate creation cap, and no-downgrade rewrap remain release gates |
+| Argon2id creation policy | verified Linux source checkpoint | Default create/init/import process-cache an ops-only 3–20 calibration at fixed 64 MiB toward a 250–750 ms dummy-input KDF measurement. Explicit RPC creation uses the independent 3–20/exact-64-MiB cap and fails before root creation; reader compatibility remains 20/1 GiB. Core and real CLI process tests prove password add/change retains both stronger authenticated components. Native host timing/resource behavior remains pending |
 | Git | verified Linux fail-closed source checkpoint | Locked-safe driver, local installer, encrypted diff3, fixed tree provenance, full-width SHA-1/SHA-256, detected/split rename/modify, and legacy v1/v2/v3 recovery pass. New v4 transactions publish a canonical pre-lock reservation plus initial/final ownership receipts before holding the real `.git/index.lock`; Linux regressions cover orphan/partial/wrong-case/link/foreign state, pre-lock winner, lock-held Git failure, marker/candidate/published recovery, target drift, and foreign-lock preservation. A kill between candidate mutation and its matching receipt is detected and preserved as `RecoveryConflict`, not automatically recovered. Native Windows abrupt-kill/power-loss, ref-only concurrency, and legacy recovery CAS remain pending |
 | VS Code unit/bundle | verified checkpoint | Strict TypeScript, 23/23 Node tests, production bundle, and integration bundle pass |
 | VS Code Extension Host | partial | The current local build and 1.125.0 directly drive the production create/folder-create/file-rename/file-delete actions plus encrypted backup/recovery against the daemon/custom editor. Close refusal, rename collision, Unix delete-I/O failure recovery, command registration, and isolated-root residue pass. InputBox/QuickPick mouse interaction is not automated, and test-mode workbench storage is in-memory, so persistent cross-process restore/Local History is unproven |
@@ -62,10 +62,11 @@ These are not documentation polish items; each changes the release decision:
    mutation are not covered by the v4 index lock. Keep the supported
    operational rule that other Git is stopped until those cases have binding
    evidence.
-5. Implement bounded creation-time Argon2id calibration toward 250–750 ms with
-   the v1 memory/parallelism contract, cap explicit RPC creation independently
-   from the reader ceiling, and ensure password add/change never silently
-   downgrades the authenticated slot's work factors.
+5. Repeat the bounded Argon2id creation/explicit-cap/no-downgrade matrix on each
+   native release target, recording hosts that select the 3/20 operation bounds
+   or an interior above-window fallback because the preferred single-KDF window
+   cannot be observed. Do not describe 250–750 ms as an end-to-end command
+   latency SLA.
 6. Build and smoke all four intended platform artifacts on their native target:
    Linux x64/arm64 and Windows x64/arm64. Verify executable architecture and
    dynamic/static native-library expectations, not only archive names.

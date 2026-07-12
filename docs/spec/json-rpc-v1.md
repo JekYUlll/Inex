@@ -44,7 +44,7 @@ session values all return `SESSION_INVALID`; their shape is not an oracle.
 | `system.hello` | `client`, `clientVersion`, `protocolMajor` | server/version/capabilities |
 | `system.ping` | optional `session` | monotonic health information; an authenticated ping renews idle allowance |
 | `system.shutdown` | none | acknowledgement, then wipe and exit |
-| `vault.create` | `vaultPath`, `password`, optional KDF policy | vault id and warnings |
+| `vault.create` | `vaultPath`, `password`, optional explicit KDF parameters | vault id and warnings |
 | `vault.unlock` | `vaultPath`, `password`, optional `slotId` | session, vault id, expiry, warnings |
 | `vault.lock` | `session` | acknowledgement |
 | `vault.status` | `session` | vault id, counts, expiry; no key data |
@@ -93,6 +93,17 @@ unpadded base64url.
 | `search.query` | `session`, `query`, optional `limit`, `caseSensitive`, and `snippetByteLimit` |
 | `cache.evict` | `session`, optional file `logicalPath` |
 
+When `vault.create.kdf` is absent, the daemon uses the process-cached v1
+ops-only calibration: fixed 64 MiB, parallelism one, and operations selected
+within 3–20 toward a 250–750 ms single-KDF measurement. An explicit object must
+use `opsLimit` 3–20 and `memLimitBytes` exactly 67108864. Nonnegative
+u64-shaped integer values outside that independent creation cap return
+`KDF_POLICY`; negative numbers, fractions, strings, missing/unknown members, and
+other malformed values return `INVALID_PARAMS`. The broader 1 GiB reader
+ceiling is never an RPC creation allowance. If host calibration for an absent
+`kdf` fails, the method returns standard `INTERNAL_ERROR` and creates no vault
+root.
+
 `vault.listTree` applies a conservative serialized-response budget while
 building results. A legal but exceptionally large tree returns
 `LIMIT_EXCEEDED` rather than constructing a response that the 24 MiB framing
@@ -129,7 +140,7 @@ Application errors occupy `-32000` through `-32099`.
 | -32007 | `INTEGRITY_FAILED` | EDRY parse/authentication/path binding failed |
 | -32008 | `LIMIT_EXCEEDED` | request/content/result exceeds configured limit |
 | -32009 | `IO_FAILED` | safe storage operation failed |
-| -32010 | `KDF_POLICY` | requested parameters violate policy/host bounds |
+| -32010 | `KDF_POLICY` | explicit creation parameters violate the independent creation policy |
 | -32011 | `UNSUPPORTED` | known feature is unavailable on this build/platform |
 | -32012 | `BUSY` | conflicting vault mutation is already in progress |
 

@@ -56,10 +56,23 @@ Passwords are exact UTF-8 bytes: implementations do not trim or Unicode
 normalize them. v1 accepts 1–1024 bytes.
 
 The KEK is the 32-byte result of libsodium `crypto_pwhash` with the explicit
-Argon2id13 algorithm, slot salt, `opsLimit`, and `memLimitBytes`. New vaults use
-at least 64 MiB and ops limit 3, with optional creation-time calibration toward
-250–750 ms. Before invoking the KDF, readers enforce configured resource upper
-bounds (v1 defaults: 1 GiB and ops limit 20) to prevent metadata-triggered OOM.
+Argon2id13 algorithm, slot salt, `opsLimit`, and `memLimitBytes`. Production v1
+creation fixes memory at 64 MiB and parallelism at one, then process-caches an
+ops-only calibration over 3–20 operations using a public dummy password and
+salt. It prefers a measured point in the 250–750 ms window. If that is not
+observed, it selects the minimum when the floor is already slow, the maximum
+when the complete range is too fast, or a measured above-window point when a
+discrete step skips the window. The selected values are stored in the slot.
+This window describes one calibration KDF measurement, not
+the end-to-end duration of create/import, which also wraps, commits, and
+re-authenticates metadata.
+
+Under the default production policy, direct and RPC new-vault parameters have
+a separate creation cap: 3–20 operations and exactly 64 MiB. Readers remain broader for compatibility
+(default ceiling: 1 GiB and operations limit 20) and enforce that ceiling
+before KDF allocation. Password add/change takes the componentwise maximum of
+the calibrated baseline and the currently authenticated slot; a stronger
+reader-safe slot is therefore retained rather than silently downgraded.
 
 The KEK wraps one random 32-byte master key using
 XChaCha20-Poly1305-IETF. Wrap AAD is deterministic CBOR over this ordered tuple:

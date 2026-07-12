@@ -277,6 +277,11 @@ and understood.
 ## Password operation recovery
 
 Adding or changing a password commits a fresh slot before removing an old one.
+Before the new password is read, the CLI obtains the process-cached v1
+calibration and combines it with the authenticated slot component by component.
+The new slot cannot have lower operations or memory cost than that slot while
+the values remain reader-safe; this is independent from the stricter 64 MiB
+new-vault creation cap.
 The expected successful sequence is:
 
 1. new slot metadata is atomically written and independently unlocked;

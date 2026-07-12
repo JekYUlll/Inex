@@ -25,8 +25,11 @@
 - Password slots use Argon2id-derived wrapping keys around a stable random
   vault master key. Adding, changing, or removing a password slot does not
   rewrite EDRY bodies and is not master-key rotation. This describes the key
-  hierarchy only; the current creation/rewrap parameter policy still has the
-  deferred gates listed below.
+  hierarchy only; old metadata plus an old password still defeats revocation.
+- New-vault creation process-caches an ops-only Argon2id calibration over 3–20
+  operations at fixed 64 MiB toward a 250–750 ms dummy-input KDF measurement.
+  Explicit RPC creation uses the same independent cap, and password add/change
+  preserves stronger authenticated slot parameters within reader limits.
 - Logical paths are canonicalized and authenticated. File rename therefore
   decrypts and re-encrypts under the new authenticated path instead of moving
   ciphertext blindly.
@@ -69,10 +72,6 @@ ReFS, physical power loss, signed distribution, or independent legal review.
   real InputBox/QuickPick UI matrix remain release gates on Linux and Windows.
 - Sublime remains experimental until its exact-package, persistent-profile,
   export/macro/clipboard/draft/crash matrix passes on every advertised OS.
-- Host-calibrated Argon2id creation toward 250–750 ms, an explicit RPC
-  creation cap separate from the reader ceiling, and no-downgrade password
-  rewrap selection are not implemented in this checkpoint. Normal creation
-  and CLI rewrap currently use the fixed 3-operation/64 MiB default.
 - Directory rename/delete, attachment streaming, filename encryption,
   master-key rotation, in-place plaintext conversion, shared daemon sessions,
   and native Search-sidebar integration are not supported in v1.

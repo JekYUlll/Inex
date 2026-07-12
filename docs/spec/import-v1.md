@@ -13,7 +13,10 @@ are intentionally unsupported.
   removes a source entry.
 - `--dry-run` performs source/target validation only. It does not prompt for a
   password, create a directory, unlock a vault, or perform KDF work.
-- A real import prompts for and confirms a new password. It reserves a sibling
+- A real import first completes or reuses the process-cached v1 Argon2id
+  ops-only calibration, before reading the new password or reserving staging.
+  The 250–750 ms target applies to one calibration KDF measurement, not the
+  complete import. It then prompts for and confirms a new password and reserves a sibling
   named `.inex-import-staging-<random>` with one create-only directory
   operation; a pre-existing directory is never initialized. Its filesystem
   identity is retained, and the random name is not printed until creation has

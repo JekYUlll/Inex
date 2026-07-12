@@ -73,6 +73,15 @@ change existing slots. Journal files bind to a master-key epoch, not a password
 slot. Password changes therefore modify `vault.json` only. A future master-key
 rotation increments the epoch and explicitly rewrites all files.
 
+Production creation calibrates only Argon2id `opsLimit`, once per process,
+against a public dummy input. v1 fixes memory at 64 MiB and parallelism at one,
+searches operations 3–20 toward a 250–750 ms single-KDF measurement, and stores
+the selected parameters in the new slot. Explicit new-vault APIs use that same
+independent cap, while readers accept the broader compatibility ceiling.
+Password add/change takes the componentwise maximum of the calibrated baseline
+and the slot that authenticated the session, so rewrapping cannot silently
+weaken a stronger slot.
+
 ## Save transaction
 
 1. Validate session, logical path, UTF-8, size, and caller's expected etag.

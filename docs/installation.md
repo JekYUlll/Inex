@@ -178,6 +178,13 @@ but it is needed to disambiguate slots after adding passwords. Both editor
 clients can now create the first encrypted Markdown document and folders; their
 file-management limits are documented in [the user guide](user-guide.md).
 
+The real import and `init` perform an ops-only Argon2id calibration before
+reading the new password. v1 fixes memory at 64 MiB and parallelism at one and
+selects operations 3–20 toward a 250–750 ms single-KDF measurement. The full
+command takes longer because it then derives the real KEK, commits metadata,
+and reopens the vault for authentication. Native-platform timing and resource
+availability remain part of the release matrix.
+
 ## Initialize Git in each clone
 
 After import or init:

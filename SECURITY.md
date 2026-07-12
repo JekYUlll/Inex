@@ -175,12 +175,14 @@ survive an abrupt exit.
 - Authentication: the canonical EDRY header, including vault identity and
   normalized logical path, is associated data.
 
-The current normal creation path still uses fixed `opsLimit=3` and 64 MiB
-rather than host calibration toward 250–750 ms. RPC callers can currently
-request creation parameters up to the broader reader ceiling, and CLI password
-add/change returns to the fixed default even when the authenticated slot is
-stronger. Bounded creation calibration, an independent RPC creation cap, and
-no-downgrade rewrap selection remain pre-alpha release gates.
+Normal creation now process-caches a public-dummy-input, ops-only calibration
+over 3–20 operations at fixed 64 MiB, targeting a 250–750 ms single KDF
+measurement. Explicit RPC creation has the same independent cap rather than the
+broader reader ceiling. Password add/change preserves the componentwise
+stronger values of the authenticated slot within reader limits. Deterministic
+core/handler tests plus real Linux CLI and daemon process tests cover these
+paths; native platform timing and resource behavior remain release evidence
+gates.
 
 Changing a password rewraps the stable master key and does not rewrite journal
 files. Master-key rotation is represented by a key epoch and is a distinct,
