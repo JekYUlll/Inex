@@ -133,6 +133,8 @@ pub const MINIMUM_ARGON2ID_PARAMS: Argon2idParams = Argon2idParams {
 
 /// Fixed Argon2id memory cost for calibrated v1 vault creation.
 pub const V1_ARGON2ID_CALIBRATION_MEM_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
+/// Fixed Argon2id parallelism recorded for calibrated v1 vault creation.
+pub const V1_ARGON2ID_CALIBRATION_PARALLELISM: u32 = 1;
 /// Smallest Argon2id operations cost considered by v1 calibration.
 pub const V1_ARGON2ID_CALIBRATION_MIN_OPS_LIMIT: u64 = 3;
 /// Largest Argon2id operations cost considered by v1 calibration.
@@ -154,7 +156,7 @@ pub const VAULT_ARGON2ID_READER_LIMITS: Argon2idLimits = Argon2idLimits {
 };
 
 static SODIUM_INIT: OnceLock<Result<SodiumVersion, SodiumError>> = OnceLock::new();
-static ARGON2ID_CALIBRATION: OnceLock<Result<Argon2idParams, SodiumError>> = OnceLock::new();
+static ARGON2ID_CALIBRATION: OnceLock<Result<Argon2idCalibration, SodiumError>> = OnceLock::new();
 
 /// Errors raised by the narrow libsodium boundary.
 ///
@@ -259,6 +261,78 @@ pub struct Argon2idParams {
     pub ops_limit: u64,
     /// Memory cost in bytes, represented as a wire-friendly `u64`.
     pub mem_limit_bytes: u64,
+}
+
+/// Public evidence captured by one bounded Argon2id v1 calibration decision.
+///
+/// The timed input is the fixed public v1 dummy profile, never a caller
+/// password. `selected_elapsed` is the observation used for the selected
+/// decision point; it is not an end-to-end vault-operation service level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Argon2idCalibration {
+    /// Selected operations and fixed-memory work factors.
+    params: Argon2idParams,
+    /// Observed duration for the selected public-dummy KDF measurement.
+    selected_elapsed: Duration,
+    /// Number of public-dummy KDF measurements made by the bounded search.
+    measurement_count: u32,
+    /// Classification of the selected point relative to the target window.
+    outcome: Argon2idCalibrationOutcome,
+}
+
+/// Why the bounded Argon2id v1 search selected its reported point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Argon2idCalibrationOutcome {
+    /// The selected observation was inside the inclusive target window.
+    TargetWindow,
+    /// The permitted minimum was already above the target window.
+    MinimumAboveWindow,
+    /// The selected interior fallback observation was above the window.
+    InteriorAboveWindow,
+    /// The permitted maximum was selected above the window.
+    MaximumAboveWindow,
+    /// Every measured point through the permitted maximum was below the window.
+    MaximumBelowWindow,
+}
+
+impl Argon2idCalibrationOutcome {
+    /// Stable report spelling used by the CLI and release evidence tooling.
+    #[must_use]
+    pub const fn report_name(self) -> &'static str {
+        match self {
+            Self::TargetWindow => "target-window",
+            Self::MinimumAboveWindow => "minimum-above-window",
+            Self::InteriorAboveWindow => "interior-above-window",
+            Self::MaximumAboveWindow => "maximum-above-window",
+            Self::MaximumBelowWindow => "maximum-below-window",
+        }
+    }
+}
+
+impl Argon2idCalibration {
+    /// Selected operations and fixed-memory work factors.
+    #[must_use]
+    pub const fn params(self) -> Argon2idParams {
+        self.params
+    }
+
+    /// Observed duration used for the selected public-dummy decision point.
+    #[must_use]
+    pub const fn selected_elapsed(self) -> Duration {
+        self.selected_elapsed
+    }
+
+    /// Number of public-dummy KDF measurements made by the bounded search.
+    #[must_use]
+    pub const fn measurement_count(self) -> u32 {
+        self.measurement_count
+    }
+
+    /// Classification of the selected point relative to the target window.
+    #[must_use]
+    pub const fn outcome(self) -> Argon2idCalibrationOutcome {
+        self.outcome
+    }
 }
 
 /// Caller-selected validation policy for Argon2id work factors.
@@ -867,28 +941,26 @@ pub fn derive_kek_argon2id13(
     }
 }
 
-/// Return the process-cached v1 Argon2id creation calibration.
+/// Return the process-cached public evidence for v1 creation calibration.
 ///
 /// The only measured input is a fixed, public dummy password and salt. The
 /// result (including a calibration failure) is initialized at most once per
 /// process. No caller password is observed by the timing loop.
-pub(crate) fn calibrated_argon2id_params() -> Result<Argon2idParams, SodiumError> {
-    ARGON2ID_CALIBRATION
-        .get_or_init(calibrate_argon2id_params)
-        .clone()
+pub(crate) fn calibrated_argon2id_calibration() -> Result<Argon2idCalibration, SodiumError> {
+    ARGON2ID_CALIBRATION.get_or_init(calibrate_argon2id).clone()
 }
 
-fn calibrate_argon2id_params() -> Result<Argon2idParams, SodiumError> {
-    calibrate_argon2id_params_in_range(
+fn calibrate_argon2id() -> Result<Argon2idCalibration, SodiumError> {
+    calibrate_argon2id_calibration_in_range(
         V1_ARGON2ID_CALIBRATION_MIN_OPS_LIMIT,
         V1_ARGON2ID_CALIBRATION_MAX_OPS_LIMIT,
     )
 }
 
-pub(crate) fn calibrate_argon2id_params_in_range(
+pub(crate) fn calibrate_argon2id_calibration_in_range(
     min_ops_limit: u64,
     max_ops_limit: u64,
-) -> Result<Argon2idParams, SodiumError> {
+) -> Result<Argon2idCalibration, SodiumError> {
     const DUMMY_PASSWORD: &[u8] = b"Inex Argon2id calibration";
     const DUMMY_SALT: [u8; ARGON2ID_SALT_BYTES] = *b"INEX-CALIB-V1!!!";
 
@@ -898,7 +970,7 @@ pub(crate) fn calibrate_argon2id_params_in_range(
         min_mem_limit_bytes: V1_ARGON2ID_CALIBRATION_MEM_LIMIT_BYTES,
         max_mem_limit_bytes: V1_ARGON2ID_CALIBRATION_MEM_LIMIT_BYTES,
     };
-    calibrate_argon2id_params_with(min_ops_limit, max_ops_limit, |params| {
+    calibrate_argon2id_calibration_with(min_ops_limit, max_ops_limit, |params| {
         let started = Instant::now();
         let derived = derive_kek_argon2id13(DUMMY_PASSWORD, &DUMMY_SALT, params, limits)?;
         let elapsed = started.elapsed();
@@ -915,11 +987,20 @@ pub(crate) fn calibrate_argon2id_params_in_range(
 /// its maximum; if the minimum is already slow it selects that minimum. When a
 /// discrete step jumps over the complete window, the first measured point at
 /// or above the lower target is retained rather than weakening below 250 ms.
+#[cfg(test)]
 pub(crate) fn calibrate_argon2id_params_with(
     min_ops_limit: u64,
     max_ops_limit: u64,
-    mut measure: impl FnMut(Argon2idParams) -> Result<Duration, SodiumError>,
+    measure: impl FnMut(Argon2idParams) -> Result<Duration, SodiumError>,
 ) -> Result<Argon2idParams, SodiumError> {
+    Ok(calibrate_argon2id_calibration_with(min_ops_limit, max_ops_limit, measure)?.params)
+}
+
+pub(crate) fn calibrate_argon2id_calibration_with(
+    min_ops_limit: u64,
+    max_ops_limit: u64,
+    mut measure: impl FnMut(Argon2idParams) -> Result<Duration, SodiumError>,
+) -> Result<Argon2idCalibration, SodiumError> {
     validate_range(
         "Argon2id calibration minimum operations limit",
         min_ops_limit,
@@ -938,13 +1019,25 @@ pub(crate) fn calibrate_argon2id_params_with(
         mem_limit_bytes: V1_ARGON2ID_CALIBRATION_MEM_LIMIT_BYTES,
     };
     let minimum_elapsed = measure(minimum)?;
+    let mut measurement_count = 1;
     if minimum_elapsed >= V1_ARGON2ID_CALIBRATION_TARGET_MIN {
-        return Ok(minimum);
+        let outcome = if minimum_elapsed <= V1_ARGON2ID_CALIBRATION_TARGET_MAX {
+            Argon2idCalibrationOutcome::TargetWindow
+        } else {
+            Argon2idCalibrationOutcome::MinimumAboveWindow
+        };
+        return Ok(Argon2idCalibration {
+            params: minimum,
+            selected_elapsed: minimum_elapsed,
+            measurement_count,
+            outcome,
+        });
     }
 
     let mut low = min_ops_limit + 1;
     let mut high = max_ops_limit;
-    let mut first_above_window = None;
+    let mut lowest_measured_above_window = None;
+    let mut last_below_window = (minimum, minimum_elapsed);
     while low <= high {
         let ops_limit = low + (high - low) / 2;
         let params = Argon2idParams {
@@ -952,20 +1045,47 @@ pub(crate) fn calibrate_argon2id_params_with(
             mem_limit_bytes: V1_ARGON2ID_CALIBRATION_MEM_LIMIT_BYTES,
         };
         let elapsed = measure(params)?;
+        measurement_count += 1;
         if elapsed < V1_ARGON2ID_CALIBRATION_TARGET_MIN {
+            last_below_window = (params, elapsed);
             low = ops_limit + 1;
         } else if elapsed <= V1_ARGON2ID_CALIBRATION_TARGET_MAX {
-            return Ok(params);
+            return Ok(Argon2idCalibration {
+                params,
+                selected_elapsed: elapsed,
+                measurement_count,
+                outcome: Argon2idCalibrationOutcome::TargetWindow,
+            });
         } else {
-            first_above_window = Some(params);
+            lowest_measured_above_window = Some((params, elapsed));
             high = ops_limit - 1;
         }
     }
 
-    Ok(first_above_window.unwrap_or(Argon2idParams {
-        ops_limit: max_ops_limit,
-        mem_limit_bytes: V1_ARGON2ID_CALIBRATION_MEM_LIMIT_BYTES,
-    }))
+    let (params, selected_elapsed, outcome) = lowest_measured_above_window.map_or_else(
+        || {
+            let (params, elapsed) = last_below_window;
+            (
+                params,
+                elapsed,
+                Argon2idCalibrationOutcome::MaximumBelowWindow,
+            )
+        },
+        |(params, elapsed)| {
+            let outcome = if params.ops_limit == max_ops_limit {
+                Argon2idCalibrationOutcome::MaximumAboveWindow
+            } else {
+                Argon2idCalibrationOutcome::InteriorAboveWindow
+            };
+            (params, elapsed, outcome)
+        },
+    );
+    Ok(Argon2idCalibration {
+        params,
+        selected_elapsed,
+        measurement_count,
+        outcome,
+    })
 }
 
 /// Encrypts a message in libsodium's combined XChaCha20-Poly1305-IETF mode.
@@ -1352,6 +1472,140 @@ mod tests {
         .expect("synthetic gap calibration succeeds");
         assert_eq!(gap.ops_limit, 6);
         assert_eq!(gap_ops, vec![3, 12, 7, 5, 6]);
+    }
+
+    #[test]
+    fn argon2id_calibration_evidence_preserves_selected_observation_and_outcome() {
+        let target = calibrate_argon2id_calibration_with(3, 20, |params| {
+            Ok(Duration::from_millis(params.ops_limit * 30))
+        })
+        .expect("synthetic target-window calibration succeeds");
+        assert_eq!(target.params().ops_limit, 12);
+        assert_eq!(target.selected_elapsed(), Duration::from_millis(360));
+        assert_eq!(target.measurement_count(), 2);
+        assert_eq!(target.outcome(), Argon2idCalibrationOutcome::TargetWindow);
+
+        let minimum_above =
+            calibrate_argon2id_calibration_with(3, 20, |_| Ok(Duration::from_millis(900)))
+                .expect("synthetic minimum-above calibration succeeds");
+        assert_eq!(minimum_above.params().ops_limit, 3);
+        assert_eq!(minimum_above.selected_elapsed(), Duration::from_millis(900));
+        assert_eq!(minimum_above.measurement_count(), 1);
+        assert_eq!(
+            minimum_above.outcome(),
+            Argon2idCalibrationOutcome::MinimumAboveWindow
+        );
+
+        let maximum_below =
+            calibrate_argon2id_calibration_with(3, 20, |_| Ok(Duration::from_millis(100)))
+                .expect("synthetic maximum-below calibration succeeds");
+        assert_eq!(maximum_below.params().ops_limit, 20);
+        assert_eq!(maximum_below.selected_elapsed(), Duration::from_millis(100));
+        assert_eq!(maximum_below.measurement_count(), 6);
+        assert_eq!(
+            maximum_below.outcome(),
+            Argon2idCalibrationOutcome::MaximumBelowWindow
+        );
+
+        let maximum_above = calibrate_argon2id_calibration_with(3, 20, |params| {
+            Ok(if params.ops_limit == 20 {
+                Duration::from_millis(900)
+            } else {
+                Duration::from_millis(100)
+            })
+        })
+        .expect("synthetic maximum-above calibration succeeds");
+        assert_eq!(maximum_above.params().ops_limit, 20);
+        assert_eq!(maximum_above.selected_elapsed(), Duration::from_millis(900));
+        assert_eq!(maximum_above.measurement_count(), 6);
+        assert_eq!(
+            maximum_above.outcome(),
+            Argon2idCalibrationOutcome::MaximumAboveWindow
+        );
+
+        let interior_above = calibrate_argon2id_calibration_with(3, 20, |params| {
+            Ok(if params.ops_limit <= 5 {
+                Duration::from_millis(100)
+            } else {
+                Duration::from_millis(900)
+            })
+        })
+        .expect("synthetic interior-above calibration succeeds");
+        assert_eq!(interior_above.params().ops_limit, 6);
+        assert_eq!(
+            interior_above.selected_elapsed(),
+            Duration::from_millis(900)
+        );
+        assert_eq!(interior_above.measurement_count(), 5);
+        assert_eq!(
+            interior_above.outcome(),
+            Argon2idCalibrationOutcome::InteriorAboveWindow
+        );
+    }
+
+    #[test]
+    fn argon2id_calibration_target_window_is_inclusive() {
+        for elapsed in [
+            V1_ARGON2ID_CALIBRATION_TARGET_MIN,
+            V1_ARGON2ID_CALIBRATION_TARGET_MAX,
+        ] {
+            let evidence = calibrate_argon2id_calibration_with(3, 20, |_| Ok(elapsed))
+                .expect("target boundary calibration succeeds");
+            assert_eq!(evidence.params().ops_limit, 3);
+            assert_eq!(evidence.selected_elapsed(), elapsed);
+            assert_eq!(evidence.measurement_count(), 1);
+            assert_eq!(evidence.outcome(), Argon2idCalibrationOutcome::TargetWindow);
+        }
+    }
+
+    #[test]
+    fn argon2id_calibration_preserves_the_selected_observation_under_noisy_timings() {
+        let mut measured = Vec::new();
+        let evidence = calibrate_argon2id_calibration_with(3, 20, |params| {
+            measured.push(params.ops_limit);
+            Ok(Duration::from_millis(match params.ops_limit {
+                3 => 100,
+                7 => 200,
+                8 => 150,
+                9 => 1_000,
+                12 => 900,
+                other => panic!("unexpected synthetic measurement at ops {other}"),
+            }))
+        })
+        .expect("bounded calibration tolerates noisy observations");
+
+        assert_eq!(measured, vec![3, 12, 7, 9, 8]);
+        assert_eq!(evidence.params().ops_limit, 9);
+        assert_eq!(evidence.selected_elapsed(), Duration::from_secs(1));
+        assert_eq!(evidence.measurement_count(), 5);
+        assert_eq!(
+            evidence.outcome(),
+            Argon2idCalibrationOutcome::InteriorAboveWindow
+        );
+    }
+
+    #[test]
+    fn argon2id_calibration_does_not_infer_unmeasured_nonmonotonic_candidates() {
+        let mut measured = Vec::new();
+        let evidence = calibrate_argon2id_calibration_with(3, 20, |params| {
+            measured.push(params.ops_limit);
+            Ok(if params.ops_limit == 4 {
+                Duration::from_millis(500)
+            } else {
+                Duration::from_millis(100)
+            })
+        })
+        .expect("bounded calibration classifies only measured observations");
+
+        assert_eq!(measured, vec![3, 12, 16, 18, 19, 20]);
+        assert!(!measured.contains(&4));
+        assert_eq!(evidence.params().ops_limit, 20);
+        assert_eq!(evidence.selected_elapsed(), Duration::from_millis(100));
+        assert_eq!(evidence.measurement_count(), 6);
+        assert_eq!(
+            evidence.outcome(),
+            Argon2idCalibrationOutcome::MaximumBelowWindow
+        );
     }
 
     #[test]

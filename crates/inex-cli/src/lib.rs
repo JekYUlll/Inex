@@ -21,7 +21,7 @@ use std::process::{Command as ProcessCommand, ExitCode};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use inex_core::atomic::ParentSyncStatus;
-use inex_core::crypto::calibrated_creation_params;
+use inex_core::crypto::{calibrated_creation_params, creation_calibration_evidence};
 use inex_core::search::{CaseSensitivity, DEFAULT_SEARCH_SNIPPET_BYTES, SearchQuery};
 use inex_core::sodium;
 use inex_core::vault::{PasswordSlotCommit, Vault, VaultError};
@@ -65,6 +65,10 @@ fn run_from_environment() -> Result<ExitCode, AppError> {
         write_runtime_info("inex")?;
         return Ok(ExitCode::SUCCESS);
     }
+    if matches!(cli.command, Command::KdfCalibrationInfo) {
+        write_kdf_calibration_info()?;
+        return Ok(ExitCode::SUCCESS);
+    }
 
     execute(cli.command)
 }
@@ -99,7 +103,7 @@ fn execute(command: Command) -> Result<ExitCode, AppError> {
         Command::MergeDriver { inputs } => Ok(command_merge_driver(inputs)),
         Command::Git(command) => command_git(command),
         Command::Serve => command_serve(),
-        Command::Help | Command::Version | Command::RuntimeInfo => {
+        Command::Help | Command::Version | Command::RuntimeInfo | Command::KdfCalibrationInfo => {
             unreachable!("handled before password input setup")
         }
     }
@@ -123,6 +127,51 @@ fn write_runtime_info(product: &str) -> Result<(), AppError> {
         .and_then(|()| writeln!(stdout, "libsodium-library-major: {}", runtime.library_major))
         .and_then(|()| writeln!(stdout, "libsodium-library-minor: {}", runtime.library_minor))
         .and_then(|()| writeln!(stdout, "libsodium-minimal: {}", runtime.minimal))
+        .and_then(|()| stdout.flush())
+        .map_err(|error| AppError::io(IoOperation::WriteOutput, &error))
+}
+
+fn write_kdf_calibration_info() -> Result<(), AppError> {
+    let evidence = creation_calibration_evidence(KdfPolicy::default()).map_err(VaultError::from)?;
+    let params = evidence.params();
+    let report = format!(
+        "kdf-calibration-info-schema: inex-kdf-calibration-v1\n\
+         product: inex\n\
+         version: {}\n\
+         rust-target: {}\n\
+         rust-debug-assertions: {}\n\
+         algorithm: argon2id13\n\
+         measurement-input: inex-public-dummy-v1\n\
+         cache-scope: process\n\
+         sample-mode: single-per-candidate\n\
+         min-ops-limit: {}\n\
+         max-ops-limit: {}\n\
+         selected-ops-limit: {}\n\
+         mem-limit-bytes: {}\n\
+         parallelism: {}\n\
+         target-min-ns: {}\n\
+         target-max-ns: {}\n\
+         selected-observed-ns: {}\n\
+         measurement-count: {}\n\
+         outcome: {}\n\
+         end-to-end-sla: false\n",
+        env!("CARGO_PKG_VERSION"),
+        sodium::COMPILED_RUST_TARGET,
+        sodium::COMPILED_WITH_DEBUG_ASSERTIONS,
+        sodium::V1_ARGON2ID_CALIBRATION_MIN_OPS_LIMIT,
+        sodium::V1_ARGON2ID_CALIBRATION_MAX_OPS_LIMIT,
+        params.ops_limit,
+        params.mem_limit_bytes,
+        sodium::V1_ARGON2ID_CALIBRATION_PARALLELISM,
+        sodium::V1_ARGON2ID_CALIBRATION_TARGET_MIN.as_nanos(),
+        sodium::V1_ARGON2ID_CALIBRATION_TARGET_MAX.as_nanos(),
+        evidence.selected_elapsed().as_nanos(),
+        evidence.measurement_count(),
+        evidence.outcome().report_name(),
+    );
+    let mut stdout = io::stdout().lock();
+    stdout
+        .write_all(report.as_bytes())
         .and_then(|()| stdout.flush())
         .map_err(|error| AppError::io(IoOperation::WriteOutput, &error))
 }

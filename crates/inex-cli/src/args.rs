@@ -23,6 +23,7 @@ Usage:
   inex git recover <vault> [--slot <uuid>]
   inex serve
   inex runtime-info
+  inex kdf-calibration-info
   inex --help
   inex --version
 
@@ -110,6 +111,7 @@ pub(crate) enum Command {
     Git(GitCommand),
     Serve,
     RuntimeInfo,
+    KdfCalibrationInfo,
     Help,
     Version,
 }
@@ -130,6 +132,7 @@ impl Command {
             Self::Git(GitCommand::Recover { .. }) => "git recover",
             Self::Serve => "serve",
             Self::RuntimeInfo => "runtime-info",
+            Self::KdfCalibrationInfo => "kdf-calibration-info",
             Self::Help => "help",
             Self::Version => "version",
         }
@@ -235,6 +238,7 @@ impl Cli {
             "git" => Command::Git(parse_git(&mut arguments)?),
             "serve" => Command::Serve,
             "runtime-info" | "--runtime-info" => Command::RuntimeInfo,
+            "kdf-calibration-info" => Command::KdfCalibrationInfo,
             "help" | "--help" | "-h" => Command::Help,
             "--version" | "-V" => Command::Version,
             "--password" | "--passphrase" => {
@@ -513,6 +517,12 @@ mod tests {
             })
         ));
         assert!(matches!(
+            Cli::parse(["kdf-calibration-info"]),
+            Ok(Cli {
+                command: Command::KdfCalibrationInfo
+            })
+        ));
+        assert!(matches!(
             Cli::parse(["git", "install-driver", "/vault"]),
             Ok(Cli {
                 command: Command::Git(GitCommand::InstallDriver { .. })
@@ -536,6 +546,25 @@ mod tests {
                 command: Command::MergeDriver { inputs: None }
             })
         ));
+    }
+
+    #[test]
+    fn kdf_calibration_info_rejects_every_argument() {
+        assert_eq!(
+            Cli::parse(["kdf-calibration-info", "/absent-vault"])
+                .expect_err("diagnostic must not accept a vault path"),
+            ArgumentError::UnexpectedArgument
+        );
+        assert_eq!(
+            Cli::parse(["kdf-calibration-info", "--password"])
+                .expect_err("diagnostic must reject password arguments"),
+            ArgumentError::ForbiddenPasswordArgument
+        );
+        assert_eq!(
+            Cli::parse(["kdf-calibration-info", "--ops", "7"])
+                .expect_err("diagnostic must not accept policy overrides"),
+            ArgumentError::UnexpectedArgument
+        );
     }
 
     #[test]

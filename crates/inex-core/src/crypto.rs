@@ -18,7 +18,8 @@ use crate::format::{
 };
 use crate::path::LogicalPath;
 use crate::sodium::{
-    self, Argon2idLimits, Argon2idParams, LockedBytes, SecureMemoryHealth, SodiumError,
+    self, Argon2idCalibration, Argon2idLimits, Argon2idParams, LockedBytes, SecureMemoryHealth,
+    SodiumError,
 };
 use crate::vault_config::{
     ConfigError, ConfigWarning, EncodedBytes, KdfAlgorithm, KdfConfig, KdfPolicy, KeySlot,
@@ -678,14 +679,33 @@ fn compute_metadata_mac(
 /// Returns [`CryptoError`] when `policy` cannot represent the fixed v1
 /// calibration profile or libsodium cannot complete a dummy measurement.
 pub fn calibrated_creation_params(policy: KdfPolicy) -> Result<Argon2idParams, CryptoError> {
+    Ok(creation_calibration_evidence(policy)?.params())
+}
+
+/// Return the public-dummy evidence used by machine-calibrated v1 creation.
+///
+/// The default policy returns the exact process-cached decision that production
+/// creation uses. A custom policy measures only its valid intersection with the
+/// fixed v1 profile. The selected observation includes public parameter
+/// validation, secure output allocation, and Argon2id13 derivation; it does not
+/// time a caller password or represent an end-to-end vault-operation SLA.
+///
+/// # Errors
+///
+/// Returns [`CryptoError`] when `policy` cannot represent the fixed v1
+/// calibration profile or libsodium cannot complete a public-dummy
+/// measurement.
+pub fn creation_calibration_evidence(
+    policy: KdfPolicy,
+) -> Result<Argon2idCalibration, CryptoError> {
     let (min_ops_limit, max_ops_limit) = calibration_ops_bounds(policy)?;
-    let params = if policy == KdfPolicy::default() {
-        sodium::calibrated_argon2id_params()?
+    let evidence = if policy == KdfPolicy::default() {
+        sodium::calibrated_argon2id_calibration()?
     } else {
-        sodium::calibrate_argon2id_params_in_range(min_ops_limit, max_ops_limit)?
+        sodium::calibrate_argon2id_calibration_in_range(min_ops_limit, max_ops_limit)?
     };
-    validate_new_vault_params(params, policy)?;
-    Ok(params)
+    validate_new_vault_params(evidence.params(), policy)?;
+    Ok(evidence)
 }
 
 #[cfg(test)]
@@ -1142,6 +1162,20 @@ mod tests {
         assert!(measured.iter().all(|value| {
             value.mem_limit_bytes == sodium::V1_ARGON2ID_CALIBRATION_MEM_LIMIT_BYTES
         }));
+    }
+
+    #[test]
+    fn default_creation_params_project_the_process_cached_calibration_evidence() {
+        let policy = KdfPolicy::default();
+        let first = creation_calibration_evidence(policy)
+            .expect("default calibration evidence is available");
+        let projected =
+            calibrated_creation_params(policy).expect("default creation parameters are available");
+        let repeated = creation_calibration_evidence(policy)
+            .expect("default calibration evidence remains available");
+
+        assert_eq!(projected, first.params());
+        assert_eq!(repeated, first);
     }
 
     #[test]
