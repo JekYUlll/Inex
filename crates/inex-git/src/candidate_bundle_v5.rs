@@ -4,10 +4,10 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use inex_core::atomic::{
-    AtomicDirectoryPublishError, FilesystemDirectoryIdentity, ParentSyncStatus,
-    VAULT_LOCAL_DIRECTORY, VaultMutationGuard, atomic_move_verified_directory_no_replace_checked,
-    atomic_move_verified_file_no_replace, filesystem_directory_identity,
-    open_file_matches_path_and_is_single_link, sync_directory,
+    AtomicDirectoryPublishError, AtomicFileMoveOutcome, FilesystemDirectoryIdentity,
+    ParentSyncStatus, VAULT_LOCAL_DIRECTORY, VaultMutationGuard,
+    atomic_move_verified_directory_no_replace_checked, atomic_move_verified_file_no_replace,
+    filesystem_directory_identity, open_file_matches_path_and_is_single_link, sync_directory,
 };
 use serde::{Deserialize, Serialize};
 
@@ -189,6 +189,22 @@ pub(super) struct LoadedCandidatePublishStagingV5 {
     pub(super) staging: PreparedCandidatePublishStagingV5,
 }
 
+/// Held proof that the exact canonical v5 marker owns the real Git index lock.
+///
+/// This type deliberately has no `Drop` cleanup. Once the marker is visible at
+/// `.git/index.lock`, only the later durable-journal state machine may advance
+/// or retire it.
+#[allow(
+    dead_code,
+    reason = "the next recovery slice consumes the held real-index-lock proof"
+)]
+#[derive(Debug)]
+pub(super) struct AcquiredIndexLockMarkerV5 {
+    pub(super) marker: CanonicalBytesReferenceV5,
+    scratch_basename: String,
+    file: File,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CandidatePublishStagingCheckpointV5 {
     ScratchCreated,
@@ -226,6 +242,60 @@ pub(super) trait CandidatePublishStagingHooksV5 {
 struct ProductionCandidatePublishStagingHooksV5;
 
 impl CandidatePublishStagingHooksV5 for ProductionCandidatePublishStagingHooksV5 {
+    fn next_token(&mut self) -> String {
+        uuid::Uuid::new_v4().simple().to_string()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum IndexLockMarkerCheckpointV5 {
+    ScratchCreated,
+    MarkerWritten,
+    BeforeMove,
+    CriticalAudit,
+    AfterMove,
+    PostAudit,
+}
+
+#[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "fault hooks inspect these paths only in isolated marker-lock tests"
+)]
+pub(super) struct IndexLockMarkerContextV5<'a> {
+    pub(super) root: &'a Path,
+    pub(super) local: &'a Path,
+    pub(super) git_directory: &'a Path,
+    pub(super) stable_path: &'a Path,
+    pub(super) publish_path: &'a Path,
+    pub(super) scratch_path: &'a Path,
+    pub(super) lock_path: &'a Path,
+}
+
+pub(super) trait IndexLockMarkerHooksV5 {
+    fn next_token(&mut self) -> String;
+
+    fn checkpoint(
+        &mut self,
+        _checkpoint: IndexLockMarkerCheckpointV5,
+        _context: &IndexLockMarkerContextV5<'_>,
+    ) -> Result<(), GitError> {
+        Ok(())
+    }
+
+    fn move_marker(
+        &mut self,
+        source: &Path,
+        source_file: &File,
+        destination: &Path,
+    ) -> io::Result<AtomicFileMoveOutcome> {
+        atomic_move_verified_file_no_replace(source, source_file, destination)
+    }
+}
+
+struct ProductionIndexLockMarkerHooksV5;
+
+impl IndexLockMarkerHooksV5 for ProductionIndexLockMarkerHooksV5 {
     fn next_token(&mut self) -> String {
         uuid::Uuid::new_v4().simple().to_string()
     }
@@ -988,8 +1058,20 @@ fn create_private_publish_scratch_file_v5<H: CandidatePublishStagingHooksV5>(
     local: &Path,
     hooks: &mut H,
 ) -> Result<(String, PathBuf, File), GitError> {
+    create_private_retained_scratch_file_v5(guard, git, local, || hooks.next_token())
+}
+
+fn create_private_retained_scratch_file_v5<F>(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    local: &Path,
+    mut next_token: F,
+) -> Result<(String, PathBuf, File), GitError>
+where
+    F: FnMut() -> String,
+{
     for _ in 0..MAX_SCRATCH_TOKEN_ATTEMPTS_V5 {
-        let token = hooks.next_token();
+        let token = next_token();
         let scratch_basename = candidate_bundle_scratch_basename_v5(&token)?;
         let scratch_path = candidate_bundle_scratch_path_v5(&git.root, &scratch_basename)?;
         let mut options = OpenOptions::new();
@@ -1365,6 +1447,302 @@ fn load_candidate_publish_staging_v5_impl(
         },
         inventory,
     })
+}
+
+fn verify_held_index_lock_marker_file_v5(
+    path: &Path,
+    file: &File,
+    reference: &CandidateBundleTransactionReferenceV5,
+) -> Result<CanonicalBytesReferenceV5, GitError> {
+    if !open_file_matches_path_and_is_single_link(path, file)
+        .map_err(|_| GitError::RecoveryConflict)?
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    let (bytes, reopened) = read_single_link_regular(path, MAX_INDEX_LOCK_MARKER_BYTES_V5, false)
+        .map_err(|_| GitError::RecoveryConflict)?;
+    if bytes != index_lock_marker_bytes_v5(reference)?
+        || !open_file_matches_path_and_is_single_link(path, &reopened)
+            .map_err(|_| GitError::RecoveryConflict)?
+        || !open_file_matches_path_and_is_single_link(path, file)
+            .map_err(|_| GitError::RecoveryConflict)?
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    canonical_bytes_reference_v5(&bytes)
+}
+
+fn require_absent_index_lock_v5(
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+    inventory: &InventoryVerifiedCandidateBundleV5,
+) -> Result<(), GitError> {
+    match classify_index_lock_v5(&git.root, reference, inventory)? {
+        IndexLockStateV5::Absent => Ok(()),
+        IndexLockStateV5::Foreign => Err(GitError::IndexChanged),
+        IndexLockStateV5::Marker | IndexLockStateV5::Candidate => Err(GitError::RecoveryConflict),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn audit_index_lock_marker_before_move_v5(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+    inventory: &InventoryVerifiedCandidateBundleV5,
+    publish: &PreparedCandidatePublishStagingV5,
+    scratch_path: &Path,
+    scratch_file: &File,
+) -> Result<(), GitError> {
+    let local = git.root.join(VAULT_LOCAL_DIRECTORY);
+    validate_local_directory(&local)?;
+    validate_local_directory(&git.root.join(".git"))?;
+    if !guard.is_for_root(&git.root) {
+        return Err(GitError::RecoveryConflict);
+    }
+    revalidate_candidate_publish_staging_v5(guard, git, reference, inventory, publish)?;
+    verify_held_index_lock_marker_file_v5(scratch_path, scratch_file, reference)?;
+    require_absent_index_lock_v5(git, reference, inventory)?;
+    verify_held_index_lock_marker_file_v5(scratch_path, scratch_file, reference)?;
+    if !guard.is_for_root(&git.root) {
+        return Err(GitError::RecoveryConflict);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn audit_acquired_index_lock_marker_v5(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+    inventory: &InventoryVerifiedCandidateBundleV5,
+    publish: &PreparedCandidatePublishStagingV5,
+    scratch_path: &Path,
+    lock_path: &Path,
+    lock_file: &File,
+) -> Result<CanonicalBytesReferenceV5, GitError> {
+    let local = git.root.join(VAULT_LOCAL_DIRECTORY);
+    validate_local_directory(&local)?;
+    validate_local_directory(&git.root.join(".git"))?;
+    if !guard.is_for_root(&git.root) || !path_entry_is_absent(scratch_path)? {
+        return Err(GitError::RecoveryConflict);
+    }
+    let marker = verify_held_index_lock_marker_file_v5(lock_path, lock_file, reference)?;
+    if classify_index_lock_v5(&git.root, reference, inventory)? != IndexLockStateV5::Marker {
+        return Err(GitError::RecoveryConflict);
+    }
+    revalidate_candidate_publish_staging_v5(guard, git, reference, inventory, publish)?;
+    let rebound_marker = verify_held_index_lock_marker_file_v5(lock_path, lock_file, reference)?;
+    if rebound_marker != marker
+        || !guard.is_for_root(&git.root)
+        || !path_entry_is_absent(scratch_path)?
+        || !open_file_matches_path_and_is_single_link(lock_path, lock_file)
+            .map_err(|_| GitError::RecoveryConflict)?
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    Ok(marker)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconcile_index_lock_marker_move_error_v5(
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+    inventory: &InventoryVerifiedCandidateBundleV5,
+    local: &Path,
+    scratch_path: &Path,
+    lock_path: &Path,
+    scratch_file: &File,
+    error: &io::Error,
+) -> Result<(), GitError> {
+    let source_matches =
+        open_file_matches_path_and_is_single_link(scratch_path, scratch_file).unwrap_or(false);
+    let destination_matches =
+        open_file_matches_path_and_is_single_link(lock_path, scratch_file).unwrap_or(false);
+    let source_absent = path_entry_is_absent(scratch_path).unwrap_or(false);
+    let lock_state = classify_index_lock_v5(&git.root, reference, inventory)
+        .map_err(|_| GitError::RecoveryConflict)?;
+
+    if source_absent && destination_matches && lock_state == IndexLockStateV5::Marker {
+        sync_directory(local).map_err(|_| GitError::DurabilityNotConfirmed)?;
+        sync_directory(&git.root.join(".git")).map_err(|_| GitError::DurabilityNotConfirmed)?;
+        return Ok(());
+    }
+    if source_matches && lock_state == IndexLockStateV5::Absent {
+        return if error.kind() == io::ErrorKind::AlreadyExists {
+            Err(GitError::IndexChanged)
+        } else {
+            Err(io_error(GitIoOperation::SyncGitState, error))
+        };
+    }
+    if source_matches && lock_state == IndexLockStateV5::Foreign {
+        return Err(GitError::IndexChanged);
+    }
+    Err(GitError::RecoveryConflict)
+}
+
+/// Acquires the real Git index lock with the canonical v5 marker.
+///
+/// The marker is first written and synchronized in a random retained scratch
+/// file, then moved without replacement after rebinding every stable/publish
+/// proof and the live expected-old index. This helper never writes a journal,
+/// worktree file, candidate index, or live index. Once the marker becomes
+/// visible it is never removed here, including on post-move failures.
+#[allow(
+    dead_code,
+    reason = "the next recovery slice consumes the bounded marker acquisition helper"
+)]
+pub(super) fn acquire_index_lock_marker_v5(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+    inventory: &InventoryVerifiedCandidateBundleV5,
+    publish: &PreparedCandidatePublishStagingV5,
+) -> Result<AcquiredIndexLockMarkerV5, GitError> {
+    let mut hooks = ProductionIndexLockMarkerHooksV5;
+    acquire_index_lock_marker_v5_impl(guard, git, reference, inventory, publish, &mut hooks)
+}
+
+#[cfg(test)]
+pub(super) fn acquire_index_lock_marker_v5_with_hooks<H: IndexLockMarkerHooksV5>(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+    inventory: &InventoryVerifiedCandidateBundleV5,
+    publish: &PreparedCandidatePublishStagingV5,
+    hooks: &mut H,
+) -> Result<AcquiredIndexLockMarkerV5, GitError> {
+    acquire_index_lock_marker_v5_impl(guard, git, reference, inventory, publish, hooks)
+}
+
+#[allow(clippy::too_many_lines)]
+fn acquire_index_lock_marker_v5_impl<H: IndexLockMarkerHooksV5>(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+    inventory: &InventoryVerifiedCandidateBundleV5,
+    publish: &PreparedCandidatePublishStagingV5,
+    hooks: &mut H,
+) -> Result<AcquiredIndexLockMarkerV5, GitError> {
+    validate_reference_inventory_binding_v5(reference, inventory)?;
+    revalidate_candidate_publish_staging_v5(guard, git, reference, inventory, publish)?;
+    require_absent_index_lock_v5(git, reference, inventory)?;
+
+    let marker_bytes = index_lock_marker_bytes_v5(reference)?;
+    let expected_marker = canonical_bytes_reference_v5(&marker_bytes)?;
+    let local = git.root.join(VAULT_LOCAL_DIRECTORY);
+    let git_directory = git.root.join(".git");
+    validate_local_directory(&local)?;
+    validate_local_directory(&git_directory)?;
+    let stable_path = candidate_bundle_stable_path_v5(&git.root, &reference.bundle_basename)?;
+    let publish_path =
+        candidate_bundle_publish_path_v5(&git.root, &reference.publish_staging_basename)?;
+    let (scratch_basename, scratch_path, mut scratch_file) =
+        create_private_retained_scratch_file_v5(guard, git, &local, || hooks.next_token())?;
+    let lock_path = index_lock_path(&git.root);
+    let context = IndexLockMarkerContextV5 {
+        root: &git.root,
+        local: &local,
+        git_directory: &git_directory,
+        stable_path: &stable_path,
+        publish_path: &publish_path,
+        scratch_path: &scratch_path,
+        lock_path: &lock_path,
+    };
+    hooks.checkpoint(IndexLockMarkerCheckpointV5::ScratchCreated, &context)?;
+
+    scratch_file
+        .write_all(&marker_bytes)
+        .and_then(|()| scratch_file.flush())
+        .and_then(|()| scratch_file.sync_all())
+        .map_err(|error| io_error(GitIoOperation::SyncGitState, &error))?;
+    sync_directory(&local).map_err(|_| GitError::DurabilityNotConfirmed)?;
+    if verify_held_index_lock_marker_file_v5(&scratch_path, &scratch_file, reference)?
+        != expected_marker
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    hooks.checkpoint(IndexLockMarkerCheckpointV5::MarkerWritten, &context)?;
+    hooks.checkpoint(IndexLockMarkerCheckpointV5::BeforeMove, &context)?;
+    hooks.checkpoint(IndexLockMarkerCheckpointV5::CriticalAudit, &context)?;
+    audit_index_lock_marker_before_move_v5(
+        guard,
+        git,
+        reference,
+        inventory,
+        publish,
+        &scratch_path,
+        &scratch_file,
+    )?;
+
+    let parents_durable = match hooks.move_marker(&scratch_path, &scratch_file, &lock_path) {
+        Ok(outcome) => {
+            outcome.source_parent_sync == ParentSyncStatus::Synced
+                && outcome.destination_parent_sync == ParentSyncStatus::Synced
+        }
+        Err(error) => {
+            reconcile_index_lock_marker_move_error_v5(
+                git,
+                reference,
+                inventory,
+                &local,
+                &scratch_path,
+                &lock_path,
+                &scratch_file,
+                &error,
+            )?;
+            true
+        }
+    };
+    hooks.checkpoint(IndexLockMarkerCheckpointV5::AfterMove, &context)?;
+    let marker = audit_acquired_index_lock_marker_v5(
+        guard,
+        git,
+        reference,
+        inventory,
+        publish,
+        &scratch_path,
+        &lock_path,
+        &scratch_file,
+    )?;
+    hooks.checkpoint(IndexLockMarkerCheckpointV5::PostAudit, &context)?;
+    if !parents_durable {
+        return Err(GitError::DurabilityNotConfirmed);
+    }
+    Ok(AcquiredIndexLockMarkerV5 {
+        marker,
+        scratch_basename,
+        file: scratch_file,
+    })
+}
+
+#[allow(
+    dead_code,
+    reason = "the durable-journal critical audit reuses this held-lock proof"
+)]
+pub(super) fn revalidate_acquired_index_lock_marker_v5(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+    inventory: &InventoryVerifiedCandidateBundleV5,
+    publish: &PreparedCandidatePublishStagingV5,
+    acquired: &AcquiredIndexLockMarkerV5,
+) -> Result<(), GitError> {
+    let scratch_path = candidate_bundle_scratch_path_v5(&git.root, &acquired.scratch_basename)?;
+    let marker = audit_acquired_index_lock_marker_v5(
+        guard,
+        git,
+        reference,
+        inventory,
+        publish,
+        &scratch_path,
+        &index_lock_path(&git.root),
+        &acquired.file,
+    )?;
+    if marker != acquired.marker {
+        return Err(GitError::RecoveryConflict);
+    }
+    Ok(())
 }
 
 const MAX_SCRATCH_TOKEN_ATTEMPTS_V5: usize = 64;

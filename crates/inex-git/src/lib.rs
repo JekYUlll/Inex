@@ -8381,6 +8381,214 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum IndexLockMarkerTestAction {
+        FailAt(candidate_bundle_v5::IndexLockMarkerCheckpointV5),
+        PartialScratch,
+        LiveIndexDrift,
+        StableCloneSwap,
+        PublishCloneSwap,
+        ScratchCloneSwap,
+        LockRebindAfterMove,
+        MoveThenError,
+        MoveErrorBeforeMove,
+        ForeignDuringMove,
+    }
+
+    #[derive(Debug)]
+    struct IndexLockMarkerTestHooks {
+        tokens: VecDeque<String>,
+        action: Option<IndexLockMarkerTestAction>,
+        action_fired: bool,
+        retained_path: Option<PathBuf>,
+    }
+
+    impl IndexLockMarkerTestHooks {
+        fn new(action: Option<IndexLockMarkerTestAction>) -> Self {
+            Self {
+                tokens: VecDeque::new(),
+                action,
+                action_fired: false,
+                retained_path: None,
+            }
+        }
+    }
+
+    impl candidate_bundle_v5::IndexLockMarkerHooksV5 for IndexLockMarkerTestHooks {
+        fn next_token(&mut self) -> String {
+            self.tokens
+                .pop_front()
+                .unwrap_or_else(|| Uuid::new_v4().simple().to_string())
+        }
+
+        #[allow(
+            clippy::too_many_lines,
+            reason = "keep every marker-lock fault mutation in one auditable checkpoint table"
+        )]
+        fn checkpoint(
+            &mut self,
+            checkpoint: candidate_bundle_v5::IndexLockMarkerCheckpointV5,
+            context: &candidate_bundle_v5::IndexLockMarkerContextV5<'_>,
+        ) -> Result<(), GitError> {
+            let Some(action) = self.action else {
+                return Ok(());
+            };
+            if self.action_fired {
+                return Ok(());
+            }
+            let matches = match action {
+                IndexLockMarkerTestAction::FailAt(expected) => checkpoint == expected,
+                IndexLockMarkerTestAction::PartialScratch => {
+                    checkpoint == candidate_bundle_v5::IndexLockMarkerCheckpointV5::ScratchCreated
+                }
+                IndexLockMarkerTestAction::LiveIndexDrift
+                | IndexLockMarkerTestAction::StableCloneSwap
+                | IndexLockMarkerTestAction::PublishCloneSwap
+                | IndexLockMarkerTestAction::ScratchCloneSwap => {
+                    checkpoint == candidate_bundle_v5::IndexLockMarkerCheckpointV5::CriticalAudit
+                }
+                IndexLockMarkerTestAction::LockRebindAfterMove => {
+                    checkpoint == candidate_bundle_v5::IndexLockMarkerCheckpointV5::AfterMove
+                }
+                IndexLockMarkerTestAction::MoveThenError
+                | IndexLockMarkerTestAction::MoveErrorBeforeMove
+                | IndexLockMarkerTestAction::ForeignDuringMove => false,
+            };
+            if !matches {
+                return Ok(());
+            }
+            self.action_fired = true;
+            match action {
+                IndexLockMarkerTestAction::FailAt(_) => {
+                    return Err(GitError::DurabilityNotConfirmed);
+                }
+                IndexLockMarkerTestAction::PartialScratch => {
+                    fs::write(context.scratch_path, b"partial v5 marker scratch")
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    sync_regular_file(context.scratch_path, MAX_GIT_OUTPUT_BYTES)?;
+                    sync_directory(context.local).map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    return Err(GitError::DurabilityNotConfirmed);
+                }
+                IndexLockMarkerTestAction::LiveIndexDrift => {
+                    fs::write(
+                        context.root.join("external-marker-index-owner.bin"),
+                        b"ciphertext-only external marker index owner",
+                    )
+                    .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    if !test_git(context.root, ["add", "external-marker-index-owner.bin"]) {
+                        return Err(GitError::DurabilityNotConfirmed);
+                    }
+                }
+                IndexLockMarkerTestAction::StableCloneSwap => {
+                    let clone = context
+                        .root
+                        .join(format!("foreign-marker-stable-{}", Uuid::new_v4().simple()));
+                    let held = context
+                        .root
+                        .join(format!("held-marker-stable-{}", Uuid::new_v4().simple()));
+                    fs::create_dir(&clone).map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    for member in [
+                        candidate_bundle_v5::CANDIDATE_BUNDLE_INDEX_V5,
+                        candidate_bundle_v5::CANDIDATE_BUNDLE_MANIFEST_V5,
+                    ] {
+                        fs::copy(context.stable_path.join(member), clone.join(member))
+                            .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    }
+                    fs::rename(context.stable_path, &held)
+                        .and_then(|()| fs::rename(&clone, context.stable_path))
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    self.retained_path = Some(held);
+                }
+                IndexLockMarkerTestAction::PublishCloneSwap => {
+                    let held = context
+                        .root
+                        .join(format!("held-marker-publish-{}", Uuid::new_v4().simple()));
+                    let bytes = fs::read(context.publish_path)
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    fs::rename(context.publish_path, &held)
+                        .and_then(|()| fs::write(context.publish_path, bytes))
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    self.retained_path = Some(held);
+                }
+                IndexLockMarkerTestAction::ScratchCloneSwap => {
+                    let held = context
+                        .root
+                        .join(format!("held-marker-scratch-{}", Uuid::new_v4().simple()));
+                    let bytes = fs::read(context.scratch_path)
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    fs::rename(context.scratch_path, &held)
+                        .and_then(|()| fs::write(context.scratch_path, bytes))
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    self.retained_path = Some(held);
+                }
+                IndexLockMarkerTestAction::LockRebindAfterMove => {
+                    let held = context
+                        .root
+                        .join(format!("held-real-index-lock-{}", Uuid::new_v4().simple()));
+                    fs::rename(context.lock_path, &held)
+                        .and_then(|()| fs::write(context.lock_path, b"foreign rebound Git lock"))
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    self.retained_path = Some(held);
+                }
+                IndexLockMarkerTestAction::MoveThenError
+                | IndexLockMarkerTestAction::MoveErrorBeforeMove
+                | IndexLockMarkerTestAction::ForeignDuringMove => unreachable!(),
+            }
+            Ok(())
+        }
+
+        fn move_marker(
+            &mut self,
+            source: &Path,
+            source_file: &File,
+            destination: &Path,
+        ) -> io::Result<AtomicFileMoveOutcome> {
+            match self.action {
+                Some(IndexLockMarkerTestAction::MoveThenError) => {
+                    self.action_fired = true;
+                    atomic_move_verified_file_no_replace(source, source_file, destination)?;
+                    Err(io::Error::other("injected error after marker move"))
+                }
+                Some(IndexLockMarkerTestAction::MoveErrorBeforeMove) => {
+                    self.action_fired = true;
+                    Err(io::Error::other("injected error before marker move"))
+                }
+                Some(IndexLockMarkerTestAction::ForeignDuringMove) => {
+                    self.action_fired = true;
+                    fs::write(destination, b"foreign Git lock during marker move")?;
+                    Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "injected competing Git lock",
+                    ))
+                }
+                _ => atomic_move_verified_file_no_replace(source, source_file, destination),
+            }
+        }
+    }
+
+    fn prepare_test_marker_state(
+        fixture: &CandidateBundlePreparationFixture,
+    ) -> (
+        candidate_bundle_v5::PreparedCandidateBundleV5,
+        candidate_bundle_v5::PreparedCandidatePublishStagingV5,
+    ) {
+        let mut prepare_hooks = CandidateBundleTestHooks::new(None);
+        let prepared = prepare_test_candidate_bundle(fixture, &mut prepare_hooks)
+            .expect("stable candidate bundle prepares for marker lock");
+        let guard = VaultMutationGuard::acquire(fixture.vault.root())
+            .expect("marker publish guard acquires");
+        let mut publish_hooks = CandidatePublishTestHooks::new(None);
+        let publish = candidate_bundle_v5::prepare_candidate_publish_staging_v5_with_hooks(
+            &guard,
+            &fixture.git,
+            &prepared.transaction_reference,
+            &prepared.inventory,
+            &mut publish_hooks,
+        )
+        .expect("candidate publish staging prepares for marker lock");
+        (prepared, publish)
+    }
+
     fn bundle_journal_v5(
         prepared: &candidate_bundle_v5::PreparedCandidateBundleV5,
     ) -> BundleMergeJournalV5 {
@@ -12512,6 +12720,418 @@ mod tests {
             worktree
         );
         assert!(!index_lock_path(root).exists());
+        assert!(!journal_path(root).exists());
+    }
+
+    #[test]
+    fn v5_marker_lock_acquires_real_sha1_and_sha256_locks_and_reclassifies_fresh() {
+        use candidate_bundle_v5::IndexLockStateV5 as State;
+
+        for object_format in [GitObjectFormat::Sha1, GitObjectFormat::Sha256] {
+            let fixture = create_candidate_bundle_preparation_fixture(object_format);
+            let root = fixture.vault.root();
+            let live_index = fs::read(index_path(root)).expect("live index snapshots");
+            let live_map = index_entry_map(&fixture.git).expect("live stage map snapshots");
+            let worktree = fs::read(root.join("entry.md.enc")).expect("worktree snapshots");
+            let (prepared, publish) = prepare_test_marker_state(&fixture);
+            let guard = VaultMutationGuard::acquire(root).expect("marker guard acquires");
+            let mut hooks = IndexLockMarkerTestHooks::new(None);
+
+            let acquired = candidate_bundle_v5::acquire_index_lock_marker_v5_with_hooks(
+                &guard,
+                &fixture.git,
+                &prepared.transaction_reference,
+                &prepared.inventory,
+                &publish,
+                &mut hooks,
+            )
+            .expect("real v5 index marker lock acquires");
+            assert_eq!(acquired.marker, prepared.index_lock_marker_reference);
+            candidate_bundle_v5::revalidate_acquired_index_lock_marker_v5(
+                &guard,
+                &fixture.git,
+                &prepared.transaction_reference,
+                &prepared.inventory,
+                &publish,
+                &acquired,
+            )
+            .expect("held real marker lock revalidates");
+            assert_eq!(
+                fs::read(index_lock_path(root)).expect("real marker lock reads"),
+                prepared.index_lock_marker
+            );
+            assert!(candidate_bundle_scratch_paths(root).is_empty());
+            assert_eq!(
+                fs::read(index_path(root)).expect("live index re-reads"),
+                live_index
+            );
+            assert_eq!(
+                index_entry_map(&fixture.git).expect("live stage map re-reads"),
+                live_map
+            );
+            assert_eq!(
+                fs::read(root.join("entry.md.enc")).expect("worktree re-reads"),
+                worktree
+            );
+            assert!(!journal_path(root).exists());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+
+                assert_eq!(
+                    fs::symlink_metadata(index_lock_path(root))
+                        .expect("marker permissions inspect")
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600
+                );
+            }
+
+            drop(acquired);
+            assert!(
+                index_lock_path(root).exists(),
+                "Drop must never remove marker"
+            );
+            drop(guard);
+            let fresh_guard =
+                VaultMutationGuard::acquire(root).expect("fresh marker guard acquires");
+            let loaded = candidate_bundle_v5::load_candidate_publish_staging_v5(
+                &fresh_guard,
+                &fixture.git,
+                &prepared.transaction_reference,
+            )
+            .expect("fresh stable/publish proofs reload under marker");
+            assert_eq!(
+                candidate_bundle_v5::classify_index_lock_v5(
+                    root,
+                    &prepared.transaction_reference,
+                    &loaded.inventory,
+                )
+                .expect("fresh real marker classifies"),
+                State::Marker
+            );
+        }
+    }
+
+    #[test]
+    fn v5_marker_lock_fault_checkpoints_retain_exact_pre_or_post_move_state() {
+        use candidate_bundle_v5::{IndexLockMarkerCheckpointV5 as Checkpoint, IndexLockStateV5};
+
+        for checkpoint in [
+            Checkpoint::ScratchCreated,
+            Checkpoint::MarkerWritten,
+            Checkpoint::BeforeMove,
+            Checkpoint::CriticalAudit,
+            Checkpoint::AfterMove,
+            Checkpoint::PostAudit,
+        ] {
+            let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+            let root = fixture.vault.root();
+            let live_index = fs::read(index_path(root)).expect("live index snapshots");
+            let worktree = fs::read(root.join("entry.md.enc")).expect("worktree snapshots");
+            let (prepared, publish) = prepare_test_marker_state(&fixture);
+            let guard = VaultMutationGuard::acquire(root).expect("marker guard acquires");
+            let mut hooks =
+                IndexLockMarkerTestHooks::new(Some(IndexLockMarkerTestAction::FailAt(checkpoint)));
+
+            assert!(matches!(
+                candidate_bundle_v5::acquire_index_lock_marker_v5_with_hooks(
+                    &guard,
+                    &fixture.git,
+                    &prepared.transaction_reference,
+                    &prepared.inventory,
+                    &publish,
+                    &mut hooks,
+                ),
+                Err(GitError::DurabilityNotConfirmed)
+            ));
+            assert!(hooks.action_fired, "{checkpoint:?}");
+            if matches!(checkpoint, Checkpoint::AfterMove | Checkpoint::PostAudit) {
+                assert!(candidate_bundle_scratch_paths(root).is_empty());
+                assert_eq!(
+                    candidate_bundle_v5::classify_index_lock_v5(
+                        root,
+                        &prepared.transaction_reference,
+                        &prepared.inventory,
+                    )
+                    .expect("post-move marker classifies"),
+                    IndexLockStateV5::Marker
+                );
+            } else {
+                let retained = candidate_bundle_scratch_paths(root);
+                assert_eq!(retained.len(), 1, "{checkpoint:?}");
+                let expected = if checkpoint == Checkpoint::ScratchCreated {
+                    Vec::new()
+                } else {
+                    prepared.index_lock_marker.clone()
+                };
+                assert_eq!(
+                    fs::read(&retained[0]).expect("retained marker reads"),
+                    expected
+                );
+                assert!(!index_lock_path(root).exists());
+            }
+            assert_eq!(
+                fs::read(index_path(root)).expect("live index re-reads"),
+                live_index
+            );
+            assert_eq!(
+                fs::read(root.join("entry.md.enc")).expect("worktree re-reads"),
+                worktree
+            );
+            assert!(!journal_path(root).exists());
+        }
+    }
+
+    #[test]
+    fn v5_marker_lock_retains_partial_scratch_and_preserves_existing_lock_owners() {
+        let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+        let root = fixture.vault.root();
+        let (prepared, publish) = prepare_test_marker_state(&fixture);
+        let guard = VaultMutationGuard::acquire(root).expect("marker guard acquires");
+        let mut hooks =
+            IndexLockMarkerTestHooks::new(Some(IndexLockMarkerTestAction::PartialScratch));
+        assert!(matches!(
+            candidate_bundle_v5::acquire_index_lock_marker_v5_with_hooks(
+                &guard,
+                &fixture.git,
+                &prepared.transaction_reference,
+                &prepared.inventory,
+                &publish,
+                &mut hooks,
+            ),
+            Err(GitError::DurabilityNotConfirmed)
+        ));
+        let retained = candidate_bundle_scratch_paths(root);
+        assert_eq!(retained.len(), 1);
+        assert_eq!(
+            fs::read(&retained[0]).expect("partial marker scratch reads"),
+            b"partial v5 marker scratch"
+        );
+        assert!(!index_lock_path(root).exists());
+        assert!(!journal_path(root).exists());
+
+        for owner in 0_u8..4 {
+            let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+            let root = fixture.vault.root();
+            let (prepared, publish) = prepare_test_marker_state(&fixture);
+            let lock = index_lock_path(root);
+            let expected;
+            let sentinel = lock.with_extension("v5-owner");
+            match owner {
+                0 => {
+                    expected = b"ordinary foreign Git lock".to_vec();
+                    fs::write(&lock, &expected).expect("foreign lock writes");
+                }
+                1 => {
+                    let mut wrong = prepared.transaction_reference.clone();
+                    wrong.token = "11111111111111111111111111111111".to_owned();
+                    wrong.bundle_basename =
+                        candidate_bundle_v5::candidate_bundle_stable_basename_v5(&wrong.token)
+                            .expect("wrong stable basename validates");
+                    wrong.publish_staging_basename =
+                        candidate_bundle_v5::candidate_bundle_publish_basename_v5(&wrong.token)
+                            .expect("wrong publish basename validates");
+                    expected = candidate_bundle_v5::index_lock_marker_bytes_v5(&wrong)
+                        .expect("wrong canonical marker serializes");
+                    fs::write(&lock, &expected).expect("wrong marker lock writes");
+                }
+                2 => {
+                    expected = b"INEXIDX".to_vec();
+                    fs::write(&lock, &expected).expect("partial marker lock writes");
+                }
+                3 => {
+                    expected = prepared.index_lock_marker.clone();
+                    fs::write(&sentinel, &expected).expect("hardlink sentinel writes");
+                    fs::hard_link(&sentinel, &lock).expect("hardlinked lock creates");
+                }
+                _ => unreachable!(),
+            }
+            let guard = VaultMutationGuard::acquire(root).expect("marker guard acquires");
+            let mut hooks = IndexLockMarkerTestHooks::new(None);
+            assert!(
+                candidate_bundle_v5::acquire_index_lock_marker_v5_with_hooks(
+                    &guard,
+                    &fixture.git,
+                    &prepared.transaction_reference,
+                    &prepared.inventory,
+                    &publish,
+                    &mut hooks,
+                )
+                .is_err(),
+                "owner case {owner} must fail closed"
+            );
+            assert_eq!(fs::read(&lock).expect("existing lock remains"), expected);
+            if owner == 3 {
+                assert_eq!(
+                    fs::read(&sentinel).expect("hardlink owner remains"),
+                    expected
+                );
+            }
+            assert!(candidate_bundle_scratch_paths(root).is_empty());
+            assert!(!journal_path(root).exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn v5_marker_lock_preserves_symlinked_existing_owner() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+        let root = fixture.vault.root();
+        let (prepared, publish) = prepare_test_marker_state(&fixture);
+        let lock = index_lock_path(root);
+        let sentinel = lock.with_extension("v5-symlink-owner");
+        fs::write(&sentinel, b"symlink foreign Git lock").expect("symlink owner writes");
+        symlink(&sentinel, &lock).expect("symlinked lock creates");
+        let guard = VaultMutationGuard::acquire(root).expect("marker guard acquires");
+        let mut hooks = IndexLockMarkerTestHooks::new(None);
+        assert!(matches!(
+            candidate_bundle_v5::acquire_index_lock_marker_v5_with_hooks(
+                &guard,
+                &fixture.git,
+                &prepared.transaction_reference,
+                &prepared.inventory,
+                &publish,
+                &mut hooks,
+            ),
+            Err(GitError::RecoveryConflict)
+        ));
+        assert!(
+            fs::symlink_metadata(&lock)
+                .expect("symlink lock remains")
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!journal_path(root).exists());
+    }
+
+    #[test]
+    fn v5_marker_lock_critical_audit_rejects_index_and_identity_rebinding() {
+        for action in [
+            IndexLockMarkerTestAction::LiveIndexDrift,
+            IndexLockMarkerTestAction::StableCloneSwap,
+            IndexLockMarkerTestAction::PublishCloneSwap,
+            IndexLockMarkerTestAction::ScratchCloneSwap,
+        ] {
+            let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+            let root = fixture.vault.root();
+            let (prepared, publish) = prepare_test_marker_state(&fixture);
+            let guard = VaultMutationGuard::acquire(root).expect("marker guard acquires");
+            let mut hooks = IndexLockMarkerTestHooks::new(Some(action));
+            assert!(
+                candidate_bundle_v5::acquire_index_lock_marker_v5_with_hooks(
+                    &guard,
+                    &fixture.git,
+                    &prepared.transaction_reference,
+                    &prepared.inventory,
+                    &publish,
+                    &mut hooks,
+                )
+                .is_err(),
+                "{action:?} must fail closed"
+            );
+            assert!(hooks.action_fired, "{action:?}");
+            if action != IndexLockMarkerTestAction::LiveIndexDrift {
+                assert!(
+                    hooks
+                        .retained_path
+                        .as_ref()
+                        .is_some_and(|path| path.exists())
+                );
+            }
+            assert!(!index_lock_path(root).exists());
+            assert!(!journal_path(root).exists());
+        }
+    }
+
+    #[test]
+    fn v5_marker_lock_move_errors_reconcile_exact_moved_not_moved_and_foreign_states() {
+        for action in [
+            IndexLockMarkerTestAction::MoveThenError,
+            IndexLockMarkerTestAction::MoveErrorBeforeMove,
+            IndexLockMarkerTestAction::ForeignDuringMove,
+        ] {
+            let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+            let root = fixture.vault.root();
+            let (prepared, publish) = prepare_test_marker_state(&fixture);
+            let guard = VaultMutationGuard::acquire(root).expect("marker guard acquires");
+            let mut hooks = IndexLockMarkerTestHooks::new(Some(action));
+            let result = candidate_bundle_v5::acquire_index_lock_marker_v5_with_hooks(
+                &guard,
+                &fixture.git,
+                &prepared.transaction_reference,
+                &prepared.inventory,
+                &publish,
+                &mut hooks,
+            );
+            assert!(hooks.action_fired, "{action:?}");
+            match action {
+                IndexLockMarkerTestAction::MoveThenError => {
+                    let acquired = result.expect("moved marker reconciles as committed");
+                    candidate_bundle_v5::revalidate_acquired_index_lock_marker_v5(
+                        &guard,
+                        &fixture.git,
+                        &prepared.transaction_reference,
+                        &prepared.inventory,
+                        &publish,
+                        &acquired,
+                    )
+                    .expect("reconciled moved marker revalidates");
+                    assert!(candidate_bundle_scratch_paths(root).is_empty());
+                }
+                IndexLockMarkerTestAction::MoveErrorBeforeMove => {
+                    assert!(matches!(result, Err(GitError::Io { .. })));
+                    assert_eq!(candidate_bundle_scratch_paths(root).len(), 1);
+                    assert!(!index_lock_path(root).exists());
+                }
+                IndexLockMarkerTestAction::ForeignDuringMove => {
+                    assert!(matches!(result, Err(GitError::IndexChanged)));
+                    assert_eq!(candidate_bundle_scratch_paths(root).len(), 1);
+                    assert_eq!(
+                        fs::read(index_lock_path(root)).expect("foreign competing lock remains"),
+                        b"foreign Git lock during marker move"
+                    );
+                }
+                _ => unreachable!(),
+            }
+            assert!(!journal_path(root).exists());
+        }
+    }
+
+    #[test]
+    fn v5_marker_lock_post_move_rebind_preserves_marker_and_foreign_lock() {
+        let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+        let root = fixture.vault.root();
+        let (prepared, publish) = prepare_test_marker_state(&fixture);
+        let guard = VaultMutationGuard::acquire(root).expect("marker guard acquires");
+        let mut hooks =
+            IndexLockMarkerTestHooks::new(Some(IndexLockMarkerTestAction::LockRebindAfterMove));
+        assert!(matches!(
+            candidate_bundle_v5::acquire_index_lock_marker_v5_with_hooks(
+                &guard,
+                &fixture.git,
+                &prepared.transaction_reference,
+                &prepared.inventory,
+                &publish,
+                &mut hooks,
+            ),
+            Err(GitError::RecoveryConflict)
+        ));
+        let held = hooks
+            .retained_path
+            .expect("moved marker owner remains held");
+        assert_eq!(
+            fs::read(held).expect("held marker reads"),
+            prepared.index_lock_marker
+        );
+        assert_eq!(
+            fs::read(index_lock_path(root)).expect("foreign rebound lock reads"),
+            b"foreign rebound Git lock"
+        );
+        assert!(candidate_bundle_scratch_paths(root).is_empty());
         assert!(!journal_path(root).exists());
     }
 
