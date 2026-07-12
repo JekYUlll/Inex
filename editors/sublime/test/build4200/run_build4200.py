@@ -39,6 +39,23 @@ def run_checked(argv: Sequence[str], **kwargs: object) -> subprocess.CompletedPr
     return subprocess.run(list(argv), **options)
 
 
+def verified_system_zenity() -> Optional[str]:
+    """Resolve only the same absolute regular helpers accepted by production."""
+
+    for candidate in (Path("/usr/bin/zenity"), Path("/usr/local/bin/zenity")):
+        try:
+            metadata = candidate.lstat()
+        except OSError:
+            continue
+        if (
+            stat.S_ISREG(metadata.st_mode)
+            and not stat.S_ISLNK(metadata.st_mode)
+            and metadata.st_mode & 0o111
+        ):
+            return str(candidate)
+    return None
+
+
 def wait_until(label: str, predicate, timeout_seconds: float) -> None:
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
@@ -288,13 +305,16 @@ def main() -> int:
     xvfb = shutil.which("Xvfb")
     dbus_daemon = shutil.which("dbus-daemon")
     window_manager = shutil.which("metacity")
+    zenity = verified_system_zenity()
     inex = repo / "target" / "debug" / "inex"
     inexd = repo / "target" / "debug" / "inexd"
     for binary in (sublime_binary, inex, inexd):
         if not binary.is_file():
             raise QaFailure("missing executable: " + str(binary))
-    if not xdotool or not xvfb or not dbus_daemon or not window_manager:
-        raise QaFailure("Xvfb, xdotool, metacity, and dbus-daemon are required")
+    if not xdotool or not xvfb or not dbus_daemon or not window_manager or not zenity:
+        raise QaFailure(
+            "Xvfb, xdotool, metacity, dbus-daemon, and zenity are required"
+        )
     if args.plugin_host_crash and not xclip:
         raise QaFailure("xclip is required for the plugin-host crash fallback probe")
     version = run_checked([str(sublime_binary), "--version"], capture_output=True, text=True).stdout
@@ -321,13 +341,19 @@ def main() -> int:
         path.mkdir(parents=True, exist_ok=True)
         os.chmod(path, 0o700)
 
-    tokens = [
+    content_tokens = [
         "INEXQA_INITIAL_" + secrets.token_hex(16),
         "INEXQA_EDIT_" + secrets.token_hex(16),
     ]
-    document = "# Build 4200 QA\n\nINITIAL_TOKEN: %s\nEDIT_TOKEN: %s\n" % tuple(tokens)
+    document = "# Build 4200 QA\n\nINITIAL_TOKEN: %s\nEDIT_TOKEN: %s\n" % tuple(
+        content_tokens
+    )
     (source / "qa.md").write_text(document, encoding="utf-8")
     password = secrets.token_hex(20)
+    # The password is part of the binding residue scan. It is supplied to the
+    # real masked prompt over xdotool stdin and must never be written into a
+    # helper script, argv, report, or isolated profile file.
+    tokens = content_tokens + [password]
     import_env = os.environ.copy()
     import_env.pop("SESSION_ID", None)
     import_env["INEX_PASSWORD_STDIN"] = "1"
@@ -351,9 +377,6 @@ def main() -> int:
     shutil.rmtree(source)
     assert_ciphertext(vault, tokens)
 
-    fake_zenity = control / "zenity"
-    fake_zenity.write_text("#!/bin/sh\nprintf '%s\\n' '" + password + "'\n", encoding="utf-8")
-    os.chmod(fake_zenity, 0o700)
     report = control / "report.jsonl"
     state = control / "state.json"
     write_json(state, {"phase": "initial"})
@@ -380,7 +403,7 @@ def main() -> int:
         {
             "vault_path": str(vault),
             "sidecar_path": str(inexd),
-            "zenity_path": str(fake_zenity),
+            "zenity_path": str(Path(zenity).resolve()),
             "draft_debounce_ms": 100,
         },
     )
@@ -441,6 +464,7 @@ def main() -> int:
     crud_markdown_renamed = False
     crud_markdown_deleted = False
     events: List[str] = []
+    answered_password_windows: set = set()
 
     signal.signal(signal.SIGTERM, raise_on_termination)
     signal.signal(signal.SIGINT, raise_on_termination)
@@ -520,11 +544,79 @@ def main() -> int:
                 return []
             return [line.strip() for line in found.stdout.splitlines() if line.strip()]
 
+        def password_window_ids() -> List[str]:
+            found = subprocess.run(
+                [
+                    xdotool,
+                    "search",
+                    "--onlyvisible",
+                    "--name",
+                    "Unlock Inex vault",
+                ],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=5,
+            )
+            if found.returncode != 0:
+                return []
+            return [
+                line.strip()
+                for line in found.stdout.splitlines()
+                if line.strip().isdigit()
+            ]
+
         offset = 0
         deadline = time.monotonic() + FLOW_TIMEOUT_SECONDS
         while time.monotonic() < deadline:
             if sublime_process.poll() is not None:
                 raise QaFailure("Sublime launcher exited before QA completion")
+            for password_window_id in password_window_ids():
+                if password_window_id in answered_password_windows:
+                    continue
+                run_checked(
+                    [
+                        xdotool,
+                        "windowactivate",
+                        "--sync",
+                        password_window_id,
+                    ],
+                    env=env,
+                    timeout=5,
+                )
+                time.sleep(0.3)
+                run_checked(
+                    [
+                        xdotool,
+                        "type",
+                        "--clearmodifiers",
+                        "--delay",
+                        "1",
+                        "--file",
+                        "-",
+                    ],
+                    env=env,
+                    input=password,
+                    text=True,
+                    timeout=5,
+                )
+                time.sleep(0.1)
+                run_checked(
+                    [
+                        xdotool,
+                        "key",
+                        "--clearmodifiers",
+                        "Return",
+                    ],
+                    env=env,
+                    timeout=5,
+                )
+                answered_password_windows.add(password_window_id)
+                append_report(
+                    report,
+                    {"event": "password_prompt_answered", "masked": True},
+                )
             offset, records = read_new_reports(report, offset)
             for record in records:
                 event = record.get("event")

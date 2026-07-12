@@ -9,17 +9,18 @@ clears third-party packages and does not reliably hot-load a package created
 after startup.
 
 The initial bounded smoke flow imports one random Markdown document with the
-real CLI, unlocks it through a controlled regular-file `zenity` helper, opens
+real CLI, unlocks it through the real absolute `zenity` executable, opens
 the real `.md.enc`, edits without putting plaintext in command arguments,
 saves through Inex, closes the scratch view, terminates Sublime, and scans the
 entire isolated root for UTF-8, UTF-16, hex, and base64 forms of both random
-canaries. `HOME`, all XDG roots, and `TMPDIR`/`TMP`/`TEMP` point into that root.
+canaries and the random password. The password is typed into the masked prompt
+from `xdotool` stdin; it is not placed in argv, a helper script, or the report.
+`HOME`, all XDG roots, and `TMPDIR`/`TMP`/`TEMP` point into that root.
 The report contains only fixed event names, booleans, lengths, and SHA-256
 hashes; it never contains managed text.
 
-The controlled password helper validates this integration path only. Password
-prompt argv/environment/stderr residue is covered by the pure Python password
-tests, not claimed by this fixture.
+The pure Python password tests still cover helper resolution, bounded output,
+cancel/error behavior, and argv/environment/stderr invariants independently.
 
 Build current binaries, then run:
 
