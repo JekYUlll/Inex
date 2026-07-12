@@ -959,6 +959,14 @@ enum IndexMutation<'a> {
     },
 }
 
+struct AuthenticatedInPlaceRecovery {
+    conflict: ConflictEntry,
+    result: Vec<u8>,
+    result_digest: [u8; 32],
+    expected_worktree_digest: [u8; 32],
+    file_id: String,
+}
+
 struct AuthenticatedRenameRecovery {
     source: ConflictEntry,
     destination: TrackedIdentity,
@@ -5612,13 +5620,11 @@ fn recover_pending(vault: &Vault, git: &Git) -> Result<bool, GitError> {
     Ok(true)
 }
 
-#[allow(clippy::too_many_lines)] // Authentication and forward recovery share one audit sequence.
-fn recover_in_place_pending(
+fn authenticate_in_place_recovery(
     vault: &Vault,
     git: &Git,
-    guard: &VaultMutationGuard,
     journal: &MergeJournal,
-) -> Result<(), GitError> {
+) -> Result<AuthenticatedInPlaceRecovery, GitError> {
     validate_journal(journal)?;
     git.validate_oid(&journal.result_oid)
         .map_err(|_| GitError::InvalidJournal)?;
@@ -5653,9 +5659,52 @@ fn recover_in_place_pending(
         .or(journal.stages[2].as_ref())
         .ok_or(GitError::RecoveryConflict)?;
     let expected_ciphertext = git.read_object(&expected_stage.oid)?;
-    if hex_digest(digest(&expected_ciphertext)) != journal.expected_worktree_sha256 {
+    let expected_worktree_digest = digest(&expected_ciphertext);
+    if hex_digest(expected_worktree_digest) != journal.expected_worktree_sha256 {
         return Err(GitError::RecoveryConflict);
     }
+    Ok(AuthenticatedInPlaceRecovery {
+        conflict: ConflictEntry {
+            physical_path: journal.physical_path.clone(),
+            logical_path,
+            stages: journal.stages.clone(),
+        },
+        result,
+        result_digest,
+        expected_worktree_digest,
+        file_id,
+    })
+}
+
+fn authenticate_all_in_place_stages_v5(
+    vault: &Vault,
+    git: &Git,
+    authenticated: &AuthenticatedInPlaceRecovery,
+) -> Result<(), GitError> {
+    for stage in authenticated.conflict.stages.iter().flatten() {
+        let identity = authenticate_stage_identity(vault, git, stage)
+            .map_err(|_| GitError::RecoveryConflict)?;
+        if identity.logical_path != authenticated.conflict.logical_path
+            || identity.file_id != authenticated.file_id
+        {
+            return Err(GitError::RecoveryConflict);
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)] // Authentication and forward recovery share one audit sequence.
+fn recover_in_place_pending(
+    vault: &Vault,
+    git: &Git,
+    guard: &VaultMutationGuard,
+    journal: &MergeJournal,
+) -> Result<(), GitError> {
+    let authenticated = authenticate_in_place_recovery(vault, git, journal)?;
+    let logical_path = &authenticated.conflict.logical_path;
+    let result = &authenticated.result;
+    let result_digest = authenticated.result_digest;
+    let file_id = &authenticated.file_id;
 
     let target = vault
         .root()
@@ -5670,21 +5719,14 @@ fn recover_in_place_pending(
         .as_ref()
         .is_some_and(|entry| entry.mode == journal.result_mode && entry.oid == journal.result_oid)
         && current_conflict.is_none();
-    if !index_done {
-        let expected = ConflictEntry {
-            physical_path: journal.physical_path.clone(),
-            logical_path: logical_path.clone(),
-            stages: journal.stages.clone(),
-        };
-        if current_conflict != Some(&expected) {
-            return Err(GitError::RecoveryConflict);
-        }
+    if !index_done && current_conflict != Some(&authenticated.conflict) {
+        return Err(GitError::RecoveryConflict);
     }
     verify_merge_identity_owners(
         vault,
         git,
         guard,
-        &file_id,
+        file_id,
         index_done.then_some(journal.physical_path.as_str()),
         &[&journal.physical_path],
     )
@@ -5703,7 +5745,7 @@ fn recover_in_place_pending(
             _ => return Err(GitError::RecoveryConflict),
         };
         let outcome = guard
-            .write(&target, &result, condition)
+            .write(&target, result, condition)
             .map_err(map_atomic_error)?;
         if outcome.parent_sync != ParentSyncStatus::Synced {
             return Err(GitError::DurabilityNotConfirmed);
@@ -5718,7 +5760,7 @@ fn recover_in_place_pending(
         {
             return Err(GitError::RecoveryConflict);
         }
-        verify_merge_identity_owners(vault, git, guard, &file_id, None, &[&journal.physical_path])
+        verify_merge_identity_owners(vault, git, guard, file_id, None, &[&journal.physical_path])
             .map_err(|_| GitError::RecoveryConflict)?;
         git.update_index(
             &journal.physical_path,
@@ -5730,7 +5772,7 @@ fn recover_in_place_pending(
         vault,
         git,
         guard,
-        &file_id,
+        file_id,
         Some(&journal.physical_path),
         &[&journal.physical_path],
     )
@@ -6215,6 +6257,237 @@ fn expected_rename_source_state(
         None if journal.renamed_side == RenameSide::Ours => Ok(CurrentTarget::Absent),
         None => Err(GitError::RecoveryConflict),
     }
+}
+
+enum AuthenticatedMergePayloadV5<'a> {
+    InPlace {
+        journal: &'a MergeJournal,
+        authenticated: AuthenticatedInPlaceRecovery,
+    },
+    DetectedRename {
+        journal: &'a DetectedRenameJournal,
+        authenticated: AuthenticatedDetectedRenameRecovery,
+    },
+    SplitRename {
+        journal: &'a RenameMergeJournal,
+        authenticated: AuthenticatedRenameRecovery,
+    },
+}
+
+fn authenticate_merge_payload_v5<'a>(
+    vault: &Vault,
+    git: &Git,
+    payload: &'a MergeJournalPayload,
+) -> Result<AuthenticatedMergePayloadV5<'a>, GitError> {
+    match payload {
+        MergeJournalPayload::InPlace(journal) => {
+            let authenticated = authenticate_in_place_recovery(vault, git, journal)?;
+            authenticate_all_in_place_stages_v5(vault, git, &authenticated)?;
+            Ok(AuthenticatedMergePayloadV5::InPlace {
+                journal,
+                authenticated,
+            })
+        }
+        MergeJournalPayload::DetectedRename(journal) => {
+            let authenticated = authenticate_detected_rename_recovery(vault, git, journal)?;
+            Ok(AuthenticatedMergePayloadV5::DetectedRename {
+                journal,
+                authenticated,
+            })
+        }
+        MergeJournalPayload::Rename(journal) => {
+            let authenticated = authenticate_rename_recovery(vault, git, journal)?;
+            Ok(AuthenticatedMergePayloadV5::SplitRename {
+                journal,
+                authenticated,
+            })
+        }
+    }
+}
+
+fn in_place_index_is_original(git: &Git, conflict: &ConflictEntry) -> Result<bool, GitError> {
+    Ok(
+        git.unmerged_entries()?.get(&conflict.physical_path) == Some(conflict)
+            && git.stage_zero(&conflict.physical_path)?.is_none(),
+    )
+}
+
+fn sync_absent_target_parent_v5(path: &Path) -> Result<(), GitError> {
+    sync_directory(path.parent().ok_or(GitError::DurabilityNotConfirmed)?)
+        .map_err(|_| GitError::DurabilityNotConfirmed)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the three immutable payload variants retain distinct original-state proofs"
+)]
+fn verify_authenticated_payload_original_v5(
+    vault: &Vault,
+    git: &Git,
+    guard: &VaultMutationGuard,
+    payload: &AuthenticatedMergePayloadV5<'_>,
+) -> Result<(), GitError> {
+    if !guard.is_for_root(&git.root) {
+        return Err(GitError::RecoveryConflict);
+    }
+    match payload {
+        AuthenticatedMergePayloadV5::InPlace {
+            journal,
+            authenticated,
+        } => {
+            if !in_place_index_is_original(git, &authenticated.conflict)? {
+                return Err(GitError::IndexChanged);
+            }
+            verify_merge_identity_owners(
+                vault,
+                git,
+                guard,
+                &authenticated.file_id,
+                None,
+                &[&journal.physical_path],
+            )?;
+            let target = vault.root().join(
+                authenticated
+                    .conflict
+                    .logical_path
+                    .to_ciphertext_relative_path(),
+            );
+            if guard.inspect(&target).map_err(map_atomic_error)?
+                != CurrentTarget::File(authenticated.expected_worktree_digest)
+            {
+                return Err(GitError::WorktreeChanged);
+            }
+        }
+        AuthenticatedMergePayloadV5::DetectedRename {
+            journal,
+            authenticated,
+        } => {
+            if !detected_index_is_original(
+                git,
+                &authenticated.conflict,
+                &journal.source_physical_path,
+            )? {
+                return Err(GitError::IndexChanged);
+            }
+            verify_active_rename_provenance(git, &journal.provenance)?;
+            verify_merge_identity_owners(
+                vault,
+                git,
+                guard,
+                &authenticated.file_id,
+                None,
+                &[
+                    &journal.source_physical_path,
+                    &journal.destination_physical_path,
+                ],
+            )?;
+            let source_target = vault.root().join(
+                authenticated
+                    .source_logical_path
+                    .to_ciphertext_relative_path(),
+            );
+            if guard.inspect(&source_target).map_err(map_atomic_error)? != CurrentTarget::Absent {
+                return Err(GitError::WorktreeChanged);
+            }
+            sync_absent_target_parent_v5(&source_target)?;
+            let destination_target = vault.root().join(
+                authenticated
+                    .conflict
+                    .logical_path
+                    .to_ciphertext_relative_path(),
+            );
+            if guard
+                .inspect(&destination_target)
+                .map_err(map_atomic_error)?
+                != CurrentTarget::File(authenticated.expected_destination_digest)
+            {
+                return Err(GitError::WorktreeChanged);
+            }
+        }
+        AuthenticatedMergePayloadV5::SplitRename {
+            journal,
+            authenticated,
+        } => {
+            if !split_index_is_original(git, &authenticated.source, &authenticated.destination)? {
+                return Err(GitError::IndexChanged);
+            }
+            verify_active_rename_provenance(git, &journal.provenance)?;
+            verify_merge_identity_owners(
+                vault,
+                git,
+                guard,
+                &authenticated.file_id,
+                Some(&journal.destination_physical_path),
+                &[
+                    &journal.source_physical_path,
+                    &journal.destination_physical_path,
+                ],
+            )?;
+            let source_target = vault.root().join(
+                authenticated
+                    .source
+                    .logical_path
+                    .to_ciphertext_relative_path(),
+            );
+            if guard.inspect(&source_target).map_err(map_atomic_error)?
+                != authenticated.expected_source_state
+            {
+                return Err(GitError::WorktreeChanged);
+            }
+            if authenticated.expected_source_state == CurrentTarget::Absent {
+                sync_absent_target_parent_v5(&source_target)?;
+            }
+            let destination_target = vault.root().join(
+                authenticated
+                    .destination
+                    .logical_path
+                    .to_ciphertext_relative_path(),
+            );
+            if guard
+                .inspect(&destination_target)
+                .map_err(map_atomic_error)?
+                != CurrentTarget::File(authenticated.expected_destination_digest)
+            {
+                return Err(GitError::WorktreeChanged);
+            }
+        }
+    }
+    if !guard.is_for_root(&git.root) {
+        return Err(GitError::RecoveryConflict);
+    }
+    Ok(())
+}
+
+#[allow(
+    dead_code,
+    reason = "the v5 durable-journal critical audit consumes this read-only authorization seam"
+)]
+fn authorize_payload_before_v5_journal(
+    vault: &Vault,
+    git: &Git,
+    guard: &VaultMutationGuard,
+    payload: &MergeJournalPayload,
+) -> Result<(), GitError> {
+    let authenticated = authenticate_merge_payload_v5(vault, git, payload)?;
+    verify_authenticated_payload_original_v5(vault, git, guard, &authenticated)?;
+    match payload {
+        MergeJournalPayload::InPlace(journal) => {
+            git.verify_attributes_for_path(&journal.physical_path)?;
+        }
+        MergeJournalPayload::DetectedRename(journal) => {
+            git.verify_attributes_for_paths(&[
+                &journal.source_physical_path,
+                &journal.destination_physical_path,
+            ])?;
+        }
+        MergeJournalPayload::Rename(journal) => {
+            git.verify_attributes_for_paths(&[
+                &journal.source_physical_path,
+                &journal.destination_physical_path,
+            ])?;
+        }
+    }
+    verify_authenticated_payload_original_v5(vault, git, guard, &authenticated)
 }
 
 fn advance_split_rename_worktree(
@@ -10012,6 +10285,148 @@ mod tests {
         assert!(recover_pending(&vault, &git).expect("SHA-256 orphan staging recovers"));
         assert!(!path.exists());
         assert_no_cas_private_files(directory.path());
+    }
+
+    #[test]
+    fn v5_payload_authorization_accepts_original_in_place_sha1_and_sha256_read_only() {
+        for object_format in [GitObjectFormat::Sha1, GitObjectFormat::Sha256] {
+            let fixture = create_candidate_bundle_preparation_fixture(object_format);
+            let root = fixture.vault.root();
+            let index_before = fs::read(index_path(root)).expect("live index snapshots");
+            let worktree_before = fs::read(root.join("entry.md.enc")).expect("worktree snapshots");
+            let guard = VaultMutationGuard::acquire(root).expect("authorization guard acquires");
+
+            authorize_payload_before_v5_journal(
+                &fixture.vault,
+                &fixture.git,
+                &guard,
+                &fixture.transaction,
+            )
+            .expect("original in-place payload authorizes");
+
+            assert_eq!(
+                fs::read(index_path(root)).expect("live index re-reads"),
+                index_before
+            );
+            assert_eq!(
+                fs::read(root.join("entry.md.enc")).expect("worktree re-reads"),
+                worktree_before
+            );
+            assert!(!journal_path(root).exists());
+            assert!(!index_lock_path(root).exists());
+        }
+    }
+
+    #[test]
+    fn v5_payload_authorization_accepts_original_rename_variants_read_only() {
+        let split = create_rename_recovery_fixture();
+        let split_source = fs::read(&split.source_target).expect("split source snapshots");
+        let split_destination =
+            fs::read(&split.destination_target).expect("split destination snapshots");
+        let split_index = fs::read(index_path(split.vault.root())).expect("split index snapshots");
+        let split_guard =
+            VaultMutationGuard::acquire(split.vault.root()).expect("split auth guard acquires");
+        authorize_payload_before_v5_journal(
+            &split.vault,
+            &split.git,
+            &split_guard,
+            &MergeJournalPayload::Rename(split.journal.clone()),
+        )
+        .expect("original split rename authorizes");
+        split.assert_original_index();
+        assert_eq!(
+            fs::read(&split.source_target).expect("split source re-reads"),
+            split_source
+        );
+        assert_eq!(
+            fs::read(&split.destination_target).expect("split destination re-reads"),
+            split_destination
+        );
+        assert_eq!(
+            fs::read(index_path(split.vault.root())).expect("split index re-reads"),
+            split_index
+        );
+        assert!(!journal_path(split.vault.root()).exists());
+
+        let detected = create_detected_rename_recovery_fixture();
+        let detected_destination =
+            fs::read(&detected.destination_target).expect("detected destination snapshots");
+        let detected_index =
+            fs::read(index_path(detected.vault.root())).expect("detected index snapshots");
+        let detected_guard = VaultMutationGuard::acquire(detected.vault.root())
+            .expect("detected auth guard acquires");
+        authorize_payload_before_v5_journal(
+            &detected.vault,
+            &detected.git,
+            &detected_guard,
+            &MergeJournalPayload::DetectedRename(detected.journal.clone()),
+        )
+        .expect("original detected rename authorizes");
+        detected.assert_original_index();
+        assert!(!detected.source_target.exists());
+        assert_eq!(
+            fs::read(&detected.destination_target).expect("detected destination re-reads"),
+            detected_destination
+        );
+        assert_eq!(
+            fs::read(index_path(detected.vault.root())).expect("detected index re-reads"),
+            detected_index
+        );
+        assert!(!journal_path(detected.vault.root()).exists());
+    }
+
+    #[test]
+    fn v5_in_place_payload_authorization_rejects_worktree_and_stage_authentication_drift() {
+        let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+        let root = fixture.vault.root();
+        let index_before = fs::read(index_path(root)).expect("live index snapshots");
+        let original_worktree = fs::read(root.join("entry.md.enc")).expect("worktree snapshots");
+        let guard = VaultMutationGuard::acquire(root).expect("authorization guard acquires");
+
+        fs::write(root.join("entry.md.enc"), b"foreign worktree owner")
+            .expect("foreign worktree writes");
+        assert!(matches!(
+            authorize_payload_before_v5_journal(
+                &fixture.vault,
+                &fixture.git,
+                &guard,
+                &fixture.transaction,
+            ),
+            Err(GitError::WorktreeChanged)
+        ));
+        assert!(!journal_path(root).exists());
+        assert_eq!(
+            fs::read(index_path(root)).expect("index remains"),
+            index_before
+        );
+        fs::write(root.join("entry.md.enc"), &original_worktree)
+            .expect("original worktree restores");
+
+        let mut tampered = fixture.transaction.clone();
+        let foreign_oid = fixture
+            .git
+            .write_object(b"not an authenticated EDRY stage")
+            .expect("foreign stage object writes");
+        let MergeJournalPayload::InPlace(journal) = &mut tampered else {
+            panic!("fixture carries in-place payload");
+        };
+        journal.stages[0]
+            .as_mut()
+            .expect("ancestor stage exists")
+            .oid = foreign_oid;
+        assert!(matches!(
+            authorize_payload_before_v5_journal(&fixture.vault, &fixture.git, &guard, &tampered,),
+            Err(GitError::RecoveryConflict)
+        ));
+        assert!(!journal_path(root).exists());
+        assert_eq!(
+            fs::read(index_path(root)).expect("index remains after auth drift"),
+            index_before
+        );
+        assert_eq!(
+            fs::read(root.join("entry.md.enc")).expect("worktree remains"),
+            original_worktree
+        );
     }
 
     #[test]
