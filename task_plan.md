@@ -75,20 +75,27 @@ Phase 7 — 跨平台验证、打包与发布准备
 ### Phase 7: 跨平台验证、打包与发布准备
 
 - [ ] 跑通格式、性质、RPC、编辑器、Git、Unicode/长路径/换行的验证矩阵
+- [ ] 闭合 init plan 的 creation-time Argon2id 校准：v1 固定 64 MiB/parallelism 1，有界选择 ops 以目标 250–750 ms；显式 fixture 参数不漂移，RPC creation cap 与 password rewrap 不降级
 - [x] 闭合 binding Git rename/modify 源码契约：detected 形态、split 两侧 rename、精确 tree provenance、v2/v3 journal 与恢复负测均通过
 - [ ] 在原生支持平台复验 Git rename/power-loss，并在 GA 前保留“禁止并行 Git porcelain”边界或实现真正的 index CAS
   - [x] 实现 alternate-index candidate、Inex 自持真实 `.git/index.lock`、old/candidate digest 绑定与 create-only journal v4
   - [x] 用真实临时 Git 仓库覆盖 foreign lock、并行 porcelain、marker/candidate/published crash states 与 SHA-1/SHA-256
+  - [x] 用真实 Linux 子 test + OS force-kill 覆盖 core atomic verified-stage/lock/replace/post-commit 四个边界，只接受完整 old/new ciphertext
+  - [x] 修复并复审 Git v4 candidate 创建前的 durable pre-lock intent：orphan staging、foreign ownership、Windows exact-name 与 link/reparse 全部 fail closed
+  - [ ] 闭合 candidate/initial/final ownership receipt 之间的强杀自动恢复，或在 GA scope 中明确这些可见状态只能保留并人工处置
   - [ ] 原生 Windows NTFS/ReFS 复验 replace/write-through/power-loss，并由绑定证据决定是否取消 no-parallel-Git 边界
 - [x] 配置 Linux/Windows x64/arm64 CI、Rust 二进制、VSIX 与 Sublime 包产物；远端 hosted jobs 尚待执行
 - [x] 完成 threat model、用户指南、安全配置、迁移/升级与故障恢复文档
 - [ ] 审计磁盘明文残留、日志秘密、依赖许可与发布清单
   - [x] 将 target-bound Cargo graph、固定四 workspace member、精确许可策略/checksum、许可文本摘要与 libsodium 声明绑定到严格 `THIRD_PARTY_LICENSES.json`
   - [x] 严格验证三包共享 inventory/sidecar，并为 package/lifecycle evidence 定义 canonical report v1 与动态秘密自扫描
-  - [x] 从新 clean HEAD 重建 Linux x64 三包，复验 audit/smoke/lifecycle 并另做 RPC/CLI/Git 负路径秘密 drill
+  - [x] 从 clean `40ff728` checkpoint 重建 Linux x64 三包，复验 audit/smoke/lifecycle 并另做 RPC/CLI/Git 负路径秘密 drill；该历史包不含后续 core/Git 变更
+  - [x] Sublime Build 4200 residue runner 改用真实 masked zenity，口令仅从 stdin 注入并纳入全根动态扫描；正常与 plugin-host kill 两路均零磁盘命中
+  - [ ] VS Code persistent-profile UI 自动化仍缺可靠可观测 driver；已撤销无法触发 extension activation 的 X11 原型，不以坐标猜测形成证据
   - [ ] 在所有原生目标重复许可/残留证据并完成独立法务、签名与发布渠道审查
-- [x] 在最终 clean commit 上用 system GCC 完成两次逐字节一致的 Linux x64 package/audit/native-dependency/VSIX-install smoke
-- [x] 从独立 standalone clean clone 对最终 Linux x64 artifact 完成 import/password/Git-bundle/tree-copy restore/frozen-v1/residue lifecycle drill
+- [x] 在 clean `40ff728` checkpoint 上用 system GCC 完成两次逐字节一致的 Linux x64 package/audit/native-dependency/VSIX-install smoke
+- [x] 从独立 standalone clean clone 对 `40ff728` 历史 artifact 完成 import/password/Git-bundle/tree-copy restore/frozen-v1/residue lifecycle drill
+- [ ] 从最终功能提交重建三包并重跑 strict audit/native smoke/lifecycle；旧 `40ff728` artifact 不得冒充当前源码产物
 - **Status:** in_progress
 
 ## Key Questions

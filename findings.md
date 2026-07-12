@@ -198,6 +198,20 @@
 - Microsoft FlushFileBuffers: https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-flushfilebuffers
 - Git for Windows release notes: https://github.com/git-for-windows/build-extra/blob/main/ReleaseNotes.md
 
+## 2026-07-12 Phase 7 fault/recovery follow-up
+
+- Hosted Windows 能形成的绑定证据是 NTFS 上 `TerminateProcess`/强杀后的新进程恢复；它不能替代 ReFS、Hyper-V guest power cut 或物理断电。三类结论必须在报告和 checklist 中分开。
+- Git v4 在 real `.git/index.lock` 之前只依赖 RAII 清理会漏掉强杀残留；新增 pre-lock intent 的方向正确，但首版独立复审发现 guard 之前的 reservation staging 窗仍会被 `has_pending_recovery` 误报为 clean，且可能永久阻断下一事务，因此当前差异保持 NO-GO 直至 orphan staging 可发现/分类。
+- Token-derived 私有路径不自动等价于文件所有权。普通 `create_new` 冲突、hardlink/reparse、错误大小写别名和未知 reserved state 都必须保留并 fail closed；Windows cleanup 前还需通过目录枚举确认 exact spelling，不能让大小写敏感 inventory 配合大小写不敏感 lookup 误删别名。
+- Core atomic write 已新增真实双进程 force-kill test：子 test 在 verified staging、lock 前、replace 前及 namespace commit 后/parent sync 前阻塞，父进程用 OS kill 终止，再证明 target 只可能是完整 old/new ciphertext 且 OS lock 已释放。该本机结果只绑定 Linux；Windows 需 hosted/native 执行后才能升级证据。
+- Sublime Build 4200 原 runner 把随机口令写入 fake zenity 脚本且未扫描口令，原 `root_scan_hits=0` 不能作为 password-residue 证据。runner 现改用真实绝对 zenity，口令仅从 `xdotool --file -` stdin 输入 masked dialog，并把口令加入 UTF-8/UTF-16/hex/base64 全根扫描；正常 CRUD 与 plugin-host SIGKILL 边界均实跑为零磁盘命中。
+- Linux VS Code persistent-profile 原型能安装 exact VSIX 并启动真实 Extension Host，但 Xvfb/xdotool 无法可靠触发 1.125.0 Command Palette/extension activation。为避免坐标猜测或生产测试后门造成假阳性，未验证 runner 已完全撤销；该门禁仍需可观测的官方 UI/accessibility driver 或人工原生矩阵。
+- `SECURITY.md` 的 strict tooling/lifecycle 数字曾滞后于 59/59 与 `d44ead9`，现同步修正；新增的 0.1.0 pre-alpha release notes 明确为 draft/NO-GO，并列出格式、工具链、libsodium、当前安全性质、deferred states 与 upgrade/rollback 边界。
+- `init_plan.md` 要求创建时把 Argon2id 校准到 250–750 ms，但生产 `Vault::create`、CLI init/import 与 RPC 缺省路径仍固定 3 ops/64 MiB；`create_with_params` 只是 deterministic seam。v1 可安全收敛为固定 64 MiB/parallelism 1、仅有界校准 ops 3..20，并用 process cache + fake clock/benchmark 单测避免 CI 抖动；冻结 fixture 继续显式参数。
+- RPC 的 optional raw `kdf` 不能沿用最高 1 GiB/ops20 unlock ceiling 作为 creation 输入上限；absent 应走校准，explicit compatibility 路径需独立较窄 creation cap。password add/change 也不能无条件降回默认参数，应至少继承并 clamp 当前已认证 slot 的强度。
+- Superseding pre-lock resolution：strict reservation + initial/final candidate ownership receipts 已闭合首版复审的 clean-miss/误删边界。目录枚举拒绝 wrong-case reserved aliases；canonical orphan staging 可精确清理，partial/multiple/link/reparse/foreign/未知 state 全部保留冲突；stable v4 journal 双可见只在完整绑定相等时移除 receipts/prelock。最终冻结复审为 0 blocker/0 major/0 required minor。
+- Receipt 安全性与可用性边界必须分开：candidate 已持久化但 initial receipt 尚未发布、Git 已改写 candidate 但 final receipt 尚未发布、或 partial receipt 都会被发现并保留，不会误报 clean 或误删；但 fresh recovery 不能自动判归属，仍返回 `RecoveryConflict`。该点与 native NTFS/ReFS power-loss 继续阻止 GA，不否定本次 fail-closed checkpoint。
+
 ## Visual/Browser Findings
 
 - 2026-07-10 官方 VS Code 文档明确区分 `CustomTextEditorProvider`（标准 TextDocument，VS Code 管 save/backup）与 `CustomEditorProvider`（扩展自管 document model/save/backup）；Inex 必须使用后者。
