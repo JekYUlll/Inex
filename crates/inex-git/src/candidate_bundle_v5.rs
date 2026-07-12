@@ -112,6 +112,14 @@ pub(super) fn candidate_bundle_stable_path_v5(
     Ok(root.join(VAULT_LOCAL_DIRECTORY).join(bundle_basename))
 }
 
+pub(super) fn candidate_bundle_scratch_path_v5(
+    root: &Path,
+    scratch_basename: &str,
+) -> Result<PathBuf, GitError> {
+    parse_candidate_bundle_scratch_basename_v5(scratch_basename)?;
+    Ok(root.join(VAULT_LOCAL_DIRECTORY).join(scratch_basename))
+}
+
 fn validate_index_metadata(metadata: &CandidateIndexMetadataV5) -> Result<(), GitError> {
     parse_hex_digest(&metadata.sha256)?;
     if metadata.size == 0 || metadata.size > u64::try_from(MAX_GIT_OUTPUT_BYTES).unwrap_or(u64::MAX)
@@ -354,7 +362,7 @@ pub(super) fn inspect_candidate_bundle_namespace_v5(
             if !name.starts_with(CANDIDATE_BUNDLE_SCRATCH_PREFIX_V5) {
                 return Err(GitError::RecoveryConflict);
             }
-            parse_candidate_bundle_scratch_basename_v5(&name)
+            candidate_bundle_scratch_path_v5(root, &name)
                 .map_err(|_| GitError::RecoveryConflict)?;
             retained_scratch_count = retained_scratch_count.saturating_add(1);
         }
@@ -606,10 +614,16 @@ mod tests {
             candidate_bundle_stable_path_v5(root.path(), &stable).expect("stable path validates"),
             root.local().join(&stable)
         );
+        assert_eq!(
+            candidate_bundle_scratch_path_v5(root.path(), &scratch)
+                .expect("scratch path validates"),
+            root.local().join(&scratch)
+        );
         assert!(stable.starts_with(crate::INDEX_CANDIDATE_PREFIX));
         assert!(candidate_bundle_stable_basename_v5(&TOKEN.to_uppercase()).is_err());
         assert!(candidate_bundle_scratch_basename_v5("../candidate").is_err());
         assert!(candidate_bundle_stable_path_v5(root.path(), &scratch).is_err());
+        assert!(candidate_bundle_scratch_path_v5(root.path(), &stable).is_err());
 
         let (installed, _, _) = install_bundle(&root, TOKEN);
         assert_eq!(installed, stable);
