@@ -277,6 +277,7 @@ Phase 7 — 跨平台验证、打包与发布准备
 | Windows GNU Clippy saw the Unix-only identity-swap test helper as unused | 1 | Gate the helper itself with `cfg(all(test, unix))`; keep production reading generic and rerun Windows check/clippy/no-run successfully |
 | A cleanup patch mistook the shared boundary line printed by two overlapping `sed` ranges for a duplicated source line | 1 | The patch failed before writing; inspect the real file with non-overlapping ranges and make no cleanup change because the source contains only one binding |
 | `origin/master` advanced concurrently to `47c6567` with reflog reason `update by push`, although this thread did not authorize or run a push | 1 | Preserve local `ea40261`, ask active agents to confirm, prohibit further pushes, and treat the remote update as external state rather than rewriting or force-updating history |
+| A third parallel marker-lock implementation could not be spawned because the four-agent thread limit was occupied by the classifier and authorization audit | 1 | Keep the two higher-priority agents running and design the marker seam locally; retry delegation only after a slot is released rather than interrupting active work |
 
 ## Notes
 
