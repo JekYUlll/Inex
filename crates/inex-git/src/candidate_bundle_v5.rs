@@ -57,8 +57,15 @@ pub(super) struct CandidateBundleManifestReferenceV5 {
     pub(super) sha256: String,
 }
 
+/// Filesystem-inventory proof for one immutable v5 candidate bundle.
+///
+/// This type proves only the canonical manifest, exact member inventory,
+/// single-link file identities, and recorded size/digest bindings. It does not
+/// validate the candidate Git stage-map, the live expected-old index, or the
+/// transaction's Git semantics. Before any mutation, the v5 writer/recovery
+/// path must perform those checks in the real repository's Git context.
 #[derive(Debug)]
-pub(super) struct VerifiedCandidateBundleV5 {
+pub(super) struct InventoryVerifiedCandidateBundleV5 {
     pub(super) manifest: CandidateBundleManifestV5,
     pub(super) manifest_reference: CandidateBundleManifestReferenceV5,
 }
@@ -299,11 +306,16 @@ fn exact_bundle_members(path: &Path) -> Result<BTreeSet<String>, GitError> {
     Ok(names)
 }
 
+/// Verifies only immutable bundle schema, member identity, and byte bindings.
+///
+/// This is not a Git-semantic authorization check. Callers must separately
+/// validate the candidate stage-map, live expected-old index, and transaction
+/// semantics in the real Git repository before performing any mutation.
 pub(super) fn validate_candidate_bundle_inventory_v5(
     root: &Path,
     bundle_basename: &str,
     expected_manifest_reference: Option<&CandidateBundleManifestReferenceV5>,
-) -> Result<VerifiedCandidateBundleV5, GitError> {
+) -> Result<InventoryVerifiedCandidateBundleV5, GitError> {
     let bundle_path = candidate_bundle_stable_path_v5(root, bundle_basename)?;
     let token = parse_candidate_bundle_stable_basename_v5(bundle_basename)?;
     let directory_identity =
@@ -338,7 +350,7 @@ pub(super) fn validate_candidate_bundle_inventory_v5(
         return Err(GitError::RecoveryConflict);
     }
     exact_bundle_members(&bundle_path)?;
-    Ok(VerifiedCandidateBundleV5 {
+    Ok(InventoryVerifiedCandidateBundleV5 {
         manifest,
         manifest_reference,
     })
@@ -671,11 +683,25 @@ mod tests {
                 "missing" => fs::remove_file(bundle.join(CANDIDATE_BUNDLE_INDEX_V5))
                     .expect("candidate removes"),
                 "extra" => fs::write(bundle.join("extra"), b"extra").expect("extra writes"),
-                "wrong-case" => fs::rename(
-                    bundle.join(CANDIDATE_BUNDLE_MANIFEST_V5),
-                    bundle.join("Manifest-v5.json"),
-                )
-                .expect("manifest case changes"),
+                "wrong-case" => {
+                    let canonical = bundle.join(CANDIDATE_BUNDLE_MANIFEST_V5);
+                    let manifest_bytes = fs::read(&canonical).expect("manifest reads");
+                    fs::remove_file(&canonical).expect("canonical manifest removes");
+                    fs::write(bundle.join("Manifest-v5.json"), manifest_bytes)
+                        .expect("wrong-case manifest writes");
+                    let enumerated = fs::read_dir(&bundle)
+                        .expect("bundle enumerates")
+                        .map(|entry| {
+                            entry
+                                .expect("bundle entry reads")
+                                .file_name()
+                                .into_string()
+                                .expect("bundle member name is UTF-8")
+                        })
+                        .collect::<BTreeSet<_>>();
+                    assert!(enumerated.contains("Manifest-v5.json"));
+                    assert!(!enumerated.contains(CANDIDATE_BUNDLE_MANIFEST_V5));
+                }
                 "directory" => {
                     fs::remove_file(bundle.join(CANDIDATE_BUNDLE_INDEX_V5))
                         .expect("candidate removes");
