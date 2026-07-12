@@ -47,6 +47,10 @@ HELPER_REPORT_MAX_RECORDS = 256
 ARTIFACT_REPORT_SCOPE = (
     "exact-packaged-sublime-build4200-single-scenario-evidence-non-release-approval"
 )
+RESTART_ARTIFACT_REPORT_SCOPE = (
+    "exact-packaged-sublime-build4200-full-application-kill-restart-evidence-"
+    "non-release-approval"
+)
 ARTIFACT_HARNESS_FILES = (
     "editors/sublime/test/build4200/InexQA.py",
     "editors/sublime/test/build4200/run_build4200.py",
@@ -104,6 +108,23 @@ CRASH_EVENT_SEQUENCE = (
     "plugin_host_crash_ready",
     "plugin_host_dead_clipboard_checked",
     "plugin_host_restart_required",
+)
+RESTART_EVENT_SEQUENCE = (
+    "loaded",
+    "unlock_dispatched",
+    "password_prompt_answered",
+    "ui",
+    "opened",
+    "saved",
+    "full_application_restart_ready",
+    "restart_loaded",
+    "restart_preunlock_checked",
+    "restart_unlock_dispatched",
+    "password_prompt_answered",
+    "ui",
+    "restart_reopened",
+    "restart_closed",
+    "complete",
 )
 
 
@@ -518,10 +539,16 @@ def materialize_packaged_inputs(
 def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--keep", action="store_true", help="retain the isolated root")
-    parser.add_argument(
+    scenario = parser.add_mutually_exclusive_group()
+    scenario.add_argument(
         "--plugin-host-crash",
         action="store_true",
         help="kill and restart the isolated Python 3.8 plugin host with plaintext open",
+    )
+    scenario.add_argument(
+        "--full-application-kill-restart",
+        action="store_true",
+        help="SIGKILL the isolated application and reopen through the same profile",
     )
     parser.add_argument("--root", type=Path, help="use an explicit empty test root")
     parser.add_argument(
@@ -1101,7 +1128,7 @@ def report_not_covered(scenario: str, result: str) -> List[str]:
     values = list(COMMON_NOT_COVERED)
     if scenario == "normal":
         values.append("plugin-host-crash-and-application-restart-recovery-in-this-report")
-    else:
+    elif scenario == "plugin-host-crash":
         values.extend(
             [
                 "normal-close-and-encrypted-crud-path-in-this-report",
@@ -1112,15 +1139,33 @@ def report_not_covered(scenario: str, result: str) -> List[str]:
             values.append(
                 "crash-time-plaintext-erasure-before-required-full-application-restart"
             )
+    elif scenario == "full-application-kill-restart":
+        values.extend(
+            [
+                "normal-close-and-encrypted-crud-path-in-this-report",
+                "plugin-host-only-crash-boundary-in-this-report",
+                "persistent-profile-matrix-beyond-one-full-application-kill-restart",
+            ]
+        )
+    else:
+        raise QaFailure("unknown Build 4200 scenario")
     return values
+
+
+def scenario_event_sequence(scenario: str) -> Tuple[str, ...]:
+    if scenario == "normal":
+        return NORMAL_EVENT_SEQUENCE
+    if scenario == "plugin-host-crash":
+        return CRASH_EVENT_SEQUENCE
+    if scenario == "full-application-kill-restart":
+        return RESTART_EVENT_SEQUENCE
+    raise QaFailure("unknown Build 4200 scenario")
 
 
 def normalize_helper_records(
     records: Sequence[Mapping[str, object]], scenario: str
 ) -> List[Dict[str, object]]:
-    expected_events = (
-        NORMAL_EVENT_SEQUENCE if scenario == "normal" else CRASH_EVENT_SEQUENCE
-    )
+    expected_events = scenario_event_sequence(scenario)
     if tuple(record.get("event") for record in records) != expected_events:
         raise QaFailure("QA helper report has an unexpected successful event sequence")
     schemas = {
@@ -1181,7 +1226,59 @@ def normalize_helper_records(
             "event",
             "documented_platform_boundary",
         },
+        "full_application_restart_ready": {
+            "event",
+            "time",
+            "view_id",
+            "logical_path",
+            "byte_count",
+            "content_sha256",
+            "marker",
+            "state_written",
+            "token_fingerprint_count",
+        },
+        "restart_loaded": {"event", "time", "build", "gate_ok", "issue_count"},
+        "restart_preunlock_checked": {
+            "event",
+            "time",
+            "view_count",
+            "managed_count",
+            "session_active",
+            "marker_count",
+            "known_fingerprint_count",
+            "token_window_match_count",
+            "clean",
+            "stable_duration_ms",
+        },
+        "restart_unlock_dispatched": {
+            "event",
+            "time",
+            "plugin_active",
+            "in_progress",
+        },
+        "restart_reopened": {
+            "event",
+            "time",
+            "scratch",
+            "unnamed",
+            "clean",
+            "marker",
+            "session_active",
+            "logical_path_matches",
+            "fingerprint_matches",
+            "byte_count",
+            "content_sha256",
+        },
+        "restart_closed": {
+            "event",
+            "time",
+            "managed_count",
+            "view_absent",
+            "normal_close",
+        },
     }
+    if scenario == "full-application-kill-restart":
+        schemas["complete"] = {"event", "time", "restarted", "managed_count"}
     normalized: List[Dict[str, object]] = []
     for record in records:
         event = record.get("event")
@@ -1259,7 +1356,7 @@ def normalize_helper_records(
             "complete"
         ].get("managed_count") != 0:
             raise QaFailure("QA helper report retained a managed view at completion")
-    else:
+    elif scenario == "plugin-host-crash":
         if ui_actions != ["select_tree"]:
             raise QaFailure("QA helper report has an invalid crash UI sequence")
         ready = by_event["plugin_host_crash_ready"]
@@ -1294,6 +1391,65 @@ def normalize_helper_records(
             is not True
         ):
             raise QaFailure("QA helper report has an invalid crash-boundary observation")
+    else:
+        if ui_actions != ["select_tree", "select_tree_after_restart"]:
+            raise QaFailure("QA helper report has an invalid restart UI sequence")
+        ready = by_event["full_application_restart_ready"]
+        preunlock = by_event["restart_preunlock_checked"]
+        reopened = by_event["restart_reopened"]
+        closed = by_event["restart_closed"]
+        if (
+            ready.get("marker") is not True
+            or ready.get("state_written") is not True
+            or ready.get("logical_path") != "qa.md"
+            or ready.get("token_fingerprint_count") != 2
+            or not isinstance(ready.get("view_id"), int)
+            or isinstance(ready.get("view_id"), bool)
+            or ready["view_id"] <= 0
+            or (ready.get("byte_count"), ready.get("content_sha256"))
+            != (
+                by_event["saved"].get("byte_count"),
+                by_event["saved"].get("content_sha256"),
+            )
+            or by_event["restart_loaded"].get("build") != BUILD
+            or by_event["restart_loaded"].get("gate_ok") is not True
+            or by_event["restart_loaded"].get("issue_count") != 0
+            or preunlock.get("clean") is not True
+            or preunlock.get("managed_count") != 0
+            or preunlock.get("session_active") is not False
+            or preunlock.get("marker_count") != 0
+            or preunlock.get("known_fingerprint_count") != 0
+            or preunlock.get("token_window_match_count") != 0
+            or preunlock.get("stable_duration_ms") != 2000
+            or not isinstance(preunlock.get("view_count"), int)
+            or isinstance(preunlock.get("view_count"), bool)
+            or preunlock["view_count"] < 0
+            or by_event["restart_unlock_dispatched"].get("plugin_active") is not True
+            or by_event["restart_unlock_dispatched"].get("in_progress") is not True
+            or any(
+                reopened.get(field) is not True
+                for field in (
+                    "scratch",
+                    "unnamed",
+                    "clean",
+                    "marker",
+                    "session_active",
+                    "logical_path_matches",
+                    "fingerprint_matches",
+                )
+            )
+            or (reopened.get("byte_count"), reopened.get("content_sha256"))
+            != (
+                by_event["saved"].get("byte_count"),
+                by_event["saved"].get("content_sha256"),
+            )
+            or closed.get("managed_count") != 0
+            or closed.get("view_absent") is not True
+            or closed.get("normal_close") is not True
+            or by_event["complete"].get("restarted") is not True
+            or by_event["complete"].get("managed_count") != 0
+        ):
+            raise QaFailure("QA helper report has an invalid full-restart observation")
     return normalized
 
 
@@ -2271,6 +2427,7 @@ def main() -> int:
         {
             "hot_exit": "disabled",
             "hot_exit_projects": False,
+            "remember_open_files": False,
             "update_system_recent_files": False,
         },
     )
@@ -2291,6 +2448,7 @@ def main() -> int:
             "report_path": str(report),
             "state_path": str(state),
             "plugin_host_crash": args.plugin_host_crash,
+            "full_application_kill_restart": args.full_application_kill_restart,
         },
     )
     if not artifact_mode:

@@ -12,15 +12,19 @@ import os
 import re
 import sys
 import time
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import sublime
 import sublime_plugin
 
 
 _TOKEN_RE = re.compile(r"^EDIT_TOKEN: (INEXQA_EDIT_[0-9a-f]{32})$", re.MULTILINE)
+_INITIAL_TOKEN_RE = re.compile(
+    r"^INITIAL_TOKEN: (INEXQA_INITIAL_[0-9a-f]{32})$", re.MULTILINE
+)
 _started = False
 _error_probe_installed = False
+_opened_fingerprint: Optional[Tuple[int, str]] = None
 _HOST_MARKER = "inex.managed_plaintext"
 _LOCKED_TEXT = "[Inex locked — unlock the vault to reopen this document]\n"
 _CRUD_DIRECTORY = "qa-crud"
@@ -224,6 +228,7 @@ def _begin() -> None:
 
 
 def _opened() -> None:
+    global _opened_fingerprint
     current = _managed()
     if current is None:
         _report("fatal", step="managed_missing_after_open")
@@ -248,6 +253,8 @@ def _opened() -> None:
     ):
         _report("fatal", step="open_invariants")
         return
+    encoded = text.encode("utf-8")
+    _opened_fingerprint = (len(encoded), hashlib.sha256(encoded).hexdigest())
     view.run_command("inex_qa_append_edit_token")
 
     def dirty() -> bool:
@@ -285,6 +292,9 @@ def _saved() -> None:
     )
     if not persisted_shape:
         _report("fatal", step="save_shape")
+        return
+    if _settings().get("full_application_kill_restart", False) is True:
+        _full_application_restart_ready()
         return
     if _settings().get("plugin_host_crash", False) is True:
         _plugin_host_crash_ready()
@@ -445,6 +455,314 @@ def _plugin_host_crash_ready() -> None:
     )
 
 
+def _full_application_restart_ready() -> None:
+    current = _managed()
+    if current is None:
+        _report("fatal", step="full_restart_managed_missing")
+        return
+    _module, view, document = current
+    text = view.substr(sublime.Region(0, view.size()))
+    encoded = text.encode("utf-8")
+    marker = view.settings().get(_HOST_MARKER) is True
+    initial_match = _INITIAL_TOKEN_RE.search(text)
+    edit_match = _TOKEN_RE.search(text)
+    if (
+        not marker
+        or _opened_fingerprint is None
+        or initial_match is None
+        or edit_match is None
+        or document.logical_path != "qa.md"
+    ):
+        _report("fatal", step="full_restart_ready_invariants")
+        return
+    token_fingerprints: List[Dict[str, Any]] = []
+    for token in (initial_match.group(1), edit_match.group(1)):
+        token_bytes = token.encode("utf-8")
+        token_fingerprints.append(
+            {
+                "byte_count": len(token_bytes),
+                "content_sha256": hashlib.sha256(token_bytes).hexdigest(),
+            }
+        )
+    saved_fingerprint = (len(encoded), hashlib.sha256(encoded).hexdigest())
+    state = {
+        "phase": "await_full_application_restart",
+        "logical_path": "qa.md",
+        "opened_byte_count": _opened_fingerprint[0],
+        "opened_content_sha256": _opened_fingerprint[1],
+        "saved_byte_count": saved_fingerprint[0],
+        "saved_content_sha256": saved_fingerprint[1],
+        "token_fingerprints": token_fingerprints,
+    }
+    if not _write_state(state):
+        _report("fatal", step="full_restart_state_write")
+        return
+    _report(
+        "full_application_restart_ready",
+        view_id=view.id(),
+        logical_path="qa.md",
+        byte_count=saved_fingerprint[0],
+        content_sha256=saved_fingerprint[1],
+        marker=marker,
+        state_written=True,
+        token_fingerprint_count=len(token_fingerprints),
+    )
+
+
+def _valid_state_fingerprint(
+    state: Dict[str, Any], byte_field: str, digest_field: str
+) -> Optional[Tuple[int, str]]:
+    byte_count = state.get(byte_field)
+    digest = state.get(digest_field)
+    if (
+        not isinstance(byte_count, int)
+        or isinstance(byte_count, bool)
+        or byte_count <= 0
+        or not isinstance(digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+    ):
+        return None
+    return byte_count, digest
+
+
+def _restart_state() -> Optional[Dict[str, Any]]:
+    state = _read_state()
+    if set(state) != {
+        "phase",
+        "logical_path",
+        "opened_byte_count",
+        "opened_content_sha256",
+        "saved_byte_count",
+        "saved_content_sha256",
+        "token_fingerprints",
+    }:
+        return None
+    if (
+        state.get("phase") != "await_full_application_restart"
+        or state.get("logical_path") != "qa.md"
+        or _valid_state_fingerprint(
+            state, "opened_byte_count", "opened_content_sha256"
+        )
+        is None
+        or _valid_state_fingerprint(state, "saved_byte_count", "saved_content_sha256")
+        is None
+    ):
+        return None
+    tokens = state.get("token_fingerprints")
+    if not isinstance(tokens, list) or len(tokens) != 2:
+        return None
+    for token in tokens:
+        if (
+            not isinstance(token, dict)
+            or set(token) != {"byte_count", "content_sha256"}
+            or _valid_state_fingerprint(
+                {
+                    "byte_count": token.get("byte_count"),
+                    "content_sha256": token.get("content_sha256"),
+                },
+                "byte_count",
+                "content_sha256",
+            )
+            is None
+        ):
+            return None
+    return state
+
+
+def _contains_hashed_window(encoded: bytes, byte_count: int, digest: str) -> bool:
+    if byte_count > len(encoded):
+        return False
+    return any(
+        hashlib.sha256(encoded[offset : offset + byte_count]).hexdigest() == digest
+        for offset in range(len(encoded) - byte_count + 1)
+    )
+
+
+def _preunlock_observation(state: Dict[str, Any]) -> Dict[str, Any]:
+    module = _inex_module()
+    managed_count = len(module._registry.values()) if module is not None else -1
+    session_active = False
+    if module is not None:
+        client, _vault, _generation = module._runtime_snapshot()
+        session_active = client is not None and client.has_session
+    known_fingerprints = {
+        _valid_state_fingerprint(state, "opened_byte_count", "opened_content_sha256"),
+        _valid_state_fingerprint(state, "saved_byte_count", "saved_content_sha256"),
+    }
+    token_fingerprints = [
+        (token["byte_count"], token["content_sha256"])
+        for token in state["token_fingerprints"]
+    ]
+    view_count = 0
+    marker_count = 0
+    known_fingerprint_count = 0
+    token_window_match_count = 0
+    for window in sublime.windows():
+        for view in window.views(include_transient=True):
+            view_count += 1
+            encoded = view.substr(sublime.Region(0, view.size())).encode("utf-8")
+            if view.settings().get(_HOST_MARKER) is True:
+                marker_count += 1
+            if (len(encoded), hashlib.sha256(encoded).hexdigest()) in known_fingerprints:
+                known_fingerprint_count += 1
+            token_window_match_count += sum(
+                1
+                for byte_count, digest in token_fingerprints
+                if _contains_hashed_window(encoded, byte_count, digest)
+            )
+    clean = (
+        managed_count == 0
+        and not session_active
+        and marker_count == 0
+        and known_fingerprint_count == 0
+        and token_window_match_count == 0
+    )
+    return {
+        "view_count": view_count,
+        "managed_count": managed_count,
+        "session_active": session_active,
+        "marker_count": marker_count,
+        "known_fingerprint_count": known_fingerprint_count,
+        "token_window_match_count": token_window_match_count,
+        "clean": clean,
+    }
+
+
+def _begin_full_application_restart() -> None:
+    state = _restart_state()
+    module = _inex_module()
+    if state is None or module is None:
+        _report("fatal", step="full_restart_state_or_module")
+        return
+    issues = module.insecure_preferences()
+    _report(
+        "restart_loaded",
+        build=sublime.version(),
+        gate_ok=not issues,
+        issue_count=len(issues),
+    )
+    if issues:
+        return
+    stable_since: Optional[float] = None
+    deadline = time.monotonic() + 20000 / 1000.0
+
+    def poll() -> None:
+        nonlocal stable_since
+        observation = _preunlock_observation(state)
+        now = time.monotonic()
+        if observation["clean"] is True:
+            if stable_since is None:
+                stable_since = now
+            if now - stable_since >= 2.0:
+                _report(
+                    "restart_preunlock_checked",
+                    stable_duration_ms=2000,
+                    **observation,
+                )
+                window = sublime.active_window()
+                if window is None:
+                    _report("fatal", step="full_restart_window_missing")
+                    return
+                window.run_command("inex_unlock")
+                sublime.set_timeout(
+                    lambda: _report(
+                        "restart_unlock_dispatched",
+                        plugin_active=getattr(module, "_plugin_active", False) is True,
+                        in_progress=getattr(module, "_unlock_in_progress", False) is True,
+                    ),
+                    500,
+                )
+
+                def unlocked() -> bool:
+                    current = _inex_module()
+                    if current is None:
+                        return False
+                    client, _vault, _generation = current._runtime_snapshot()
+                    return client is not None and client.has_session
+
+                def select_tree() -> None:
+                    _report("ui", action="select_tree_after_restart")
+                    _wait_for(
+                        "managed_reopen", lambda: _managed() is not None, _restart_reopened
+                    )
+
+                _wait_for("restart_unlock", unlocked, select_tree)
+                return
+        else:
+            stable_since = None
+        if now >= deadline:
+            _report("fatal", step="full_restart_preunlock_stability")
+            return
+        sublime.set_timeout(poll, 100)
+
+    poll()
+
+
+def _restart_reopened() -> None:
+    state = _restart_state()
+    current = _managed()
+    if state is None or current is None:
+        _report("fatal", step="full_restart_reopen_missing")
+        return
+    module, view, document = current
+    text = view.substr(sublime.Region(0, view.size()))
+    encoded = text.encode("utf-8")
+    fingerprint_matches = (
+        len(encoded) == state["saved_byte_count"]
+        and hashlib.sha256(encoded).hexdigest() == state["saved_content_sha256"]
+    )
+    client, _vault, _generation = module._runtime_snapshot()
+    session_active = client is not None and client.has_session
+    marker = view.settings().get(_HOST_MARKER) is True
+    logical_path_matches = document.logical_path == state["logical_path"]
+    _report(
+        "restart_reopened",
+        scratch=view.is_scratch(),
+        unnamed=view.file_name() is None,
+        clean=not document.dirty,
+        marker=marker,
+        session_active=session_active,
+        logical_path_matches=logical_path_matches,
+        fingerprint_matches=fingerprint_matches,
+        byte_count=len(encoded),
+        content_sha256=hashlib.sha256(encoded).hexdigest(),
+    )
+    if not all(
+        (
+            view.is_scratch(),
+            view.file_name() is None,
+            not document.dirty,
+            marker,
+            session_active,
+            logical_path_matches,
+            fingerprint_matches,
+        )
+    ):
+        _report("fatal", step="full_restart_reopen_invariants")
+        return
+    window = view.window()
+    if window is None:
+        _report("fatal", step="full_restart_close_window_missing")
+        return
+    window.run_command("inex_close_active")
+
+    def closed() -> bool:
+        visible_ids = {
+            candidate.id()
+            for candidate_window in sublime.windows()
+            for candidate in candidate_window.views(include_transient=True)
+        }
+        return _managed() is None and view.id() not in visible_ids
+
+    def finish() -> None:
+        _report(
+            "restart_closed", managed_count=0, view_absent=True, normal_close=True
+        )
+        _report("complete", restarted=True, managed_count=0)
+
+    _wait_for("restart_close", closed, finish)
+
+
 def _check_plugin_host_restart() -> None:
     state = _read_state()
     window = sublime.active_window()
@@ -510,8 +828,17 @@ def plugin_loaded() -> None:
         return
     _started = True
 
-    if _read_state().get("phase") == "await_plugin_host_restart":
+    phase = _read_state().get("phase")
+    if phase == "await_plugin_host_restart":
         sublime.set_timeout(_check_plugin_host_restart, 1000)
+        return
+    if phase == "await_full_application_restart":
+        _wait_for(
+            "restart_inex_plugin_active",
+            lambda: _inex_module() is not None
+            and getattr(_inex_module(), "_plugin_active", False) is True,
+            _begin_full_application_restart,
+        )
         return
 
     def wait_for_inex() -> None:

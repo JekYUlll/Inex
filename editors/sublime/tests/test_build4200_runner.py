@@ -95,6 +95,62 @@ def _helper_observations(scenario: str) -> list[dict]:
                 "documented_platform_boundary": True,
             },
         ]
+    if scenario == "full-application-kill-restart":
+        return common + [
+            {
+                "event": "full_application_restart_ready",
+                "view_id": 7,
+                "logical_path": "qa.md",
+                "byte_count": 20,
+                "content_sha256": _digest("b"),
+                "marker": True,
+                "state_written": True,
+                "token_fingerprint_count": 2,
+            },
+            {
+                "event": "restart_loaded",
+                "build": "4200",
+                "gate_ok": True,
+                "issue_count": 0,
+            },
+            {
+                "event": "restart_preunlock_checked",
+                "view_count": 0,
+                "managed_count": 0,
+                "session_active": False,
+                "marker_count": 0,
+                "known_fingerprint_count": 0,
+                "token_window_match_count": 0,
+                "clean": True,
+                "stable_duration_ms": 2000,
+            },
+            {
+                "event": "restart_unlock_dispatched",
+                "plugin_active": True,
+                "in_progress": True,
+            },
+            {"event": "password_prompt_answered", "masked": True},
+            {"event": "ui", "action": "select_tree_after_restart"},
+            {
+                "event": "restart_reopened",
+                "scratch": True,
+                "unnamed": True,
+                "clean": True,
+                "marker": True,
+                "session_active": True,
+                "logical_path_matches": True,
+                "fingerprint_matches": True,
+                "byte_count": 20,
+                "content_sha256": _digest("b"),
+            },
+            {
+                "event": "restart_closed",
+                "managed_count": 0,
+                "view_absent": True,
+                "normal_close": True,
+            },
+            {"event": "complete", "restarted": True, "managed_count": 0},
+        ]
     return common + [
         {"event": "ui", "action": "crud_new_folder"},
         {"event": "crud_folder_created", "exists": True},
@@ -424,6 +480,46 @@ class Build4200RunnerFoundationTests(unittest.TestCase):
         ):
             with self.subTest(arguments=arguments), self.assertRaises(SystemExit):
                 runner.parse_arguments(arguments)
+
+    def test_scenarios_are_mutually_exclusive(self) -> None:
+        restart = runner.parse_arguments(["--full-application-kill-restart"])
+        self.assertTrue(restart.full_application_kill_restart)
+        self.assertFalse(restart.plugin_host_crash)
+        with self.assertRaises(SystemExit):
+            runner.parse_arguments(
+                ["--plugin-host-crash", "--full-application-kill-restart"]
+            )
+
+    def test_restart_helper_contract_requires_stable_clean_preunlock(self) -> None:
+        observations = _helper_observations("full-application-kill-restart")
+        reconstructed = [
+            dict(record, **({} if record["event"] == "password_prompt_answered" else {"time": 0.0}))
+            for record in observations
+        ]
+        self.assertEqual(
+            runner.normalize_helper_records(
+                reconstructed, "full-application-kill-restart"
+            ),
+            observations,
+        )
+        for field, value in (
+            ("clean", False),
+            ("marker_count", 1),
+            ("known_fingerprint_count", 1),
+            ("token_window_match_count", 1),
+            ("stable_duration_ms", 1900),
+        ):
+            with self.subTest(field=field):
+                candidate = copy.deepcopy(reconstructed)
+                next(
+                    record
+                    for record in candidate
+                    if record["event"] == "restart_preunlock_checked"
+                )[field] = value
+                with self.assertRaises(runner.QaFailure):
+                    runner.normalize_helper_records(
+                        candidate, "full-application-kill-restart"
+                    )
 
     def test_physical_seal_rejects_mutation_rebind_and_hardlink(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
