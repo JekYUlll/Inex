@@ -278,6 +278,9 @@ Phase 7 — 跨平台验证、打包与发布准备
 | A cleanup patch mistook the shared boundary line printed by two overlapping `sed` ranges for a duplicated source line | 1 | The patch failed before writing; inspect the real file with non-overlapping ranges and make no cleanup change because the source contains only one binding |
 | `origin/master` advanced concurrently to `47c6567` with reflog reason `update by push`, although this thread did not authorize or run a push | 1 | Preserve local `ea40261`, ask active agents to confirm, prohibit further pushes, and treat the remote update as external state rather than rewriting or force-updating history |
 | A third parallel marker-lock implementation could not be spawned because the four-agent thread limit was occupied by the classifier and authorization audit | 1 | Keep the two higher-priority agents running and design the marker seam locally; retry delegation only after a slot is released rather than interrupting active work |
+| The reused marker-lock agent created an independent worktree but relative `apply_patch` paths wrote 361 candidate lines and stale planning copies into the shared main worktree | 1 | Interrupt immediately; restore candidate/planning from committed `91153b9` through `apply_patch`, retain only the main thread's authorization diff, and require absolute worktree paths for every subagent patch |
+| First payload-authorization Clippy run found one collapsible condition and four needless borrows introduced by the in-place recovery extraction | 1 | Apply the exact lint suggestions without suppressions; targeted authorization tests and pedantic Clippy then pass |
+| Independent payload-authorization review could not start because classifier, marker, and existing review threads occupied the agent limit | 2 | Commit the fully green seam as an isolated reversible checkpoint; request an independent review as soon as either implementation agent finishes, before wiring journal publication |
 
 ## Notes
 
