@@ -466,3 +466,24 @@
 - v4 receipt gap 的根因已定位为 candidate create→initial receipt、Git mutation→final receipt 与 partial stable receipt 三个窗口；没有持久最终 digest/完整 payload 时，recovery 不能把 torn Inex state 与 foreign bytes 安全区分。v5 选择在非 active scratch 内完成 candidate、final digest、完整 transaction 与 exact inventory，再以一次 verified no-replace directory move 发布 immutable stable bundle；exact partial scratch 只计数/保留且不阻塞。
 - `4322612`/`ec6272b` 从 import 专用目录发布中抽出跨平台 verified no-replace primitive：Linux 使用 held-parent `renameat2(RENAME_NOREPLACE)`，Windows 使用无 replace/copy flag 的 `MoveFileExW(WRITE_THROUGH)`；callback 固定接收 caller path，内部仍复验 canonical physical identity，公共 API 明确要求上层 mutation guard 且不是 OS directory-identity CAS。Core 160/160、CLI 全套、workspace Clippy 与 Windows GNU/Wine targeted 7/7 通过。
 - `8d298c4`/`d77b242`/`9febba5` 定义 strict v5 canonical manifest、`manifest-v5.json`+`candidate.index` exact inventory、old-v4-visible stable name、exact scratch status 与兼容 `has_pending_recovery`。Linux `inex-git` 78/78、Windows GNU/Wine targeted 11/11 通过。类型名和 rustdoc 明确 inventory-only：真实 stage-zero map、live expected-old 和 transaction Git semantics 仍必须由后续 writer/recovery 在任何 mutation 前验证；production 目前继续写 v4。
+
+## 2026-07-13 — Git v5 production integration continuation
+
+- 重新完整读取 `planning-with-files`、根计划/进度/发现文件并执行 session catch-up；无未同步报告。当前 clean `master` 为 `ed51c59`，领先 `origin/master` 72 个提交，继续按独立可回滚 checkpoint 推进且不擅自推送。
+- 复核 `.agent/init_plan.md`：上位计划要求密文 Git merge、冲突恢复与端到端崩溃恢复验证；v5 marker/journal/index 状态机是为闭合现有 v4 receipt-gap 而细化的安全实现，不缩减原始交付范围。
+- 当前关键路径冻结为五步：严格 v5 reference schema、sealed bundle 语义加载、真实 `.git/index.lock` 消费与 worktree/index 前滚、恢复/精确清理、SHA-1/SHA-256 与 force-kill 矩阵。已并行启动现有 v4 调用图和 v5 状态机的两路只读审计；主线程同步核对代码与测试缝。
+- 初步调用图确认 v4 的 prepare/write/publish/recover 已分成可替换边界，v5 模块也已包含 manifest reference 与 held inventory seal；后续优先扩展 strict journal dispatch 和只读 loader，不直接重写三个 merge plan 的语义代码。
+- 完整阅读 v5 schema/inventory/preparation：stable bundle 的唯一完整 transaction 已在 manifest 内，outer marker/journal 可安全收敛为 digest reference；fresh recovery 需要重开 inventory seal，当前调用内则可延续发布前句柄身份。下一实现会把 Git 语义 loader 与 namespace mutation 明确分层。
+- 对照 v4 物理顺序后确认 v5 可消除 receipt 窗：stable bundle 在真实 lock 前已是完整、一次发布的 durable receipt；marker 前后的任何恢复都可重新加载同一 manifest。实现还需增加独立 publish staging 副本，stable bundle 始终保持 exact two-member immutable inventory。
+- 阅读 v4 commit/recovery/journal 后形成的早期 cleanup 顺序已被后续 reference-only 审计取代：不能先残缺化 bundle 再依赖 journal。当前冻结顺序是 final 后完整 stable→cleanup 原子退休、在完整 cleanup 上删 journal、最后清 cleanup 成员。
+- 发现一个必须显式接线的生产分派点：`Git::update_index*` 目前仅识别 v4 `Cas` journal；v5 journal若只加入 parser 而不扩展该分派，会绕过物理 publisher。该点已列入实现与回归测试。
+- 现有真实 Git fixture 和 fault hook 足够支撑下一切片，无需引入 mock-only状态机。先实现 strict schema/loader并用 SHA-1/SHA-256验证，再扩展消费侧 checkpoint；保持 preparation 测试原样作为 immutable boundary 回归。
+- 第一实现切片已落地：新增 token 唯一派生的 stable/publish namespace reference、canonical `INEXIDX5\0` + strict JSON marker codec、marker bytes reference，以及 fresh-guard stable bundle Git 语义 loader；cleanup namespace 仅完成状态机设计，尚未提前暴露未使用 helper。定向 `v5_` 测试 19/19 通过，包含真实 SHA-1/SHA-256 stage map、reference tamper 和 external live-index drift；尚未提交或接入 production journal/writer。
+- 首轮 inex-git all-target Clippy 在测试通过后正确拒绝 20 个 non-test dead-code 项；不是行为失败。修正方向是不做模块级放宽：让 production preparation 返回 reference/marker seals，移除尚未实现 cleanup 所需的过早 helper，仅对下一切片即将消费的 marker parser 与 fresh loader保留窄理由。
+- 一次 cleanup-helper 测试补丁因 rustfmt 已把两个绑定压成单行而在写入前拒绝；检查当前块后改用精确上下文，不重复原补丁。
+- 收敛 dead-code 后完整 `inex-git` 92/92、all-target/all-feature pedantic Clippy、fmt 与 `git diff --check` 通过；Windows GNU all-target check、pedantic Clippy和 test no-run link 也全部通过。Reference/marker/loader 切片仍待独立差异审查后再提交。
+- Reference/marker/loader 独立审查为 GO（0 blocker/0 major/0 minor），另复验 canonical marker 与 fresh loader。两个 Rust 文件单独提交为 `b3671b6`（`feat: bind Git v5 transaction references`）；planning 仍留待本轮状态机推进后独立提交。
+- 新增 strict `BundleMergeJournalV5`：stable 文件仍复用既有 journal pathname，但 version 5 只嵌 transaction reference 与从同一 reference 重建的 marker bytes size/SHA；v1-v4 parser 分支不变。Matching stable+journal 可被 locked-safe status 接受，跨 object-format/reference、duplicate/unknown/trailing JSON 全部拒绝；在 publisher 接线前 `recover` 与真实 `update_index*` 显式 fail closed。定向 2/2 与 inex-git Clippy/fmt/diff 通过。
+- 独立 schema 审查在提交前发现 1 个 major：matching v5 stable+journal 分支未拒绝额外 reserved v4 state。当前无写入风险但 locked-safe 分类不严格；修复将本切片允许集合收窄为仅 stable+journal，并补 foreign marker-staging 共存负测。
+- Major 修复后又消除 status 对同一 journal 的双重读取，`pending/matching_v5` 由单次 parse共同产生；补齐 `update_index_rename` hard-stop 与 marker-size mutation。最终独立复核 GO（0 blocker/0 major/0 minor），完整 `inex-git` 94/94、native Clippy/fmt/diff、Windows GNU check/clippy/no-run 全绿。
+- Strict v5 journal 与过渡期 hard-stop 单独提交为 `89f91e9`（`feat: define Git v5 recovery journal`）。下一步已拆为并行边界：独立 worktree实现 sealed candidate→publish staging；主线程冻结真实 marker lock、journal publication和 prejournal recovery，production writer继续保持 v4直至 recovery先闭合。

@@ -94,7 +94,10 @@ Phase 7 — 跨平台验证、打包与发布准备
     - [ ] 设计并实现 v5 immutable candidate bundle：只在未发布 scratch 完成 Git mutation、final digest 与完整 payload，再以 verified no-replace directory move 一次性发布；partial scratch 保留但不阻塞，active namespace 不再暴露多文件 receipt gap
       - [x] 抽取跨平台 verified no-replace directory move，并冻结 audit-path/public API；Linux 与 Windows GNU/Wine 定向门禁通过
       - [x] 定义 strict canonical v5 manifest、exact two-file inventory、stable/scratch namespace 与 `RecoveryStatus`；明确 inventory 验证不替代真实 Git stage-map/expected-old/transaction 语义验证
-      - [ ] 在 scratch 完成 alternate-index mutation 与完整语义验证，一次性发布 immutable stable bundle，再接入 v5 marker/journal/index recovery 与强杀矩阵
+      - [ ] 将 immutable stable bundle 接入 v5 marker/journal/index recovery 与强杀矩阵
+        - [x] 在 scratch 完成 alternate-index mutation、完整语义验证并一次性发布 immutable stable bundle
+        - [x] 冻结 manifest transaction reference、canonical `INEXIDX5` marker、strict stable journal 与 fresh-process Git 语义 loader；v1-v4 读取/恢复兼容保持不变
+        - [ ] 完成 publish staging、真实 `.git/index.lock`、worktree/index 前滚、bundle retire/cleanup 与 force-kill recovery
   - [ ] 原生 Windows NTFS/ReFS 复验 replace/write-through/power-loss，并由绑定证据决定是否取消 no-parallel-Git 边界
 - [x] 配置 Linux/Windows x64/arm64 CI、Rust 二进制、VSIX 与 Sublime 包产物；远端 hosted jobs 尚待执行
 - [x] 完成 threat model、用户指南、安全配置、迁移/升级与故障恢复文档
@@ -263,6 +266,9 @@ Phase 7 — 跨平台验证、打包与发布准备
 | Git v5 preflight found a Windows canonical-vs-caller audit-path mismatch, a crate-private primitive, and a case-only wrong-case fixture that did not create a distinct stored name | 1 each | Freeze the callback on the caller path while retaining internal canonical identity checks, expose a constrained documented API, create the wrong-case member directly, and require Windows GNU/Wine targeted gates before integration |
 | Combined current-checkpoint planning patch targeted an earlier progress tail and failed context verification | 1 | No partial planning write occurred; split task-plan edits from append-only progress/findings sections and anchor each patch to the actual current tail |
 | First split findings append omitted the literal space in `power-loss 证据` and failed exact context matching | 1 | No partial findings write occurred; copy the exact current tail before the append-only patch and rerun `git diff --check` |
+| Isolated v5 reference/marker loader passed 19 tests but non-test Clippy rejected 20 intentionally unwired items as dead code | 1 | Keep the codec slice real: return the reference and marker seals from production bundle preparation, remove premature cleanup/path helpers, and narrowly annotate only parser/loader entry points until the immediately following writer/recovery slice consumes them |
+| Cleanup-helper removal patch missed rustfmt's single-line test bindings | 1 | No partial test edit occurred; inspect the exact formatted block, remove only the premature cleanup/path assertions, and retain the token-derived publish basename assertion |
+| v5 journal review found locked-safe status accepted matching bundle+journal beside unrelated reserved v4 files | 1 | Require the post-stable reserved namespace to be exactly the stable journal in this schema slice; add foreign marker-staging coexistence regression, then let the later publisher replace this narrow rule with a transaction-specific physical-state inspector |
 
 ## Notes
 
