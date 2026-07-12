@@ -8,6 +8,7 @@ import atexit
 import base64
 import ctypes
 from dataclasses import dataclass, field
+import errno
 import hashlib
 import json
 import os
@@ -137,6 +138,11 @@ ROOT_ENVIRONMENT_KEYS = (
     "TMP",
     "TEMP",
 )
+PROCESS_IDENTITY_ENVIRONMENT_KEYS = ROOT_ENVIRONMENT_KEYS + ("GTK_USE_PORTAL",)
+MOUNTINFO_MAX_BYTES = 1024 * 1024
+MOUNTINFO_MAX_LINES = 4096
+MOUNTINFO_MAX_LINE_BYTES = 16 * 1024
+PORTAL_UNMOUNT_HELPER = Path("/usr/bin/fusermount3")
 PR_SET_CHILD_SUBREAPER = 36
 PR_GET_CHILD_SUBREAPER = 37
 
@@ -152,7 +158,9 @@ class ProcessDisappeared(QaFailure):
 _ACTIVE_ARTIFACT_ROOT: Optional[Tuple[Path, os.stat_result]] = None
 
 
-def cleanup_active_artifact_root() -> None:
+def cleanup_active_artifact_root(
+    *, allow_dead_failure_portal_unmount: bool = False
+) -> None:
     """Delete only the exact private artifact-mode root registered by this process."""
 
     global _ACTIVE_ARTIFACT_ROOT
@@ -174,8 +182,25 @@ def cleanup_active_artifact_root() -> None:
         or stat.S_IMODE(observed.st_mode) != 0o700
     ):
         raise QaFailure("artifact evidence root changed physical identity")
-    if stable_root_binding_census(root, expected_root_environment(root)):
+    table = process_table()
+    runner_started = process_snapshot(os.getpid()).start_time_ticks
+    strict_candidates = {
+        snapshot.pid
+        for snapshot in table.values()
+        if snapshot.parent_pid == os.getpid()
+        and snapshot.start_time_ticks >= runner_started
+    }
+    if stable_root_binding_census(
+        root,
+        expected_root_environment(root),
+        strict_candidate_pids=strict_candidates,
+    ):
         raise QaFailure("artifact evidence root retains a live process binding")
+    mounts = root_mounts(root)
+    if mounts:
+        if not allow_dead_failure_portal_unmount:
+            raise QaFailure("artifact evidence root retains a mount")
+        unmount_exact_dead_failure_portal(root, mounts)
     shutil.rmtree(root)
     if os.path.lexists(root):
         raise QaFailure("artifact evidence root deletion was not verified")
@@ -227,6 +252,20 @@ class RootBindingObservation:
     sources: Tuple[str, ...]
     environment_keys: Tuple[str, ...]
     argv_mentions_root: bool
+
+
+@dataclass(frozen=True)
+class MountInfoRecord:
+    mount_id: int
+    parent_id: int
+    major_minor: str
+    root: str
+    mount_point: str
+    mount_options: str
+    optional_fields: Tuple[str, ...]
+    filesystem_type: str
+    mount_source: str
+    super_options: str
 
 
 def _metadata_signature(metadata: os.stat_result) -> Tuple[int, ...]:
@@ -701,6 +740,39 @@ def fixed_child_environment(root: Path) -> Dict[str, str]:
         "LC_ALL": "C.UTF-8",
     }
     return environment
+
+
+def restart_child_environment(root: Path) -> Dict[str, str]:
+    environment = fixed_child_environment(root)
+    environment["GTK_USE_PORTAL"] = "0"
+    return environment
+
+
+def private_dbus_config_bytes(socket_path: Path) -> bytes:
+    raw_path = str(socket_path)
+    if (
+        not socket_path.is_absolute()
+        or os.path.normpath(raw_path) != raw_path
+        or any(character in raw_path for character in "&<>\"'\r\n")
+    ):
+        raise QaFailure("private D-Bus socket path is unsafe for fixed XML")
+    return (
+        "<!DOCTYPE busconfig PUBLIC \"-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN\"\n"
+        " \"http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd\">\n"
+        "<busconfig>\n"
+        "  <type>session</type>\n"
+        "  <keep_umask/>\n"
+        "  <listen>unix:path="
+        + raw_path
+        + "</listen>\n"
+        "  <auth>EXTERNAL</auth>\n"
+        "  <policy context=\"default\">\n"
+        "    <allow send_destination=\"*\" eavesdrop=\"true\"/>\n"
+        "    <allow eavesdrop=\"true\"/>\n"
+        "    <allow own=\"*\"/>\n"
+        "  </policy>\n"
+        "</busconfig>\n"
+    ).encode("utf-8")
 
 
 def bounded_tool_version(path: Path, arguments: Sequence[str]) -> str:
@@ -1238,6 +1310,216 @@ def stable_root_binding_census(
     raise QaFailure("procfs root-binding census did not stabilize")
 
 
+def _decode_mountinfo_path(raw: bytes) -> str:
+    decoded = bytearray()
+    index = 0
+    while index < len(raw):
+        if raw[index] != 0x5C:
+            decoded.append(raw[index])
+            index += 1
+            continue
+        if index + 3 >= len(raw):
+            raise QaFailure("mountinfo contains a truncated path escape")
+        escaped = raw[index + 1 : index + 4]
+        if any(byte < ord("0") or byte > ord("7") for byte in escaped):
+            raise QaFailure("mountinfo contains a malformed path escape")
+        value = int(escaped.decode("ascii"), 8)
+        if value not in {0o11, 0o12, 0o40, 0o134}:
+            raise QaFailure("mountinfo contains a noncanonical path escape")
+        decoded.append(value)
+        index += 4
+    if b"\0" in decoded:
+        raise QaFailure("mountinfo contains a NUL path")
+    return os.fsdecode(bytes(decoded))
+
+
+def parse_mountinfo(encoded: bytes) -> Tuple[MountInfoRecord, ...]:
+    if len(encoded) > MOUNTINFO_MAX_BYTES:
+        raise QaFailure("mountinfo exceeds its byte bound")
+    if encoded and not encoded.endswith(b"\n"):
+        raise QaFailure("mountinfo ends with an incomplete record")
+    lines = encoded.splitlines()
+    if len(lines) > MOUNTINFO_MAX_LINES:
+        raise QaFailure("mountinfo exceeds its record bound")
+    records = []
+    for line in lines:
+        if not line or len(line) > MOUNTINFO_MAX_LINE_BYTES:
+            raise QaFailure("mountinfo contains an empty or oversized record")
+        fields = line.split(b" ")
+        if any(not field for field in fields) or fields.count(b"-") != 1:
+            raise QaFailure("mountinfo contains malformed field boundaries")
+        separator = fields.index(b"-")
+        before = fields[:separator]
+        after = fields[separator + 1 :]
+        if len(before) < 6 or len(after) != 3:
+            raise QaFailure("mountinfo contains an invalid record schema")
+        try:
+            mount_id = int(before[0].decode("ascii"))
+            parent_id = int(before[1].decode("ascii"))
+            major_minor = before[2].decode("ascii")
+            mount_options = before[5].decode("ascii")
+            optional_fields = tuple(
+                field.decode("ascii") for field in before[6:]
+            )
+            filesystem_type = after[0].decode("ascii")
+            mount_source = os.fsdecode(after[1])
+            super_options = after[2].decode("ascii")
+        except (UnicodeError, ValueError) as error:
+            raise QaFailure("mountinfo contains an invalid scalar field") from error
+        if (
+            mount_id <= 0
+            or parent_id < 0
+            or re.fullmatch(r"[0-9]+:[0-9]+", major_minor) is None
+        ):
+            raise QaFailure("mountinfo contains invalid mount identity metadata")
+        root = _decode_mountinfo_path(before[3])
+        mount_point = _decode_mountinfo_path(before[4])
+        if not root or not mount_point.startswith(os.sep):
+            raise QaFailure("mountinfo contains an invalid root or mount path")
+        records.append(
+            MountInfoRecord(
+                mount_id=mount_id,
+                parent_id=parent_id,
+                major_minor=major_minor,
+                root=root,
+                mount_point=mount_point,
+                mount_options=mount_options,
+                optional_fields=optional_fields,
+                filesystem_type=filesystem_type,
+                mount_source=mount_source,
+                super_options=super_options,
+            )
+        )
+    if len({record.mount_id for record in records}) != len(records):
+        raise QaFailure("mountinfo repeats a mount identity")
+    return tuple(records)
+
+
+def read_mountinfo(path: Path = Path("/proc/self/mountinfo")) -> bytes:
+    descriptor = -1
+    chunks = bytearray()
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_BINARY", 0),
+        )
+        while True:
+            chunk = os.read(
+                descriptor,
+                min(64 * 1024, MOUNTINFO_MAX_BYTES + 1 - len(chunks)),
+            )
+            if not chunk:
+                break
+            chunks.extend(chunk)
+            if len(chunks) > MOUNTINFO_MAX_BYTES:
+                raise QaFailure("mountinfo exceeds its byte bound")
+    except OSError as error:
+        raise QaFailure("mountinfo is unavailable") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    return bytes(chunks)
+
+
+def root_mounts(root: Path) -> Tuple[MountInfoRecord, ...]:
+    root_path = os.path.abspath(os.fspath(root))
+    matches = []
+    for record in parse_mountinfo(read_mountinfo()):
+        try:
+            within = os.path.commonpath((record.mount_point, root_path)) == root_path
+        except ValueError as error:
+            raise QaFailure("mountinfo path comparison failed") from error
+        if within:
+            matches.append(record)
+    return tuple(sorted(matches, key=lambda record: record.mount_id))
+
+
+def wait_for_no_root_bindings(
+    root: Path,
+    expected_environment: Mapping[str, str],
+    timeout: float,
+) -> None:
+    deadline = time.monotonic() + timeout
+    runner_started = process_snapshot(os.getpid()).start_time_ticks
+    while True:
+        table = process_table()
+        strict_candidates = {
+            snapshot.pid
+            for snapshot in table.values()
+            if snapshot.parent_pid == os.getpid()
+            and snapshot.start_time_ticks >= runner_started
+        }
+        if not stable_root_binding_census(
+            root,
+            expected_environment,
+            strict_candidate_pids=strict_candidates,
+        ):
+            return
+        if time.monotonic() >= deadline:
+            raise QaFailure("root-bound process did not exit after infrastructure stop")
+        time.sleep(0.05)
+
+
+def wait_for_no_root_mounts(root: Path, timeout: float) -> None:
+    deadline = time.monotonic() + timeout
+    while True:
+        if not root_mounts(root):
+            return
+        if time.monotonic() >= deadline:
+            raise QaFailure("isolated root retains a mount after infrastructure stop")
+        time.sleep(0.05)
+
+
+def _dead_portal_mount_is_exact(root: Path, record: MountInfoRecord) -> bool:
+    expected_mountpoint = root / "runtime" / "doc"
+    if (
+        record.mount_point != str(expected_mountpoint)
+        or record.root != "/"
+        or record.filesystem_type != "fuse.portal"
+        or record.mount_source != "portal"
+    ):
+        return False
+    try:
+        expected_mountpoint.lstat()
+    except OSError as error:
+        return error.errno == errno.ENOTCONN
+    return False
+
+
+def unmount_exact_dead_failure_portal(
+    root: Path, records: Sequence[MountInfoRecord]
+) -> None:
+    if len(records) != 1 or not _dead_portal_mount_is_exact(root, records[0]):
+        raise QaFailure("failure cleanup encountered an unknown or live root mount")
+    helper_seal = capture_physical_file_seal(
+        PORTAL_UNMOUNT_HELPER,
+        "failure cleanup fusermount3 helper",
+        require_posix_executable=True,
+    )
+    if (
+        helper_seal.metadata.st_uid != 0
+        or stat.S_IMODE(helper_seal.metadata.st_mode) & stat.S_ISUID == 0
+    ):
+        raise QaFailure("failure cleanup fusermount3 helper is not root-owned setuid")
+    run_checked(
+        [str(PORTAL_UNMOUNT_HELPER), "-u", records[0].mount_point],
+        env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"},
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=5,
+    )
+    verify_physical_file_seal(
+        PORTAL_UNMOUNT_HELPER,
+        helper_seal,
+        "failure cleanup fusermount3 helper",
+        require_posix_executable=True,
+    )
+    wait_for_no_root_mounts(root, 5)
+
+
 def capture_process_identity(
     pid: int,
     role: str,
@@ -1619,22 +1901,6 @@ def kill_verified_application_session(
         else:
             raise QaFailure("subreaper-adopted application descendants did not drain")
 
-        survivor_table = process_table()
-        strict_survivor_pids = {
-            snapshot.pid
-            for snapshot in survivor_table.values()
-            if snapshot.parent_pid == os.getpid()
-            and snapshot.start_time_ticks >= launcher_snapshot.start_time_ticks
-            and snapshot.pid not in infrastructure
-        }
-        survivors = stable_root_binding_census(
-            root,
-            expected_environment,
-            excluded_pids=infrastructure,
-            strict_candidate_pids=strict_survivor_pids,
-        )
-        if survivors:
-            raise QaFailure("unverified root-bound process survived application SIGKILL")
         return len(all_handles)
     finally:
         close_process_handles(all_handles)
@@ -3063,9 +3329,14 @@ def validate_artifact_report(report: Dict[str, object]) -> None:
     if runtime != {"implementation": "CPython", "pythonVersion": "3.13.14"}:
         raise QaFailure("artifact report has an invalid harness runtime")
     environment_policy = report.get("childEnvironmentPolicy")
+    expected_allowed_variables = sorted(
+        restart_child_environment(Path("/unused"))
+        if schema_version == 4
+        else fixed_child_environment(Path("/unused"))
+    )
     if environment_policy != {
         "policy": "fixed-allowlist",
-        "allowedVariables": sorted(fixed_child_environment(Path("/unused"))),
+        "allowedVariables": expected_allowed_variables,
         "explicitScenarioVariables": [
             "DBUS_SESSION_BUS_ADDRESS",
             "DISPLAY",
@@ -3075,11 +3346,19 @@ def validate_artifact_report(report: Dict[str, object]) -> None:
         "removedCategories": ["GIT", "INEX-nonessential", "LD", "proxy", "PYTHON"],
     }:
         raise QaFailure("artifact report has an invalid child environment policy")
-    if report.get("x11Isolation") != {
+    expected_x11_isolation = {
         "authentication": "isolated-root-xauthority-cookie",
         "tcpListening": False,
         "dbusAddress": "isolated-root-runtime-path",
-    }:
+    }
+    if schema_version == 4:
+        expected_x11_isolation.update(
+            {
+                "gtkUsePortal": "0",
+                "dbusServiceActivation": "disabled-private-config",
+            }
+        )
+    if report.get("x11Isolation") != expected_x11_isolation:
         raise QaFailure("artifact report has an invalid X11 isolation claim")
 
     import_process = report.get("importProcess")
@@ -3266,6 +3545,7 @@ def validate_artifact_report(report: Dict[str, object]) -> None:
             "sameInstalledPackageTree",
             "childSubreaperConfirmed",
             "processClosurePolicy",
+            "mountPolicy",
             "signalDelivery",
             "killSignal",
             "killedProcessClosureCount",
@@ -3305,21 +3585,36 @@ def validate_artifact_report(report: Dict[str, object]) -> None:
             "unverifiedRootBoundSurvivors": 0,
         }:
             raise QaFailure("artifact report has an invalid process closure policy")
+        if lifecycle.get("mountPolicy") != {
+            "source": "/proc/self/mountinfo",
+            "boundedParser": True,
+            "checkpointRootMounts": 0,
+            "finalRootMounts": 0,
+            "successPathUnmounts": False,
+            "failurePortalUnmount": "exact-dead-fuse.portal-non-lazy-only",
+        }:
+            raise QaFailure("artifact report has an invalid root mount policy")
         roles = ["sublime-main", "plugin-host-3.8", "packaged-inexd"]
         isolated_environment = lifecycle.get("isolatedEnvironment")
         if (
             not isinstance(isolated_environment, dict)
-            or set(isolated_environment) != set(ROOT_ENVIRONMENT_KEYS)
+            or set(isolated_environment)
+            != set(PROCESS_IDENTITY_ENVIRONMENT_KEYS)
             or any(
-                not isinstance(value, str)
-                or not os.path.isabs(value)
-                or os.path.normpath(value) != value
-                for value in isolated_environment.values()
+                not isinstance(isolated_environment.get(key), str)
+                or not os.path.isabs(str(isolated_environment[key]))
+                or os.path.normpath(str(isolated_environment[key]))
+                != isolated_environment[key]
+                for key in ROOT_ENVIRONMENT_KEYS
             )
         ):
             raise QaFailure("artifact report has an invalid isolated environment")
+        if isolated_environment.get("GTK_USE_PORTAL") != "0":
+            raise QaFailure("artifact report did not disable GTK portal integration")
         isolated_root = Path(str(isolated_environment["HOME"])).parent
-        if isolated_environment != expected_root_environment(isolated_root):
+        if {
+            key: isolated_environment[key] for key in ROOT_ENVIRONMENT_KEYS
+        } != expected_root_environment(isolated_root):
             raise QaFailure("artifact report environment paths do not share one root")
         expected_environment_digest = sha256_bytes(
             json.dumps(
@@ -3879,6 +4174,14 @@ def main() -> int:
     write_json(state, {"phase": "initial"})
     bootstrap = control / "bootstrap.txt"
     bootstrap.touch()
+    dbus_config: Optional[Path] = None
+    if args.full_application_kill_restart:
+        dbus_config = control / "dbus-no-activation.conf"
+        write_exclusive_member(
+            dbus_config,
+            private_dbus_config_bytes(runtime / "dbus-session-bus"),
+            0o600,
+        )
 
     # Normal Build 4200 mode with a brand-new XDG data directory is the
     # deterministic isolated-profile path. Safe Mode intentionally clears
@@ -3940,7 +4243,11 @@ def main() -> int:
             packages / "Inex" / ".python-version", qa_package / ".python-version"
         )
 
-    env = fixed_child_environment(root) if artifact_mode else os.environ.copy()
+    env = (
+        restart_child_environment(root)
+        if artifact_mode and args.full_application_kill_restart
+        else (fixed_child_environment(root) if artifact_mode else os.environ.copy())
+    )
     # This harness and every child emit only the explicit result records below.
     # Some orchestration shells define/echo SESSION_ID themselves; do not pass
     # that unrelated value into any Build 4200 subprocess.
@@ -3956,17 +4263,18 @@ def main() -> int:
             "TEMP": str(isolated_tmp),
         }
     )
+    if args.full_application_kill_restart:
+        env["GTK_USE_PORTAL"] = "0"
+    identity_environment_keys = (
+        PROCESS_IDENTITY_ENVIRONMENT_KEYS
+        if args.full_application_kill_restart
+        else ROOT_ENVIRONMENT_KEYS
+    )
     process_environment_binding_values = {
-        key: env[key]
-        for key in (
-            "HOME",
-            "XDG_CONFIG_HOME",
-            "XDG_CACHE_HOME",
-            "XDG_RUNTIME_DIR",
-            "TMPDIR",
-            "TMP",
-            "TEMP",
-        )
+        key: env[key] for key in identity_environment_keys
+    }
+    root_binding_environment_values = {
+        key: env[key] for key in ROOT_ENVIRONMENT_KEYS
     }
     display_number = 120 + (os.getpid() % 70)
     while Path("/tmp/.X11-unix/X%d" % display_number).exists():
@@ -4016,6 +4324,39 @@ def main() -> int:
     answered_password_windows: set = set()
     pending_artifact_report: Optional[bytes] = None
 
+    def launch_isolated_dbus() -> Tuple[str, int, ProcessSnapshot]:
+        if args.full_application_kill_restart:
+            if dbus_config is None:
+                raise QaFailure("private no-activation D-Bus config is unavailable")
+            arguments = [
+                dbus_daemon,
+                "--config-file=" + str(dbus_config),
+                "--fork",
+                "--print-address=1",
+                "--print-pid=1",
+            ]
+        else:
+            arguments = [
+                dbus_daemon,
+                "--session",
+                "--fork",
+                "--address=unix:path=" + str(runtime / "dbus-session-bus"),
+                "--print-address=1",
+                "--print-pid=1",
+            ]
+        result = run_checked(
+            arguments,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        if len(lines) < 2 or not lines[-1].isdigit():
+            raise QaFailure("isolated D-Bus session did not return identity")
+        pid = int(lines[-1])
+        return lines[0], pid, process_snapshot(pid)
+
     try:
         if args.full_application_kill_restart:
             restart_profile_bindings.append(directory_binding(profile))
@@ -4038,26 +4379,8 @@ def main() -> int:
                 harness_source,
                 harness_seals,
             )
-        dbus = run_checked(
-            [
-                dbus_daemon,
-                "--session",
-                "--fork",
-                "--address=unix:path=" + str(runtime / "dbus-session-bus"),
-                "--print-address=1",
-                "--print-pid=1",
-            ],
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        dbus_lines = [line.strip() for line in dbus.stdout.splitlines() if line.strip()]
-        if len(dbus_lines) < 2 or not dbus_lines[-1].isdigit():
-            raise QaFailure("dbus-daemon did not return address and pid")
-        env["DBUS_SESSION_BUS_ADDRESS"] = dbus_lines[0]
-        dbus_pid = int(dbus_lines[-1])
-        dbus_snapshot = process_snapshot(dbus_pid)
+        dbus_address, dbus_pid, dbus_snapshot = launch_isolated_dbus()
+        env["DBUS_SESSION_BUS_ADDRESS"] = dbus_address
 
         run_checked(
             [xauth, "-f", str(xauthority), "add", display, ".", x11_cookie],
@@ -4426,7 +4749,7 @@ def main() -> int:
                             restart_first_identities,
                             sublime_process,
                             root,
-                            process_environment_binding_values,
+                            root_binding_environment_values,
                             tuple(
                                 pid
                                 for pid in (
@@ -4498,13 +4821,10 @@ def main() -> int:
                             raise QaFailure(
                                 "restart checkpoint runtime cleanup failed"
                             ) from error
-                    checkpoint_survivors = stable_root_binding_census(
-                        root, process_environment_binding_values
+                    wait_for_no_root_bindings(
+                        root, root_binding_environment_values, 5
                     )
-                    if checkpoint_survivors:
-                        raise QaFailure(
-                            "root-bound process survived the full restart checkpoint"
-                        )
+                    wait_for_no_root_mounts(root, 5)
                     if scan_for_tokens((root,), tokens):
                         raise QaFailure("plaintext residue existed at restart checkpoint")
                     restart_checkpoint_scan_complete = True
@@ -4535,29 +4855,8 @@ def main() -> int:
                     if restart_profile_bindings[0] != restart_profile_bindings[1]:
                         raise QaFailure("profile directory identity changed across restart")
 
-                    dbus = run_checked(
-                        [
-                            dbus_daemon,
-                            "--session",
-                            "--fork",
-                            "--address=unix:path="
-                            + str(runtime / "dbus-session-bus"),
-                            "--print-address=1",
-                            "--print-pid=1",
-                        ],
-                        env=env,
-                        capture_output=True,
-                        text=True,
-                        timeout=5,
-                    )
-                    dbus_lines = [
-                        line.strip() for line in dbus.stdout.splitlines() if line.strip()
-                    ]
-                    if len(dbus_lines) < 2 or not dbus_lines[-1].isdigit():
-                        raise QaFailure("second D-Bus session did not return identity")
-                    env["DBUS_SESSION_BUS_ADDRESS"] = dbus_lines[0]
-                    dbus_pid = int(dbus_lines[-1])
-                    dbus_snapshot = process_snapshot(dbus_pid)
+                    dbus_address, dbus_pid, dbus_snapshot = launch_isolated_dbus()
+                    env["DBUS_SESSION_BUS_ADDRESS"] = dbus_address
                     run_checked(
                         [xauth, "-f", str(xauthority), "add", display, ".", x11_cookie],
                         env=env,
@@ -5003,8 +5302,8 @@ def main() -> int:
                 pass
             except OSError as error:
                 raise QaFailure("isolated display or D-Bus residue cleanup failed") from error
-        if stable_root_binding_census(root, process_environment_binding_values):
-            raise QaFailure("isolated root retains a live process binding")
+        wait_for_no_root_bindings(root, root_binding_environment_values, 5)
+        wait_for_no_root_mounts(root, 5)
         offset, final_records = read_new_reports(report, offset)
         helper_records.extend(final_records)
         events.extend(str(record["event"]) for record in final_records)
@@ -5252,7 +5551,11 @@ def main() -> int:
                 },
                 "childEnvironmentPolicy": {
                     "policy": "fixed-allowlist",
-                    "allowedVariables": sorted(fixed_child_environment(root)),
+                    "allowedVariables": sorted(
+                        restart_child_environment(root)
+                        if args.full_application_kill_restart
+                        else fixed_child_environment(root)
+                    ),
                     "explicitScenarioVariables": [
                         "DBUS_SESSION_BUS_ADDRESS",
                         "DISPLAY",
@@ -5271,6 +5574,14 @@ def main() -> int:
                     "authentication": "isolated-root-xauthority-cookie",
                     "tcpListening": False,
                     "dbusAddress": "isolated-root-runtime-path",
+                    **(
+                        {
+                            "gtkUsePortal": "0",
+                            "dbusServiceActivation": "disabled-private-config",
+                        }
+                        if args.full_application_kill_restart
+                        else {}
+                    ),
                 },
                 "residueScan": {
                     "roots": ["isolated-root"],
@@ -5310,6 +5621,14 @@ def main() -> int:
                         ],
                         "argvOnlyIsNotBinding": True,
                         "unverifiedRootBoundSurvivors": 0,
+                    },
+                    "mountPolicy": {
+                        "source": "/proc/self/mountinfo",
+                        "boundedParser": True,
+                        "checkpointRootMounts": 0,
+                        "finalRootMounts": 0,
+                        "successPathUnmounts": False,
+                        "failurePortalUnmount": "exact-dead-fuse.portal-non-lazy-only",
                     },
                     "signalDelivery": "pidfd-per-stable-session-descendant-closure",
                     "killSignal": "SIGKILL",
@@ -5372,16 +5691,19 @@ def main() -> int:
         if dbus_snapshot is not None:
             terminate_process_snapshot(dbus_snapshot, 0.2)
             reap_subreaper_process(dbus_snapshot)
-        if cleanup_failure is None and stable_root_binding_census(
-            root, process_environment_binding_values
-        ):
-            cleanup_failure = QaFailure(
-                "isolated root retains a live process binding during cleanup"
-            )
+        if cleanup_failure is None:
+            try:
+                wait_for_no_root_bindings(
+                    root, root_binding_environment_values, 5
+                )
+            except QaFailure as error:
+                cleanup_failure = error
         if cleanup_failure is not None:
             raise cleanup_failure
         if artifact_mode:
-            cleanup_active_artifact_root()
+            cleanup_active_artifact_root(
+                allow_dead_failure_portal_unmount=not final_success
+            )
             if final_success:
                 if output_path is None or pending_artifact_report is None:
                     raise QaFailure("artifact report was not ready after successful cleanup")
@@ -5403,7 +5725,9 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except (QaFailure, subprocess.SubprocessError, OSError) as error:
         try:
-            cleanup_active_artifact_root()
+            cleanup_active_artifact_root(
+                allow_dead_failure_portal_unmount=True
+            )
         except QaFailure as cleanup_error:
             print(
                 "artifact-root-cleanup-failed=" + type(cleanup_error).__name__,

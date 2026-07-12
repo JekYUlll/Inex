@@ -494,7 +494,11 @@ def _valid_report(scenario: str = "normal") -> dict:
         "trustAssumptions": list(runner.REPORT_TRUST_ASSUMPTIONS),
     }
     if scenario == "full-application-kill-restart":
-        isolated_environment = runner.expected_root_environment(Path("/private"))
+        restart_environment = runner.restart_child_environment(Path("/private"))
+        isolated_environment = {
+            key: restart_environment[key]
+            for key in runner.PROCESS_IDENTITY_ENVIRONMENT_KEYS
+        }
         environment_digest = runner.sha256_bytes(
             json.dumps(
                 isolated_environment,
@@ -505,6 +509,15 @@ def _valid_report(scenario: str = "normal") -> dict:
         )
         profile_path = "/private/config/sublime-text"
         sidecar_path = profile_path + "/Packages/Inex/bin/inexd"
+        report["childEnvironmentPolicy"]["allowedVariables"] = sorted(
+            restart_environment
+        )
+        report["x11Isolation"].update(
+            {
+                "gtkUsePortal": "0",
+                "dbusServiceActivation": "disabled-private-config",
+            }
+        )
         main_seal = copy.deepcopy(report["build4200"]["seal"])
         main_seal["name"] = "sublime-main"
         first_sidecar_seal = copy.deepcopy(sidecar_seal)
@@ -631,6 +644,14 @@ def _valid_report(scenario: str = "normal") -> dict:
                         ],
                         "argvOnlyIsNotBinding": True,
                         "unverifiedRootBoundSurvivors": 0,
+                    },
+                    "mountPolicy": {
+                        "source": "/proc/self/mountinfo",
+                        "boundedParser": True,
+                        "checkpointRootMounts": 0,
+                        "finalRootMounts": 0,
+                        "successPathUnmounts": False,
+                        "failurePortalUnmount": "exact-dead-fuse.portal-non-lazy-only",
                     },
                     "signalDelivery": "pidfd-per-stable-session-descendant-closure",
                     "killSignal": "SIGKILL",
@@ -920,6 +941,133 @@ time.sleep(60)
                         os.getpid(), root, runner.expected_root_environment(root)
                     )
 
+    def test_mountinfo_parser_is_bounded_and_decodes_paths(self) -> None:
+        encoded = (
+            b"36 31 0:65 / /tmp/inex\\040root/runtime/doc rw,nosuid,nodev "
+            b"shared:642 - fuse.portal portal rw,user_id=1000,group_id=1000\n"
+        )
+        records = runner.parse_mountinfo(encoded)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].mount_point, "/tmp/inex root/runtime/doc")
+        self.assertEqual(records[0].filesystem_type, "fuse.portal")
+        self.assertEqual(records[0].mount_source, "portal")
+        self.assertEqual(records[0].optional_fields, ("shared:642",))
+        for malformed in (
+            encoded.rstrip(b"\n"),
+            encoded.replace(b"\\040", b"\\999"),
+            b"36 31 malformed / /tmp rw - tmpfs tmpfs rw\n",
+        ):
+            with self.subTest(malformed=malformed), self.assertRaises(
+                runner.QaFailure
+            ):
+                runner.parse_mountinfo(malformed)
+
+        with mock.patch.object(runner.os, "open", return_value=91), mock.patch.object(
+            runner.os, "read", side_effect=[encoded[:20], encoded[20:], b""]
+        ), mock.patch.object(runner.os, "close") as close:
+            self.assertEqual(runner.read_mountinfo(Path("/proc/test")), encoded)
+            close.assert_called_once_with(91)
+
+    def test_restart_environment_and_dbus_config_disable_portals(self) -> None:
+        root = Path("/private/root")
+        environment = runner.restart_child_environment(root)
+        self.assertEqual(environment["GTK_USE_PORTAL"], "0")
+        self.assertNotIn("GTK_USE_PORTAL", runner.fixed_child_environment(root))
+        encoded = runner.private_dbus_config_bytes(
+            root / "runtime" / "dbus-session-bus"
+        )
+        self.assertIn(
+            b"<listen>unix:path=/private/root/runtime/dbus-session-bus</listen>",
+            encoded,
+        )
+        self.assertNotIn(b"servicedir", encoded)
+        self.assertNotIn(b"<include", encoded)
+
+    def test_artifact_cleanup_never_hides_success_mounts(self) -> None:
+        previous = runner._ACTIVE_ARTIFACT_ROOT
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary) / "root"
+                root.mkdir(mode=0o700)
+                record = runner.MountInfoRecord(
+                    mount_id=36,
+                    parent_id=31,
+                    major_minor="0:65",
+                    root="/",
+                    mount_point=str(root / "runtime" / "doc"),
+                    mount_options="rw",
+                    optional_fields=(),
+                    filesystem_type="fuse.portal",
+                    mount_source="portal",
+                    super_options="rw",
+                )
+                runner._ACTIVE_ARTIFACT_ROOT = (root, root.lstat())
+                with mock.patch.object(
+                    runner, "stable_root_binding_census", return_value=()
+                ), mock.patch.object(
+                    runner, "root_mounts", return_value=(record,)
+                ), mock.patch.object(
+                    runner, "unmount_exact_dead_failure_portal"
+                ) as unmount:
+                    with self.assertRaisesRegex(runner.QaFailure, "retains a mount"):
+                        runner.cleanup_active_artifact_root(
+                            allow_dead_failure_portal_unmount=False
+                        )
+                    unmount.assert_not_called()
+        finally:
+            runner._ACTIVE_ARTIFACT_ROOT = previous
+
+    def test_failure_cleanup_unmounts_only_exact_dead_portal(self) -> None:
+        previous = runner._ACTIVE_ARTIFACT_ROOT
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary) / "root"
+                root.mkdir(mode=0o700)
+                exact = runner.MountInfoRecord(
+                    mount_id=36,
+                    parent_id=31,
+                    major_minor="0:65",
+                    root="/",
+                    mount_point=str(root / "runtime" / "doc"),
+                    mount_options="rw",
+                    optional_fields=(),
+                    filesystem_type="fuse.portal",
+                    mount_source="portal",
+                    super_options="rw",
+                )
+                runner._ACTIVE_ARTIFACT_ROOT = (root, root.lstat())
+                with mock.patch.object(
+                    runner, "stable_root_binding_census", return_value=()
+                ), mock.patch.object(
+                    runner, "root_mounts", return_value=(exact,)
+                ), mock.patch.object(
+                    runner, "unmount_exact_dead_failure_portal"
+                ) as unmount:
+                    runner.cleanup_active_artifact_root(
+                        allow_dead_failure_portal_unmount=True
+                    )
+                    unmount.assert_called_once_with(root, (exact,))
+                    self.assertFalse(root.exists())
+
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                unknown = runner.MountInfoRecord(
+                    mount_id=37,
+                    parent_id=31,
+                    major_minor="0:66",
+                    root="/",
+                    mount_point=str(root / "other"),
+                    mount_options="rw",
+                    optional_fields=(),
+                    filesystem_type="tmpfs",
+                    mount_source="tmpfs",
+                    super_options="rw",
+                )
+                with self.assertRaisesRegex(runner.QaFailure, "unknown or live"):
+                    runner.unmount_exact_dead_failure_portal(root, (unknown,))
+        finally:
+            runner._ACTIVE_ARTIFACT_ROOT = previous
+
     def test_artifact_directory_and_output_are_required_together(self) -> None:
         self.assertIsNone(runner.parse_arguments([]).artifact_directory)
         paired = runner.parse_arguments(
@@ -1039,6 +1187,16 @@ time.sleep(60)
         def weaker_signal_delivery(report: dict) -> None:
             report["restartLifecycle"]["signalDelivery"] = "killpg"
 
+        def portal_reenabled(report: dict) -> None:
+            report["restartLifecycle"]["isolatedEnvironment"][
+                "GTK_USE_PORTAL"
+            ] = "1"
+
+        def hidden_checkpoint_mount(report: dict) -> None:
+            report["restartLifecycle"]["mountPolicy"][
+                "checkpointRootMounts"
+            ] = 1
+
         def profile_rebound(report: dict) -> None:
             report["restartLifecycle"]["profileDirectoryBindings"][1]["inode"] += 1
 
@@ -1133,6 +1291,8 @@ time.sleep(60)
         for mutation in (
             predecessor_v3_schema,
             weaker_signal_delivery,
+            portal_reenabled,
+            hidden_checkpoint_mount,
             profile_rebound,
             jointly_forged_profile_bindings,
             package_tree_changed,
