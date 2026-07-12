@@ -548,7 +548,10 @@ pub(super) fn parse_index_lock_marker_v5(
     Ok(marker.reference)
 }
 
-fn index_lock_bytes_v5(path: &Path) -> Result<Option<Vec<u8>>, GitError> {
+fn index_lock_bytes_v5_with_hook<F>(path: &Path, after_open: F) -> Result<Option<Vec<u8>>, GitError>
+where
+    F: FnOnce() -> Result<(), GitError>,
+{
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -569,6 +572,7 @@ fn index_lock_bytes_v5(path: &Path) -> Result<Option<Vec<u8>>, GitError> {
     {
         return Err(GitError::RecoveryConflict);
     }
+    after_open()?;
     if metadata.len() > u64::try_from(MAX_GIT_OUTPUT_BYTES).unwrap_or(u64::MAX) {
         return Ok(Some(Vec::new()));
     }
@@ -593,6 +597,21 @@ fn index_lock_bytes_v5(path: &Path) -> Result<Option<Vec<u8>>, GitError> {
         return Err(GitError::RecoveryConflict);
     }
     Ok(Some(bytes))
+}
+
+fn index_lock_bytes_v5(path: &Path) -> Result<Option<Vec<u8>>, GitError> {
+    index_lock_bytes_v5_with_hook(path, || Ok(()))
+}
+
+#[cfg(all(test, unix))]
+pub(super) fn index_lock_bytes_v5_after_open<F>(
+    path: &Path,
+    after_open: F,
+) -> Result<Option<Vec<u8>>, GitError>
+where
+    F: FnOnce() -> Result<(), GitError>,
+{
+    index_lock_bytes_v5_with_hook(path, after_open)
 }
 
 /// Classifies `.git/index.lock` without changing or removing any namespace

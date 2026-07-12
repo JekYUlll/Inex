@@ -97,7 +97,9 @@ Phase 7 — 跨平台验证、打包与发布准备
       - [ ] 将 immutable stable bundle 接入 v5 marker/journal/index recovery 与强杀矩阵
         - [x] 在 scratch 完成 alternate-index mutation、完整语义验证并一次性发布 immutable stable bundle
         - [x] 冻结 manifest transaction reference、canonical `INEXIDX5` marker、strict stable journal 与 fresh-process Git 语义 loader；v1-v4 读取/恢复兼容保持不变
-        - [ ] 完成 publish staging、真实 `.git/index.lock`、worktree/index 前滚、bundle retire/cleanup 与 force-kill recovery
+        - [x] 从 immutable bundle 生成 token-derived publish staging，并支持 fresh-process 重新形成 held bundle/publish proofs；partial scratch 保留不阻塞，foreign/link/rebind/live drift fail closed
+        - [x] 严格只读分类真实 `.git/index.lock` 的 absent/exact marker/exact candidate/foreign 状态；candidate 枚举不替代 stage-map/live-old/worktree授权
+        - [ ] 完成 marker lock 获取、durable journal、worktree/index 前滚、bundle retire/cleanup 与 force-kill recovery
   - [ ] 原生 Windows NTFS/ReFS 复验 replace/write-through/power-loss，并由绑定证据决定是否取消 no-parallel-Git 边界
 - [x] 配置 Linux/Windows x64/arm64 CI、Rust 二进制、VSIX 与 Sublime 包产物；远端 hosted jobs 尚待执行
 - [x] 完成 threat model、用户指南、安全配置、迁移/升级与故障恢复文档
@@ -270,6 +272,9 @@ Phase 7 — 跨平台验证、打包与发布准备
 | Cleanup-helper removal patch missed rustfmt's single-line test bindings | 1 | No partial test edit occurred; inspect the exact formatted block, remove only the premature cleanup/path assertions, and retain the token-derived publish basename assertion |
 | v5 journal review found locked-safe status accepted matching bundle+journal beside unrelated reserved v4 files | 1 | Require the post-stable reserved namespace to be exactly the stable journal in this schema slice; add foreign marker-staging coexistence regression, then let the later publisher replace this narrow rule with a transaction-specific physical-state inspector |
 | A second read-only v5 authorization audit could not be spawned or resumed because the four-agent thread limit was already occupied | 2 | Keep the existing publish/classifier agents running; perform the bounded source audit on the main thread and do not retry until an agent slot is released |
+| Cherry-picking the lock classifier after the larger publish-staging commit conflicted in the shared candidate-module import block | 1 | Combine both required imports with `apply_patch`, verify no conflict markers plus fmt/diff checks, then continue the cherry-pick without selecting either side wholesale |
+| The first merged lock-boundary Clippy run rejected a 106-line test after adding empty/oversize cases | 1 | Split the new boundaries into a focused test instead of suppressing `too_many_lines`; all five lock tests and pedantic Clippy then passed |
+| Windows GNU Clippy saw the Unix-only identity-swap test helper as unused | 1 | Gate the helper itself with `cfg(all(test, unix))`; keep production reading generic and rerun Windows check/clippy/no-run successfully |
 
 ## Notes
 

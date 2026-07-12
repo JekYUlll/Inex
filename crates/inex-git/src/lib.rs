@@ -10362,6 +10362,73 @@ mod tests {
     }
 
     #[test]
+    fn v5_index_lock_classifier_preserves_empty_and_oversized_foreign_locks() {
+        use candidate_bundle_v5::IndexLockStateV5 as State;
+
+        let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+        let root = fixture.vault.root();
+        let mut hooks = CandidateBundleTestHooks::new(None);
+        let prepared = prepare_test_candidate_bundle(&fixture, &mut hooks)
+            .expect("v5 candidate bundle prepares");
+        let lock = index_lock_path(root);
+
+        for expected_len in [
+            0,
+            u64::try_from(MAX_GIT_OUTPUT_BYTES)
+                .expect("Git output bound fits u64")
+                .saturating_add(1),
+        ] {
+            File::create(&lock)
+                .and_then(|file| file.set_len(expected_len))
+                .expect("sparse foreign lock writes");
+            assert_eq!(
+                candidate_bundle_v5::classify_index_lock_v5(
+                    root,
+                    &prepared.transaction_reference,
+                    &prepared.inventory,
+                )
+                .expect("bounded foreign lock classifies"),
+                State::Foreign
+            );
+            assert_eq!(
+                fs::symlink_metadata(&lock)
+                    .expect("foreign lock remains")
+                    .len(),
+                expected_len
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn v5_index_lock_reader_rejects_identity_swap_during_bounded_read() {
+        let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+        let root = fixture.vault.root();
+        let mut hooks = CandidateBundleTestHooks::new(None);
+        let prepared = prepare_test_candidate_bundle(&fixture, &mut hooks)
+            .expect("v5 candidate bundle prepares");
+        let lock = index_lock_path(root);
+        let held = root.join("held-index-lock-during-v5-read");
+        let foreign = b"concurrent foreign Git lock";
+        fs::write(&lock, &prepared.index_lock_marker).expect("exact marker lock writes");
+
+        let result = candidate_bundle_v5::index_lock_bytes_v5_after_open(&lock, || {
+            fs::rename(&lock, &held)
+                .and_then(|()| fs::write(&lock, foreign))
+                .map_err(|error| io_error(GitIoOperation::SyncGitState, &error))
+        });
+        assert!(matches!(result, Err(GitError::RecoveryConflict)));
+        assert_eq!(
+            fs::read(&held).expect("original marker owner remains"),
+            prepared.index_lock_marker
+        );
+        assert_eq!(
+            fs::read(&lock).expect("foreign replacement remains"),
+            foreign
+        );
+    }
+
+    #[test]
     fn v5_reference_loader_preserves_bundle_on_reference_or_live_index_drift() {
         let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
         let root = fixture.vault.root();
