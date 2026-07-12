@@ -350,9 +350,9 @@ pub fn recover(vault: &Vault) -> Result<RecoveryReport, GitError> {
 pub fn recovery_status(vault_root: &Path) -> Result<RecoveryStatus, GitError> {
     let _guard = VaultMutationGuard::acquire(vault_root).map_err(map_atomic_error)?;
     let v5 = candidate_bundle_v5::inspect_candidate_bundle_namespace_v5(vault_root)?;
-    let legacy_pending =
+    let (legacy_pending, matching_v5_journal) =
         legacy_has_pending_recovery(vault_root, v5.stable_bundle_basename.as_deref())?;
-    if v5.stable_bundle_basename.is_some() && legacy_pending {
+    if v5.stable_bundle_basename.is_some() && legacy_pending && !matching_v5_journal {
         return Err(GitError::RecoveryConflict);
     }
     Ok(RecoveryStatus {
@@ -375,10 +375,31 @@ pub fn has_pending_recovery(vault_root: &Path) -> Result<bool, GitError> {
     Ok(recovery_status(vault_root)?.pending_transaction)
 }
 
+fn validate_v5_journal_stable_bundle(
+    vault_root: &Path,
+    stable_bundle_basename: &str,
+    journal: &BundleMergeJournalV5,
+) -> Result<(), GitError> {
+    if journal.reference.bundle_basename != stable_bundle_basename {
+        return Err(GitError::RecoveryConflict);
+    }
+    let inventory = candidate_bundle_v5::validate_candidate_bundle_inventory_v5(
+        vault_root,
+        stable_bundle_basename,
+        Some(&journal.reference.manifest),
+    )?;
+    if inventory.manifest.object_format != journal.reference.object_format
+        || inventory.manifest.token != journal.reference.token
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    Ok(())
+}
+
 fn legacy_has_pending_recovery(
     vault_root: &Path,
     ignored_v5_stable_basename: Option<&str>,
-) -> Result<bool, GitError> {
+) -> Result<(bool, bool), GitError> {
     let mut reserved_names = exact_reserved_private_names(vault_root)?;
     if let Some(basename) = ignored_v5_stable_basename
         && !reserved_names.remove(basename)
@@ -388,6 +409,20 @@ fn legacy_has_pending_recovery(
     let pending = read_journal(vault_root)?;
     let prelock = read_prelock_reservation(vault_root)?;
     if let Some(pending) = &pending {
+        if let PendingMergeJournal::BundleV5(journal) = pending {
+            if prelock.is_some()
+                || ignored_v5_stable_basename != Some(journal.reference.bundle_basename.as_str())
+                || reserved_names != BTreeSet::from([JOURNAL_FILE.to_owned()])
+            {
+                return Err(GitError::RecoveryConflict);
+            }
+            validate_v5_journal_stable_bundle(
+                vault_root,
+                &journal.reference.bundle_basename,
+                journal,
+            )?;
+            return Ok((true, true));
+        }
         if let Some(reservation) = &prelock {
             let PendingMergeJournal::Cas(journal) = pending else {
                 return Err(GitError::RecoveryConflict);
@@ -425,7 +460,7 @@ fn legacy_has_pending_recovery(
         }) {
             return Err(GitError::RecoveryConflict);
         }
-        return Ok(true);
+        return Ok((true, false));
     }
     if let Some(reservation) = &prelock {
         validate_prelock_private_inventory(vault_root, reservation, false, false)?;
@@ -436,10 +471,10 @@ fn legacy_has_pending_recovery(
             return Err(GitError::RecoveryConflict);
         }
         validate_prelock_owned_files(vault_root, reservation)?;
-        return Ok(true);
+        return Ok((true, false));
     }
     match inspect_orphan_prelock_staging(vault_root, &reserved_names)? {
-        OrphanPrelockStaging::Exact { .. } => return Ok(true),
+        OrphanPrelockStaging::Exact { .. } => return Ok((true, false)),
         OrphanPrelockStaging::Conflict => return Err(GitError::RecoveryConflict),
         OrphanPrelockStaging::None => {}
     }
@@ -447,10 +482,10 @@ fn legacy_has_pending_recovery(
         inspect_abandoned_cas_reservation(vault_root)?,
         AbandonedCasReservation::None
     ) {
-        return Ok(true);
+        return Ok((true, false));
     }
     if reserved_names.is_empty() {
-        Ok(false)
+        Ok((false, false))
     } else {
         Err(GitError::RecoveryConflict)
     }
@@ -739,6 +774,14 @@ struct CasMergeJournal {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+struct BundleMergeJournalV5 {
+    version: u32,
+    reference: candidate_bundle_v5::CandidateBundleTransactionReferenceV5,
+    index_lock_marker: candidate_bundle_v5::CanonicalBytesReferenceV5,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 struct PreLockReservation {
     version: u32,
     object_format: GitObjectFormat,
@@ -772,6 +815,7 @@ enum PendingMergeJournal {
     Rename(RenameMergeJournal),
     DetectedRename(DetectedRenameJournal),
     Cas(CasMergeJournal),
+    BundleV5(BundleMergeJournalV5),
 }
 
 struct PreparedIndexCas {
@@ -1375,18 +1419,29 @@ impl Git {
     }
 
     fn update_index(&self, physical_path: &str, mode: &str, oid: &str) -> Result<(), GitError> {
-        if self.index_file.is_none()
-            && let Some(PendingMergeJournal::Cas(journal)) = read_journal(&self.root)?
-        {
-            return publish_cas_index(
-                self,
-                &journal,
-                IndexMutation::Upsert {
-                    physical_path,
-                    mode,
-                    oid,
-                },
-            );
+        if self.index_file.is_none() {
+            match read_journal(&self.root)? {
+                Some(PendingMergeJournal::Cas(journal)) => {
+                    return publish_cas_index(
+                        self,
+                        &journal,
+                        IndexMutation::Upsert {
+                            physical_path,
+                            mode,
+                            oid,
+                        },
+                    );
+                }
+                Some(PendingMergeJournal::BundleV5(_)) => {
+                    return Err(GitError::RecoveryConflict);
+                }
+                Some(
+                    PendingMergeJournal::InPlace(_)
+                    | PendingMergeJournal::Rename(_)
+                    | PendingMergeJournal::DetectedRename(_),
+                )
+                | None => {}
+            }
         }
         self.update_index_direct(physical_path, mode, oid)
     }
@@ -1425,19 +1480,30 @@ impl Git {
         mode: &str,
         oid: &str,
     ) -> Result<(), GitError> {
-        if self.index_file.is_none()
-            && let Some(PendingMergeJournal::Cas(journal)) = read_journal(&self.root)?
-        {
-            return publish_cas_index(
-                self,
-                &journal,
-                IndexMutation::Rename {
-                    source_physical_path,
-                    destination_physical_path,
-                    mode,
-                    oid,
-                },
-            );
+        if self.index_file.is_none() {
+            match read_journal(&self.root)? {
+                Some(PendingMergeJournal::Cas(journal)) => {
+                    return publish_cas_index(
+                        self,
+                        &journal,
+                        IndexMutation::Rename {
+                            source_physical_path,
+                            destination_physical_path,
+                            mode,
+                            oid,
+                        },
+                    );
+                }
+                Some(PendingMergeJournal::BundleV5(_)) => {
+                    return Err(GitError::RecoveryConflict);
+                }
+                Some(
+                    PendingMergeJournal::InPlace(_)
+                    | PendingMergeJournal::Rename(_)
+                    | PendingMergeJournal::DetectedRename(_),
+                )
+                | None => {}
+            }
         }
         self.update_index_rename_direct(source_physical_path, destination_physical_path, mode, oid)
     }
@@ -3372,6 +3438,28 @@ fn validate_cas_journal(journal: &CasMergeJournal) -> Result<(), GitError> {
         }
     }
     Ok(())
+}
+
+fn validate_bundle_journal_v5(journal: &BundleMergeJournalV5) -> Result<(), GitError> {
+    if journal.version != 5 {
+        return Err(GitError::InvalidJournal);
+    }
+    candidate_bundle_v5::validate_candidate_bundle_transaction_reference_v5(&journal.reference)?;
+    candidate_bundle_v5::validate_canonical_bytes_reference_v5(&journal.index_lock_marker)?;
+    let marker = candidate_bundle_v5::index_lock_marker_bytes_v5(&journal.reference)?;
+    if candidate_bundle_v5::canonical_bytes_reference_v5(&marker)? != journal.index_lock_marker {
+        return Err(GitError::InvalidJournal);
+    }
+    Ok(())
+}
+
+fn serialize_bundle_journal_v5(journal: &BundleMergeJournalV5) -> Result<Vec<u8>, GitError> {
+    validate_bundle_journal_v5(journal)?;
+    let bytes = serde_json::to_vec(journal).map_err(|_| GitError::InvalidJournal)?;
+    if bytes.is_empty() || bytes.len() > MAX_JOURNAL_BYTES {
+        return Err(GitError::InvalidJournal);
+    }
+    Ok(bytes)
 }
 
 fn index_entry_map(git: &Git) -> Result<BTreeMap<(String, u8), StageEntry>, GitError> {
@@ -5518,6 +5606,7 @@ fn recover_pending(vault: &Vault, git: &Git) -> Result<bool, GitError> {
             }
             recover_cas_pending(vault, git, &guard, journal)?;
         }
+        PendingMergeJournal::BundleV5(_) => return Err(GitError::RecoveryConflict),
     }
     remove_journal(vault.root(), &pending)?;
     Ok(true)
@@ -6425,6 +6514,7 @@ fn journal_path(root: &Path) -> PathBuf {
 fn journal_staging_path(root: &Path, journal: &PendingMergeJournal) -> PathBuf {
     let suffix = match journal {
         PendingMergeJournal::Cas(journal) => journal.lock_token.clone(),
+        PendingMergeJournal::BundleV5(journal) => journal.reference.token.clone(),
         PendingMergeJournal::InPlace(_)
         | PendingMergeJournal::Rename(_)
         | PendingMergeJournal::DetectedRename(_) => Uuid::new_v4().simple().to_string(),
@@ -6450,12 +6540,20 @@ fn write_journal(root: &Path, journal: &PendingMergeJournal) -> Result<(), GitEr
         return Err(GitError::InvalidJournal);
     }
     let bytes = match journal {
-        PendingMergeJournal::InPlace(journal) => serde_json::to_vec(journal),
-        PendingMergeJournal::Rename(journal) => serde_json::to_vec(journal),
-        PendingMergeJournal::DetectedRename(journal) => serde_json::to_vec(journal),
-        PendingMergeJournal::Cas(journal) => serde_json::to_vec(journal),
-    }
-    .map_err(|_| GitError::InvalidJournal)?;
+        PendingMergeJournal::InPlace(journal) => {
+            serde_json::to_vec(journal).map_err(|_| GitError::InvalidJournal)?
+        }
+        PendingMergeJournal::Rename(journal) => {
+            serde_json::to_vec(journal).map_err(|_| GitError::InvalidJournal)?
+        }
+        PendingMergeJournal::DetectedRename(journal) => {
+            serde_json::to_vec(journal).map_err(|_| GitError::InvalidJournal)?
+        }
+        PendingMergeJournal::Cas(journal) => {
+            serde_json::to_vec(journal).map_err(|_| GitError::InvalidJournal)?
+        }
+        PendingMergeJournal::BundleV5(journal) => serialize_bundle_journal_v5(journal)?,
+    };
     if bytes.len() > MAX_JOURNAL_BYTES {
         return Err(GitError::InvalidJournal);
     }
@@ -6662,6 +6760,15 @@ fn read_journal_file(path: &Path) -> Result<PendingMergeJournal, GitError> {
             validate_cas_journal(&journal)?;
             PendingMergeJournal::Cas(journal)
         }
+        5 => {
+            let journal = serde_json::from_value::<BundleMergeJournalV5>(value)
+                .map_err(|_| GitError::InvalidJournal)?;
+            validate_bundle_journal_v5(&journal)?;
+            if serialize_bundle_journal_v5(&journal)? != bytes {
+                return Err(GitError::InvalidJournal);
+            }
+            PendingMergeJournal::BundleV5(journal)
+        }
         _ => return Err(GitError::InvalidJournal),
     };
     Ok(journal)
@@ -6682,6 +6789,9 @@ fn remove_journal(root: &Path, expected: &PendingMergeJournal) -> Result<(), Git
         ) {
             return Err(GitError::RecoveryConflict);
         }
+    }
+    if matches!(expected, PendingMergeJournal::BundleV5(_)) {
+        return Err(GitError::RecoveryConflict);
     }
     let path = journal_path(root);
     fs::remove_file(path).map_err(|error| io_error(GitIoOperation::RemoveJournal, &error))?;
@@ -7620,6 +7730,16 @@ mod tests {
             &fixture.transaction,
             hooks,
         )
+    }
+
+    fn bundle_journal_v5(
+        prepared: &candidate_bundle_v5::PreparedCandidateBundleV5,
+    ) -> BundleMergeJournalV5 {
+        BundleMergeJournalV5 {
+            version: 5,
+            reference: prepared.transaction_reference.clone(),
+            index_lock_marker: prepared.index_lock_marker_reference.clone(),
+        }
     }
 
     struct DetectedRenameRecoveryFixture {
@@ -9875,6 +9995,135 @@ mod tests {
         ));
         candidate_bundle_v5::revalidate_prepared_candidate_bundle_v5(root, &prepared)
             .expect("live drift preserves stable bundle");
+    }
+
+    #[test]
+    fn v5_stable_journal_round_trips_and_blocks_unwired_index_publication() {
+        let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+        let root = fixture.vault.root();
+        let old = read_index_snapshot(&index_path(root)).expect("live old index snapshots");
+        let mut hooks = CandidateBundleTestHooks::new(None);
+        let prepared = prepare_test_candidate_bundle(&fixture, &mut hooks)
+            .expect("v5 candidate bundle prepares");
+        let journal = bundle_journal_v5(&prepared);
+        let pending = PendingMergeJournal::BundleV5(journal.clone());
+        write_journal(root, &pending).expect("v5 stable journal publishes");
+        assert_eq!(
+            read_journal(root).expect("v5 stable journal reads"),
+            Some(pending)
+        );
+        assert_eq!(
+            recovery_status(root).expect("matching stable bundle and journal inspect"),
+            RecoveryStatus {
+                pending_transaction: true,
+                retained_candidate_scratch_count: 0,
+            }
+        );
+        let foreign_reserved = index_marker_staging_path(root, &journal.reference.token);
+        fs::write(&foreign_reserved, b"foreign reserved marker staging")
+            .expect("foreign reserved fixture writes");
+        assert!(matches!(
+            recovery_status(root),
+            Err(GitError::RecoveryConflict)
+        ));
+        fs::remove_file(foreign_reserved).expect("foreign reserved fixture removes");
+        assert!(
+            recovery_status(root)
+                .expect("exact matching namespace re-inspects")
+                .pending_transaction
+        );
+        assert!(matches!(
+            recover_pending(&fixture.vault, &fixture.git),
+            Err(GitError::RecoveryConflict)
+        ));
+        assert!(journal_path(root).is_file());
+        candidate_bundle_v5::revalidate_prepared_candidate_bundle_v5(root, &prepared)
+            .expect("unwired recovery preserves stable bundle");
+
+        let MergeJournalPayload::InPlace(transaction) = &prepared.inventory.manifest.transaction
+        else {
+            panic!("fixture must carry an in-place transaction");
+        };
+        assert!(matches!(
+            fixture.git.update_index(
+                &transaction.physical_path,
+                &transaction.result_mode,
+                &transaction.result_oid,
+            ),
+            Err(GitError::RecoveryConflict)
+        ));
+        assert!(matches!(
+            fixture.git.update_index_rename(
+                "other.md.enc",
+                &transaction.physical_path,
+                &transaction.result_mode,
+                &transaction.result_oid,
+            ),
+            Err(GitError::RecoveryConflict)
+        ));
+        let live = read_index_snapshot(&index_path(root)).expect("live index re-reads");
+        assert_eq!((live.size, live.sha256), (old.size, old.sha256));
+        assert!(!index_lock_path(root).exists());
+    }
+
+    #[test]
+    fn v5_stable_journal_rejects_noncanonical_and_cross_bound_references() {
+        let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+        let root = fixture.vault.root();
+        let mut hooks = CandidateBundleTestHooks::new(None);
+        let prepared = prepare_test_candidate_bundle(&fixture, &mut hooks)
+            .expect("v5 candidate bundle prepares");
+        let canonical = bundle_journal_v5(&prepared);
+        let bytes = serialize_bundle_journal_v5(&canonical).expect("v5 journal serializes");
+
+        let mut wrong_marker = canonical.clone();
+        wrong_marker.index_lock_marker.sha256 = hex_digest(digest(b"wrong marker reference"));
+        assert!(validate_bundle_journal_v5(&wrong_marker).is_err());
+        let mut wrong_marker_size = canonical.clone();
+        wrong_marker_size.index_lock_marker.size =
+            wrong_marker_size.index_lock_marker.size.saturating_add(1);
+        assert!(validate_bundle_journal_v5(&wrong_marker_size).is_err());
+
+        for invalid in [
+            {
+                let text = std::str::from_utf8(&bytes).expect("journal is UTF-8");
+                text.replacen("\"version\":5", "\"version\":5,\"version\":5", 1)
+                    .into_bytes()
+            },
+            {
+                let mut value: serde_json::Value =
+                    serde_json::from_slice(&bytes).expect("journal value parses");
+                value
+                    .as_object_mut()
+                    .expect("journal is an object")
+                    .insert("unknown".to_owned(), serde_json::Value::Bool(true));
+                serde_json::to_vec(&value).expect("unknown journal fixture serializes")
+            },
+            {
+                let mut value = bytes.clone();
+                value.push(b'\n');
+                value
+            },
+        ] {
+            fs::write(journal_path(root), invalid).expect("invalid journal fixture writes");
+            assert!(read_journal(root).is_err());
+            fs::remove_file(journal_path(root)).expect("invalid journal fixture removes");
+        }
+
+        let mut cross_bound = canonical;
+        cross_bound.reference.object_format = GitObjectFormat::Sha256;
+        let marker = candidate_bundle_v5::index_lock_marker_bytes_v5(&cross_bound.reference)
+            .expect("cross-bound marker serializes structurally");
+        cross_bound.index_lock_marker = candidate_bundle_v5::canonical_bytes_reference_v5(&marker)
+            .expect("cross-bound marker reference builds");
+        write_journal(root, &PendingMergeJournal::BundleV5(cross_bound))
+            .expect("cross-bound structural journal publishes");
+        assert!(matches!(
+            recovery_status(root),
+            Err(GitError::RecoveryConflict)
+        ));
+        candidate_bundle_v5::revalidate_prepared_candidate_bundle_v5(root, &prepared)
+            .expect("cross-bound journal preserves stable bundle");
     }
 
     #[test]
