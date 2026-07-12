@@ -287,7 +287,7 @@ def _valid_report(scenario: str = "normal") -> dict:
     ]
     sidecar_seal = _seal("inexd", _digest("d"), size=4, mode=0o555)
     report = {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "reportType": "inex-sublime-build4200-evidence",
         "reportScope": runner.ARTIFACT_REPORT_SCOPE,
         "artifactSource": artifact_source,
@@ -649,6 +649,9 @@ class Build4200RunnerFoundationTests(unittest.TestCase):
         def extra_root_field(report: dict) -> None:
             report["unexpected"] = True
 
+        def legacy_schema_version(report: dict) -> None:
+            report["schemaVersion"] = 1
+
         mutations = (
             duplicate_member,
             reverse_members,
@@ -662,6 +665,7 @@ class Build4200RunnerFoundationTests(unittest.TestCase):
             omit_sublime_product_module,
             arbitrary_cli_digest,
             extra_root_field,
+            legacy_schema_version,
         )
         baseline = _valid_report()
         runner.validate_artifact_report(baseline)

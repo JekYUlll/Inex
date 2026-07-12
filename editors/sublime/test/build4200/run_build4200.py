@@ -1465,7 +1465,7 @@ def validate_artifact_report(report: Dict[str, object]) -> None:
     scenario = report.get("scenario")
     result = report.get("scenarioResult")
     if (
-        report.get("schemaVersion") != 1
+        report.get("schemaVersion") != 2
         or report.get("reportType") != "inex-sublime-build4200-evidence"
         or report.get("reportScope") != ARTIFACT_REPORT_SCOPE
         or scenario not in {"normal", "plugin-host-crash"}
@@ -3109,7 +3109,7 @@ def main() -> int:
                 if record["archiveKind"] == "rust"
             )
             artifact_report: Dict[str, object] = {
-                "schemaVersion": 1,
+                "schemaVersion": 2,
                 "reportType": "inex-sublime-build4200-evidence",
                 "reportScope": ARTIFACT_REPORT_SCOPE,
                 "artifactSource": artifact_source,
