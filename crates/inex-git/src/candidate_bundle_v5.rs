@@ -201,7 +201,7 @@ pub(super) struct LoadedCandidatePublishStagingV5 {
 #[derive(Debug)]
 pub(super) struct AcquiredIndexLockMarkerV5 {
     pub(super) marker: CanonicalBytesReferenceV5,
-    scratch_basename: String,
+    scratch_basename: Option<String>,
     file: File,
 }
 
@@ -1061,7 +1061,7 @@ fn create_private_publish_scratch_file_v5<H: CandidatePublishStagingHooksV5>(
     create_private_retained_scratch_file_v5(guard, git, local, || hooks.next_token())
 }
 
-fn create_private_retained_scratch_file_v5<F>(
+pub(super) fn create_private_retained_scratch_file_v5<F>(
     guard: &VaultMutationGuard,
     git: &Git,
     local: &Path,
@@ -1360,6 +1360,27 @@ pub(super) fn revalidate_candidate_publish_staging_v5(
     inventory: &InventoryVerifiedCandidateBundleV5,
     prepared: &PreparedCandidatePublishStagingV5,
 ) -> Result<(), GitError> {
+    revalidate_candidate_publish_staging_v5_impl(guard, git, reference, inventory, prepared, false)
+}
+
+pub(super) fn revalidate_candidate_publish_staging_with_journal_v5(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+    inventory: &InventoryVerifiedCandidateBundleV5,
+    prepared: &PreparedCandidatePublishStagingV5,
+) -> Result<(), GitError> {
+    revalidate_candidate_publish_staging_v5_impl(guard, git, reference, inventory, prepared, true)
+}
+
+fn revalidate_candidate_publish_staging_v5_impl(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+    inventory: &InventoryVerifiedCandidateBundleV5,
+    prepared: &PreparedCandidatePublishStagingV5,
+    journal_published: bool,
+) -> Result<(), GitError> {
     if prepared.publish_staging_basename != reference.publish_staging_basename
         || prepared.candidate != inventory.manifest.final_index
     {
@@ -1377,7 +1398,7 @@ pub(super) fn revalidate_candidate_publish_staging_v5(
         &prepared.file,
         &before,
         true,
-        false,
+        journal_published,
     )
 }
 
@@ -1517,27 +1538,45 @@ fn audit_acquired_index_lock_marker_v5(
     reference: &CandidateBundleTransactionReferenceV5,
     inventory: &InventoryVerifiedCandidateBundleV5,
     publish: &PreparedCandidatePublishStagingV5,
-    scratch_path: &Path,
+    scratch_path: Option<&Path>,
     lock_path: &Path,
     lock_file: &File,
+    journal_published: bool,
 ) -> Result<CanonicalBytesReferenceV5, GitError> {
     let local = git.root.join(VAULT_LOCAL_DIRECTORY);
     validate_local_directory(&local)?;
     validate_local_directory(&git.root.join(".git"))?;
-    if !guard.is_for_root(&git.root) || !path_entry_is_absent(scratch_path)? {
+    if !guard.is_for_root(&git.root) {
+        return Err(GitError::RecoveryConflict);
+    }
+    if let Some(path) = scratch_path
+        && !path_entry_is_absent(path)?
+    {
         return Err(GitError::RecoveryConflict);
     }
     let marker = verify_held_index_lock_marker_file_v5(lock_path, lock_file, reference)?;
     if classify_index_lock_v5(&git.root, reference, inventory)? != IndexLockStateV5::Marker {
         return Err(GitError::RecoveryConflict);
     }
-    revalidate_candidate_publish_staging_v5(guard, git, reference, inventory, publish)?;
+    revalidate_candidate_publish_staging_v5_impl(
+        guard,
+        git,
+        reference,
+        inventory,
+        publish,
+        journal_published,
+    )?;
     let rebound_marker = verify_held_index_lock_marker_file_v5(lock_path, lock_file, reference)?;
-    if rebound_marker != marker
-        || !guard.is_for_root(&git.root)
-        || !path_entry_is_absent(scratch_path)?
-        || !open_file_matches_path_and_is_single_link(lock_path, lock_file)
-            .map_err(|_| GitError::RecoveryConflict)?
+    if rebound_marker != marker || !guard.is_for_root(&git.root) {
+        return Err(GitError::RecoveryConflict);
+    }
+    if let Some(path) = scratch_path
+        && !path_entry_is_absent(path)?
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    if !open_file_matches_path_and_is_single_link(lock_path, lock_file)
+        .map_err(|_| GitError::RecoveryConflict)?
     {
         return Err(GitError::RecoveryConflict);
     }
@@ -1701,9 +1740,10 @@ fn acquire_index_lock_marker_v5_impl<H: IndexLockMarkerHooksV5>(
         reference,
         inventory,
         publish,
-        &scratch_path,
+        Some(&scratch_path),
         &lock_path,
         &scratch_file,
+        false,
     )?;
     hooks.checkpoint(IndexLockMarkerCheckpointV5::PostAudit, &context)?;
     if !parents_durable {
@@ -1711,8 +1751,62 @@ fn acquire_index_lock_marker_v5_impl<H: IndexLockMarkerHooksV5>(
     }
     Ok(AcquiredIndexLockMarkerV5 {
         marker,
-        scratch_basename,
+        scratch_basename: Some(scratch_basename),
         file: scratch_file,
+    })
+}
+
+/// Reopens the canonical marker that already owns the real Git index lock.
+///
+/// This fresh-process proof binds a newly opened lock handle to the exact
+/// marker bytes, immutable stable bundle, publish staging, live expected-old
+/// index, and Git stage map. It deliberately has no cleanup behavior.
+pub(super) fn load_acquired_index_lock_marker_v5(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+    inventory: &InventoryVerifiedCandidateBundleV5,
+    publish: &PreparedCandidatePublishStagingV5,
+) -> Result<AcquiredIndexLockMarkerV5, GitError> {
+    load_acquired_index_lock_marker_v5_impl(guard, git, reference, inventory, publish, false)
+}
+
+pub(super) fn load_acquired_index_lock_marker_with_journal_v5(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+    inventory: &InventoryVerifiedCandidateBundleV5,
+    publish: &PreparedCandidatePublishStagingV5,
+) -> Result<AcquiredIndexLockMarkerV5, GitError> {
+    load_acquired_index_lock_marker_v5_impl(guard, git, reference, inventory, publish, true)
+}
+
+fn load_acquired_index_lock_marker_v5_impl(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+    inventory: &InventoryVerifiedCandidateBundleV5,
+    publish: &PreparedCandidatePublishStagingV5,
+    journal_published: bool,
+) -> Result<AcquiredIndexLockMarkerV5, GitError> {
+    let lock_path = index_lock_path(&git.root);
+    let file =
+        File::open(&lock_path).map_err(|error| io_error(GitIoOperation::ReadMetadata, &error))?;
+    let marker = audit_acquired_index_lock_marker_v5(
+        guard,
+        git,
+        reference,
+        inventory,
+        publish,
+        None,
+        &lock_path,
+        &file,
+        journal_published,
+    )?;
+    Ok(AcquiredIndexLockMarkerV5 {
+        marker,
+        scratch_basename: None,
+        file,
     })
 }
 
@@ -1728,16 +1822,46 @@ pub(super) fn revalidate_acquired_index_lock_marker_v5(
     publish: &PreparedCandidatePublishStagingV5,
     acquired: &AcquiredIndexLockMarkerV5,
 ) -> Result<(), GitError> {
-    let scratch_path = candidate_bundle_scratch_path_v5(&git.root, &acquired.scratch_basename)?;
+    let scratch_path = acquired
+        .scratch_basename
+        .as_deref()
+        .map(|basename| candidate_bundle_scratch_path_v5(&git.root, basename))
+        .transpose()?;
     let marker = audit_acquired_index_lock_marker_v5(
         guard,
         git,
         reference,
         inventory,
         publish,
-        &scratch_path,
+        scratch_path.as_deref(),
         &index_lock_path(&git.root),
         &acquired.file,
+        false,
+    )?;
+    if marker != acquired.marker {
+        return Err(GitError::RecoveryConflict);
+    }
+    Ok(())
+}
+
+pub(super) fn revalidate_acquired_index_lock_marker_with_journal_v5(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+    inventory: &InventoryVerifiedCandidateBundleV5,
+    publish: &PreparedCandidatePublishStagingV5,
+    acquired: &AcquiredIndexLockMarkerV5,
+) -> Result<(), GitError> {
+    let marker = audit_acquired_index_lock_marker_v5(
+        guard,
+        git,
+        reference,
+        inventory,
+        publish,
+        None,
+        &index_lock_path(&git.root),
+        &acquired.file,
+        true,
     )?;
     if marker != acquired.marker {
         return Err(GitError::RecoveryConflict);

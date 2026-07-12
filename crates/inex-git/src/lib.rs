@@ -122,6 +122,61 @@ enum V5PreJournalState {
     Conflict,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DurableJournalCheckpointV5 {
+    ScratchCreated,
+    JournalWritten,
+    BeforeMove,
+    CriticalAudit,
+    AfterMove,
+    PostAudit,
+}
+
+#[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "fault-injection tests inspect the complete durable-journal boundary"
+)]
+struct DurableJournalContextV5<'a> {
+    root: &'a Path,
+    local: &'a Path,
+    git_directory: &'a Path,
+    stable_path: &'a Path,
+    publish_path: &'a Path,
+    scratch_path: &'a Path,
+    journal_path: &'a Path,
+    lock_path: &'a Path,
+}
+
+trait DurableJournalHooksV5 {
+    fn next_token(&mut self) -> String;
+
+    fn checkpoint(
+        &mut self,
+        _checkpoint: DurableJournalCheckpointV5,
+        _context: &DurableJournalContextV5<'_>,
+    ) -> Result<(), GitError> {
+        Ok(())
+    }
+
+    fn move_journal(
+        &mut self,
+        source: &Path,
+        source_file: &File,
+        destination: &Path,
+    ) -> io::Result<AtomicFileMoveOutcome> {
+        atomic_move_verified_file_no_replace(source, source_file, destination)
+    }
+}
+
+struct ProductionDurableJournalHooksV5;
+
+impl DurableJournalHooksV5 for ProductionDurableJournalHooksV5 {
+    fn next_token(&mut self) -> String {
+        Uuid::new_v4().simple().to_string()
+    }
+}
+
 /// A scrubbed Git integration failure.
 #[derive(Debug, Error)]
 pub enum GitError {
@@ -531,6 +586,129 @@ where
             | candidate_bundle_v5::IndexLockStateV5::Foreign,
         ) => V5PreJournalState::Conflict,
     }))
+}
+
+fn read_v5_prejournal_state_from_disk(
+    guard: &VaultMutationGuard,
+    root: &Path,
+) -> Result<Option<V5PreJournalState>, GitError> {
+    let namespace = candidate_bundle_v5::inspect_candidate_bundle_namespace_v5(root)?;
+    let pending = read_journal(root)?;
+    inspect_v5_prejournal_state(guard, root, &namespace, pending.as_ref())
+}
+
+fn load_v5_reference_from_disk(
+    root: &Path,
+) -> Result<candidate_bundle_v5::CandidateBundleTransactionReferenceV5, GitError> {
+    let namespace = candidate_bundle_v5::inspect_candidate_bundle_namespace_v5(root)?;
+    let stable_basename = namespace
+        .stable_bundle_basename
+        .as_deref()
+        .ok_or(GitError::RecoveryConflict)?;
+    let inventory =
+        candidate_bundle_v5::validate_candidate_bundle_inventory_v5(root, stable_basename, None)?;
+    let reference = candidate_bundle_v5::candidate_bundle_transaction_reference_v5(
+        stable_basename,
+        inventory.manifest.object_format,
+        inventory.manifest_reference.clone(),
+    )?;
+    Ok(reference)
+}
+
+/// Advances only the recoverable v5 prefix through durable journal creation.
+///
+/// Every successful transition is discarded and then reclassified from the
+/// filesystem. This function deliberately stops at `JournalReady`; it never
+/// changes a worktree file, candidate index, live index, or cleanup namespace.
+fn advance_v5_to_durable_journal(
+    vault: &Vault,
+    git: &Git,
+    guard: &VaultMutationGuard,
+) -> Result<V5PreJournalState, GitError> {
+    if vault.root() != git.root || !guard.is_for_root(vault.root()) {
+        return Err(GitError::RecoveryConflict);
+    }
+    let mut state = read_v5_prejournal_state_from_disk(guard, vault.root())?
+        .ok_or(GitError::RecoveryConflict)?;
+    for _ in 0..3 {
+        let expected = match state {
+            V5PreJournalState::StableOnly => {
+                let reference = load_v5_reference_from_disk(vault.root())?;
+                let inventory =
+                    candidate_bundle_v5::load_candidate_bundle_for_git_v5(guard, git, &reference)?;
+                candidate_bundle_v5::prepare_candidate_publish_staging_v5(
+                    guard, git, &reference, &inventory,
+                )?;
+                V5PreJournalState::PublishReady
+            }
+            V5PreJournalState::PublishReady => {
+                let reference = load_v5_reference_from_disk(vault.root())?;
+                let loaded =
+                    candidate_bundle_v5::load_candidate_publish_staging_v5(guard, git, &reference)?;
+                authorize_payload_before_v5_journal(
+                    vault,
+                    git,
+                    guard,
+                    &loaded.inventory.manifest.transaction,
+                )?;
+                candidate_bundle_v5::acquire_index_lock_marker_v5(
+                    guard,
+                    git,
+                    &reference,
+                    &loaded.inventory,
+                    &loaded.staging,
+                )?;
+                V5PreJournalState::MarkerNoJournal
+            }
+            V5PreJournalState::MarkerNoJournal => {
+                let reference = load_v5_reference_from_disk(vault.root())?;
+                let loaded =
+                    candidate_bundle_v5::load_candidate_publish_staging_v5(guard, git, &reference)?;
+                let marker = candidate_bundle_v5::load_acquired_index_lock_marker_v5(
+                    guard,
+                    git,
+                    &reference,
+                    &loaded.inventory,
+                    &loaded.staging,
+                )?;
+                let mut hooks = ProductionDurableJournalHooksV5;
+                publish_durable_journal_v5_with_hooks(
+                    vault,
+                    git,
+                    guard,
+                    &reference,
+                    &loaded.inventory,
+                    &loaded.staging,
+                    &marker,
+                    &mut hooks,
+                )?;
+                V5PreJournalState::JournalReady
+            }
+            V5PreJournalState::JournalReady => return Ok(state),
+            V5PreJournalState::LiveIndexDrift => return Err(GitError::IndexChanged),
+            V5PreJournalState::ForeignLock | V5PreJournalState::Conflict => {
+                return Err(GitError::RecoveryConflict);
+            }
+        };
+        state = read_v5_prejournal_state_from_disk(guard, vault.root())?
+            .ok_or(GitError::RecoveryConflict)?;
+        if state != expected {
+            return Err(match state {
+                V5PreJournalState::LiveIndexDrift => GitError::IndexChanged,
+                V5PreJournalState::StableOnly
+                | V5PreJournalState::PublishReady
+                | V5PreJournalState::MarkerNoJournal
+                | V5PreJournalState::JournalReady
+                | V5PreJournalState::ForeignLock
+                | V5PreJournalState::Conflict => GitError::RecoveryConflict,
+            });
+        }
+    }
+    if state == V5PreJournalState::JournalReady {
+        Ok(state)
+    } else {
+        Err(GitError::RecoveryConflict)
+    }
 }
 
 /// Inspect whether a structurally valid encrypted merge transaction is pending.
@@ -5716,6 +5894,19 @@ fn recover_cas_pending(
 
 fn recover_pending(vault: &Vault, git: &Git) -> Result<bool, GitError> {
     let guard = VaultMutationGuard::acquire(vault.root()).map_err(map_atomic_error)?;
+    let v5_namespace = candidate_bundle_v5::inspect_candidate_bundle_namespace_v5(vault.root())?;
+    let v5_pending = read_journal(vault.root())?;
+    if v5_namespace.stable_bundle_basename.is_some()
+        || v5_namespace.publish_staging_basename.is_some()
+        || matches!(v5_pending, Some(PendingMergeJournal::BundleV5(_)))
+    {
+        if advance_v5_to_durable_journal(vault, git, &guard)? != V5PreJournalState::JournalReady {
+            return Err(GitError::RecoveryConflict);
+        }
+        // Journal publication is durable, but worktree/index recovery is a
+        // later slice. Do not report this prefix-only advance as recovered.
+        return Err(GitError::RecoveryConflict);
+    }
     let reserved_names = exact_reserved_private_names(vault.root())?;
     let Some(pending) = read_journal(vault.root())? else {
         if read_prelock_reservation(vault.root())?.is_none() {
@@ -6648,6 +6839,247 @@ fn authorize_payload_before_v5_journal(
         }
     }
     verify_authenticated_payload_original_v5(vault, git, guard, &authenticated)
+}
+
+fn verify_held_durable_journal_v5(
+    path: &Path,
+    file: &File,
+    bytes: &[u8],
+    journal: &BundleMergeJournalV5,
+) -> Result<(), GitError> {
+    if !open_file_matches_path_and_is_single_link(path, file)
+        .map_err(|_| GitError::RecoveryConflict)?
+        || read_regular_exact(path, bytes.len()).map_err(|_| GitError::RecoveryConflict)? != bytes
+        || read_journal_file(path)? != PendingMergeJournal::BundleV5(journal.clone())
+        || !open_file_matches_path_and_is_single_link(path, file)
+            .map_err(|_| GitError::RecoveryConflict)?
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn audit_durable_journal_before_move_v5(
+    vault: &Vault,
+    git: &Git,
+    guard: &VaultMutationGuard,
+    reference: &candidate_bundle_v5::CandidateBundleTransactionReferenceV5,
+    inventory: &candidate_bundle_v5::InventoryVerifiedCandidateBundleV5,
+    publish: &candidate_bundle_v5::PreparedCandidatePublishStagingV5,
+    marker: &candidate_bundle_v5::AcquiredIndexLockMarkerV5,
+    scratch_path: &Path,
+    scratch_file: &File,
+    bytes: &[u8],
+    journal: &BundleMergeJournalV5,
+) -> Result<(), GitError> {
+    validate_local_directory(&git.root.join(VAULT_LOCAL_DIRECTORY))?;
+    validate_local_directory(&git.root.join(".git"))?;
+    if vault.root() != git.root || !guard.is_for_root(vault.root()) {
+        return Err(GitError::RecoveryConflict);
+    }
+    candidate_bundle_v5::revalidate_acquired_index_lock_marker_v5(
+        guard, git, reference, inventory, publish, marker,
+    )?;
+    verify_held_durable_journal_v5(scratch_path, scratch_file, bytes, journal)?;
+    if read_v5_prejournal_state_from_disk(guard, vault.root())?
+        != Some(V5PreJournalState::MarkerNoJournal)
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    authorize_payload_before_v5_journal(vault, git, guard, &inventory.manifest.transaction)?;
+    candidate_bundle_v5::revalidate_acquired_index_lock_marker_v5(
+        guard, git, reference, inventory, publish, marker,
+    )?;
+    verify_held_durable_journal_v5(scratch_path, scratch_file, bytes, journal)?;
+    if read_v5_prejournal_state_from_disk(guard, vault.root())?
+        != Some(V5PreJournalState::MarkerNoJournal)
+        || !guard.is_for_root(vault.root())
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconcile_durable_journal_move_error_v5(
+    git: &Git,
+    scratch_path: &Path,
+    journal_path: &Path,
+    scratch_file: &File,
+    bytes: &[u8],
+    journal: &BundleMergeJournalV5,
+    error: &io::Error,
+) -> Result<(), GitError> {
+    let source_matches =
+        open_file_matches_path_and_is_single_link(scratch_path, scratch_file).unwrap_or(false);
+    let destination_matches =
+        open_file_matches_path_and_is_single_link(journal_path, scratch_file).unwrap_or(false);
+    let source_absent = path_entry_is_absent(scratch_path).unwrap_or(false);
+    let destination_absent = path_entry_is_absent(journal_path).unwrap_or(false);
+
+    if source_absent && destination_matches {
+        verify_held_durable_journal_v5(journal_path, scratch_file, bytes, journal)?;
+        sync_directory(&git.root.join(VAULT_LOCAL_DIRECTORY))
+            .map_err(|_| GitError::DurabilityNotConfirmed)?;
+        sync_directory(&git.root.join(".git")).map_err(|_| GitError::DurabilityNotConfirmed)?;
+        return Ok(());
+    }
+    if source_matches && destination_absent {
+        return Err(io_error(GitIoOperation::WriteJournal, error));
+    }
+    if source_matches && !destination_absent {
+        return Err(GitError::RecoveryConflict);
+    }
+    Err(GitError::RecoveryConflict)
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn publish_durable_journal_v5_with_hooks<H: DurableJournalHooksV5>(
+    vault: &Vault,
+    git: &Git,
+    guard: &VaultMutationGuard,
+    reference: &candidate_bundle_v5::CandidateBundleTransactionReferenceV5,
+    inventory: &candidate_bundle_v5::InventoryVerifiedCandidateBundleV5,
+    publish: &candidate_bundle_v5::PreparedCandidatePublishStagingV5,
+    marker: &candidate_bundle_v5::AcquiredIndexLockMarkerV5,
+    hooks: &mut H,
+) -> Result<(), GitError> {
+    if vault.root() != git.root || !guard.is_for_root(vault.root()) {
+        return Err(GitError::RecoveryConflict);
+    }
+    authorize_payload_before_v5_journal(vault, git, guard, &inventory.manifest.transaction)?;
+    candidate_bundle_v5::revalidate_acquired_index_lock_marker_v5(
+        guard, git, reference, inventory, publish, marker,
+    )?;
+    if read_v5_prejournal_state_from_disk(guard, vault.root())?
+        != Some(V5PreJournalState::MarkerNoJournal)
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+
+    let journal = BundleMergeJournalV5 {
+        version: 5,
+        reference: reference.clone(),
+        index_lock_marker: marker.marker.clone(),
+    };
+    let bytes = serialize_bundle_journal_v5(&journal)?;
+    let local = git.root.join(VAULT_LOCAL_DIRECTORY);
+    let git_directory = git.root.join(".git");
+    validate_local_directory(&local)?;
+    validate_local_directory(&git_directory)?;
+    let stable_path = candidate_bundle_v5::candidate_bundle_stable_path_v5(
+        &git.root,
+        &reference.bundle_basename,
+    )?;
+    let publish_path = candidate_bundle_v5::candidate_bundle_publish_path_v5(
+        &git.root,
+        &reference.publish_staging_basename,
+    )?;
+    let (_scratch_basename, scratch_path, mut scratch_file) =
+        candidate_bundle_v5::create_private_retained_scratch_file_v5(guard, git, &local, || {
+            hooks.next_token()
+        })?;
+    let journal_path = journal_path(&git.root);
+    let lock_path = index_lock_path(&git.root);
+    let context = DurableJournalContextV5 {
+        root: &git.root,
+        local: &local,
+        git_directory: &git_directory,
+        stable_path: &stable_path,
+        publish_path: &publish_path,
+        scratch_path: &scratch_path,
+        journal_path: &journal_path,
+        lock_path: &lock_path,
+    };
+    hooks.checkpoint(DurableJournalCheckpointV5::ScratchCreated, &context)?;
+
+    scratch_file
+        .write_all(&bytes)
+        .and_then(|()| scratch_file.flush())
+        .and_then(|()| scratch_file.sync_all())
+        .map_err(|error| io_error(GitIoOperation::WriteJournal, &error))?;
+    sync_directory(&local).map_err(|_| GitError::DurabilityNotConfirmed)?;
+    verify_held_durable_journal_v5(&scratch_path, &scratch_file, &bytes, &journal)?;
+    hooks.checkpoint(DurableJournalCheckpointV5::JournalWritten, &context)?;
+    hooks.checkpoint(DurableJournalCheckpointV5::BeforeMove, &context)?;
+    hooks.checkpoint(DurableJournalCheckpointV5::CriticalAudit, &context)?;
+    audit_durable_journal_before_move_v5(
+        vault,
+        git,
+        guard,
+        reference,
+        inventory,
+        publish,
+        marker,
+        &scratch_path,
+        &scratch_file,
+        &bytes,
+        &journal,
+    )?;
+
+    let parents_durable = match hooks.move_journal(&scratch_path, &scratch_file, &journal_path) {
+        Ok(outcome) => {
+            outcome.source_parent_sync == ParentSyncStatus::Synced
+                && outcome.destination_parent_sync == ParentSyncStatus::Synced
+        }
+        Err(error) => {
+            reconcile_durable_journal_move_error_v5(
+                git,
+                &scratch_path,
+                &journal_path,
+                &scratch_file,
+                &bytes,
+                &journal,
+                &error,
+            )?;
+            true
+        }
+    };
+    hooks.checkpoint(DurableJournalCheckpointV5::AfterMove, &context)?;
+    if !path_entry_is_absent(&scratch_path)? {
+        return Err(GitError::RecoveryConflict);
+    }
+    verify_held_durable_journal_v5(&journal_path, &scratch_file, &bytes, &journal)?;
+    sync_directory(&local).map_err(|_| GitError::DurabilityNotConfirmed)?;
+    sync_directory(&git_directory).map_err(|_| GitError::DurabilityNotConfirmed)?;
+    if read_journal(&git.root)? != Some(PendingMergeJournal::BundleV5(journal.clone())) {
+        return Err(GitError::RecoveryConflict);
+    }
+    let loaded =
+        candidate_bundle_v5::load_candidate_publish_staging_with_journal_v5(guard, git, reference)?;
+    candidate_bundle_v5::revalidate_candidate_publish_staging_with_journal_v5(
+        guard,
+        git,
+        reference,
+        &loaded.inventory,
+        &loaded.staging,
+    )?;
+    let rebound_marker = candidate_bundle_v5::load_acquired_index_lock_marker_with_journal_v5(
+        guard,
+        git,
+        reference,
+        &loaded.inventory,
+        &loaded.staging,
+    )?;
+    candidate_bundle_v5::revalidate_acquired_index_lock_marker_with_journal_v5(
+        guard,
+        git,
+        reference,
+        &loaded.inventory,
+        &loaded.staging,
+        &rebound_marker,
+    )?;
+    if read_v5_prejournal_state_from_disk(guard, vault.root())?
+        != Some(V5PreJournalState::JournalReady)
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    hooks.checkpoint(DurableJournalCheckpointV5::PostAudit, &context)?;
+    if !parents_durable {
+        return Err(GitError::DurabilityNotConfirmed);
+    }
+    Ok(())
 }
 
 fn advance_split_rename_worktree(
@@ -7901,6 +8333,54 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum CandidatePayloadKindV5 {
+        InPlace,
+        DetectedRename,
+        SplitRename,
+    }
+
+    fn create_candidate_payload_fixture_v5(
+        object_format: GitObjectFormat,
+        kind: CandidatePayloadKindV5,
+    ) -> CandidateBundlePreparationFixture {
+        match kind {
+            CandidatePayloadKindV5::InPlace => {
+                create_candidate_bundle_preparation_fixture(object_format)
+            }
+            CandidatePayloadKindV5::DetectedRename => {
+                let DetectedRenameRecoveryFixture {
+                    _directory: directory,
+                    vault,
+                    git,
+                    journal,
+                    ..
+                } = create_detected_rename_recovery_fixture_with_format(object_format);
+                CandidateBundlePreparationFixture {
+                    _directory: directory,
+                    vault,
+                    git,
+                    transaction: MergeJournalPayload::DetectedRename(journal),
+                }
+            }
+            CandidatePayloadKindV5::SplitRename => {
+                let RenameRecoveryFixture {
+                    _directory: directory,
+                    vault,
+                    git,
+                    journal,
+                    ..
+                } = create_rename_recovery_fixture_with_format(object_format);
+                CandidateBundlePreparationFixture {
+                    _directory: directory,
+                    vault,
+                    git,
+                    transaction: MergeJournalPayload::Rename(journal),
+                }
+            }
+        }
+    }
+
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum CandidateBundleTestAction {
         FailAt(candidate_bundle_v5::CandidateBundlePrepareCheckpointV5),
@@ -8566,6 +9046,234 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum DurableJournalTestActionV5 {
+        FailAt(DurableJournalCheckpointV5),
+        PartialScratch,
+        ScratchTamper,
+        ScratchRebind,
+        StableRebind,
+        PublishRebind,
+        MarkerRebind,
+        LiveIndexDrift,
+        WorktreeDrift,
+        AttributesDrift,
+        ForeignReserved,
+        MoveThenError,
+        MoveErrorBeforeMove,
+        ForeignDuringMove,
+        MoveWithUnsyncedParent,
+    }
+
+    #[derive(Debug)]
+    struct DurableJournalTestHooksV5 {
+        tokens: VecDeque<String>,
+        action: Option<DurableJournalTestActionV5>,
+        action_fired: bool,
+        retained_path: Option<PathBuf>,
+    }
+
+    impl DurableJournalTestHooksV5 {
+        fn new(action: Option<DurableJournalTestActionV5>) -> Self {
+            Self {
+                tokens: VecDeque::new(),
+                action,
+                action_fired: false,
+                retained_path: None,
+            }
+        }
+    }
+
+    impl DurableJournalHooksV5 for DurableJournalTestHooksV5 {
+        fn next_token(&mut self) -> String {
+            self.tokens
+                .pop_front()
+                .unwrap_or_else(|| Uuid::new_v4().simple().to_string())
+        }
+
+        #[allow(
+            clippy::too_many_lines,
+            reason = "keep every journal fault mutation in one auditable checkpoint table"
+        )]
+        fn checkpoint(
+            &mut self,
+            checkpoint: DurableJournalCheckpointV5,
+            context: &DurableJournalContextV5<'_>,
+        ) -> Result<(), GitError> {
+            let Some(action) = self.action else {
+                return Ok(());
+            };
+            if self.action_fired {
+                return Ok(());
+            }
+            let matches = match action {
+                DurableJournalTestActionV5::FailAt(expected) => checkpoint == expected,
+                DurableJournalTestActionV5::PartialScratch => {
+                    checkpoint == DurableJournalCheckpointV5::ScratchCreated
+                }
+                DurableJournalTestActionV5::ScratchTamper
+                | DurableJournalTestActionV5::ScratchRebind
+                | DurableJournalTestActionV5::StableRebind
+                | DurableJournalTestActionV5::PublishRebind
+                | DurableJournalTestActionV5::MarkerRebind
+                | DurableJournalTestActionV5::LiveIndexDrift
+                | DurableJournalTestActionV5::WorktreeDrift
+                | DurableJournalTestActionV5::AttributesDrift
+                | DurableJournalTestActionV5::ForeignReserved => {
+                    checkpoint == DurableJournalCheckpointV5::CriticalAudit
+                }
+                DurableJournalTestActionV5::MoveThenError
+                | DurableJournalTestActionV5::MoveErrorBeforeMove
+                | DurableJournalTestActionV5::ForeignDuringMove
+                | DurableJournalTestActionV5::MoveWithUnsyncedParent => false,
+            };
+            if !matches {
+                return Ok(());
+            }
+            self.action_fired = true;
+            match action {
+                DurableJournalTestActionV5::FailAt(_) => {
+                    return Err(GitError::DurabilityNotConfirmed);
+                }
+                DurableJournalTestActionV5::PartialScratch => {
+                    fs::write(context.scratch_path, b"{\"version\":5")
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    sync_regular_file(context.scratch_path, MAX_JOURNAL_BYTES)?;
+                    sync_directory(context.local).map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    return Err(GitError::DurabilityNotConfirmed);
+                }
+                DurableJournalTestActionV5::ScratchTamper => {
+                    let mut bytes = fs::read(context.scratch_path)
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    bytes[0] ^= 1;
+                    fs::write(context.scratch_path, bytes)
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                }
+                DurableJournalTestActionV5::ScratchRebind => {
+                    let held = context.root.join(format!(
+                        "held-v5-journal-scratch-{}",
+                        Uuid::new_v4().simple()
+                    ));
+                    let bytes = fs::read(context.scratch_path)
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    fs::rename(context.scratch_path, held)
+                        .and_then(|()| fs::write(context.scratch_path, bytes))
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                }
+                DurableJournalTestActionV5::StableRebind => {
+                    let clone = context.root.join(format!(
+                        "foreign-journal-stable-{}",
+                        Uuid::new_v4().simple()
+                    ));
+                    let held = context
+                        .root
+                        .join(format!("held-journal-stable-{}", Uuid::new_v4().simple()));
+                    fs::create_dir(&clone).map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    for member in [
+                        candidate_bundle_v5::CANDIDATE_BUNDLE_INDEX_V5,
+                        candidate_bundle_v5::CANDIDATE_BUNDLE_MANIFEST_V5,
+                    ] {
+                        fs::copy(context.stable_path.join(member), clone.join(member))
+                            .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    }
+                    fs::rename(context.stable_path, held)
+                        .and_then(|()| fs::rename(clone, context.stable_path))
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                }
+                DurableJournalTestActionV5::PublishRebind => {
+                    let held = context
+                        .root
+                        .join(format!("held-journal-publish-{}", Uuid::new_v4().simple()));
+                    let bytes = fs::read(context.publish_path)
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    fs::rename(context.publish_path, held)
+                        .and_then(|()| fs::write(context.publish_path, bytes))
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                }
+                DurableJournalTestActionV5::MarkerRebind => {
+                    let held = context
+                        .root
+                        .join(format!("held-journal-marker-{}", Uuid::new_v4().simple()));
+                    let bytes = fs::read(context.lock_path)
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    fs::rename(context.lock_path, &held)
+                        .and_then(|()| fs::write(context.lock_path, bytes))
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    self.retained_path = Some(held);
+                }
+                DurableJournalTestActionV5::LiveIndexDrift => {
+                    let path = index_path(context.root);
+                    let mut bytes =
+                        fs::read(&path).map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    bytes[0] ^= 1;
+                    fs::write(path, bytes).map_err(|_| GitError::DurabilityNotConfirmed)?;
+                }
+                DurableJournalTestActionV5::WorktreeDrift => {
+                    fs::write(
+                        context.root.join("entry.md.enc"),
+                        b"foreign ciphertext worktree owner",
+                    )
+                    .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                }
+                DurableJournalTestActionV5::AttributesDrift => {
+                    fs::write(
+                        context.root.join(GIT_ATTRIBUTES_FILE),
+                        b"*.md.enc text diff\n",
+                    )
+                    .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                }
+                DurableJournalTestActionV5::ForeignReserved => {
+                    fs::write(
+                        context.local.join(PRELOCK_RESERVATION_FILE),
+                        b"foreign reserved v4 owner",
+                    )
+                    .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                }
+                DurableJournalTestActionV5::MoveThenError
+                | DurableJournalTestActionV5::MoveErrorBeforeMove
+                | DurableJournalTestActionV5::ForeignDuringMove
+                | DurableJournalTestActionV5::MoveWithUnsyncedParent => unreachable!(),
+            }
+            Ok(())
+        }
+
+        fn move_journal(
+            &mut self,
+            source: &Path,
+            source_file: &File,
+            destination: &Path,
+        ) -> io::Result<AtomicFileMoveOutcome> {
+            match self.action {
+                Some(DurableJournalTestActionV5::MoveThenError) => {
+                    self.action_fired = true;
+                    atomic_move_verified_file_no_replace(source, source_file, destination)?;
+                    Err(io::Error::other("injected error after journal move"))
+                }
+                Some(DurableJournalTestActionV5::MoveErrorBeforeMove) => {
+                    self.action_fired = true;
+                    Err(io::Error::other("injected error before journal move"))
+                }
+                Some(DurableJournalTestActionV5::ForeignDuringMove) => {
+                    self.action_fired = true;
+                    fs::write(destination, b"foreign journal owner")?;
+                    Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "injected competing journal",
+                    ))
+                }
+                Some(DurableJournalTestActionV5::MoveWithUnsyncedParent) => {
+                    self.action_fired = true;
+                    atomic_move_verified_file_no_replace(source, source_file, destination)?;
+                    Ok(AtomicFileMoveOutcome {
+                        source_parent_sync: ParentSyncStatus::NotSynced,
+                        destination_parent_sync: ParentSyncStatus::Synced,
+                    })
+                }
+                _ => atomic_move_verified_file_no_replace(source, source_file, destination),
+            }
+        }
+    }
+
     fn prepare_test_marker_state(
         fixture: &CandidateBundlePreparationFixture,
     ) -> (
@@ -8589,6 +9297,42 @@ mod tests {
         (prepared, publish)
     }
 
+    fn prepare_test_durable_journal_state(
+        fixture: &CandidateBundlePreparationFixture,
+    ) -> (
+        candidate_bundle_v5::PreparedCandidateBundleV5,
+        candidate_bundle_v5::LoadedCandidatePublishStagingV5,
+        candidate_bundle_v5::AcquiredIndexLockMarkerV5,
+    ) {
+        let (prepared, publish) = prepare_test_marker_state(fixture);
+        let guard = VaultMutationGuard::acquire(fixture.vault.root())
+            .expect("journal marker guard acquires");
+        candidate_bundle_v5::acquire_index_lock_marker_v5(
+            &guard,
+            &fixture.git,
+            &prepared.transaction_reference,
+            &prepared.inventory,
+            &publish,
+        )
+        .expect("journal marker acquires");
+        drop(publish);
+        let loaded = candidate_bundle_v5::load_candidate_publish_staging_v5(
+            &guard,
+            &fixture.git,
+            &prepared.transaction_reference,
+        )
+        .expect("fresh journal publish state loads");
+        let marker = candidate_bundle_v5::load_acquired_index_lock_marker_v5(
+            &guard,
+            &fixture.git,
+            &prepared.transaction_reference,
+            &loaded.inventory,
+            &loaded.staging,
+        )
+        .expect("fresh journal marker proof loads");
+        (prepared, loaded, marker)
+    }
+
     fn bundle_journal_v5(
         prepared: &candidate_bundle_v5::PreparedCandidateBundleV5,
     ) -> BundleMergeJournalV5 {
@@ -8597,6 +9341,34 @@ mod tests {
             reference: prepared.transaction_reference.clone(),
             index_lock_marker: prepared.index_lock_marker_reference.clone(),
         }
+    }
+
+    fn payload_worktree_snapshot_v5(
+        root: &Path,
+        payload: &MergeJournalPayload,
+    ) -> BTreeMap<String, Option<Vec<u8>>> {
+        let paths = match payload {
+            MergeJournalPayload::InPlace(journal) => vec![journal.physical_path.as_str()],
+            MergeJournalPayload::DetectedRename(journal) => vec![
+                journal.source_physical_path.as_str(),
+                journal.destination_physical_path.as_str(),
+            ],
+            MergeJournalPayload::Rename(journal) => vec![
+                journal.source_physical_path.as_str(),
+                journal.destination_physical_path.as_str(),
+            ],
+        };
+        paths
+            .into_iter()
+            .map(|path| {
+                let bytes = match fs::read(root.join(path)) {
+                    Ok(bytes) => Some(bytes),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                    Err(error) => panic!("worktree snapshot failed: {error:?}"),
+                };
+                (path.to_owned(), bytes)
+            })
+            .collect()
     }
 
     fn prepare_test_candidate_publish(
@@ -13133,6 +13905,467 @@ mod tests {
         );
         assert!(candidate_bundle_scratch_paths(root).is_empty());
         assert!(!journal_path(root).exists());
+    }
+
+    #[test]
+    fn v5_recovery_advances_all_payloads_and_object_formats_only_to_durable_journal() {
+        for object_format in [GitObjectFormat::Sha1, GitObjectFormat::Sha256] {
+            for kind in [
+                CandidatePayloadKindV5::InPlace,
+                CandidatePayloadKindV5::DetectedRename,
+                CandidatePayloadKindV5::SplitRename,
+            ] {
+                let fixture = create_candidate_payload_fixture_v5(object_format, kind);
+                let root = fixture.vault.root();
+                let live_before = read_index_snapshot(&index_path(root))
+                    .expect("pre-journal live index snapshots");
+                let worktree_before = payload_worktree_snapshot_v5(root, &fixture.transaction);
+                let mut prepare_hooks = CandidateBundleTestHooks::new(None);
+                let prepared = prepare_test_candidate_bundle(&fixture, &mut prepare_hooks)
+                    .expect("v5 stable bundle prepares");
+
+                assert_eq!(
+                    inspect_test_v5_prejournal_state(root).expect("stable state inspects"),
+                    Some(V5PreJournalState::StableOnly)
+                );
+                assert!(matches!(
+                    recover_pending(&fixture.vault, &fixture.git),
+                    Err(GitError::RecoveryConflict)
+                ));
+                assert_eq!(
+                    inspect_test_v5_prejournal_state(root).expect("journal-ready state inspects"),
+                    Some(V5PreJournalState::JournalReady),
+                    "{object_format:?} {kind:?}"
+                );
+                let expected = PendingMergeJournal::BundleV5(bundle_journal_v5(&prepared));
+                assert_eq!(
+                    read_journal(root).expect("durable journal reads"),
+                    Some(expected)
+                );
+                let live_after =
+                    read_index_snapshot(&index_path(root)).expect("live index re-snapshots");
+                assert_eq!(
+                    (live_after.size, live_after.sha256),
+                    (live_before.size, live_before.sha256)
+                );
+                assert_eq!(
+                    payload_worktree_snapshot_v5(root, &fixture.transaction),
+                    worktree_before
+                );
+
+                let journal_bytes = fs::read(journal_path(root)).expect("journal bytes snapshot");
+                let scratch_count =
+                    candidate_bundle_v5::inspect_candidate_bundle_namespace_v5(root)
+                        .expect("journal-ready namespace inspects")
+                        .retained_scratch_count;
+                assert!(matches!(
+                    recover_pending(&fixture.vault, &fixture.git),
+                    Err(GitError::RecoveryConflict)
+                ));
+                assert_eq!(
+                    fs::read(journal_path(root)).expect("journal remains byte exact"),
+                    journal_bytes
+                );
+                assert_eq!(
+                    candidate_bundle_v5::inspect_candidate_bundle_namespace_v5(root)
+                        .expect("fresh journal-ready namespace inspects")
+                        .retained_scratch_count,
+                    scratch_count
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn v5_recovery_fresh_entries_resume_publish_ready_and_marker_no_journal() {
+        for start_with_marker in [false, true] {
+            for object_format in [GitObjectFormat::Sha1, GitObjectFormat::Sha256] {
+                for kind in [
+                    CandidatePayloadKindV5::InPlace,
+                    CandidatePayloadKindV5::DetectedRename,
+                    CandidatePayloadKindV5::SplitRename,
+                ] {
+                    let fixture = create_candidate_payload_fixture_v5(object_format, kind);
+                    let root = fixture.vault.root();
+                    let live_before = read_index_snapshot(&index_path(root))
+                        .expect("fresh-entry live index snapshots");
+                    let worktree_before = payload_worktree_snapshot_v5(root, &fixture.transaction);
+                    let mut prepare_hooks = CandidateBundleTestHooks::new(None);
+                    let prepared = prepare_test_candidate_bundle(&fixture, &mut prepare_hooks)
+                        .expect("fresh-entry stable bundle prepares");
+                    prepare_test_candidate_publish(&fixture, &prepared);
+                    if start_with_marker {
+                        let guard = VaultMutationGuard::acquire(root)
+                            .expect("fresh-entry marker guard acquires");
+                        let loaded = candidate_bundle_v5::load_candidate_publish_staging_v5(
+                            &guard,
+                            &fixture.git,
+                            &prepared.transaction_reference,
+                        )
+                        .expect("fresh-entry publish state loads");
+                        authorize_payload_before_v5_journal(
+                            &fixture.vault,
+                            &fixture.git,
+                            &guard,
+                            &loaded.inventory.manifest.transaction,
+                        )
+                        .expect("fresh-entry payload authorizes before marker");
+                        candidate_bundle_v5::acquire_index_lock_marker_v5(
+                            &guard,
+                            &fixture.git,
+                            &prepared.transaction_reference,
+                            &loaded.inventory,
+                            &loaded.staging,
+                        )
+                        .expect("fresh-entry marker acquires");
+                    }
+                    assert_eq!(
+                        inspect_test_v5_prejournal_state(root)
+                            .expect("fresh-entry initial state inspects"),
+                        Some(if start_with_marker {
+                            V5PreJournalState::MarkerNoJournal
+                        } else {
+                            V5PreJournalState::PublishReady
+                        })
+                    );
+
+                    assert!(matches!(
+                        recover_pending(&fixture.vault, &fixture.git),
+                        Err(GitError::RecoveryConflict)
+                    ));
+                    assert_eq!(
+                        inspect_test_v5_prejournal_state(root)
+                            .expect("fresh-entry journal state inspects"),
+                        Some(V5PreJournalState::JournalReady),
+                        "marker={start_with_marker} {object_format:?} {kind:?}"
+                    );
+                    let live_after = read_index_snapshot(&index_path(root))
+                        .expect("fresh-entry live index re-snapshots");
+                    assert_eq!(
+                        (live_after.size, live_after.sha256),
+                        (live_before.size, live_before.sha256)
+                    );
+                    assert_eq!(
+                        payload_worktree_snapshot_v5(root, &fixture.transaction),
+                        worktree_before
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "keep pre-move, partial-write, and post-move crash checkpoints in one matrix"
+    )]
+    fn v5_durable_journal_fault_checkpoints_reclassify_exact_disk_state() {
+        use DurableJournalCheckpointV5 as Point;
+
+        for point in [
+            Point::ScratchCreated,
+            Point::JournalWritten,
+            Point::BeforeMove,
+            Point::CriticalAudit,
+        ] {
+            let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+            let root = fixture.vault.root();
+            let (prepared, loaded, marker) = prepare_test_durable_journal_state(&fixture);
+            let guard = VaultMutationGuard::acquire(root).expect("journal guard acquires");
+            let mut hooks =
+                DurableJournalTestHooksV5::new(Some(DurableJournalTestActionV5::FailAt(point)));
+            assert!(matches!(
+                publish_durable_journal_v5_with_hooks(
+                    &fixture.vault,
+                    &fixture.git,
+                    &guard,
+                    &prepared.transaction_reference,
+                    &loaded.inventory,
+                    &loaded.staging,
+                    &marker,
+                    &mut hooks,
+                ),
+                Err(GitError::DurabilityNotConfirmed)
+            ));
+            drop(guard);
+            assert_eq!(
+                inspect_test_v5_prejournal_state(root).expect("pre-move state reclassifies"),
+                Some(V5PreJournalState::MarkerNoJournal),
+                "{point:?}"
+            );
+            assert!(!journal_path(root).exists());
+            assert_eq!(
+                fs::read(index_lock_path(root)).expect("marker remains"),
+                prepared.index_lock_marker
+            );
+            assert_eq!(candidate_bundle_scratch_paths(root).len(), 1);
+        }
+
+        {
+            let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+            let root = fixture.vault.root();
+            let (prepared, loaded, marker) = prepare_test_durable_journal_state(&fixture);
+            let guard = VaultMutationGuard::acquire(root).expect("journal guard acquires");
+            let mut hooks =
+                DurableJournalTestHooksV5::new(Some(DurableJournalTestActionV5::PartialScratch));
+            assert!(matches!(
+                publish_durable_journal_v5_with_hooks(
+                    &fixture.vault,
+                    &fixture.git,
+                    &guard,
+                    &prepared.transaction_reference,
+                    &loaded.inventory,
+                    &loaded.staging,
+                    &marker,
+                    &mut hooks,
+                ),
+                Err(GitError::DurabilityNotConfirmed)
+            ));
+            drop(guard);
+            let retained = candidate_bundle_scratch_paths(root);
+            assert_eq!(retained.len(), 1);
+            assert_eq!(
+                fs::read(&retained[0]).expect("partial journal scratch reads"),
+                b"{\"version\":5"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+
+                assert_eq!(
+                    fs::metadata(&retained[0])
+                        .expect("partial scratch metadata reads")
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600
+                );
+            }
+            assert_eq!(
+                inspect_test_v5_prejournal_state(root).expect("partial state reclassifies"),
+                Some(V5PreJournalState::MarkerNoJournal)
+            );
+            assert_eq!(
+                fs::read(index_lock_path(root)).expect("marker remains"),
+                prepared.index_lock_marker
+            );
+            assert!(!journal_path(root).exists());
+            assert!(matches!(
+                recover_pending(&fixture.vault, &fixture.git),
+                Err(GitError::RecoveryConflict)
+            ));
+            assert_eq!(
+                inspect_test_v5_prejournal_state(root)
+                    .expect("partial scratch does not block fresh recovery"),
+                Some(V5PreJournalState::JournalReady)
+            );
+            assert_eq!(
+                fs::read(&retained[0]).expect("partial scratch remains retained"),
+                b"{\"version\":5"
+            );
+        }
+
+        for point in [Point::AfterMove, Point::PostAudit] {
+            let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+            let root = fixture.vault.root();
+            let (prepared, loaded, marker) = prepare_test_durable_journal_state(&fixture);
+            let guard = VaultMutationGuard::acquire(root).expect("journal guard acquires");
+            let mut hooks =
+                DurableJournalTestHooksV5::new(Some(DurableJournalTestActionV5::FailAt(point)));
+            assert!(matches!(
+                publish_durable_journal_v5_with_hooks(
+                    &fixture.vault,
+                    &fixture.git,
+                    &guard,
+                    &prepared.transaction_reference,
+                    &loaded.inventory,
+                    &loaded.staging,
+                    &marker,
+                    &mut hooks,
+                ),
+                Err(GitError::DurabilityNotConfirmed)
+            ));
+            drop(guard);
+            assert_eq!(
+                inspect_test_v5_prejournal_state(root).expect("post-move state reclassifies"),
+                Some(V5PreJournalState::JournalReady),
+                "{point:?}"
+            );
+            let journal_before = fs::read(journal_path(root)).expect("visible journal snapshots");
+            let guard = VaultMutationGuard::acquire(root).expect("fresh journal guard acquires");
+            assert_eq!(
+                advance_v5_to_durable_journal(&fixture.vault, &fixture.git, &guard)
+                    .expect("fresh recovery accepts journal-ready state"),
+                V5PreJournalState::JournalReady
+            );
+            assert_eq!(
+                fs::read(journal_path(root)).expect("journal is not rewritten"),
+                journal_before
+            );
+            assert!(candidate_bundle_scratch_paths(root).is_empty());
+        }
+    }
+
+    #[test]
+    fn v5_durable_journal_move_errors_distinguish_moved_not_moved_and_foreign() {
+        for action in [
+            DurableJournalTestActionV5::MoveThenError,
+            DurableJournalTestActionV5::MoveWithUnsyncedParent,
+            DurableJournalTestActionV5::MoveErrorBeforeMove,
+            DurableJournalTestActionV5::ForeignDuringMove,
+        ] {
+            let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha256);
+            let root = fixture.vault.root();
+            let (prepared, loaded, marker) = prepare_test_durable_journal_state(&fixture);
+            let guard = VaultMutationGuard::acquire(root).expect("journal guard acquires");
+            let mut hooks = DurableJournalTestHooksV5::new(Some(action));
+            let result = publish_durable_journal_v5_with_hooks(
+                &fixture.vault,
+                &fixture.git,
+                &guard,
+                &prepared.transaction_reference,
+                &loaded.inventory,
+                &loaded.staging,
+                &marker,
+                &mut hooks,
+            );
+            drop(guard);
+            match action {
+                DurableJournalTestActionV5::MoveThenError => {
+                    result.expect("moved-then-error reconciles exact held journal");
+                    assert_eq!(
+                        inspect_test_v5_prejournal_state(root).expect("moved state inspects"),
+                        Some(V5PreJournalState::JournalReady)
+                    );
+                }
+                DurableJournalTestActionV5::MoveWithUnsyncedParent => {
+                    assert!(matches!(result, Err(GitError::DurabilityNotConfirmed)));
+                    assert_eq!(
+                        inspect_test_v5_prejournal_state(root)
+                            .expect("unsynced visible state inspects"),
+                        Some(V5PreJournalState::JournalReady)
+                    );
+                    let bytes = fs::read(journal_path(root)).expect("unsynced journal snapshots");
+                    let guard =
+                        VaultMutationGuard::acquire(root).expect("fresh journal guard acquires");
+                    assert_eq!(
+                        advance_v5_to_durable_journal(&fixture.vault, &fixture.git, &guard)
+                            .expect("fresh recovery accepts exact visible journal"),
+                        V5PreJournalState::JournalReady
+                    );
+                    assert_eq!(fs::read(journal_path(root)).expect("journal reads"), bytes);
+                }
+                DurableJournalTestActionV5::MoveErrorBeforeMove => {
+                    assert!(matches!(
+                        result,
+                        Err(GitError::Io {
+                            operation: GitIoOperation::WriteJournal,
+                            ..
+                        })
+                    ));
+                    assert_eq!(
+                        inspect_test_v5_prejournal_state(root).expect("not-moved state inspects"),
+                        Some(V5PreJournalState::MarkerNoJournal)
+                    );
+                    assert!(!journal_path(root).exists());
+                    assert_eq!(candidate_bundle_scratch_paths(root).len(), 1);
+                }
+                DurableJournalTestActionV5::ForeignDuringMove => {
+                    assert!(matches!(result, Err(GitError::RecoveryConflict)));
+                    assert_eq!(
+                        fs::read(journal_path(root)).expect("foreign journal remains"),
+                        b"foreign journal owner"
+                    );
+                    assert_eq!(candidate_bundle_scratch_paths(root).len(), 1);
+                    assert!(matches!(
+                        recovery_status(root),
+                        Err(GitError::InvalidJournal | GitError::RecoveryConflict)
+                    ));
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn v5_durable_journal_critical_audit_rejects_all_rebinding_and_drift() {
+        for action in [
+            DurableJournalTestActionV5::ScratchTamper,
+            DurableJournalTestActionV5::ScratchRebind,
+            DurableJournalTestActionV5::StableRebind,
+            DurableJournalTestActionV5::PublishRebind,
+            DurableJournalTestActionV5::MarkerRebind,
+            DurableJournalTestActionV5::LiveIndexDrift,
+            DurableJournalTestActionV5::WorktreeDrift,
+            DurableJournalTestActionV5::AttributesDrift,
+            DurableJournalTestActionV5::ForeignReserved,
+        ] {
+            let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+            let root = fixture.vault.root();
+            let (prepared, loaded, marker) = prepare_test_durable_journal_state(&fixture);
+            let guard = VaultMutationGuard::acquire(root).expect("journal guard acquires");
+            let mut hooks = DurableJournalTestHooksV5::new(Some(action));
+            assert!(
+                publish_durable_journal_v5_with_hooks(
+                    &fixture.vault,
+                    &fixture.git,
+                    &guard,
+                    &prepared.transaction_reference,
+                    &loaded.inventory,
+                    &loaded.staging,
+                    &marker,
+                    &mut hooks,
+                )
+                .is_err(),
+                "{action:?}"
+            );
+            assert!(!journal_path(root).exists(), "{action:?}");
+            assert_eq!(candidate_bundle_scratch_paths(root).len(), 1, "{action:?}");
+            if action == DurableJournalTestActionV5::MarkerRebind {
+                let held = hooks
+                    .retained_path
+                    .as_ref()
+                    .expect("rebound marker keeps original owner");
+                assert_eq!(
+                    fs::read(held).expect("held original marker reads"),
+                    prepared.index_lock_marker
+                );
+                assert_eq!(
+                    fs::read(index_lock_path(root)).expect("replacement marker remains"),
+                    prepared.index_lock_marker
+                );
+            } else {
+                assert_eq!(
+                    fs::read(index_lock_path(root)).expect("canonical marker remains"),
+                    prepared.index_lock_marker,
+                    "{action:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn v5_fresh_marker_loader_requires_single_link_identity() {
+        let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+        let root = fixture.vault.root();
+        let (prepared, loaded, _marker) = prepare_test_durable_journal_state(&fixture);
+        let sentinel = root.join("v5-marker-hardlink-sentinel");
+        fs::hard_link(index_lock_path(root), &sentinel).expect("marker hard link creates");
+        let guard = VaultMutationGuard::acquire(root).expect("fresh marker guard acquires");
+        assert!(matches!(
+            candidate_bundle_v5::load_acquired_index_lock_marker_v5(
+                &guard,
+                &fixture.git,
+                &prepared.transaction_reference,
+                &loaded.inventory,
+                &loaded.staging,
+            ),
+            Err(GitError::RecoveryConflict)
+        ));
+        assert_eq!(
+            fs::read(index_lock_path(root)).expect("marker remains"),
+            prepared.index_lock_marker
+        );
     }
 
     #[test]
