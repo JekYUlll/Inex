@@ -109,6 +109,19 @@ pub struct RecoveryStatus {
     pub retained_candidate_scratch_count: usize,
 }
 
+/// Read-only recovery classification for the v5 transaction prefix before
+/// the final candidate replaces the real Git index lock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum V5PreJournalState {
+    StableOnly,
+    PublishReady,
+    MarkerNoJournal,
+    JournalReady,
+    ForeignLock,
+    LiveIndexDrift,
+    Conflict,
+}
+
 /// A scrubbed Git integration failure.
 #[derive(Debug, Error)]
 pub enum GitError {
@@ -338,27 +351,167 @@ pub fn recover(vault: &Vault) -> Result<RecoveryReport, GitError> {
 
 /// Inspect locked-safe Git recovery state without mutating it.
 ///
-/// This check reads only bounded path/OID/ciphertext-digest metadata. It does
-/// not start Git, unlock a vault, remove retained v5 scratch entries, or mutate
-/// recovery state. A pending result still requires [`recover`] with an
-/// authenticated vault once the corresponding recovery writer is available.
+/// This check reads only bounded path/OID/ciphertext-digest metadata and runs
+/// bounded read-only Git plumbing to prove the live stage map. It does not
+/// unlock a vault, remove retained v5 scratch entries, or mutate recovery
+/// state. A pending result still requires [`recover`] with an authenticated
+/// vault once the corresponding recovery writer is available.
 ///
 /// # Errors
 ///
 /// Returns [`GitError`] when active state is ambiguous, link-like,
 /// hard-linked, oversized, truncated, or fails its strict versioned schema.
 pub fn recovery_status(vault_root: &Path) -> Result<RecoveryStatus, GitError> {
-    let _guard = VaultMutationGuard::acquire(vault_root).map_err(map_atomic_error)?;
+    let guard = VaultMutationGuard::acquire(vault_root).map_err(map_atomic_error)?;
     let v5 = candidate_bundle_v5::inspect_candidate_bundle_namespace_v5(vault_root)?;
-    let (legacy_pending, matching_v5_journal) =
-        legacy_has_pending_recovery(vault_root, v5.stable_bundle_basename.as_deref())?;
-    if v5.stable_bundle_basename.is_some() && legacy_pending && !matching_v5_journal {
-        return Err(GitError::RecoveryConflict);
-    }
+    let pending = read_journal(vault_root)?;
+    let v5_state = inspect_v5_prejournal_state(&guard, vault_root, &v5, pending.as_ref())?;
+    let pending_transaction = match v5_state {
+        Some(
+            V5PreJournalState::StableOnly
+            | V5PreJournalState::PublishReady
+            | V5PreJournalState::MarkerNoJournal
+            | V5PreJournalState::JournalReady,
+        ) => true,
+        Some(V5PreJournalState::LiveIndexDrift) => return Err(GitError::IndexChanged),
+        Some(V5PreJournalState::ForeignLock | V5PreJournalState::Conflict) => {
+            return Err(GitError::RecoveryConflict);
+        }
+        None => legacy_has_pending_recovery(vault_root, pending.as_ref())?,
+    };
     Ok(RecoveryStatus {
-        pending_transaction: legacy_pending || v5.stable_bundle_basename.is_some(),
+        pending_transaction,
         retained_candidate_scratch_count: v5.retained_scratch_count,
     })
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "keep the exact namespace, proof, lock, and phase decision table in one audit unit"
+)]
+fn inspect_v5_prejournal_state(
+    guard: &VaultMutationGuard,
+    vault_root: &Path,
+    namespace: &candidate_bundle_v5::CandidateBundleNamespaceStatusV5,
+    pending: Option<&PendingMergeJournal>,
+) -> Result<Option<V5PreJournalState>, GitError> {
+    let Some(stable_basename) = namespace.stable_bundle_basename.as_deref() else {
+        return Ok(
+            if namespace.publish_staging_basename.is_some()
+                || matches!(pending, Some(PendingMergeJournal::BundleV5(_)))
+            {
+                Some(V5PreJournalState::Conflict)
+            } else {
+                None
+            },
+        );
+    };
+
+    let inventory = candidate_bundle_v5::validate_candidate_bundle_inventory_v5(
+        vault_root,
+        stable_basename,
+        None,
+    )?;
+    let reference = candidate_bundle_v5::candidate_bundle_transaction_reference_v5(
+        stable_basename,
+        inventory.manifest.object_format,
+        inventory.manifest_reference.clone(),
+    )?;
+    let journal = match pending {
+        None => None,
+        Some(PendingMergeJournal::BundleV5(journal)) => Some(journal),
+        Some(
+            PendingMergeJournal::InPlace(_)
+            | PendingMergeJournal::Rename(_)
+            | PendingMergeJournal::DetectedRename(_)
+            | PendingMergeJournal::Cas(_),
+        ) => return Ok(Some(V5PreJournalState::Conflict)),
+    };
+    if journal.is_some_and(|journal| journal.reference != reference) {
+        return Ok(Some(V5PreJournalState::Conflict));
+    }
+    if let Some(journal) = journal
+        && validate_v5_journal_stable_bundle(vault_root, stable_basename, journal).is_err()
+    {
+        return Ok(Some(V5PreJournalState::Conflict));
+    }
+
+    let published = match namespace.publish_staging_basename.as_deref() {
+        None => false,
+        Some(actual) if actual == reference.publish_staging_basename => true,
+        Some(_) => return Ok(Some(V5PreJournalState::Conflict)),
+    };
+    if journal.is_some() && !published {
+        return Ok(Some(V5PreJournalState::Conflict));
+    }
+    let mut expected_reserved = BTreeSet::from([stable_basename.to_owned()]);
+    if published {
+        expected_reserved.insert(reference.publish_staging_basename.clone());
+    }
+    if journal.is_some() {
+        expected_reserved.insert(JOURNAL_FILE.to_owned());
+    }
+    if exact_reserved_private_names(vault_root)? != expected_reserved {
+        return Ok(Some(V5PreJournalState::Conflict));
+    }
+
+    let lock_state =
+        candidate_bundle_v5::classify_index_lock_v5(vault_root, &reference, &inventory)?;
+    let git = Git::open(vault_root)?;
+    let semantic_result = if published {
+        if journal.is_some() {
+            candidate_bundle_v5::load_candidate_publish_staging_with_journal_v5(
+                guard, &git, &reference,
+            )
+            .map(drop)
+        } else {
+            candidate_bundle_v5::load_candidate_publish_staging_v5(guard, &git, &reference)
+                .map(drop)
+        }
+    } else {
+        candidate_bundle_v5::load_candidate_bundle_for_git_v5(guard, &git, &reference).map(drop)
+    };
+    let live_index_drift = match semantic_result {
+        Ok(()) => false,
+        Err(GitError::IndexChanged) => true,
+        Err(GitError::InvalidJournal | GitError::RecoveryConflict) => {
+            return Ok(Some(V5PreJournalState::Conflict));
+        }
+        Err(error) => return Err(error),
+    };
+
+    if let Some(_journal) = journal {
+        return Ok(Some(
+            if lock_state == candidate_bundle_v5::IndexLockStateV5::Marker && !live_index_drift {
+                V5PreJournalState::JournalReady
+            } else {
+                V5PreJournalState::Conflict
+            },
+        ));
+    }
+    if lock_state == candidate_bundle_v5::IndexLockStateV5::Foreign {
+        return Ok(Some(V5PreJournalState::ForeignLock));
+    }
+    if live_index_drift {
+        return Ok(Some(
+            if lock_state == candidate_bundle_v5::IndexLockStateV5::Absent {
+                V5PreJournalState::LiveIndexDrift
+            } else {
+                V5PreJournalState::Conflict
+            },
+        ));
+    }
+    Ok(Some(match (published, lock_state) {
+        (false, candidate_bundle_v5::IndexLockStateV5::Absent) => V5PreJournalState::StableOnly,
+        (true, candidate_bundle_v5::IndexLockStateV5::Absent) => V5PreJournalState::PublishReady,
+        (true, candidate_bundle_v5::IndexLockStateV5::Marker) => V5PreJournalState::MarkerNoJournal,
+        (false, candidate_bundle_v5::IndexLockStateV5::Marker)
+        | (
+            _,
+            candidate_bundle_v5::IndexLockStateV5::Candidate
+            | candidate_bundle_v5::IndexLockStateV5::Foreign,
+        ) => V5PreJournalState::Conflict,
+    }))
 }
 
 /// Inspect whether a structurally valid encrypted merge transaction is pending.
@@ -398,30 +551,13 @@ fn validate_v5_journal_stable_bundle(
 
 fn legacy_has_pending_recovery(
     vault_root: &Path,
-    ignored_v5_stable_basename: Option<&str>,
-) -> Result<(bool, bool), GitError> {
-    let mut reserved_names = exact_reserved_private_names(vault_root)?;
-    if let Some(basename) = ignored_v5_stable_basename
-        && !reserved_names.remove(basename)
-    {
-        return Err(GitError::RecoveryConflict);
-    }
-    let pending = read_journal(vault_root)?;
+    pending: Option<&PendingMergeJournal>,
+) -> Result<bool, GitError> {
+    let reserved_names = exact_reserved_private_names(vault_root)?;
     let prelock = read_prelock_reservation(vault_root)?;
-    if let Some(pending) = &pending {
-        if let PendingMergeJournal::BundleV5(journal) = pending {
-            if prelock.is_some()
-                || ignored_v5_stable_basename != Some(journal.reference.bundle_basename.as_str())
-                || reserved_names != BTreeSet::from([JOURNAL_FILE.to_owned()])
-            {
-                return Err(GitError::RecoveryConflict);
-            }
-            validate_v5_journal_stable_bundle(
-                vault_root,
-                &journal.reference.bundle_basename,
-                journal,
-            )?;
-            return Ok((true, true));
+    if let Some(pending) = pending {
+        if matches!(pending, PendingMergeJournal::BundleV5(_)) {
+            return Err(GitError::RecoveryConflict);
         }
         if let Some(reservation) = &prelock {
             let PendingMergeJournal::Cas(journal) = pending else {
@@ -460,7 +596,7 @@ fn legacy_has_pending_recovery(
         }) {
             return Err(GitError::RecoveryConflict);
         }
-        return Ok((true, false));
+        return Ok(true);
     }
     if let Some(reservation) = &prelock {
         validate_prelock_private_inventory(vault_root, reservation, false, false)?;
@@ -471,10 +607,10 @@ fn legacy_has_pending_recovery(
             return Err(GitError::RecoveryConflict);
         }
         validate_prelock_owned_files(vault_root, reservation)?;
-        return Ok((true, false));
+        return Ok(true);
     }
     match inspect_orphan_prelock_staging(vault_root, &reserved_names)? {
-        OrphanPrelockStaging::Exact { .. } => return Ok((true, false)),
+        OrphanPrelockStaging::Exact { .. } => return Ok(true),
         OrphanPrelockStaging::Conflict => return Err(GitError::RecoveryConflict),
         OrphanPrelockStaging::None => {}
     }
@@ -482,10 +618,10 @@ fn legacy_has_pending_recovery(
         inspect_abandoned_cas_reservation(vault_root)?,
         AbandonedCasReservation::None
     ) {
-        return Ok((true, false));
+        return Ok(true);
     }
     if reserved_names.is_empty() {
-        Ok((false, false))
+        Ok(false)
     } else {
         Err(GitError::RecoveryConflict)
     }
@@ -8225,6 +8361,30 @@ mod tests {
         }
     }
 
+    fn prepare_test_candidate_publish(
+        fixture: &CandidateBundlePreparationFixture,
+        prepared: &candidate_bundle_v5::PreparedCandidateBundleV5,
+    ) {
+        let guard = VaultMutationGuard::acquire(fixture.vault.root())
+            .expect("candidate publish mutation guard acquires");
+        candidate_bundle_v5::prepare_candidate_publish_staging_v5(
+            &guard,
+            &fixture.git,
+            &prepared.transaction_reference,
+            &prepared.inventory,
+        )
+        .expect("candidate publish staging prepares");
+    }
+
+    fn inspect_test_v5_prejournal_state(
+        root: &Path,
+    ) -> Result<Option<V5PreJournalState>, GitError> {
+        let guard = VaultMutationGuard::acquire(root).map_err(map_atomic_error)?;
+        let namespace = candidate_bundle_v5::inspect_candidate_bundle_namespace_v5(root)?;
+        let pending = read_journal(root)?;
+        inspect_v5_prejournal_state(&guard, root, &namespace, pending.as_ref())
+    }
+
     struct DetectedRenameRecoveryFixture {
         _directory: TestDirectory,
         vault: Vault,
@@ -10567,6 +10727,337 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one table-like test proves the four monotonic durable prefix states"
+    )]
+    fn v5_prejournal_inspector_proves_four_read_only_sha1_and_sha256_states() {
+        for object_format in [GitObjectFormat::Sha1, GitObjectFormat::Sha256] {
+            let fixture = create_candidate_bundle_preparation_fixture(object_format);
+            let root = fixture.vault.root();
+            let live_index = fs::read(index_path(root)).expect("live index snapshots");
+            let live_stage_map = index_entry_map(&fixture.git).expect("live stage map snapshots");
+            let worktree = fs::read(root.join("entry.md.enc")).expect("worktree snapshots");
+            let mut hooks = CandidateBundleTestHooks::new(None);
+            let prepared = prepare_test_candidate_bundle(&fixture, &mut hooks)
+                .expect("v5 stable bundle prepares");
+            let scratch = candidate_bundle_v5::candidate_bundle_scratch_basename_v5(
+                "11111111111111111111111111111111",
+            )
+            .expect("retained scratch name validates");
+            fs::write(
+                root.join(VAULT_LOCAL_DIRECTORY).join(&scratch),
+                b"partial retained scratch",
+            )
+            .expect("retained scratch writes");
+
+            let assert_read_only = |expected: V5PreJournalState| {
+                assert_eq!(
+                    inspect_test_v5_prejournal_state(root).expect("v5 pre-journal state inspects"),
+                    Some(expected)
+                );
+                assert_eq!(
+                    recovery_status(root).expect("v5 recovery status inspects"),
+                    RecoveryStatus {
+                        pending_transaction: true,
+                        retained_candidate_scratch_count: 1,
+                    }
+                );
+                assert_eq!(
+                    fs::read(index_path(root)).expect("live index re-reads"),
+                    live_index
+                );
+                assert_eq!(
+                    index_entry_map(&fixture.git).expect("live stage map re-reads"),
+                    live_stage_map
+                );
+                assert_eq!(
+                    fs::read(root.join("entry.md.enc")).expect("worktree re-reads"),
+                    worktree
+                );
+                assert!(
+                    root.join(VAULT_LOCAL_DIRECTORY).join(&scratch).exists(),
+                    "retained scratch must remain untouched"
+                );
+            };
+
+            assert_read_only(V5PreJournalState::StableOnly);
+            {
+                let guard = VaultMutationGuard::acquire(root).expect("publish guard acquires");
+                let published = candidate_bundle_v5::prepare_candidate_publish_staging_v5(
+                    &guard,
+                    &fixture.git,
+                    &prepared.transaction_reference,
+                    &prepared.inventory,
+                )
+                .expect("publish staging prepares");
+                candidate_bundle_v5::revalidate_candidate_publish_staging_v5(
+                    &guard,
+                    &fixture.git,
+                    &prepared.transaction_reference,
+                    &prepared.inventory,
+                    &published,
+                )
+                .expect("held publish staging revalidates");
+            }
+            assert_read_only(V5PreJournalState::PublishReady);
+
+            fs::write(index_lock_path(root), &prepared.index_lock_marker)
+                .expect("exact marker materializes");
+            assert_read_only(V5PreJournalState::MarkerNoJournal);
+
+            write_journal(
+                root,
+                &PendingMergeJournal::BundleV5(bundle_journal_v5(&prepared)),
+            )
+            .expect("v5 journal materializes");
+            assert_read_only(V5PreJournalState::JournalReady);
+        }
+    }
+
+    #[test]
+    fn v5_prejournal_inspector_distinguishes_foreign_lock_and_index_drift() {
+        let foreign = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+        let foreign_root = foreign.vault.root();
+        let mut foreign_hooks = CandidateBundleTestHooks::new(None);
+        prepare_test_candidate_bundle(&foreign, &mut foreign_hooks)
+            .expect("foreign-lock stable bundle prepares");
+        let foreign_bytes = b"ordinary Git-owned index lock";
+        fs::write(index_lock_path(foreign_root), foreign_bytes).expect("foreign lock writes");
+        assert_eq!(
+            inspect_test_v5_prejournal_state(foreign_root).expect("foreign lock state inspects"),
+            Some(V5PreJournalState::ForeignLock)
+        );
+        assert!(matches!(
+            recovery_status(foreign_root),
+            Err(GitError::RecoveryConflict)
+        ));
+        assert_eq!(
+            fs::read(index_lock_path(foreign_root)).expect("foreign lock remains"),
+            foreign_bytes
+        );
+
+        let prelock_drift = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+        let prelock_root = prelock_drift.vault.root();
+        let mut prelock_hooks = CandidateBundleTestHooks::new(None);
+        prepare_test_candidate_bundle(&prelock_drift, &mut prelock_hooks)
+            .expect("pre-lock drift stable bundle prepares");
+        fs::write(
+            prelock_root.join("external-prelock-owner.bin"),
+            b"external pre-lock index owner",
+        )
+        .expect("pre-lock external owner writes");
+        assert!(test_git(
+            prelock_root,
+            ["add", "external-prelock-owner.bin"]
+        ));
+        let drifted_index = fs::read(index_path(prelock_root)).expect("drifted index snapshots");
+        assert_eq!(
+            inspect_test_v5_prejournal_state(prelock_root).expect("pre-lock drift state inspects"),
+            Some(V5PreJournalState::LiveIndexDrift)
+        );
+        assert!(matches!(
+            recovery_status(prelock_root),
+            Err(GitError::IndexChanged)
+        ));
+        assert_eq!(
+            fs::read(index_path(prelock_root)).expect("drifted index remains"),
+            drifted_index
+        );
+
+        let marker_drift = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+        let marker_root = marker_drift.vault.root();
+        let worktree = fs::read(marker_root.join("entry.md.enc")).expect("worktree snapshots");
+        let mut marker_hooks = CandidateBundleTestHooks::new(None);
+        let marker_prepared = prepare_test_candidate_bundle(&marker_drift, &mut marker_hooks)
+            .expect("marker-drift stable bundle prepares");
+        prepare_test_candidate_publish(&marker_drift, &marker_prepared);
+        fs::write(
+            marker_root.join("external-marker-owner.bin"),
+            b"external marker index owner",
+        )
+        .expect("marker external owner writes");
+        assert!(test_git(marker_root, ["add", "external-marker-owner.bin"]));
+        let drifted_index = fs::read(index_path(marker_root)).expect("marker drift snapshots");
+        fs::write(
+            index_lock_path(marker_root),
+            &marker_prepared.index_lock_marker,
+        )
+        .expect("exact marker lock writes");
+        assert_eq!(
+            inspect_test_v5_prejournal_state(marker_root).expect("marker drift state inspects"),
+            Some(V5PreJournalState::Conflict)
+        );
+        assert!(matches!(
+            recovery_status(marker_root),
+            Err(GitError::RecoveryConflict)
+        ));
+        assert_eq!(
+            fs::read(index_path(marker_root)).expect("marker drift index remains"),
+            drifted_index
+        );
+        assert_eq!(
+            fs::read(index_lock_path(marker_root)).expect("marker remains"),
+            marker_prepared.index_lock_marker
+        );
+        assert_eq!(
+            fs::read(marker_root.join("entry.md.enc")).expect("worktree re-reads"),
+            worktree
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the fail-closed matrix materializes each impossible durable v5 prefix"
+    )]
+    fn v5_prejournal_inspector_rejects_impossible_and_tampered_prefixes() {
+        let early_journal = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+        let early_root = early_journal.vault.root();
+        let mut early_hooks = CandidateBundleTestHooks::new(None);
+        let early_prepared = prepare_test_candidate_bundle(&early_journal, &mut early_hooks)
+            .expect("early-journal stable bundle prepares");
+        prepare_test_candidate_publish(&early_journal, &early_prepared);
+        write_journal(
+            early_root,
+            &PendingMergeJournal::BundleV5(bundle_journal_v5(&early_prepared)),
+        )
+        .expect("early journal writes");
+        assert_eq!(
+            inspect_test_v5_prejournal_state(early_root).expect("early journal state inspects"),
+            Some(V5PreJournalState::Conflict)
+        );
+        assert!(matches!(
+            recovery_status(early_root),
+            Err(GitError::RecoveryConflict)
+        ));
+        assert!(journal_path(early_root).is_file());
+
+        let wrong_marker = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+        let wrong_root = wrong_marker.vault.root();
+        let mut wrong_hooks = CandidateBundleTestHooks::new(None);
+        let wrong_prepared = prepare_test_candidate_bundle(&wrong_marker, &mut wrong_hooks)
+            .expect("wrong-marker stable bundle prepares");
+        prepare_test_candidate_publish(&wrong_marker, &wrong_prepared);
+        let wrong_basename = candidate_bundle_v5::candidate_bundle_stable_basename_v5(
+            "22222222222222222222222222222222",
+        )
+        .expect("wrong stable basename validates");
+        let wrong_reference = candidate_bundle_v5::candidate_bundle_transaction_reference_v5(
+            &wrong_basename,
+            wrong_prepared.transaction_reference.object_format,
+            wrong_prepared.transaction_reference.manifest.clone(),
+        )
+        .expect("wrong marker reference validates structurally");
+        let wrong_marker_bytes = candidate_bundle_v5::index_lock_marker_bytes_v5(&wrong_reference)
+            .expect("wrong marker serializes");
+        fs::write(index_lock_path(wrong_root), &wrong_marker_bytes).expect("wrong marker writes");
+        assert_eq!(
+            inspect_test_v5_prejournal_state(wrong_root).expect("wrong marker state inspects"),
+            Some(V5PreJournalState::ForeignLock)
+        );
+        assert!(matches!(
+            recovery_status(wrong_root),
+            Err(GitError::RecoveryConflict)
+        ));
+        assert_eq!(
+            fs::read(index_lock_path(wrong_root)).expect("wrong marker remains"),
+            wrong_marker_bytes
+        );
+
+        let candidate_lock = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+        let candidate_root = candidate_lock.vault.root();
+        let mut candidate_hooks = CandidateBundleTestHooks::new(None);
+        let candidate_prepared =
+            prepare_test_candidate_bundle(&candidate_lock, &mut candidate_hooks)
+                .expect("candidate-lock stable bundle prepares");
+        prepare_test_candidate_publish(&candidate_lock, &candidate_prepared);
+        let stable = candidate_bundle_v5::candidate_bundle_stable_path_v5(
+            candidate_root,
+            &candidate_prepared.bundle_basename,
+        )
+        .expect("candidate stable path validates");
+        let candidate_bytes = fs::read(stable.join(candidate_bundle_v5::CANDIDATE_BUNDLE_INDEX_V5))
+            .expect("candidate bytes read");
+        fs::write(index_lock_path(candidate_root), &candidate_bytes)
+            .expect("candidate lock writes");
+        assert_eq!(
+            inspect_test_v5_prejournal_state(candidate_root)
+                .expect("candidate lock state inspects"),
+            Some(V5PreJournalState::Conflict)
+        );
+        assert!(matches!(
+            recovery_status(candidate_root),
+            Err(GitError::RecoveryConflict)
+        ));
+        assert_eq!(
+            fs::read(index_lock_path(candidate_root)).expect("candidate lock remains"),
+            candidate_bytes
+        );
+
+        let extra = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+        let extra_root = extra.vault.root();
+        let mut extra_hooks = CandidateBundleTestHooks::new(None);
+        prepare_test_candidate_bundle(&extra, &mut extra_hooks)
+            .expect("extra-reserved stable bundle prepares");
+        let extra_reserved =
+            index_marker_staging_path(extra_root, "33333333333333333333333333333333");
+        fs::write(&extra_reserved, b"foreign v4 reserved owner")
+            .expect("extra reserved owner writes");
+        assert_eq!(
+            inspect_test_v5_prejournal_state(extra_root).expect("extra reserved state inspects"),
+            Some(V5PreJournalState::Conflict)
+        );
+        assert!(recovery_status(extra_root).is_err());
+        assert!(extra_reserved.is_file());
+
+        let partial_publish = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+        let partial_root = partial_publish.vault.root();
+        let mut partial_hooks = CandidateBundleTestHooks::new(None);
+        let partial_prepared = prepare_test_candidate_bundle(&partial_publish, &mut partial_hooks)
+            .expect("partial-publish stable bundle prepares");
+        let partial_path = candidate_bundle_v5::candidate_bundle_publish_path_v5(
+            partial_root,
+            &partial_prepared
+                .transaction_reference
+                .publish_staging_basename,
+        )
+        .expect("partial publish path validates");
+        let partial_bytes = b"partial publish candidate";
+        fs::write(&partial_path, partial_bytes).expect("partial publish writes");
+        assert_eq!(
+            inspect_test_v5_prejournal_state(partial_root).expect("partial publish state inspects"),
+            Some(V5PreJournalState::Conflict)
+        );
+        assert!(recovery_status(partial_root).is_err());
+        assert_eq!(
+            fs::read(&partial_path).expect("partial publish remains"),
+            partial_bytes
+        );
+
+        let tampered = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+        let tampered_root = tampered.vault.root();
+        let mut tampered_hooks = CandidateBundleTestHooks::new(None);
+        let tampered_prepared = prepare_test_candidate_bundle(&tampered, &mut tampered_hooks)
+            .expect("tampered stable bundle prepares");
+        let tampered_manifest = candidate_bundle_v5::candidate_bundle_stable_path_v5(
+            tampered_root,
+            &tampered_prepared.bundle_basename,
+        )
+        .expect("tampered stable path validates")
+        .join(candidate_bundle_v5::CANDIDATE_BUNDLE_MANIFEST_V5);
+        let mut tampered_bytes = fs::read(&tampered_manifest).expect("manifest reads");
+        tampered_bytes[0] ^= 1;
+        fs::write(&tampered_manifest, &tampered_bytes).expect("manifest tampers");
+        assert!(inspect_test_v5_prejournal_state(tampered_root).is_err());
+        assert!(recovery_status(tampered_root).is_err());
+        assert_eq!(
+            fs::read(tampered_manifest).expect("tampered manifest remains"),
+            tampered_bytes
+        );
+    }
+
+    #[test]
     fn v5_index_lock_classifier_binds_real_sha1_and_sha256_marker_and_candidate() {
         use candidate_bundle_v5::IndexLockStateV5 as State;
 
@@ -11471,6 +11962,18 @@ mod tests {
         let mut hooks = CandidateBundleTestHooks::new(None);
         let prepared = prepare_test_candidate_bundle(&fixture, &mut hooks)
             .expect("v5 candidate bundle prepares");
+        {
+            let guard = VaultMutationGuard::acquire(root).expect("publish guard acquires");
+            candidate_bundle_v5::prepare_candidate_publish_staging_v5(
+                &guard,
+                &fixture.git,
+                &prepared.transaction_reference,
+                &prepared.inventory,
+            )
+            .expect("v5 publish staging prepares");
+        }
+        fs::write(index_lock_path(root), &prepared.index_lock_marker)
+            .expect("v5 marker lock writes");
         let journal = bundle_journal_v5(&prepared);
         let pending = PendingMergeJournal::BundleV5(journal.clone());
         write_journal(root, &pending).expect("v5 stable journal publishes");
@@ -11529,7 +12032,10 @@ mod tests {
         ));
         let live = read_index_snapshot(&index_path(root)).expect("live index re-reads");
         assert_eq!((live.size, live.sha256), (old.size, old.sha256));
-        assert!(!index_lock_path(root).exists());
+        assert_eq!(
+            fs::read(index_lock_path(root)).expect("v5 marker lock remains"),
+            prepared.index_lock_marker
+        );
     }
 
     #[test]

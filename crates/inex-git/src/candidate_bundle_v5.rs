@@ -12,13 +12,14 @@ use inex_core::atomic::{
 use serde::{Deserialize, Serialize};
 
 use super::{
-    Git, GitError, GitIoOperation, GitObjectFormat, MAX_GIT_OUTPUT_BYTES, MAX_JOURNAL_BYTES,
-    MergeJournalPayload, apply_payload_to_index, ascii_casefold_starts_with, digest,
-    ensure_no_journal, exact_reserved_private_names, hex_digest, index_entry_map, index_lock_path,
-    index_path, io_error, is_link_or_reparse_point, parse_duplicate_free_json, parse_hex_digest,
-    path_entry_is_absent, payload_oids, payload_rename_provenance, read_index_snapshot,
-    restrict_file_permissions_best_effort, sync_regular_file, validate_local_directory,
-    validate_lock_token, validate_oid, validate_payload, verify_candidate_index,
+    Git, GitError, GitIoOperation, GitObjectFormat, JOURNAL_FILE, MAX_GIT_OUTPUT_BYTES,
+    MAX_JOURNAL_BYTES, MergeJournalPayload, apply_payload_to_index, ascii_casefold_starts_with,
+    digest, ensure_no_journal, exact_reserved_private_names, hex_digest, index_entry_map,
+    index_lock_path, index_path, io_error, is_link_or_reparse_point, parse_duplicate_free_json,
+    parse_hex_digest, path_entry_is_absent, payload_oids, payload_rename_provenance,
+    read_index_snapshot, restrict_file_permissions_best_effort, sync_regular_file,
+    validate_local_directory, validate_lock_token, validate_oid, validate_payload,
+    verify_candidate_index,
 };
 
 #[cfg(unix)]
@@ -959,6 +960,7 @@ fn verify_candidate_publish_namespace_v5(
     root: &Path,
     reference: &CandidateBundleTransactionReferenceV5,
     published: bool,
+    journal_published: bool,
 ) -> Result<(), GitError> {
     let namespace = inspect_candidate_bundle_namespace_v5(root)?;
     if namespace.stable_bundle_basename.as_deref() != Some(&reference.bundle_basename)
@@ -970,6 +972,9 @@ fn verify_candidate_publish_namespace_v5(
     let mut expected = BTreeSet::from([reference.bundle_basename.clone()]);
     if published {
         expected.insert(reference.publish_staging_basename.clone());
+    }
+    if journal_published {
+        expected.insert(JOURNAL_FILE.to_owned());
     }
     if exact_reserved_private_names(root)? != expected {
         return Err(GitError::RecoveryConflict);
@@ -1097,11 +1102,12 @@ fn audit_candidate_publish_staging_v5(
     file: &File,
     before: &BTreeMap<(String, u8), super::StageEntry>,
     published: bool,
+    journal_published: bool,
 ) -> Result<(), GitError> {
     if !guard.is_for_root(&git.root) {
         return Err(GitError::RecoveryConflict);
     }
-    verify_candidate_publish_namespace_v5(&git.root, reference, published)?;
+    verify_candidate_publish_namespace_v5(&git.root, reference, published, journal_published)?;
     verify_bundle_git_semantics_v5(guard, git, reference, inventory, Some(before))?;
     verify_candidate_publish_file_v5(git, path, file, &inventory.manifest, before)?;
     if !guard.is_for_root(&git.root) {
@@ -1172,7 +1178,7 @@ fn prepare_candidate_publish_staging_v5_impl<H: CandidatePublishStagingHooksV5>(
     hooks: &mut H,
 ) -> Result<PreparedCandidatePublishStagingV5, GitError> {
     validate_reference_inventory_binding_v5(reference, inventory)?;
-    verify_candidate_publish_namespace_v5(&git.root, reference, false)?;
+    verify_candidate_publish_namespace_v5(&git.root, reference, false, false)?;
     let before = verify_bundle_git_semantics_v5(guard, git, reference, inventory, None)?;
     let local = git.root.join(VAULT_LOCAL_DIRECTORY);
     validate_local_directory(&local)?;
@@ -1218,6 +1224,7 @@ fn prepare_candidate_publish_staging_v5_impl<H: CandidatePublishStagingHooksV5>(
         &scratch_file,
         &before,
         false,
+        false,
     )?;
 
     let outcome =
@@ -1246,6 +1253,7 @@ fn prepare_candidate_publish_staging_v5_impl<H: CandidatePublishStagingHooksV5>(
         &scratch_file,
         &before,
         true,
+        false,
     )?;
     if outcome.source_parent_sync != ParentSyncStatus::Synced
         || outcome.destination_parent_sync != ParentSyncStatus::Synced
@@ -1287,6 +1295,7 @@ pub(super) fn revalidate_candidate_publish_staging_v5(
         &prepared.file,
         &before,
         true,
+        false,
     )
 }
 
@@ -1304,11 +1313,34 @@ pub(super) fn load_candidate_publish_staging_v5(
     git: &Git,
     reference: &CandidateBundleTransactionReferenceV5,
 ) -> Result<LoadedCandidatePublishStagingV5, GitError> {
+    load_candidate_publish_staging_v5_impl(guard, git, reference, false)
+}
+
+/// Recovery-only fresh loader for a published candidate whose exact stable
+/// v5 journal may already occupy the fixed journal pathname.
+///
+/// The caller must parse and bind that journal before entering this dedicated
+/// capability; the function only admits the additional exact namespace entry
+/// and still reopens every bundle/publish proof.
+pub(super) fn load_candidate_publish_staging_with_journal_v5(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+) -> Result<LoadedCandidatePublishStagingV5, GitError> {
+    load_candidate_publish_staging_v5_impl(guard, git, reference, true)
+}
+
+fn load_candidate_publish_staging_v5_impl(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+    journal_published: bool,
+) -> Result<LoadedCandidatePublishStagingV5, GitError> {
     if !guard.is_for_root(&git.root) {
         return Err(GitError::RecoveryConflict);
     }
     validate_candidate_bundle_transaction_reference_v5(reference)?;
-    verify_candidate_publish_namespace_v5(&git.root, reference, true)?;
+    verify_candidate_publish_namespace_v5(&git.root, reference, true, journal_published)?;
     let inventory = load_candidate_bundle_for_git_v5(guard, git, reference)?;
     let before = verify_bundle_git_semantics_v5(guard, git, reference, &inventory, None)?;
     let publish_path =
@@ -1323,6 +1355,7 @@ pub(super) fn load_candidate_publish_staging_v5(
         &publish_file,
         &before,
         true,
+        journal_published,
     )?;
     Ok(LoadedCandidatePublishStagingV5 {
         staging: PreparedCandidatePublishStagingV5 {
@@ -2280,17 +2313,20 @@ mod tests {
     }
 
     #[test]
-    fn stable_bundle_is_pending_and_coexists_with_retained_scratch() {
+    fn stable_bundle_namespace_coexists_with_retained_scratch() {
         let root = TestRoot::new();
         let (basename, _, _) = install_bundle(&root, TOKEN);
         let scratch = candidate_bundle_scratch_basename_v5("11111111111111111111111111111111")
             .expect("scratch basename builds");
         fs::write(root.local().join(&scratch), b"retained partial scratch")
             .expect("scratch writes");
-        let status = recovery_status(root.path()).expect("v5 status succeeds");
-        assert!(status.pending_transaction);
-        assert_eq!(status.retained_candidate_scratch_count, 1);
-        assert!(has_pending_recovery(root.path()).expect("compat status succeeds"));
+        let status = inspect_candidate_bundle_namespace_v5(root.path())
+            .expect("v5 namespace inspection succeeds without opening Git");
+        assert_eq!(
+            status.stable_bundle_basename.as_deref(),
+            Some(basename.as_str())
+        );
+        assert_eq!(status.retained_scratch_count, 1);
         assert!(root.local().join(basename).is_dir());
         assert!(root.local().join(scratch).is_file());
     }
