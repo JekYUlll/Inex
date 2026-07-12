@@ -24,6 +24,10 @@ pub const MAX_VAULT_JSON_BYTES: usize = 1024 * 1024;
 pub const MIN_CREATION_MEM_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
 /// New vaults must use at least three Argon2id operations.
 pub const MIN_CREATION_OPS_LIMIT: u64 = 3;
+/// New v1 vaults may use at most 20 Argon2id operations.
+pub const DEFAULT_MAX_CREATION_OPS_LIMIT: u64 = 20;
+/// New v1 vaults keep Argon2id memory fixed at 64 MiB.
+pub const DEFAULT_MAX_CREATION_MEM_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
 /// Default defensive ceiling applied before invoking an untrusted KDF request.
 pub const DEFAULT_MAX_UNLOCK_MEM_LIMIT_BYTES: u64 = 1024 * 1024 * 1024;
 /// Default defensive Argon2id operations ceiling.
@@ -200,9 +204,17 @@ pub struct VaultConfig {
 /// Resource ceilings and creation floors for Argon2id metadata.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KdfPolicy {
+    /// Minimum operations cost accepted for newly-created password metadata.
     pub min_creation_ops_limit: u64,
+    /// Minimum memory cost accepted for newly-created password metadata.
     pub min_creation_mem_limit_bytes: u64,
+    /// Maximum operations cost accepted from direct new-vault creation APIs.
+    pub max_creation_ops_limit: u64,
+    /// Maximum memory cost accepted from direct new-vault creation APIs.
+    pub max_creation_mem_limit_bytes: u64,
+    /// Maximum operations cost accepted while reading authenticated metadata.
     pub max_unlock_ops_limit: u64,
+    /// Maximum memory cost accepted while reading authenticated metadata.
     pub max_unlock_mem_limit_bytes: u64,
 }
 
@@ -211,6 +223,8 @@ impl Default for KdfPolicy {
         Self {
             min_creation_ops_limit: MIN_CREATION_OPS_LIMIT,
             min_creation_mem_limit_bytes: MIN_CREATION_MEM_LIMIT_BYTES,
+            max_creation_ops_limit: DEFAULT_MAX_CREATION_OPS_LIMIT,
+            max_creation_mem_limit_bytes: DEFAULT_MAX_CREATION_MEM_LIMIT_BYTES,
             max_unlock_ops_limit: DEFAULT_MAX_UNLOCK_OPS_LIMIT,
             max_unlock_mem_limit_bytes: DEFAULT_MAX_UNLOCK_MEM_LIMIT_BYTES,
         }
@@ -252,6 +266,8 @@ pub enum ConfigError {
     KdfOutsideReaderBounds,
     #[error("Argon2id creation parameters are below policy")]
     KdfBelowCreationPolicy,
+    #[error("Argon2id creation parameters exceed policy")]
+    KdfAboveCreationPolicy,
     #[error("password length is outside the supported range")]
     InvalidPasswordLength,
     #[error("password is not valid UTF-8")]
@@ -348,11 +364,16 @@ impl VaultConfig {
     /// when one or more slots fall below the new-vault KDF floor.
     pub fn validate_for_creation(&self, policy: KdfPolicy) -> Result<(), ConfigError> {
         let warnings = self.validate_untrusted(policy)?;
-        if warnings.is_empty() {
-            Ok(())
-        } else {
-            Err(ConfigError::KdfBelowCreationPolicy)
+        if !warnings.is_empty() {
+            return Err(ConfigError::KdfBelowCreationPolicy);
         }
+        if self.key_slots.iter().any(|slot| {
+            slot.kdf.ops_limit > policy.max_creation_ops_limit
+                || slot.kdf.mem_limit_bytes > policy.max_creation_mem_limit_bytes
+        }) {
+            return Err(ConfigError::KdfAboveCreationPolicy);
+        }
+        Ok(())
     }
 
     /// Serialize stable, human-readable JSON. Security does not depend on JSON
@@ -697,6 +718,23 @@ mod tests {
         assert!(matches!(
             value.validate_for_creation(KdfPolicy::default()),
             Err(ConfigError::KdfBelowCreationPolicy)
+        ));
+    }
+
+    #[test]
+    fn default_creation_ceiling_is_independent_from_reader_ceiling() {
+        let policy = KdfPolicy::default();
+        assert_eq!(policy.max_creation_ops_limit, 20);
+        assert_eq!(policy.max_creation_mem_limit_bytes, 64 * 1024 * 1024);
+        assert_eq!(policy.max_unlock_ops_limit, 20);
+        assert_eq!(policy.max_unlock_mem_limit_bytes, 1024 * 1024 * 1024);
+
+        let mut value = config();
+        value.key_slots[0].kdf.mem_limit_bytes = 128 * 1024 * 1024;
+        assert!(value.validate_untrusted(policy).is_ok());
+        assert!(matches!(
+            value.validate_for_creation(policy),
+            Err(ConfigError::KdfAboveCreationPolicy)
         ));
     }
 

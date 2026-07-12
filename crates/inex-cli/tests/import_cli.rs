@@ -125,6 +125,9 @@ fn dry_run_then_copy_import_preserves_source_and_commits_only_ciphertext() {
 
     let vault = Vault::unlock(&vault_path, PASSWORD, None, KdfPolicy::default())
         .unwrap_or_else(|error| panic!("post-import unlock failed: {error}"));
+    let created_slot = &vault.config().key_slots[0];
+    assert!((3..=20).contains(&created_slot.kdf.ops_limit));
+    assert_eq!(created_slot.kdf.mem_limit_bytes, 64 * 1024 * 1024);
     let logical = LogicalPath::parse_canonical("notes/entry.md")
         .unwrap_or_else(|error| panic!("logical path failed: {error}"));
     let imported = vault

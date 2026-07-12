@@ -660,6 +660,8 @@ mod tests {
         KdfPolicy {
             min_creation_ops_limit: 1,
             min_creation_mem_limit_bytes: 8 * 1024,
+            max_creation_ops_limit: 4,
+            max_creation_mem_limit_bytes: 64 * 1024 * 1024,
             max_unlock_ops_limit: 4,
             max_unlock_mem_limit_bytes: 64 * 1024 * 1024,
         }

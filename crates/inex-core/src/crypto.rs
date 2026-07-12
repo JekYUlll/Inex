@@ -6,6 +6,8 @@
 //! been produced in memory.
 
 use std::fmt;
+#[cfg(test)]
+use std::time::Duration;
 
 use thiserror::Error;
 use uuid::Uuid;
@@ -190,12 +192,26 @@ pub enum CryptoError {
 /// cryptographic initialization, KDF, allocation, wrapping, or metadata
 /// authentication failure.
 pub fn create_vault(password: &[u8], created_at_ms: i64) -> Result<CreatedVault, CryptoError> {
-    create_vault_with_params(
-        password,
-        created_at_ms,
-        sodium::DEFAULT_ARGON2ID_PARAMS,
-        KdfPolicy::default(),
-    )
+    create_vault_with_policy(password, created_at_ms, KdfPolicy::default())
+}
+
+/// Create a new vault using process-cached v1 calibration bounded by `policy`.
+///
+/// The default policy is calibrated only once per process. A non-default
+/// policy is measured over the intersection of its creation bounds and the v1
+/// fixed 64 MiB, 3--20 operations profile.
+///
+/// # Errors
+///
+/// Returns [`CryptoError`] when the policy has no valid v1 calibration point,
+/// calibration fails, or vault creation fails.
+pub fn create_vault_with_policy(
+    password: &[u8],
+    created_at_ms: i64,
+    policy: KdfPolicy,
+) -> Result<CreatedVault, CryptoError> {
+    let params = calibrated_creation_params(policy)?;
+    create_vault_with_params(password, created_at_ms, params, policy)
 }
 
 /// Create a new vault with explicit parameters and policy.
@@ -213,11 +229,7 @@ pub fn create_vault_with_params(
     params: Argon2idParams,
     policy: KdfPolicy,
 ) -> Result<CreatedVault, CryptoError> {
-    validate_password(password)?;
-    if created_at_ms < 0 {
-        return Err(ConfigError::InvalidTimestamp.into());
-    }
-    validate_new_slot_params(params, policy)?;
+    validate_vault_creation_request(password, created_at_ms, params, policy)?;
 
     let master_key = VaultMasterKey::random()?;
     let vault_id = random_uuid_v4()?;
@@ -261,6 +273,19 @@ pub fn create_vault_with_params(
         master_key,
         slot_id,
     })
+}
+
+pub(crate) fn validate_vault_creation_request(
+    password: &[u8],
+    created_at_ms: i64,
+    params: Argon2idParams,
+    policy: KdfPolicy,
+) -> Result<(), CryptoError> {
+    validate_password(password)?;
+    if created_at_ms < 0 {
+        return Err(ConfigError::InvalidTimestamp.into());
+    }
+    validate_new_vault_params(params, policy)
 }
 
 /// Unlock and authenticate a vault password slot and the complete metadata.
@@ -307,7 +332,7 @@ pub fn unlock_vault(
 /// Returns [`CryptoError`] when current metadata is unauthenticated, capacity
 /// is exhausted, the new password/KDF is invalid, or wrapping/MAC generation
 /// fails.
-pub fn add_password_slot(
+pub(crate) fn add_password_slot(
     config: &VaultConfig,
     master_key: &VaultMasterKey,
     password: &[u8],
@@ -318,7 +343,7 @@ pub fn add_password_slot(
     validate_password(password)?;
     config.validate_untrusted(policy)?;
     verify_metadata_mac(config, master_key)?;
-    validate_new_slot_params(params, policy)?;
+    validate_password_slot_params(params, policy)?;
     if created_at_ms < 0 {
         return Err(ConfigError::InvalidKeySlotTimestamp.into());
     }
@@ -642,7 +667,138 @@ fn compute_metadata_mac(
     Ok(result?)
 }
 
-fn validate_new_slot_params(params: Argon2idParams, policy: KdfPolicy) -> Result<(), CryptoError> {
+/// Return machine-calibrated v1 parameters bounded by new-vault policy.
+///
+/// The default policy uses a process-wide cached measurement. A custom policy
+/// is measured over only its valid intersection with the v1 3--20 operations
+/// range. Calibration memory remains exactly 64 MiB.
+///
+/// # Errors
+///
+/// Returns [`CryptoError`] when `policy` cannot represent the fixed v1
+/// calibration profile or libsodium cannot complete a dummy measurement.
+pub fn calibrated_creation_params(policy: KdfPolicy) -> Result<Argon2idParams, CryptoError> {
+    let (min_ops_limit, max_ops_limit) = calibration_ops_bounds(policy)?;
+    let params = if policy == KdfPolicy::default() {
+        sodium::calibrated_argon2id_params()?
+    } else {
+        sodium::calibrate_argon2id_params_in_range(min_ops_limit, max_ops_limit)?
+    };
+    validate_new_vault_params(params, policy)?;
+    Ok(params)
+}
+
+#[cfg(test)]
+fn calibrated_creation_params_with_measure(
+    policy: KdfPolicy,
+    measure: impl FnMut(Argon2idParams) -> Result<Duration, SodiumError>,
+) -> Result<Argon2idParams, CryptoError> {
+    let (min_ops_limit, max_ops_limit) = calibration_ops_bounds(policy)?;
+    let params = sodium::calibrate_argon2id_params_with(min_ops_limit, max_ops_limit, measure)?;
+    validate_new_vault_params(params, policy)?;
+    Ok(params)
+}
+
+/// Select password-rewrap costs without weakening the authenticated slot.
+///
+/// `calibrated` must satisfy the independent new-vault creation bounds. The
+/// returned operations and memory costs are the componentwise maxima of it and
+/// `current_authenticated`. A stronger authenticated slot may exceed the
+/// new-vault creation ceiling, but it is preserved only while it remains within
+/// the reader resource ceiling.
+///
+/// # Errors
+///
+/// Returns [`CryptoError`] when the calibrated candidate violates creation
+/// policy, the authenticated parameters exceed reader bounds, or their maxima
+/// cannot be safely derived under `policy`.
+pub fn select_password_rewrap_params(
+    calibrated: Argon2idParams,
+    current_authenticated: Argon2idParams,
+    policy: KdfPolicy,
+) -> Result<Argon2idParams, CryptoError> {
+    validate_new_vault_params(calibrated, policy)?;
+    current_authenticated.validate(reader_limits(policy))?;
+    let selected = Argon2idParams {
+        ops_limit: calibrated.ops_limit.max(current_authenticated.ops_limit),
+        mem_limit_bytes: calibrated
+            .mem_limit_bytes
+            .max(current_authenticated.mem_limit_bytes),
+    };
+    validate_password_slot_params(selected, policy)?;
+    Ok(selected)
+}
+
+/// Calibrate and select no-downgrade password-rewrap parameters.
+///
+/// # Errors
+///
+/// Returns [`CryptoError`] for calibration, creation-policy, or reader-policy
+/// failures.
+pub fn calibrated_password_rewrap_params(
+    current_authenticated: Argon2idParams,
+    policy: KdfPolicy,
+) -> Result<Argon2idParams, CryptoError> {
+    let calibrated = calibrated_creation_params(policy)?;
+    select_password_rewrap_params(calibrated, current_authenticated, policy)
+}
+
+fn calibration_ops_bounds(policy: KdfPolicy) -> Result<(u64, u64), CryptoError> {
+    let memory = sodium::V1_ARGON2ID_CALIBRATION_MEM_LIMIT_BYTES;
+    if memory < policy.min_creation_mem_limit_bytes {
+        return Err(ConfigError::KdfBelowCreationPolicy.into());
+    }
+    if memory > policy.max_creation_mem_limit_bytes {
+        return Err(ConfigError::KdfAboveCreationPolicy.into());
+    }
+    if memory > policy.max_unlock_mem_limit_bytes {
+        return Err(ConfigError::KdfOutsideReaderBounds.into());
+    }
+
+    let min_ops_limit =
+        sodium::V1_ARGON2ID_CALIBRATION_MIN_OPS_LIMIT.max(policy.min_creation_ops_limit);
+    if min_ops_limit > sodium::V1_ARGON2ID_CALIBRATION_MAX_OPS_LIMIT {
+        return Err(ConfigError::KdfBelowCreationPolicy.into());
+    }
+    let max_ops_limit = sodium::V1_ARGON2ID_CALIBRATION_MAX_OPS_LIMIT
+        .min(policy.max_creation_ops_limit)
+        .min(policy.max_unlock_ops_limit);
+    if max_ops_limit < sodium::V1_ARGON2ID_CALIBRATION_MIN_OPS_LIMIT {
+        return if policy.max_unlock_ops_limit < sodium::V1_ARGON2ID_CALIBRATION_MIN_OPS_LIMIT {
+            Err(ConfigError::KdfOutsideReaderBounds.into())
+        } else {
+            Err(ConfigError::KdfAboveCreationPolicy.into())
+        };
+    }
+    if min_ops_limit > max_ops_limit {
+        return if min_ops_limit > policy.max_unlock_ops_limit {
+            Err(ConfigError::KdfOutsideReaderBounds.into())
+        } else {
+            Err(ConfigError::KdfAboveCreationPolicy.into())
+        };
+    }
+    Ok((min_ops_limit, max_ops_limit))
+}
+
+fn validate_new_vault_params(params: Argon2idParams, policy: KdfPolicy) -> Result<(), CryptoError> {
+    if params.ops_limit < policy.min_creation_ops_limit
+        || params.mem_limit_bytes < policy.min_creation_mem_limit_bytes
+    {
+        return Err(ConfigError::KdfBelowCreationPolicy.into());
+    }
+    if params.ops_limit > policy.max_creation_ops_limit
+        || params.mem_limit_bytes > policy.max_creation_mem_limit_bytes
+    {
+        return Err(ConfigError::KdfAboveCreationPolicy.into());
+    }
+    params.validate(reader_limits(policy))?;
+    Ok(())
+}
+
+fn validate_password_slot_params(
+    params: Argon2idParams,
+    policy: KdfPolicy,
+) -> Result<(), CryptoError> {
     if params.ops_limit < policy.min_creation_ops_limit
         || params.mem_limit_bytes < policy.min_creation_mem_limit_bytes
     {
@@ -740,6 +896,8 @@ mod tests {
         KdfPolicy {
             min_creation_ops_limit: 1,
             min_creation_mem_limit_bytes: 8 * 1024,
+            max_creation_ops_limit: 4,
+            max_creation_mem_limit_bytes: 64 * 1024 * 1024,
             max_unlock_ops_limit: 4,
             max_unlock_mem_limit_bytes: 64 * 1024 * 1024,
         }
@@ -957,6 +1115,82 @@ mod tests {
         assert!(debug.contains("<redacted>"));
         assert!(debug.contains(&format!("{health:?}")));
         assert!(!debug.contains("5a5a5a5a"));
+    }
+
+    #[test]
+    fn custom_creation_policy_uses_injected_bounded_calibration() {
+        let mut measured = Vec::new();
+        let params = calibrated_creation_params_with_measure(test_policy(), |params| {
+            measured.push(params);
+            if params.ops_limit == 3 {
+                Ok(Duration::from_millis(100))
+            } else {
+                Ok(Duration::from_millis(300))
+            }
+        })
+        .expect("synthetic policy calibration succeeds");
+
+        assert_eq!(params.ops_limit, 4);
+        assert_eq!(params.mem_limit_bytes, 64 * 1024 * 1024);
+        assert_eq!(
+            measured
+                .iter()
+                .map(|value| value.ops_limit)
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+        assert!(measured.iter().all(|value| {
+            value.mem_limit_bytes == sodium::V1_ARGON2ID_CALIBRATION_MEM_LIMIT_BYTES
+        }));
+    }
+
+    #[test]
+    fn direct_new_vault_parameters_fail_closed_above_creation_cap() {
+        let result = create_vault_with_params(
+            b"correct horse",
+            1_783_699_200_000,
+            Argon2idParams {
+                ops_limit: 3,
+                mem_limit_bytes: 128 * 1024 * 1024,
+            },
+            KdfPolicy::default(),
+        );
+        assert!(matches!(
+            result,
+            Err(CryptoError::Config(ConfigError::KdfAboveCreationPolicy))
+        ));
+    }
+
+    #[test]
+    fn password_rewrap_uses_componentwise_max_without_downgrade() {
+        let policy = KdfPolicy::default();
+        let selected = select_password_rewrap_params(
+            Argon2idParams {
+                ops_limit: 7,
+                mem_limit_bytes: 64 * 1024 * 1024,
+            },
+            Argon2idParams {
+                ops_limit: 5,
+                mem_limit_bytes: 128 * 1024 * 1024,
+            },
+            policy,
+        )
+        .expect("strong authenticated parameters remain reader-safe");
+        assert_eq!(selected.ops_limit, 7);
+        assert_eq!(selected.mem_limit_bytes, 128 * 1024 * 1024);
+
+        let outside_reader = select_password_rewrap_params(
+            sodium::MINIMUM_ARGON2ID_PARAMS,
+            Argon2idParams {
+                ops_limit: policy.max_unlock_ops_limit + 1,
+                mem_limit_bytes: 64 * 1024 * 1024,
+            },
+            policy,
+        );
+        assert!(matches!(
+            outside_reader,
+            Err(CryptoError::Sodium(SodiumError::InvalidParameter { .. }))
+        ));
     }
 
     #[test]

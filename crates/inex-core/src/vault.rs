@@ -253,10 +253,27 @@ impl Vault {
         password: &[u8],
         created_at_ms: i64,
     ) -> Result<Self, VaultError> {
-        let root = prepare_vault_root(root.as_ref())?;
-        ensure_uninitialized_root(&root)?;
-        let created = crypto::create_vault(password, created_at_ms)?;
-        Self::commit_created(&root, created, password, KdfPolicy::default())
+        Self::create_with_policy(root, password, created_at_ms, KdfPolicy::default())
+    }
+
+    /// Create a vault using process-cached v1 calibration bounded by `policy`.
+    ///
+    /// Calibration and pure request validation complete before an absent vault
+    /// root may be created.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError`] for an invalid calibration policy, KDF failure,
+    /// unsafe root, existing metadata, commit failure, or post-commit
+    /// authentication failure.
+    pub fn create_with_policy(
+        root: impl AsRef<Path>,
+        password: &[u8],
+        created_at_ms: i64,
+        policy: KdfPolicy,
+    ) -> Result<Self, VaultError> {
+        let params = crypto::calibrated_creation_params(policy)?;
+        Self::create_with_params(root, password, created_at_ms, params, policy)
     }
 
     /// Create a vault with explicit KDF parameters and policy.
@@ -276,6 +293,7 @@ impl Vault {
         params: Argon2idParams,
         policy: KdfPolicy,
     ) -> Result<Self, VaultError> {
+        crypto::validate_vault_creation_request(password, created_at_ms, params, policy)?;
         let root = prepare_vault_root(root.as_ref())?;
         ensure_uninitialized_root(&root)?;
         let created = crypto::create_vault_with_params(password, created_at_ms, params, policy)?;
@@ -789,7 +807,9 @@ impl Vault {
     ///
     /// Existing slots are never removed by this operation. Password changes
     /// therefore use this method first and call [`Self::remove_password_slot`]
-    /// only after the new credential has returned successfully.
+    /// only after the new credential has returned successfully. Each supplied
+    /// work factor is raised to at least the authenticated slot's value before
+    /// wrapping, so this operation cannot silently weaken that credential.
     ///
     /// # Errors
     ///
@@ -803,6 +823,11 @@ impl Vault {
         params: Argon2idParams,
         policy: KdfPolicy,
     ) -> Result<PasswordSlotCommit, VaultError> {
+        let current_slot = self.config.key_slot(self.unlocked_slot_id)?;
+        let params = Argon2idParams {
+            ops_limit: params.ops_limit.max(current_slot.kdf.ops_limit),
+            mem_limit_bytes: params.mem_limit_bytes.max(current_slot.kdf.mem_limit_bytes),
+        };
         let (updated, new_slot_id) = crypto::add_password_slot(
             &self.config,
             &self.master_key,
@@ -833,6 +858,30 @@ impl Vault {
             new_slot_id,
             parent_sync: outcome.parent_sync,
         })
+    }
+
+    /// Return calibrated no-downgrade parameters for a password rewrap.
+    ///
+    /// The authenticated slot used to open this session is the lower bound for
+    /// each work-factor component. Stronger legacy values are retained while
+    /// they remain inside the configured reader ceiling.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError`] when calibration fails, the authenticated slot
+    /// is missing, or its parameters cannot be safely retained under `policy`.
+    pub fn calibrated_password_rewrap_params(
+        &self,
+        policy: KdfPolicy,
+    ) -> Result<Argon2idParams, VaultError> {
+        let current_slot = self.config.key_slot(self.unlocked_slot_id)?;
+        Ok(crypto::calibrated_password_rewrap_params(
+            Argon2idParams {
+                ops_limit: current_slot.kdf.ops_limit,
+                mem_limit_bytes: current_slot.kdf.mem_limit_bytes,
+            },
+            policy,
+        )?)
     }
 
     /// Remove one old password slot after another slot has been verified.
@@ -1640,6 +1689,8 @@ mod tests {
         KdfPolicy {
             min_creation_ops_limit: 1,
             min_creation_mem_limit_bytes: 8 * 1024,
+            max_creation_ops_limit: 4,
+            max_creation_mem_limit_bytes: 64 * 1024 * 1024,
             max_unlock_ops_limit: 4,
             max_unlock_mem_limit_bytes: 64 * 1024 * 1024,
         }
@@ -1965,6 +2016,87 @@ mod tests {
     }
 
     #[test]
+    fn password_slot_addition_never_weakens_authenticated_work_factors() {
+        let directory = TestDirectory::new();
+        let mut vault = Vault::create_with_params(
+            directory.path(),
+            b"old password",
+            1_783_699_200_000,
+            Argon2idParams {
+                ops_limit: 2,
+                mem_limit_bytes: 16 * 1024,
+            },
+            test_policy(),
+        )
+        .unwrap_or_else(|error| panic!("strong test vault creation failed: {error}"));
+        let committed = vault
+            .add_password_slot(
+                b"new password",
+                1_783_699_202_000,
+                test_params(),
+                test_policy(),
+            )
+            .unwrap_or_else(|error| panic!("slot add failed: {error}"));
+        let slot = vault
+            .config()
+            .key_slot(committed.new_slot_id)
+            .unwrap_or_else(|error| panic!("new slot missing: {error}"));
+        assert_eq!(slot.kdf.ops_limit, 2);
+        assert_eq!(slot.kdf.mem_limit_bytes, 16 * 1024);
+    }
+
+    #[test]
+    fn calibrated_password_change_preserves_slot_above_creation_cap() {
+        let directory = TestDirectory::new();
+        let strong_memory = crate::vault_config::DEFAULT_MAX_CREATION_MEM_LIMIT_BYTES + 8 * 1024;
+        let strong_creation_policy = KdfPolicy {
+            max_creation_mem_limit_bytes: strong_memory,
+            ..KdfPolicy::default()
+        };
+        let mut vault = Vault::create_with_params(
+            directory.path(),
+            b"old password",
+            1_783_699_200_000,
+            Argon2idParams {
+                ops_limit: crate::vault_config::MIN_CREATION_OPS_LIMIT,
+                mem_limit_bytes: strong_memory,
+            },
+            strong_creation_policy,
+        )
+        .unwrap_or_else(|error| panic!("strong vault creation failed: {error}"));
+
+        let rewrap_params = vault
+            .calibrated_password_rewrap_params(KdfPolicy::default())
+            .unwrap_or_else(|error| panic!("rewrap calibration failed: {error}"));
+        assert_eq!(rewrap_params.mem_limit_bytes, strong_memory);
+        let committed = vault
+            .change_password(
+                b"new password",
+                1_783_699_202_000,
+                rewrap_params,
+                KdfPolicy::default(),
+            )
+            .unwrap_or_else(|error| panic!("strong password change failed: {error}"));
+        let slot = vault
+            .config()
+            .key_slot(committed.new_slot_id)
+            .unwrap_or_else(|error| panic!("new strong slot missing: {error}"));
+        assert_eq!(slot.kdf.ops_limit, rewrap_params.ops_limit);
+        assert_eq!(slot.kdf.mem_limit_bytes, strong_memory);
+        drop(vault);
+
+        assert!(
+            Vault::unlock(
+                directory.path(),
+                b"new password",
+                Some(committed.new_slot_id),
+                KdfPolicy::default(),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn symlink_document_and_plaintext_markdown_fail_closed() {
         let directory = TestDirectory::new();
         let mut vault = create_test_vault(&directory);
@@ -2213,6 +2345,50 @@ mod tests {
             ),
             Err(VaultError::AlreadyInitialized)
         ));
+    }
+
+    #[test]
+    fn invalid_creation_policy_has_no_absent_root_side_effect() {
+        let directory = TestDirectory::new();
+        assert!(!directory.path().exists());
+
+        let mut explicit_policy = test_policy();
+        explicit_policy.max_creation_ops_limit = 2;
+        let explicit = Vault::create_with_params(
+            directory.path(),
+            b"new password",
+            1_783_699_200_000,
+            Argon2idParams {
+                ops_limit: 3,
+                mem_limit_bytes: 8 * 1024,
+            },
+            explicit_policy,
+        );
+        assert!(matches!(
+            explicit,
+            Err(VaultError::Crypto(CryptoError::Config(
+                ConfigError::KdfAboveCreationPolicy
+            )))
+        ));
+        assert!(!directory.path().exists());
+
+        let calibrated_policy = KdfPolicy {
+            max_creation_mem_limit_bytes: 32 * 1024 * 1024,
+            ..KdfPolicy::default()
+        };
+        let calibrated = Vault::create_with_policy(
+            directory.path(),
+            b"new password",
+            1_783_699_200_000,
+            calibrated_policy,
+        );
+        assert!(matches!(
+            calibrated,
+            Err(VaultError::Crypto(CryptoError::Config(
+                ConfigError::KdfAboveCreationPolicy
+            )))
+        ));
+        assert!(!directory.path().exists());
     }
 
     #[cfg(unix)]

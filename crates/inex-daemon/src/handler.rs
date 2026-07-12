@@ -11,16 +11,16 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use inex_core::atomic::ParentSyncStatus;
-use inex_core::crypto::{CryptoError, DecryptedDocument, EncryptedDocument};
+use inex_core::crypto::{
+    CryptoError, DecryptedDocument, EncryptedDocument, calibrated_creation_params,
+};
 use inex_core::format::{EdryHeader, MAX_PLAINTEXT_LEN};
 use inex_core::path::{LogicalDir, LogicalPath};
 use inex_core::search::{
     CaseSensitivity, DEFAULT_SEARCH_RESULTS, DEFAULT_SEARCH_SNIPPET_BYTES, MAX_SEARCH_QUERY_BYTES,
     MAX_SEARCH_RESULTS, MAX_SEARCH_SNIPPET_BYTES, SearchQuery,
 };
-use inex_core::sodium::{
-    Argon2idParams, DEFAULT_ARGON2ID_PARAMS, MAX_PASSWORD_BYTES, VAULT_ARGON2ID_READER_LIMITS,
-};
+use inex_core::sodium::{Argon2idParams, MAX_PASSWORD_BYTES};
 use inex_core::tree::{TreeEntryKind, TreeError};
 use inex_core::vault::{
     DocumentMetadata, MAX_EDRY_ENVELOPE_BYTES, RenameOutcome, Vault, VaultError,
@@ -214,12 +214,13 @@ impl<C: MonotonicClock> RpcService<C> {
         let vault_path =
             params.required_sensitive_string("vaultPath", 1, MAX_PHYSICAL_PATH_BYTES)?;
         let password = params.required_sensitive_string("password", 1, MAX_PASSWORD_BYTES)?;
-        let kdf = parse_optional_kdf(&mut params, self.kdf_policy)?;
+        let requested_kdf = parse_optional_kdf(&mut params)?;
         params.finish()?;
         if self.sessions.is_active() {
             return Err(ErrorObject::new(ErrorCode::Busy));
         }
         let vault_path = validated_vault_path(&vault_path)?;
+        let kdf = resolve_creation_kdf(requested_kdf, self.kdf_policy, calibrated_creation_params)?;
         let vault = Vault::create_with_params(
             vault_path,
             password.as_bytes(),
@@ -682,28 +683,35 @@ fn parse_session_path(
     Ok((session, logical_path))
 }
 
-fn parse_optional_kdf(
-    params: &mut ParamObject,
-    policy: KdfPolicy,
-) -> Result<Argon2idParams, ErrorObject> {
+fn parse_optional_kdf(params: &mut ParamObject) -> Result<Option<Argon2idParams>, ErrorObject> {
     let Some(mut kdf) = params.optional_object("kdf")? else {
-        return Ok(DEFAULT_ARGON2ID_PARAMS);
+        return Ok(None);
     };
-    let ops_limit = kdf.required_u64(
-        "opsLimit",
-        VAULT_ARGON2ID_READER_LIMITS.min_ops_limit,
-        policy.max_unlock_ops_limit,
-    )?;
-    let mem_limit_bytes = kdf.required_u64(
-        "memLimitBytes",
-        VAULT_ARGON2ID_READER_LIMITS.min_mem_limit_bytes,
-        policy.max_unlock_mem_limit_bytes,
-    )?;
+    let ops_limit = kdf.required_u64("opsLimit", 0, u64::MAX)?;
+    let mem_limit_bytes = kdf.required_u64("memLimitBytes", 0, u64::MAX)?;
     kdf.finish()?;
-    Ok(Argon2idParams {
+    Ok(Some(Argon2idParams {
         ops_limit,
         mem_limit_bytes,
-    })
+    }))
+}
+
+fn resolve_creation_kdf(
+    requested: Option<Argon2idParams>,
+    policy: KdfPolicy,
+    calibrate: impl FnOnce(KdfPolicy) -> Result<Argon2idParams, CryptoError>,
+) -> Result<Argon2idParams, ErrorObject> {
+    if let Some(params) = requested {
+        if params.ops_limit < policy.min_creation_ops_limit
+            || params.ops_limit > policy.max_creation_ops_limit
+            || params.mem_limit_bytes < policy.min_creation_mem_limit_bytes
+            || params.mem_limit_bytes > policy.max_creation_mem_limit_bytes
+        {
+            return Err(ErrorObject::new(ErrorCode::KdfPolicy));
+        }
+        return Ok(params);
+    }
+    calibrate(policy).map_err(|_| ErrorObject::new(ErrorCode::InternalError))
 }
 
 fn validated_vault_path(value: &str) -> Result<PathBuf, ErrorObject> {
@@ -923,9 +931,9 @@ fn map_crypto_error(error: CryptoError, context: ErrorContext) -> ErrorCode {
 
 fn map_config_error(error: &ConfigError, context: ErrorContext) -> ErrorCode {
     match error {
-        ConfigError::KdfOutsideReaderBounds | ConfigError::KdfBelowCreationPolicy => {
-            ErrorCode::KdfPolicy
-        }
+        ConfigError::KdfOutsideReaderBounds
+        | ConfigError::KdfBelowCreationPolicy
+        | ConfigError::KdfAboveCreationPolicy => ErrorCode::KdfPolicy,
         ConfigError::InvalidPasswordLength | ConfigError::InvalidPasswordUtf8 => {
             ErrorCode::InvalidParams
         }
@@ -955,7 +963,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use inex_core::sodium::Argon2idParams;
+    use inex_core::sodium::{Argon2idParams, SodiumError};
     use serde_json::{Map, Value, json};
     use zeroize::{Zeroize, Zeroizing};
 
@@ -992,6 +1000,8 @@ mod tests {
         KdfPolicy {
             min_creation_ops_limit: 1,
             min_creation_mem_limit_bytes: 8 * 1024,
+            max_creation_ops_limit: 4,
+            max_creation_mem_limit_bytes: 64 * 1024 * 1024,
             max_unlock_ops_limit: 4,
             max_unlock_mem_limit_bytes: 64 * 1024 * 1024,
         }
@@ -1026,6 +1036,152 @@ mod tests {
         );
         assert_eq!(result["result"]["protocolMajor"], 1);
         scrub_object(&mut result);
+    }
+
+    #[test]
+    fn creation_kdf_resolution_calibrates_only_when_absent() {
+        let policy = KdfPolicy::default();
+        let mut calls = 0;
+        let calibrated = resolve_creation_kdf(None, policy, |_| {
+            calls += 1;
+            Ok(Argon2idParams {
+                ops_limit: 7,
+                mem_limit_bytes: 64 * 1024 * 1024,
+            })
+        })
+        .expect("absent KDF uses calibrated parameters");
+        assert_eq!(calls, 1);
+        assert_eq!(calibrated.ops_limit, 7);
+
+        let explicit = Argon2idParams {
+            ops_limit: 9,
+            mem_limit_bytes: 64 * 1024 * 1024,
+        };
+        let selected = resolve_creation_kdf(Some(explicit), policy, |_| {
+            panic!("explicit KDF must not run calibration")
+        })
+        .expect("valid explicit KDF is retained");
+        assert_eq!(selected, explicit);
+    }
+
+    #[test]
+    fn creation_kdf_resolution_separates_client_policy_and_host_failures() {
+        let policy = KdfPolicy::default();
+        for explicit in [
+            Argon2idParams {
+                ops_limit: policy.min_creation_ops_limit - 1,
+                mem_limit_bytes: 64 * 1024 * 1024,
+            },
+            Argon2idParams {
+                ops_limit: policy.max_creation_ops_limit + 1,
+                mem_limit_bytes: 64 * 1024 * 1024,
+            },
+            Argon2idParams {
+                ops_limit: policy.min_creation_ops_limit,
+                mem_limit_bytes: 64 * 1024 * 1024 - 1,
+            },
+            Argon2idParams {
+                ops_limit: policy.min_creation_ops_limit,
+                mem_limit_bytes: 64 * 1024 * 1024 + 1,
+            },
+        ] {
+            let error = resolve_creation_kdf(Some(explicit), policy, |_| {
+                panic!("invalid explicit KDF must not run calibration")
+            })
+            .expect_err("out-of-policy explicit KDF fails");
+            assert_eq!(error.code(), ErrorCode::KdfPolicy);
+        }
+
+        let error = resolve_creation_kdf(None, policy, |_| {
+            Err(CryptoError::Sodium(SodiumError::InitializationFailed))
+        })
+        .expect_err("host calibration failure is fixed and safe");
+        assert_eq!(error.code(), ErrorCode::InternalError);
+    }
+
+    #[test]
+    fn rpc_explicit_creation_cap_fails_before_creating_root() {
+        let directory = TestDirectory::new();
+        let mut service = RpcService::new();
+        hello(&mut service);
+        let response = service.handle_object(request(
+            2,
+            "vault.create",
+            json!({
+                "vaultPath": directory.path().to_string_lossy(),
+                "password": "policy-canary-password",
+                "kdf": {
+                    "opsLimit": 3,
+                    "memLimitBytes": 64 * 1024 * 1024 + 1,
+                },
+            }),
+        ));
+        let debug = format!("{response:?}");
+        assert!(!debug.contains("policy-canary"));
+        let mut object = response.into_json_object();
+        assert_eq!(object["error"]["code"], ErrorCode::KdfPolicy.number());
+        assert!(!directory.path().exists());
+        scrub_object(&mut object);
+    }
+
+    #[test]
+    fn rpc_valid_explicit_kdf_is_preserved_without_calibration() {
+        let directory = TestDirectory::new();
+        let password = b"explicit handler password";
+        let mut service = RpcService::with_clock_and_policy(SystemClock::new(), test_policy());
+        hello(&mut service);
+        let response = service.handle_object(request(
+            2,
+            "vault.create",
+            json!({
+                "vaultPath": directory.path().to_string_lossy(),
+                "password": String::from_utf8_lossy(password),
+                "kdf": {"opsLimit":1, "memLimitBytes":8 * 1024},
+            }),
+        ));
+        assert!(!format!("{response:?}").contains("explicit handler password"));
+        let mut object = response.into_json_object();
+        assert!(object["result"]["vaultId"].as_str().is_some());
+        scrub_object(&mut object);
+
+        let vault = Vault::unlock(directory.path(), password, None, test_policy())
+            .expect("explicit-KDF RPC vault reopens");
+        let slot = vault
+            .config()
+            .key_slot(vault.unlocked_slot_id())
+            .expect("explicit RPC slot exists");
+        assert_eq!(slot.kdf.ops_limit, 1);
+        assert_eq!(slot.kdf.mem_limit_bytes, 8 * 1024);
+    }
+
+    #[test]
+    fn rpc_explicit_kdf_shape_errors_remain_invalid_params() {
+        let directory = TestDirectory::new();
+        let mut service = RpcService::new();
+        hello(&mut service);
+        for (id, kdf) in [
+            (2, json!({"opsLimit":"3", "memLimitBytes":64 * 1024 * 1024})),
+            (3, json!({"opsLimit":-1, "memLimitBytes":64 * 1024 * 1024})),
+            (4, json!({"opsLimit":3.5, "memLimitBytes":64 * 1024 * 1024})),
+            (
+                5,
+                json!({"opsLimit":3, "memLimitBytes":64 * 1024 * 1024, "extra":1}),
+            ),
+        ] {
+            let mut object = response(
+                &mut service,
+                id,
+                "vault.create",
+                json!({
+                    "vaultPath": directory.path().to_string_lossy(),
+                    "password": "shape-canary-password",
+                    "kdf": kdf,
+                }),
+            );
+            assert_eq!(object["error"]["code"], ErrorCode::InvalidParams.number());
+            assert!(!directory.path().exists());
+            scrub_object(&mut object);
+        }
     }
 
     #[test]

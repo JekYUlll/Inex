@@ -10,6 +10,7 @@ use std::ffi::CStr;
 use std::fmt;
 use std::ptr::{self, NonNull};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
@@ -124,11 +125,22 @@ pub const MIN_PASSWORD_BYTES: usize = 1;
 /// Largest password accepted by the vault v1 format.
 pub const MAX_PASSWORD_BYTES: usize = 1024;
 
-/// The default cost for a newly-created vault password slot.
-pub const DEFAULT_ARGON2ID_PARAMS: Argon2idParams = Argon2idParams {
+/// The v1 creation floor and lowest possible calibrated password-slot cost.
+pub const MINIMUM_ARGON2ID_PARAMS: Argon2idParams = Argon2idParams {
     ops_limit: 3,
     mem_limit_bytes: 64 * 1024 * 1024,
 };
+
+/// Fixed Argon2id memory cost for calibrated v1 vault creation.
+pub const V1_ARGON2ID_CALIBRATION_MEM_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
+/// Smallest Argon2id operations cost considered by v1 calibration.
+pub const V1_ARGON2ID_CALIBRATION_MIN_OPS_LIMIT: u64 = 3;
+/// Largest Argon2id operations cost considered by v1 calibration.
+pub const V1_ARGON2ID_CALIBRATION_MAX_OPS_LIMIT: u64 = 20;
+/// Lower edge of the preferred v1 password-KDF latency window.
+pub const V1_ARGON2ID_CALIBRATION_TARGET_MIN: Duration = Duration::from_millis(250);
+/// Upper edge of the preferred v1 password-KDF latency window.
+pub const V1_ARGON2ID_CALIBRATION_TARGET_MAX: Duration = Duration::from_millis(750);
 
 /// Vault v1 reader limits, including the metadata-triggered resource ceiling.
 ///
@@ -142,6 +154,7 @@ pub const VAULT_ARGON2ID_READER_LIMITS: Argon2idLimits = Argon2idLimits {
 };
 
 static SODIUM_INIT: OnceLock<Result<SodiumVersion, SodiumError>> = OnceLock::new();
+static ARGON2ID_CALIBRATION: OnceLock<Result<Argon2idParams, SodiumError>> = OnceLock::new();
 
 /// Errors raised by the narrow libsodium boundary.
 ///
@@ -319,8 +332,8 @@ impl Argon2idParams {
     /// Returns whether these costs satisfy the v1 new-vault policy floor.
     #[must_use]
     pub const fn satisfies_new_vault_minimum(self) -> bool {
-        self.ops_limit >= DEFAULT_ARGON2ID_PARAMS.ops_limit
-            && self.mem_limit_bytes >= DEFAULT_ARGON2ID_PARAMS.mem_limit_bytes
+        self.ops_limit >= MINIMUM_ARGON2ID_PARAMS.ops_limit
+            && self.mem_limit_bytes >= MINIMUM_ARGON2ID_PARAMS.mem_limit_bytes
     }
 }
 
@@ -854,6 +867,107 @@ pub fn derive_kek_argon2id13(
     }
 }
 
+/// Return the process-cached v1 Argon2id creation calibration.
+///
+/// The only measured input is a fixed, public dummy password and salt. The
+/// result (including a calibration failure) is initialized at most once per
+/// process. No caller password is observed by the timing loop.
+pub(crate) fn calibrated_argon2id_params() -> Result<Argon2idParams, SodiumError> {
+    ARGON2ID_CALIBRATION
+        .get_or_init(calibrate_argon2id_params)
+        .clone()
+}
+
+fn calibrate_argon2id_params() -> Result<Argon2idParams, SodiumError> {
+    calibrate_argon2id_params_in_range(
+        V1_ARGON2ID_CALIBRATION_MIN_OPS_LIMIT,
+        V1_ARGON2ID_CALIBRATION_MAX_OPS_LIMIT,
+    )
+}
+
+pub(crate) fn calibrate_argon2id_params_in_range(
+    min_ops_limit: u64,
+    max_ops_limit: u64,
+) -> Result<Argon2idParams, SodiumError> {
+    const DUMMY_PASSWORD: &[u8] = b"Inex Argon2id calibration";
+    const DUMMY_SALT: [u8; ARGON2ID_SALT_BYTES] = *b"INEX-CALIB-V1!!!";
+
+    let limits = Argon2idLimits {
+        min_ops_limit,
+        max_ops_limit,
+        min_mem_limit_bytes: V1_ARGON2ID_CALIBRATION_MEM_LIMIT_BYTES,
+        max_mem_limit_bytes: V1_ARGON2ID_CALIBRATION_MEM_LIMIT_BYTES,
+    };
+    calibrate_argon2id_params_with(min_ops_limit, max_ops_limit, |params| {
+        let started = Instant::now();
+        let derived = derive_kek_argon2id13(DUMMY_PASSWORD, &DUMMY_SALT, params, limits)?;
+        let elapsed = started.elapsed();
+        drop(derived);
+        Ok(elapsed)
+    })
+}
+
+/// Select calibrated v1 parameters using an injected duration measurement.
+///
+/// The search assumes KDF time is broadly monotonic in `opslimit`, but remains
+/// bounded even under noisy measurements. It prefers any measured point in the
+/// 250--750 ms window. If the complete permitted range is too fast it selects
+/// its maximum; if the minimum is already slow it selects that minimum. When a
+/// discrete step jumps over the complete window, the first measured point at
+/// or above the lower target is retained rather than weakening below 250 ms.
+pub(crate) fn calibrate_argon2id_params_with(
+    min_ops_limit: u64,
+    max_ops_limit: u64,
+    mut measure: impl FnMut(Argon2idParams) -> Result<Duration, SodiumError>,
+) -> Result<Argon2idParams, SodiumError> {
+    validate_range(
+        "Argon2id calibration minimum operations limit",
+        min_ops_limit,
+        V1_ARGON2ID_CALIBRATION_MIN_OPS_LIMIT,
+        V1_ARGON2ID_CALIBRATION_MAX_OPS_LIMIT,
+    )?;
+    validate_range(
+        "Argon2id calibration maximum operations limit",
+        max_ops_limit,
+        min_ops_limit,
+        V1_ARGON2ID_CALIBRATION_MAX_OPS_LIMIT,
+    )?;
+
+    let minimum = Argon2idParams {
+        ops_limit: min_ops_limit,
+        mem_limit_bytes: V1_ARGON2ID_CALIBRATION_MEM_LIMIT_BYTES,
+    };
+    let minimum_elapsed = measure(minimum)?;
+    if minimum_elapsed >= V1_ARGON2ID_CALIBRATION_TARGET_MIN {
+        return Ok(minimum);
+    }
+
+    let mut low = min_ops_limit + 1;
+    let mut high = max_ops_limit;
+    let mut first_above_window = None;
+    while low <= high {
+        let ops_limit = low + (high - low) / 2;
+        let params = Argon2idParams {
+            ops_limit,
+            mem_limit_bytes: V1_ARGON2ID_CALIBRATION_MEM_LIMIT_BYTES,
+        };
+        let elapsed = measure(params)?;
+        if elapsed < V1_ARGON2ID_CALIBRATION_TARGET_MIN {
+            low = ops_limit + 1;
+        } else if elapsed <= V1_ARGON2ID_CALIBRATION_TARGET_MAX {
+            return Ok(params);
+        } else {
+            first_above_window = Some(params);
+            high = ops_limit - 1;
+        }
+    }
+
+    Ok(first_above_window.unwrap_or(Argon2idParams {
+        ops_limit: max_ops_limit,
+        mem_limit_bytes: V1_ARGON2ID_CALIBRATION_MEM_LIMIT_BYTES,
+    }))
+}
+
 /// Encrypts a message in libsodium's combined XChaCha20-Poly1305-IETF mode.
 ///
 /// # Errors
@@ -1154,7 +1268,7 @@ mod tests {
             .with_read(|left| second.with_read(|right| constant_time_eq(left, right)))???;
         assert!(equal);
         assert!(!params.satisfies_new_vault_minimum());
-        assert!(DEFAULT_ARGON2ID_PARAMS.satisfies_new_vault_minimum());
+        assert!(MINIMUM_ARGON2ID_PARAMS.satisfies_new_vault_minimum());
         Ok(())
     }
 
@@ -1164,7 +1278,7 @@ mod tests {
         let empty = derive_kek_argon2id13(
             b"",
             &salt,
-            DEFAULT_ARGON2ID_PARAMS,
+            MINIMUM_ARGON2ID_PARAMS,
             VAULT_ARGON2ID_READER_LIMITS,
         );
         assert!(matches!(empty, Err(SodiumError::InvalidLength { .. })));
@@ -1182,6 +1296,73 @@ mod tests {
             excessive,
             Err(SodiumError::InvalidParameter { .. })
         ));
+    }
+
+    #[test]
+    fn argon2id_calibration_selects_a_measured_point_in_target_window() {
+        let mut measured = Vec::new();
+        let selected = calibrate_argon2id_params_with(3, 20, |params| {
+            measured.push(params);
+            Ok(Duration::from_millis(params.ops_limit * 30))
+        })
+        .expect("synthetic calibration succeeds");
+
+        assert_eq!(selected.ops_limit, 12);
+        assert_eq!(selected.mem_limit_bytes, 64 * 1024 * 1024);
+        assert_eq!(
+            measured
+                .iter()
+                .map(|params| params.ops_limit)
+                .collect::<Vec<_>>(),
+            vec![3, 12]
+        );
+        assert!(
+            measured.iter().all(|params| {
+                params.mem_limit_bytes == V1_ARGON2ID_CALIBRATION_MEM_LIMIT_BYTES
+            })
+        );
+    }
+
+    #[test]
+    fn argon2id_calibration_has_deterministic_fast_slow_and_gap_fallbacks() {
+        let too_fast = calibrate_argon2id_params_with(3, 20, |params| {
+            Ok(Duration::from_millis(params.ops_limit * 5))
+        })
+        .expect("synthetic fast calibration succeeds");
+        assert_eq!(too_fast.ops_limit, 20);
+
+        let mut slow_measurements = 0;
+        let too_slow = calibrate_argon2id_params_with(3, 20, |_| {
+            slow_measurements += 1;
+            Ok(Duration::from_millis(900))
+        })
+        .expect("synthetic slow calibration succeeds");
+        assert_eq!(too_slow.ops_limit, 3);
+        assert_eq!(slow_measurements, 1);
+
+        let mut gap_ops = Vec::new();
+        let gap = calibrate_argon2id_params_with(3, 20, |params| {
+            gap_ops.push(params.ops_limit);
+            if params.ops_limit <= 5 {
+                Ok(Duration::from_millis(100))
+            } else {
+                Ok(Duration::from_millis(900))
+            }
+        })
+        .expect("synthetic gap calibration succeeds");
+        assert_eq!(gap.ops_limit, 6);
+        assert_eq!(gap_ops, vec![3, 12, 7, 5, 6]);
+    }
+
+    #[test]
+    fn argon2id_calibration_rejects_invalid_bounds_before_measurement() {
+        let mut measurements = 0;
+        let result = calibrate_argon2id_params_with(2, 20, |_| {
+            measurements += 1;
+            Ok(Duration::ZERO)
+        });
+        assert!(matches!(result, Err(SodiumError::InvalidParameter { .. })));
+        assert_eq!(measurements, 0);
     }
 
     #[test]

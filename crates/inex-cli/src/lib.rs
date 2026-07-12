@@ -21,8 +21,9 @@ use std::process::{Command as ProcessCommand, ExitCode};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use inex_core::atomic::ParentSyncStatus;
+use inex_core::crypto::calibrated_creation_params;
 use inex_core::search::{CaseSensitivity, DEFAULT_SEARCH_SNIPPET_BYTES, SearchQuery};
-use inex_core::sodium::{self, DEFAULT_ARGON2ID_PARAMS};
+use inex_core::sodium;
 use inex_core::vault::{PasswordSlotCommit, Vault, VaultError};
 use inex_core::vault_config::{ConfigWarning, KdfPolicy};
 use uuid::Uuid;
@@ -232,6 +233,8 @@ fn command_import(source: &Path, vault_path: &Path, dry_run: bool) -> Result<Exi
         return Ok(ExitCode::SUCCESS);
     }
 
+    let creation_params =
+        calibrated_creation_params(KdfPolicy::default()).map_err(VaultError::from)?;
     let password_input = PasswordInput::from_environment()?;
     let password = read_confirmed_password(password_input, "New vault password: ")?;
     let staging = import::create_staging_root(&plan)?;
@@ -246,8 +249,14 @@ fn command_import(source: &Path, vault_path: &Path, dry_run: bool) -> Result<Exi
     io::stdout()
         .flush()
         .map_err(|error| AppError::io(IoOperation::WriteOutput, &error))?;
-    let mut vault = Vault::create(staging.path(), password.as_slice(), unix_time_ms()?)
-        .map_err(|_| import::ImportError::StagingCreateFailed)?;
+    let mut vault = Vault::create_with_params(
+        staging.path(),
+        password.as_slice(),
+        unix_time_ms()?,
+        creation_params,
+        KdfPolicy::default(),
+    )
+    .map_err(|_| import::ImportError::StagingCreateFailed)?;
     let mut summary = import::populate_staging(&plan, &staging, &mut vault, unix_time_ms()?)?;
     drop(vault);
 
@@ -289,9 +298,17 @@ fn command_import(source: &Path, vault_path: &Path, dry_run: bool) -> Result<Exi
 }
 
 fn command_init(vault_path: &Path, input: PasswordInput) -> Result<ExitCode, AppError> {
+    let creation_params =
+        calibrated_creation_params(KdfPolicy::default()).map_err(VaultError::from)?;
     let password = read_confirmed_password(input, "New vault password: ")?;
     let created_at_ms = unix_time_ms()?;
-    let created = Vault::create(vault_path, password.as_slice(), created_at_ms);
+    let created = Vault::create_with_params(
+        vault_path,
+        password.as_slice(),
+        created_at_ms,
+        creation_params,
+        KdfPolicy::default(),
+    );
     drop(password);
     let created = created?;
     println!("vault created");
@@ -339,12 +356,13 @@ fn command_password(command: PasswordCommand, input: PasswordInput) -> Result<Ex
             drop(current);
             let mut vault = unlocked?;
             print_warnings(vault.warnings());
+            let rewrap_params = vault.calibrated_password_rewrap_params(KdfPolicy::default())?;
             let new = read_confirmed_password(input, "New password: ")?;
             let created_at_ms = unix_time_ms()?;
             let committed = vault.add_password_slot(
                 new.as_slice(),
                 created_at_ms,
-                DEFAULT_ARGON2ID_PARAMS,
+                rewrap_params,
                 KdfPolicy::default(),
             );
             drop(new);
@@ -386,12 +404,13 @@ fn command_password(command: PasswordCommand, input: PasswordInput) -> Result<Ex
             let mut vault = unlocked?;
             print_warnings(vault.warnings());
             let selected_old_slot = vault.unlocked_slot_id();
+            let rewrap_params = vault.calibrated_password_rewrap_params(KdfPolicy::default())?;
             let new = read_confirmed_password(input, "New password: ")?;
             let created_at_ms = unix_time_ms()?;
             let committed = vault.change_password(
                 new.as_slice(),
                 created_at_ms,
-                DEFAULT_ARGON2ID_PARAMS,
+                rewrap_params,
                 KdfPolicy::default(),
             );
             let committed = match committed {

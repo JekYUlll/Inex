@@ -11,6 +11,7 @@ use inex_core::sodium::Argon2idParams;
 use inex_core::vault::Vault;
 use inex_core::vault_config::KdfPolicy;
 use inex_daemon::framing::{JsonObject, read_frame, write_frame};
+use inex_daemon::protocol::ErrorCode;
 use inex_daemon::sensitive::{encode_base64url, scrub_object};
 use serde_json::{Map, Value};
 use zeroize::{Zeroize, Zeroizing};
@@ -121,6 +122,8 @@ fn test_policy() -> KdfPolicy {
     KdfPolicy {
         min_creation_ops_limit: 1,
         min_creation_mem_limit_bytes: 8 * 1024,
+        max_creation_ops_limit: 4,
+        max_creation_mem_limit_bytes: 64 * 1024 * 1024,
         max_unlock_ops_limit: 4,
         max_unlock_mem_limit_bytes: 64 * 1024 * 1024,
     }
@@ -253,4 +256,55 @@ fn shipped_process_negotiates_and_completes_encrypted_file_lifecycle() {
     scrub_object(&mut shutdown);
     let stderr = rpc.finish();
     assert!(stderr.is_empty(), "successful process emitted stderr");
+}
+
+#[test]
+fn shipped_process_rejects_creation_kdf_above_cap_without_root() {
+    let directory = TestDirectory::new();
+    assert!(!directory.path().exists());
+    let mut rpc = RpcChild::spawn();
+    let mut hello = rpc.call(
+        1,
+        "system.hello",
+        object([
+            ("client", Value::String("integration-test".to_owned())),
+            ("clientVersion", Value::String("1".to_owned())),
+            ("protocolMajor", Value::from(1)),
+        ]),
+    );
+    assert_eq!(hello["result"]["protocolMajor"], 1);
+    scrub_object(&mut hello);
+
+    let mut rejected = rpc.call(
+        2,
+        "vault.create",
+        object([
+            (
+                "vaultPath",
+                Value::String(directory.path().to_string_lossy().into_owned()),
+            ),
+            (
+                "password",
+                Value::String("process-policy-canary".to_owned()),
+            ),
+            (
+                "kdf",
+                object([
+                    ("opsLimit", Value::from(3)),
+                    ("memLimitBytes", Value::from(64 * 1024 * 1024 + 1)),
+                ]),
+            ),
+        ]),
+    );
+    assert!(!format!("{rejected:?}").contains("process-policy-canary"));
+    assert_eq!(rejected["error"]["code"], ErrorCode::KdfPolicy.number());
+    assert_eq!(rejected["error"]["data"]["name"], "KDF_POLICY");
+    assert!(!directory.path().exists());
+    scrub_object(&mut rejected);
+
+    let mut shutdown = rpc.call(3, "system.shutdown", Value::Object(Map::new()));
+    assert_eq!(shutdown["result"]["ok"], true);
+    scrub_object(&mut shutdown);
+    let stderr = rpc.finish();
+    assert!(stderr.is_empty(), "policy rejection emitted stderr");
 }
