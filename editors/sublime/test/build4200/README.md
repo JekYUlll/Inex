@@ -71,8 +71,8 @@ not be the same commit.
 The normal and plugin-host-crash reports retain the strict outer schema v2.
 The successor full-application-kill-restart scenario uses outer schema v4;
 the current validator deliberately rejects the predecessor v3 report as a
-successor. It keeps the
-same isolated profile and installed package for two launches. After the first
+successor. It keeps the same isolated profile and installed package for two
+launches. After the first
 encrypted save, the helper writes only canonical length/SHA-256 fingerprints
 to a mode-0600 state file. Before launch, the runner enables and reads back the
 Linux child-subreaper setting. It pre-seals and captures the exact main, Python
@@ -83,6 +83,11 @@ Any descendant which used `setsid` or daemonized is either already in that
 closure or is adopted by the confirmed subreaper and drained through a newly
 verified pidfd.
 
+The restart child environment also fixes `GTK_USE_PORTAL=0`, and its private
+D-Bus daemon uses a generated configuration with no activation service
+directories or included host configuration. This prevents GTK or Build 4200
+from activating host desktop/document portals against the isolated runtime.
+
 The checkpoint then stops the isolated desktop, X11 socket, and D-Bus session
 and performs two stable procfs censuses. A process is root-bound only through
 an exact isolated HOME/XDG/TMP environment value or an executable, cwd,
@@ -90,8 +95,18 @@ process-root, or open-fd target within the private root; an argv mention alone
 is not a binding and is never a reason to signal an unrelated process.
 Unreadable procfs state for a verified closure/adopted candidate fails closed.
 Any remaining root-bound process also fails the scenario instead of being
-blindly killed. Only after the zero-survivor census does the runner perform the
-intermediate zero-hit residue scan and start the second launch.
+blindly killed. The runner then parses bounded `/proc/self/mountinfo` input and
+requires zero mountpoints at or below the isolated root. Only after both the
+zero-survivor and zero-mount checkpoints does it perform the intermediate
+zero-hit residue scan and start the second launch. The same checks are repeated
+after the final launch.
+
+A successful run never unmounts anything to manufacture a zero-mount claim.
+On a failed run only, after confirming no live root-bound process, cleanup may
+use the sealed root-owned `fusermount3` helper for one exact disconnected
+`fuse.portal`/`portal` mount at `runtime/doc`. It invokes ordinary `-u` only;
+lazy/detach unmounts are forbidden. Any live or unknown mount fails closed and
+the root is retained.
 
 Before the runner may answer the second password prompt, the restarted helper
 must observe every window and view continuously for two seconds with no Inex
