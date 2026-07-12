@@ -18,10 +18,10 @@ In particular:
   workbench storage is forced in-memory, and InputBox/QuickPick mouse interaction
   is not automated; it does not prove persistent cross-process Hot Exit or
   Local History behavior;
-- the Sublime Python suite passes 76/76: 61 product tests plus 15
+- the Sublime Python suite passes 84/84: 61 product tests plus 23
   runner/evidence tests. On Linux, separately preserved canonical reports bind
   three exact packaged Build 4200 scenarios: normal schema v2,
-  plugin-host-crash schema v2, and full-application SIGKILL/restart schema v3
+  plugin-host-crash schema v2, and full-application SIGKILL/restart schema v4
   (`PASS`) against the same isolated profile and installed package. Before the
   second unlock, the restart flow scans every view continuously for two seconds with
   no known content/token fingerprint or Inex state; after unlock it reopens the
@@ -168,11 +168,13 @@ the same editor process. No Inex code is then running, the already open buffer
 remains visible and actively copyable, and the user must restart the entire
 Sublime application to end that editor-process plaintext lifetime. The marker
 is a load-time defense, not observed same-process crash recovery or
-instantaneous containment. A separate exact-packaged schema v3 flow has passed
+instantaneous containment. A separate exact-packaged schema v4 flow has passed
 one full-application SIGKILL/restart against the same isolated profile and
 package: all views were clean of known content/token fingerprints and Inex
 state for two continuous seconds before the second unlock, and the same
-encrypted saved-content fingerprint reopened afterward. That isolated path
+encrypted saved-content fingerprint reopened afterward. The harness also binds
+the full process closure and requires zero root-bound survivors and zero
+mounts at both restart boundaries. That isolated path
 does not represent a real-user persistent profile or close the remaining
 keyboard/menu, kill-variant, Hot Exit/history/sync, platform, or signing
 matrix. Sublime remains experimental until the complete black-box residue

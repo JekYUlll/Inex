@@ -387,11 +387,11 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=editors/sublime \
   python3 -m unittest discover -s editors/sublime/tests -v
 ```
 
-The suite passes 76/76: 61 product tests plus 15 runner/evidence tests. It does
+The suite passes 84/84: 61 product tests plus 23 runner/evidence tests. It does
 not by itself replace exact-package black-box evidence. On Linux, separately
 preserved canonical reports bind three exact packaged Build 4200 scenarios:
 normal schema v2, plugin-host-crash schema v2, and full-application
-SIGKILL/restart schema v3 (`PASS`) against the same isolated profile and
+SIGKILL/restart schema v4 (`PASS`) against the same isolated profile and
 installed package. The normal scenario passed unlock/open/edit/save/close and
 used registered WindowCommands plus real InputPanel/QuickPanel interaction for
 New Folder, New Markdown, rename, and etag-bound delete. Authenticated `listTree`
@@ -408,8 +408,10 @@ kills the host after open/edit/save, while the normal branch separately covers
 CRUD. That reproduces the editor-memory/active-clipboard boundary; it is not a
 crash-erasure pass.
 
-The schema v3 flow then kills the complete first launch and restarts the same
-isolated profile and package. Before the second unlock, it scans every view
+The schema v4 flow then kills the complete first session/descendant closure
+through verified pidfds and restarts the same isolated profile and package.
+The checkpoint requires zero root-bound process or mount survivors. Before the
+second unlock, it scans every view
 continuously for two seconds with no known content/token fingerprint or Inex
 state; after unlock it reopens the same encrypted saved-content fingerprint.
 This passes one isolated harness path, not a real-user persistent-profile

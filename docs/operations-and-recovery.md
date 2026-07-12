@@ -338,11 +338,13 @@ no scanned disk residue after application exit, not as plaintext erasure.
 Preserve the distinction in incident reports; do not describe the marker as
 observed same-process recovery or instantaneous crash containment.
 
-Separately, one exact-packaged schema v3 flow has passed a complete
+Separately, one exact-packaged schema v4 flow has passed a complete
 application SIGKILL/restart against the same isolated profile and package. All
 views were free of known content/token fingerprints and Inex state for two
 continuous seconds before the second unlock, and the same encrypted
-saved-content fingerprint reopened afterward. This controlled path is not a
+saved-content fingerprint reopened afterward. The harness also requires the
+verified process closure to die and both restart boundaries to contain no
+root-bound process or mount. This controlled path is not a
 real-user persistent-profile recovery guarantee and does not close the
 remaining keyboard/menu, kill-variant, Hot Exit/history/sync, platform, or
 signing matrix.

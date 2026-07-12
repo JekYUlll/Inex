@@ -187,10 +187,10 @@ binding crash matrix.
 
 ### Experimental release gate
 
-The current Python suite passes 76/76: 61 product tests plus 15 runner/evidence
+The current Python suite passes 84/84: 61 product tests plus 23 runner/evidence
 tests. On Linux, separately preserved canonical reports bind three exact
 packaged Build 4200 scenarios: normal schema v2, plugin-host-crash schema v2,
-and full-application SIGKILL/restart schema v3 (`PASS`) against the same
+and full-application SIGKILL/restart schema v4 (`PASS`) against the same
 isolated profile and installed package.
 The normal scenario drives unlock/open/edit/save/close and registered
 WindowCommands with real InputPanel/QuickPanel interaction for New Folder, New
@@ -207,9 +207,11 @@ scanned after application exit report `root_scan_hits=0` and
 branch above covers CRUD independently. This proves the boundary was
 reproduced, not that crash-time plaintext was erased.
 
-The schema v3 flow keeps that same isolated profile and package for two
+The schema v4 flow keeps that same isolated profile and package for two
 application launches. After the first encrypted save it kills the complete
-profile-bound launch session. Before the runner may answer the second password
+profile-bound session/descendant closure through verified pidfds, stops the
+private desktop and D-Bus infrastructure, and requires zero root-bound process
+or mount survivors. Before the runner may answer the second password
 prompt, every window and view must remain free of known content/token
 fingerprints and Inex client/session/view state continuously for two seconds.
 After unlock, reopening the same encrypted document must match the first

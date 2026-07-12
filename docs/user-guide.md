@@ -147,11 +147,11 @@ be restarted to end that editor-process plaintext lifetime. The fixed marker
 is therefore not observed same-process crash recovery or instantaneous
 fail-safe containment.
 
-Current checkpoint evidence is deliberately split: 76/76 Python tests pass
-(61 product tests plus 15 runner/evidence tests), and separately preserved
+Current checkpoint evidence is deliberately split: 84/84 Python tests pass
+(61 product tests plus 23 runner/evidence tests), and separately preserved
 canonical reports bind three exact packaged Build 4200 Linux scenarios: normal
 schema v2, plugin-host-crash schema v2, and full-application SIGKILL/restart
-schema v3 (`PASS`) against the same isolated profile and installed package. The
+schema v4 (`PASS`) against the same isolated profile and installed package. The
 normal scenario passed unlock/open/edit/save/close plus real InputPanel/QuickPanel New
 Folder, New Markdown, rename, and etag-bound delete. Authenticated tree state
 was checked after every mutation; the report records all four CRUD events,
@@ -161,8 +161,10 @@ and is recorded as `PASS_WITH_DOCUMENTED_BOUNDARY`, not as a crash-erasure
 pass. That boundary is within the existing editor-memory/active-clipboard
 exclusion, but is a binding reason to keep Sublime experimental.
 
-The schema v3 flow kills the complete first application launch and starts the
-same isolated profile and package again. Before the second unlock, every view
+The schema v4 flow kills the complete first session/descendant closure through
+verified pidfds and starts the same isolated profile and package again. It
+requires zero root-bound process or mount survivors at the restart boundaries.
+Before the second unlock, every view
 is scanned continuously for two seconds with no known content/token
 fingerprint or Inex state. After unlock, reopening the encrypted document must
 match the first saved-content fingerprint. This is one controlled harness path,
