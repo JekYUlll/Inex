@@ -7732,6 +7732,216 @@ mod tests {
         )
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum CandidatePublishTestAction {
+        FailAt(candidate_bundle_v5::CandidatePublishStagingCheckpointV5),
+        PartialScratch,
+        ForeignPublish,
+        PartialPublish,
+        WrongCasePublish,
+        HardlinkedPublish,
+        #[cfg(unix)]
+        SymlinkedPublish,
+        StableCloneSwap,
+        ParentSwap,
+        LiveIndexDrift,
+    }
+
+    #[derive(Debug)]
+    struct CandidatePublishTestHooks {
+        tokens: VecDeque<String>,
+        action: Option<CandidatePublishTestAction>,
+        action_fired: bool,
+        relocation: Option<CandidateBundleRelocation>,
+        created_path: Option<PathBuf>,
+    }
+
+    impl CandidatePublishTestHooks {
+        fn new(action: Option<CandidatePublishTestAction>) -> Self {
+            Self {
+                tokens: VecDeque::new(),
+                action,
+                action_fired: false,
+                relocation: None,
+                created_path: None,
+            }
+        }
+
+        fn restore_relocation(&mut self) {
+            match self.relocation.take() {
+                Some(CandidateBundleRelocation::Parent { held, replacement }) => {
+                    fs::remove_dir(&replacement).expect("publish parent replacement removes");
+                    fs::rename(held, replacement).expect("publish parent restores");
+                }
+                Some(CandidateBundleRelocation::StableClone { held, replacement }) => {
+                    fs::remove_file(
+                        replacement.join(candidate_bundle_v5::CANDIDATE_BUNDLE_INDEX_V5),
+                    )
+                    .expect("publish stable-clone candidate removes");
+                    fs::remove_file(
+                        replacement.join(candidate_bundle_v5::CANDIDATE_BUNDLE_MANIFEST_V5),
+                    )
+                    .expect("publish stable-clone manifest removes");
+                    fs::remove_dir(&replacement).expect("publish stable-clone directory removes");
+                    fs::rename(held, replacement).expect("publish stable original restores");
+                }
+                Some(CandidateBundleRelocation::Source { .. }) => {
+                    panic!("publish staging hook never records a source relocation")
+                }
+                None => {}
+            }
+        }
+    }
+
+    impl candidate_bundle_v5::CandidatePublishStagingHooksV5 for CandidatePublishTestHooks {
+        fn next_token(&mut self) -> String {
+            self.tokens
+                .pop_front()
+                .unwrap_or_else(|| Uuid::new_v4().simple().to_string())
+        }
+
+        #[allow(
+            clippy::too_many_lines,
+            reason = "keep publish-staging fault mutations in one audited checkpoint table"
+        )]
+        fn checkpoint(
+            &mut self,
+            checkpoint: candidate_bundle_v5::CandidatePublishStagingCheckpointV5,
+            context: &candidate_bundle_v5::CandidatePublishStagingContextV5<'_>,
+        ) -> Result<(), GitError> {
+            let Some(action) = self.action else {
+                return Ok(());
+            };
+            if self.action_fired {
+                return Ok(());
+            }
+            let matches =
+                match action {
+                    CandidatePublishTestAction::FailAt(expected) => checkpoint == expected,
+                    CandidatePublishTestAction::PartialScratch => checkpoint
+                        == candidate_bundle_v5::CandidatePublishStagingCheckpointV5::ScratchCreated,
+                    CandidatePublishTestAction::ForeignPublish
+                    | CandidatePublishTestAction::PartialPublish
+                    | CandidatePublishTestAction::WrongCasePublish
+                    | CandidatePublishTestAction::HardlinkedPublish => checkpoint
+                        == candidate_bundle_v5::CandidatePublishStagingCheckpointV5::BeforePublish,
+                    #[cfg(unix)]
+                    CandidatePublishTestAction::SymlinkedPublish => checkpoint
+                        == candidate_bundle_v5::CandidatePublishStagingCheckpointV5::BeforePublish,
+                    CandidatePublishTestAction::StableCloneSwap
+                    | CandidatePublishTestAction::ParentSwap
+                    | CandidatePublishTestAction::LiveIndexDrift => checkpoint
+                        == candidate_bundle_v5::CandidatePublishStagingCheckpointV5::CriticalAudit,
+                };
+            if !matches {
+                return Ok(());
+            }
+            self.action_fired = true;
+            match action {
+                CandidatePublishTestAction::FailAt(_) => {
+                    return Err(GitError::DurabilityNotConfirmed);
+                }
+                CandidatePublishTestAction::PartialScratch => {
+                    let partial = b"partial retained publish scratch";
+                    fs::write(context.scratch_path, partial)
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    sync_regular_file(context.scratch_path, MAX_GIT_OUTPUT_BYTES)?;
+                    sync_directory(context.local).map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    return Err(GitError::DurabilityNotConfirmed);
+                }
+                CandidatePublishTestAction::ForeignPublish => {
+                    fs::write(context.publish_path, b"foreign publish owner")
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    self.created_path = Some(context.publish_path.to_path_buf());
+                }
+                CandidatePublishTestAction::PartialPublish => {
+                    fs::write(context.publish_path, b"partial candidate index")
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    self.created_path = Some(context.publish_path.to_path_buf());
+                }
+                CandidatePublishTestAction::WrongCasePublish => {
+                    let name = context
+                        .publish_path
+                        .file_name()
+                        .and_then(OsStr::to_str)
+                        .ok_or(GitError::DurabilityNotConfirmed)?
+                        .replacen("publish", "PUBLISH", 1);
+                    let path = context.local.join(name);
+                    fs::write(&path, b"wrong-case publish owner")
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    self.created_path = Some(path);
+                }
+                CandidatePublishTestAction::HardlinkedPublish => {
+                    let sentinel = context.local.join("foreign-publish-hardlink-sentinel");
+                    fs::write(&sentinel, b"hardlinked foreign publish owner")
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    fs::hard_link(&sentinel, context.publish_path)
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    self.created_path = Some(sentinel);
+                }
+                #[cfg(unix)]
+                CandidatePublishTestAction::SymlinkedPublish => {
+                    use std::os::unix::fs::symlink;
+
+                    let sentinel = context.local.join("foreign-publish-symlink-sentinel");
+                    fs::write(&sentinel, b"symlink foreign publish owner")
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    symlink(&sentinel, context.publish_path)
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    self.created_path = Some(sentinel);
+                }
+                CandidatePublishTestAction::StableCloneSwap => {
+                    let clone = context.root.join(format!(
+                        "foreign-publish-stable-{}",
+                        Uuid::new_v4().simple()
+                    ));
+                    let held = context
+                        .root
+                        .join(format!("held-publish-stable-{}", Uuid::new_v4().simple()));
+                    fs::create_dir(&clone).map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    for member in [
+                        candidate_bundle_v5::CANDIDATE_BUNDLE_INDEX_V5,
+                        candidate_bundle_v5::CANDIDATE_BUNDLE_MANIFEST_V5,
+                    ] {
+                        fs::copy(context.stable_path.join(member), clone.join(member))
+                            .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    }
+                    fs::rename(context.stable_path, &held)
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    fs::rename(&clone, context.stable_path)
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    self.relocation = Some(CandidateBundleRelocation::StableClone {
+                        held,
+                        replacement: context.stable_path.to_path_buf(),
+                    });
+                }
+                CandidatePublishTestAction::ParentSwap => {
+                    let held = context
+                        .root
+                        .join(format!("held-publish-parent-{}", Uuid::new_v4().simple()));
+                    fs::rename(context.local, &held)
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    fs::create_dir(context.local).map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    self.relocation = Some(CandidateBundleRelocation::Parent {
+                        held,
+                        replacement: context.local.to_path_buf(),
+                    });
+                }
+                CandidatePublishTestAction::LiveIndexDrift => {
+                    fs::write(
+                        context.root.join("external-publish-index-owner.bin"),
+                        b"ciphertext-only external publish index owner",
+                    )
+                    .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    if !test_git(context.root, ["add", "external-publish-index-owner.bin"]) {
+                        return Err(GitError::DurabilityNotConfirmed);
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+
     fn bundle_journal_v5(
         prepared: &candidate_bundle_v5::PreparedCandidateBundleV5,
     ) -> BundleMergeJournalV5 {
@@ -9995,6 +10205,570 @@ mod tests {
         ));
         candidate_bundle_v5::revalidate_prepared_candidate_bundle_v5(root, &prepared)
             .expect("live drift preserves stable bundle");
+    }
+
+    #[test]
+    fn v5_publish_staging_copies_reopened_real_sha1_and_sha256_candidates() {
+        for object_format in [GitObjectFormat::Sha1, GitObjectFormat::Sha256] {
+            let fixture = create_candidate_bundle_preparation_fixture(object_format);
+            let root = fixture.vault.root();
+            let live_index = fs::read(index_path(root)).expect("live index snapshots");
+            let live_map = index_entry_map(&fixture.git).expect("live stage map snapshots");
+            let worktree = fs::read(root.join("entry.md.enc")).expect("worktree snapshots");
+            let mut prepare_hooks = CandidateBundleTestHooks::new(None);
+            let prepared = prepare_test_candidate_bundle(&fixture, &mut prepare_hooks)
+                .expect("stable candidate bundle prepares");
+            let stable_path = candidate_bundle_v5::candidate_bundle_stable_path_v5(
+                root,
+                &prepared.bundle_basename,
+            )
+            .expect("stable path validates");
+            let stable_candidate =
+                fs::read(stable_path.join(candidate_bundle_v5::CANDIDATE_BUNDLE_INDEX_V5))
+                    .expect("stable candidate snapshots");
+
+            let guard = VaultMutationGuard::acquire(root).expect("fresh publish guard acquires");
+            let inventory = candidate_bundle_v5::load_candidate_bundle_for_git_v5(
+                &guard,
+                &fixture.git,
+                &prepared.transaction_reference,
+            )
+            .expect("fresh bundle inventory and Git semantics load");
+            let mut publish_hooks = CandidatePublishTestHooks::new(None);
+            let publish = candidate_bundle_v5::prepare_candidate_publish_staging_v5_with_hooks(
+                &guard,
+                &fixture.git,
+                &prepared.transaction_reference,
+                &inventory,
+                &mut publish_hooks,
+            )
+            .expect("publish staging prepares");
+            candidate_bundle_v5::revalidate_candidate_publish_staging_v5(
+                &guard,
+                &fixture.git,
+                &prepared.transaction_reference,
+                &inventory,
+                &publish,
+            )
+            .expect("held publish staging revalidates");
+
+            let namespace = candidate_bundle_v5::inspect_candidate_bundle_namespace_v5(root)
+                .expect("publish namespace inspects");
+            assert_eq!(
+                namespace.stable_bundle_basename.as_deref(),
+                Some(prepared.bundle_basename.as_str())
+            );
+            assert_eq!(
+                namespace.publish_staging_basename.as_deref(),
+                Some(
+                    prepared
+                        .transaction_reference
+                        .publish_staging_basename
+                        .as_str()
+                )
+            );
+            assert_eq!(namespace.retained_scratch_count, 0);
+            let publish_path = candidate_bundle_v5::candidate_bundle_publish_path_v5(
+                root,
+                &prepared.transaction_reference.publish_staging_basename,
+            )
+            .expect("publish path validates");
+            assert_eq!(
+                fs::read(&publish_path).expect("publish candidate reads"),
+                stable_candidate
+            );
+            let publish_git = fixture
+                .git
+                .with_index_file(publish_path.clone())
+                .expect("publish alternate index opens");
+            verify_candidate_index(&publish_git, &fixture.transaction, &live_map)
+                .expect("publish candidate carries the exact final stage map");
+            candidate_bundle_v5::revalidate_prepared_candidate_bundle_v5(root, &prepared)
+                .expect("stable immutable bundle remains exact");
+            assert_eq!(
+                fs::read(index_path(root)).expect("live index re-reads"),
+                live_index
+            );
+            assert_eq!(
+                fs::read(root.join("entry.md.enc")).expect("worktree re-reads"),
+                worktree
+            );
+            assert!(!index_lock_path(root).exists());
+            assert!(!journal_path(root).exists());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+
+                assert_eq!(
+                    fs::symlink_metadata(&publish_path)
+                        .expect("publish permissions inspect")
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn v5_publish_staging_recovery_reopens_fresh_held_proofs() {
+        let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+        let root = fixture.vault.root();
+        let live_index = fs::read(index_path(root)).expect("live index snapshots");
+        let live_map = index_entry_map(&fixture.git).expect("live stage map snapshots");
+        let worktree = fs::read(root.join("entry.md.enc")).expect("worktree snapshots");
+        let mut prepare_hooks = CandidateBundleTestHooks::new(None);
+        let prepared = prepare_test_candidate_bundle(&fixture, &mut prepare_hooks)
+            .expect("stable candidate bundle prepares");
+        let reference = prepared.transaction_reference.clone();
+        let guard = VaultMutationGuard::acquire(root).expect("publish guard acquires");
+        let inventory =
+            candidate_bundle_v5::load_candidate_bundle_for_git_v5(&guard, &fixture.git, &reference)
+                .expect("fresh bundle inventory loads");
+        let mut publish_hooks = CandidatePublishTestHooks::new(None);
+        let publish = candidate_bundle_v5::prepare_candidate_publish_staging_v5_with_hooks(
+            &guard,
+            &fixture.git,
+            &reference,
+            &inventory,
+            &mut publish_hooks,
+        )
+        .expect("publish staging prepares");
+
+        drop(publish);
+        drop(inventory);
+        drop(prepared);
+        drop(guard);
+
+        let recovery_guard =
+            VaultMutationGuard::acquire(root).expect("fresh recovery guard acquires");
+        let recovered = candidate_bundle_v5::load_candidate_publish_staging_v5(
+            &recovery_guard,
+            &fixture.git,
+            &reference,
+        )
+        .expect("published candidate reopens from filesystem state only");
+        candidate_bundle_v5::revalidate_candidate_publish_staging_v5(
+            &recovery_guard,
+            &fixture.git,
+            &reference,
+            &recovered.inventory,
+            &recovered.staging,
+        )
+        .expect("fresh held recovery proof revalidates");
+        let publish_path = candidate_bundle_v5::candidate_bundle_publish_path_v5(
+            root,
+            &reference.publish_staging_basename,
+        )
+        .expect("publish path validates");
+        let publish_git = fixture
+            .git
+            .with_index_file(publish_path)
+            .expect("publish alternate index opens");
+        verify_candidate_index(&publish_git, &fixture.transaction, &live_map)
+            .expect("recovered publish candidate carries the final stage map");
+        assert_eq!(
+            fs::read(index_path(root)).expect("live index re-reads"),
+            live_index
+        );
+        assert_eq!(
+            fs::read(root.join("entry.md.enc")).expect("worktree re-reads"),
+            worktree
+        );
+        assert!(!index_lock_path(root).exists());
+        assert!(!journal_path(root).exists());
+    }
+
+    #[test]
+    fn v5_every_prepublish_checkpoint_retains_nonactive_scratch() {
+        for checkpoint in [
+            candidate_bundle_v5::CandidatePublishStagingCheckpointV5::ScratchCreated,
+            candidate_bundle_v5::CandidatePublishStagingCheckpointV5::CandidateCopied,
+            candidate_bundle_v5::CandidatePublishStagingCheckpointV5::BeforePublish,
+            candidate_bundle_v5::CandidatePublishStagingCheckpointV5::CriticalAudit,
+        ] {
+            let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+            let root = fixture.vault.root();
+            let live_index = fs::read(index_path(root)).expect("live index snapshots");
+            let worktree = fs::read(root.join("entry.md.enc")).expect("worktree snapshots");
+            let mut prepare_hooks = CandidateBundleTestHooks::new(None);
+            let prepared = prepare_test_candidate_bundle(&fixture, &mut prepare_hooks)
+                .expect("stable candidate bundle prepares");
+            let guard = VaultMutationGuard::acquire(root).expect("publish guard acquires");
+            let mut hooks = CandidatePublishTestHooks::new(Some(
+                CandidatePublishTestAction::FailAt(checkpoint),
+            ));
+
+            assert!(
+                candidate_bundle_v5::prepare_candidate_publish_staging_v5_with_hooks(
+                    &guard,
+                    &fixture.git,
+                    &prepared.transaction_reference,
+                    &prepared.inventory,
+                    &mut hooks,
+                )
+                .is_err(),
+                "{checkpoint:?} must retain its scratch"
+            );
+            let retained = candidate_bundle_scratch_paths(root);
+            assert_eq!(retained.len(), 1, "{checkpoint:?}");
+            if checkpoint
+                == candidate_bundle_v5::CandidatePublishStagingCheckpointV5::ScratchCreated
+            {
+                assert_eq!(
+                    fs::metadata(&retained[0]).expect("scratch inspects").len(),
+                    0
+                );
+            } else {
+                assert_eq!(
+                    read_index_snapshot(&retained[0])
+                        .map(|snapshot| (snapshot.size, snapshot.sha256))
+                        .expect("copied scratch snapshots"),
+                    (
+                        prepared.inventory.manifest.final_index.size,
+                        prepared.inventory.manifest.final_index.sha256.clone()
+                    ),
+                    "{checkpoint:?}"
+                );
+            }
+            let namespace = candidate_bundle_v5::inspect_candidate_bundle_namespace_v5(root)
+                .expect("retained scratch namespace inspects");
+            assert_eq!(namespace.retained_scratch_count, 1);
+            assert!(namespace.publish_staging_basename.is_none());
+            candidate_bundle_v5::revalidate_prepared_candidate_bundle_v5(root, &prepared)
+                .expect("stable bundle remains exact");
+            assert_eq!(
+                fs::read(index_path(root)).expect("live index re-reads"),
+                live_index
+            );
+            assert_eq!(
+                fs::read(root.join("entry.md.enc")).expect("worktree re-reads"),
+                worktree
+            );
+            assert!(!index_lock_path(root).exists());
+            assert!(!journal_path(root).exists());
+        }
+    }
+
+    #[test]
+    fn v5_partial_publish_scratch_is_durable_retained_and_nonactive() {
+        let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+        let root = fixture.vault.root();
+        let live_index = fs::read(index_path(root)).expect("live index snapshots");
+        let worktree = fs::read(root.join("entry.md.enc")).expect("worktree snapshots");
+        let mut prepare_hooks = CandidateBundleTestHooks::new(None);
+        let prepared = prepare_test_candidate_bundle(&fixture, &mut prepare_hooks)
+            .expect("stable candidate bundle prepares");
+        let guard = VaultMutationGuard::acquire(root).expect("publish guard acquires");
+        let mut hooks =
+            CandidatePublishTestHooks::new(Some(CandidatePublishTestAction::PartialScratch));
+
+        assert!(
+            candidate_bundle_v5::prepare_candidate_publish_staging_v5_with_hooks(
+                &guard,
+                &fixture.git,
+                &prepared.transaction_reference,
+                &prepared.inventory,
+                &mut hooks,
+            )
+            .is_err()
+        );
+        let retained = candidate_bundle_scratch_paths(root);
+        assert_eq!(retained.len(), 1);
+        assert_eq!(
+            fs::read(&retained[0]).expect("partial scratch reads"),
+            b"partial retained publish scratch"
+        );
+        let namespace = candidate_bundle_v5::inspect_candidate_bundle_namespace_v5(root)
+            .expect("partial scratch namespace inspects");
+        assert_eq!(namespace.retained_scratch_count, 1);
+        assert!(namespace.publish_staging_basename.is_none());
+        assert_eq!(
+            exact_reserved_private_names(root).expect("active namespace inspects"),
+            BTreeSet::from([prepared.bundle_basename.clone()])
+        );
+        candidate_bundle_v5::revalidate_prepared_candidate_bundle_v5(root, &prepared)
+            .expect("stable bundle remains exact");
+        assert_eq!(
+            fs::read(index_path(root)).expect("live index re-reads"),
+            live_index
+        );
+        assert_eq!(
+            fs::read(root.join("entry.md.enc")).expect("worktree re-reads"),
+            worktree
+        );
+        assert!(!index_lock_path(root).exists());
+        assert!(!journal_path(root).exists());
+    }
+
+    #[test]
+    fn v5_foreign_partial_wrongcase_and_hardlinked_publish_destinations_are_preserved() {
+        for action in [
+            CandidatePublishTestAction::ForeignPublish,
+            CandidatePublishTestAction::PartialPublish,
+            CandidatePublishTestAction::WrongCasePublish,
+            CandidatePublishTestAction::HardlinkedPublish,
+        ] {
+            let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+            let root = fixture.vault.root();
+            let live_index = fs::read(index_path(root)).expect("live index snapshots");
+            let worktree = fs::read(root.join("entry.md.enc")).expect("worktree snapshots");
+            let mut prepare_hooks = CandidateBundleTestHooks::new(None);
+            let prepared = prepare_test_candidate_bundle(&fixture, &mut prepare_hooks)
+                .expect("stable candidate bundle prepares");
+            let guard = VaultMutationGuard::acquire(root).expect("publish guard acquires");
+            let mut hooks = CandidatePublishTestHooks::new(Some(action));
+
+            assert!(
+                candidate_bundle_v5::prepare_candidate_publish_staging_v5_with_hooks(
+                    &guard,
+                    &fixture.git,
+                    &prepared.transaction_reference,
+                    &prepared.inventory,
+                    &mut hooks,
+                )
+                .is_err(),
+                "{action:?} must fail closed"
+            );
+            assert!(
+                hooks
+                    .created_path
+                    .as_ref()
+                    .is_some_and(|path| path.exists())
+            );
+            let publish_path = candidate_bundle_v5::candidate_bundle_publish_path_v5(
+                root,
+                &prepared.transaction_reference.publish_staging_basename,
+            )
+            .expect("publish path validates");
+            match action {
+                CandidatePublishTestAction::ForeignPublish => assert_eq!(
+                    fs::read(&publish_path).expect("foreign publish reads"),
+                    b"foreign publish owner"
+                ),
+                CandidatePublishTestAction::PartialPublish => assert_eq!(
+                    fs::read(&publish_path).expect("partial publish reads"),
+                    b"partial candidate index"
+                ),
+                CandidatePublishTestAction::WrongCasePublish => {
+                    assert_eq!(
+                        fs::read(
+                            hooks
+                                .created_path
+                                .as_ref()
+                                .expect("wrong-case publish path exists")
+                        )
+                        .expect("wrong-case publish reads"),
+                        b"wrong-case publish owner"
+                    );
+                    assert!(
+                        candidate_bundle_v5::inspect_candidate_bundle_namespace_v5(root).is_err()
+                    );
+                }
+                CandidatePublishTestAction::HardlinkedPublish => {
+                    assert_eq!(
+                        fs::read(&publish_path).expect("hardlinked publish reads"),
+                        b"hardlinked foreign publish owner"
+                    );
+                    assert_eq!(
+                        fs::read(hooks.created_path.as_ref().expect("sentinel path exists"))
+                            .expect("hardlink sentinel reads"),
+                        b"hardlinked foreign publish owner"
+                    );
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(candidate_bundle_scratch_paths(root).len(), 1);
+            candidate_bundle_v5::revalidate_prepared_candidate_bundle_v5(root, &prepared)
+                .expect("stable bundle remains exact");
+            assert_eq!(
+                fs::read(index_path(root)).expect("live index re-reads"),
+                live_index
+            );
+            assert_eq!(
+                fs::read(root.join("entry.md.enc")).expect("worktree re-reads"),
+                worktree
+            );
+            assert!(!index_lock_path(root).exists());
+            assert!(!journal_path(root).exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn v5_symlinked_publish_destination_is_preserved() {
+        let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+        let root = fixture.vault.root();
+        let mut prepare_hooks = CandidateBundleTestHooks::new(None);
+        let prepared = prepare_test_candidate_bundle(&fixture, &mut prepare_hooks)
+            .expect("stable candidate bundle prepares");
+        let guard = VaultMutationGuard::acquire(root).expect("publish guard acquires");
+        let mut hooks =
+            CandidatePublishTestHooks::new(Some(CandidatePublishTestAction::SymlinkedPublish));
+
+        assert!(
+            candidate_bundle_v5::prepare_candidate_publish_staging_v5_with_hooks(
+                &guard,
+                &fixture.git,
+                &prepared.transaction_reference,
+                &prepared.inventory,
+                &mut hooks,
+            )
+            .is_err()
+        );
+        let publish_path = candidate_bundle_v5::candidate_bundle_publish_path_v5(
+            root,
+            &prepared.transaction_reference.publish_staging_basename,
+        )
+        .expect("publish path validates");
+        assert!(
+            fs::symlink_metadata(&publish_path)
+                .expect("publish symlink remains")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read(hooks.created_path.expect("symlink sentinel path exists"))
+                .expect("symlink sentinel reads"),
+            b"symlink foreign publish owner"
+        );
+        assert_eq!(candidate_bundle_scratch_paths(root).len(), 1);
+        candidate_bundle_v5::revalidate_prepared_candidate_bundle_v5(root, &prepared)
+            .expect("stable bundle remains exact");
+        assert!(!index_lock_path(root).exists());
+        assert!(!journal_path(root).exists());
+    }
+
+    #[test]
+    fn v5_publish_critical_rebinds_and_live_index_drift_fail_before_publish() {
+        for action in [
+            CandidatePublishTestAction::StableCloneSwap,
+            CandidatePublishTestAction::ParentSwap,
+            CandidatePublishTestAction::LiveIndexDrift,
+        ] {
+            let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+            let root = fixture.vault.root();
+            let live_index = fs::read(index_path(root)).expect("live index snapshots");
+            let worktree = fs::read(root.join("entry.md.enc")).expect("worktree snapshots");
+            let mut prepare_hooks = CandidateBundleTestHooks::new(None);
+            let prepared = prepare_test_candidate_bundle(&fixture, &mut prepare_hooks)
+                .expect("stable candidate bundle prepares");
+            let guard = VaultMutationGuard::acquire(root).expect("publish guard acquires");
+            let mut hooks = CandidatePublishTestHooks::new(Some(action));
+            assert!(
+                candidate_bundle_v5::prepare_candidate_publish_staging_v5_with_hooks(
+                    &guard,
+                    &fixture.git,
+                    &prepared.transaction_reference,
+                    &prepared.inventory,
+                    &mut hooks,
+                )
+                .is_err(),
+                "{action:?} must fail closed"
+            );
+            assert!(hooks.action_fired, "{action:?} fault must be injected");
+            if matches!(
+                action,
+                CandidatePublishTestAction::StableCloneSwap
+                    | CandidatePublishTestAction::ParentSwap
+            ) {
+                assert!(
+                    hooks.relocation.is_some(),
+                    "{action:?} rebind must complete before the defense rejects it"
+                );
+            }
+            hooks.restore_relocation();
+
+            assert_eq!(candidate_bundle_scratch_paths(root).len(), 1);
+            let namespace = candidate_bundle_v5::inspect_candidate_bundle_namespace_v5(root)
+                .expect("restored publish namespace inspects");
+            assert!(namespace.publish_staging_basename.is_none());
+            candidate_bundle_v5::revalidate_prepared_candidate_bundle_v5(root, &prepared)
+                .expect("restored stable bundle remains exact");
+            if action == CandidatePublishTestAction::LiveIndexDrift {
+                assert!(
+                    index_entry_map(&fixture.git)
+                        .expect("external stage map inspects")
+                        .contains_key(&("external-publish-index-owner.bin".to_owned(), 0))
+                );
+            } else {
+                assert_eq!(
+                    fs::read(index_path(root)).expect("live index re-reads"),
+                    live_index
+                );
+            }
+            assert_eq!(
+                fs::read(root.join("entry.md.enc")).expect("worktree re-reads"),
+                worktree
+            );
+            assert!(!index_lock_path(root).exists());
+            assert!(!journal_path(root).exists());
+        }
+    }
+
+    #[test]
+    fn v5_after_publish_failure_retains_complete_active_staging() {
+        let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+        let root = fixture.vault.root();
+        let live_index = fs::read(index_path(root)).expect("live index snapshots");
+        let worktree = fs::read(root.join("entry.md.enc")).expect("worktree snapshots");
+        let mut prepare_hooks = CandidateBundleTestHooks::new(None);
+        let prepared = prepare_test_candidate_bundle(&fixture, &mut prepare_hooks)
+            .expect("stable candidate bundle prepares");
+        let guard = VaultMutationGuard::acquire(root).expect("publish guard acquires");
+        let mut hooks = CandidatePublishTestHooks::new(Some(CandidatePublishTestAction::FailAt(
+            candidate_bundle_v5::CandidatePublishStagingCheckpointV5::AfterPublish,
+        )));
+        assert!(
+            candidate_bundle_v5::prepare_candidate_publish_staging_v5_with_hooks(
+                &guard,
+                &fixture.git,
+                &prepared.transaction_reference,
+                &prepared.inventory,
+                &mut hooks,
+            )
+            .is_err()
+        );
+
+        assert!(candidate_bundle_scratch_paths(root).is_empty());
+        let namespace = candidate_bundle_v5::inspect_candidate_bundle_namespace_v5(root)
+            .expect("post-publish namespace inspects");
+        assert_eq!(
+            namespace.publish_staging_basename.as_deref(),
+            Some(
+                prepared
+                    .transaction_reference
+                    .publish_staging_basename
+                    .as_str()
+            )
+        );
+        let publish_path = candidate_bundle_v5::candidate_bundle_publish_path_v5(
+            root,
+            &prepared.transaction_reference.publish_staging_basename,
+        )
+        .expect("publish path validates");
+        assert_eq!(
+            read_index_snapshot(&publish_path)
+                .map(|snapshot| (snapshot.size, snapshot.sha256))
+                .expect("published candidate snapshots"),
+            (
+                prepared.inventory.manifest.final_index.size,
+                prepared.inventory.manifest.final_index.sha256.clone()
+            )
+        );
+        candidate_bundle_v5::revalidate_prepared_candidate_bundle_v5(root, &prepared)
+            .expect("stable bundle remains exact");
+        assert_eq!(
+            fs::read(index_path(root)).expect("live index re-reads"),
+            live_index
+        );
+        assert_eq!(
+            fs::read(root.join("entry.md.enc")).expect("worktree re-reads"),
+            worktree
+        );
+        assert!(!index_lock_path(root).exists());
+        assert!(!journal_path(root).exists());
     }
 
     #[test]

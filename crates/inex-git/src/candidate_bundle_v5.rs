@@ -1,12 +1,13 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use inex_core::atomic::{
     AtomicDirectoryPublishError, FilesystemDirectoryIdentity, ParentSyncStatus,
     VAULT_LOCAL_DIRECTORY, VaultMutationGuard, atomic_move_verified_directory_no_replace_checked,
-    filesystem_directory_identity, open_file_matches_path_and_is_single_link, sync_directory,
+    atomic_move_verified_file_no_replace, filesystem_directory_identity,
+    open_file_matches_path_and_is_single_link, sync_directory,
 };
 use serde::{Deserialize, Serialize};
 
@@ -14,14 +15,14 @@ use super::{
     Git, GitError, GitIoOperation, GitObjectFormat, MAX_GIT_OUTPUT_BYTES, MAX_JOURNAL_BYTES,
     MergeJournalPayload, apply_payload_to_index, ascii_casefold_starts_with, digest,
     ensure_no_journal, exact_reserved_private_names, hex_digest, index_entry_map, index_path,
-    io_error, is_link_or_reparse_point, parse_duplicate_free_json, parse_hex_digest, payload_oids,
-    payload_rename_provenance, read_index_snapshot, restrict_file_permissions_best_effort,
-    sync_regular_file, validate_local_directory, validate_lock_token, validate_oid,
-    validate_payload, verify_candidate_index,
+    io_error, is_link_or_reparse_point, parse_duplicate_free_json, parse_hex_digest,
+    path_entry_is_absent, payload_oids, payload_rename_provenance, read_index_snapshot,
+    restrict_file_permissions_best_effort, sync_regular_file, validate_local_directory,
+    validate_lock_token, validate_oid, validate_payload, verify_candidate_index,
 };
 
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
 pub(super) const CANDIDATE_BUNDLE_SCRATCH_PREFIX_V5: &str = "git-index-candidate-scratch-v5-";
 pub(super) const CANDIDATE_BUNDLE_STABLE_PREFIX_V5: &str = "git-index-candidate-v4-bundle-v5-";
@@ -138,6 +139,77 @@ pub(super) struct PreparedCandidateBundleV5 {
     pub(super) index_lock_marker_reference: CanonicalBytesReferenceV5,
 }
 
+/// Held proof for the exact token-derived publish staging file.
+///
+/// This is still pre-lock state. It authorizes neither a real Git index-lock
+/// acquisition nor any journal, worktree, or live-index mutation.
+#[allow(
+    dead_code,
+    reason = "the next writer slice consumes the held publish-staging proof"
+)]
+#[derive(Debug)]
+pub(super) struct PreparedCandidatePublishStagingV5 {
+    pub(super) publish_staging_basename: String,
+    pub(super) candidate: CandidateIndexMetadataV5,
+    file: File,
+}
+
+/// Fresh-process proof for an already-published token-derived staging file.
+///
+/// Both the immutable bundle inventory and publish file are reopened here;
+/// callers cannot accidentally reuse a pre-crash held file identity.
+#[allow(
+    dead_code,
+    reason = "the next recovery slice consumes the fresh held publish-staging proof"
+)]
+#[derive(Debug)]
+pub(super) struct LoadedCandidatePublishStagingV5 {
+    pub(super) inventory: InventoryVerifiedCandidateBundleV5,
+    pub(super) staging: PreparedCandidatePublishStagingV5,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CandidatePublishStagingCheckpointV5 {
+    ScratchCreated,
+    CandidateCopied,
+    BeforePublish,
+    CriticalAudit,
+    AfterPublish,
+}
+
+#[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "fault hooks inspect these paths only in isolated publish-staging tests"
+)]
+pub(super) struct CandidatePublishStagingContextV5<'a> {
+    pub(super) root: &'a Path,
+    pub(super) local: &'a Path,
+    pub(super) stable_path: &'a Path,
+    pub(super) scratch_path: &'a Path,
+    pub(super) publish_path: &'a Path,
+}
+
+pub(super) trait CandidatePublishStagingHooksV5 {
+    fn next_token(&mut self) -> String;
+
+    fn checkpoint(
+        &mut self,
+        _checkpoint: CandidatePublishStagingCheckpointV5,
+        _context: &CandidatePublishStagingContextV5<'_>,
+    ) -> Result<(), GitError> {
+        Ok(())
+    }
+}
+
+struct ProductionCandidatePublishStagingHooksV5;
+
+impl CandidatePublishStagingHooksV5 for ProductionCandidatePublishStagingHooksV5 {
+    fn next_token(&mut self) -> String {
+        uuid::Uuid::new_v4().simple().to_string()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CandidateBundlePrepareCheckpointV5 {
     ScratchCreated,
@@ -186,6 +258,7 @@ impl CandidateBundlePrepareHooksV5 for ProductionCandidateBundlePrepareHooksV5 {
 #[derive(Debug, Eq, PartialEq)]
 pub(super) struct CandidateBundleNamespaceStatusV5 {
     pub(super) stable_bundle_basename: Option<String>,
+    pub(super) publish_staging_basename: Option<String>,
     pub(super) retained_scratch_count: usize,
 }
 
@@ -228,6 +301,17 @@ fn parse_candidate_bundle_stable_basename_v5(basename: &str) -> Result<&str, Git
     Ok(token)
 }
 
+fn parse_candidate_bundle_publish_basename_v5(basename: &str) -> Result<&str, GitError> {
+    let token = basename
+        .strip_prefix(CANDIDATE_BUNDLE_PUBLISH_PREFIX_V5)
+        .ok_or(GitError::InvalidJournal)?;
+    validate_lock_token(token)?;
+    if basename != candidate_bundle_publish_basename_v5(token)? {
+        return Err(GitError::InvalidJournal);
+    }
+    Ok(token)
+}
+
 pub(super) fn candidate_bundle_stable_path_v5(
     root: &Path,
     bundle_basename: &str,
@@ -242,6 +326,14 @@ pub(super) fn candidate_bundle_scratch_path_v5(
 ) -> Result<PathBuf, GitError> {
     parse_candidate_bundle_scratch_basename_v5(scratch_basename)?;
     Ok(root.join(VAULT_LOCAL_DIRECTORY).join(scratch_basename))
+}
+
+pub(super) fn candidate_bundle_publish_path_v5(
+    root: &Path,
+    publish_basename: &str,
+) -> Result<PathBuf, GitError> {
+    parse_candidate_bundle_publish_basename_v5(publish_basename)?;
+    Ok(root.join(VAULT_LOCAL_DIRECTORY).join(publish_basename))
 }
 
 fn validate_index_metadata(metadata: &CandidateIndexMetadataV5) -> Result<(), GitError> {
@@ -639,6 +731,76 @@ pub(super) fn validate_candidate_bundle_inventory_v5(
     )
 }
 
+fn validate_reference_inventory_binding_v5(
+    reference: &CandidateBundleTransactionReferenceV5,
+    inventory: &InventoryVerifiedCandidateBundleV5,
+) -> Result<(), GitError> {
+    validate_candidate_bundle_transaction_reference_v5(reference)?;
+    validate_candidate_bundle_manifest_v5(&inventory.manifest)?;
+    if inventory.manifest_reference != reference.manifest
+        || inventory.manifest.object_format != reference.object_format
+        || inventory.manifest.token != reference.token
+        || inventory.manifest.bundle_basename != reference.bundle_basename
+    {
+        return Err(GitError::InvalidJournal);
+    }
+    Ok(())
+}
+
+fn verified_live_stage_map_v5(
+    git: &Git,
+    old_index: &CandidateIndexMetadataV5,
+    expected: Option<&BTreeMap<(String, u8), super::StageEntry>>,
+) -> Result<BTreeMap<(String, u8), super::StageEntry>, GitError> {
+    let first = read_index_snapshot(&index_path(&git.root))?;
+    if first.size != old_index.size || first.sha256 != old_index.sha256 {
+        return Err(GitError::IndexChanged);
+    }
+    let stage_map = index_entry_map(git)?;
+    let second = read_index_snapshot(&index_path(&git.root))?;
+    if second.size != old_index.size
+        || second.sha256 != old_index.sha256
+        || expected.is_some_and(|expected| expected != &stage_map)
+    {
+        return Err(GitError::IndexChanged);
+    }
+    Ok(stage_map)
+}
+
+fn verify_bundle_git_semantics_v5(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+    inventory: &InventoryVerifiedCandidateBundleV5,
+    expected_stage_map: Option<&BTreeMap<(String, u8), super::StageEntry>>,
+) -> Result<BTreeMap<(String, u8), super::StageEntry>, GitError> {
+    validate_reference_inventory_binding_v5(reference, inventory)?;
+    if reference.object_format != git.object_format {
+        return Err(GitError::InvalidJournal);
+    }
+    if !guard.is_for_root(&git.root) {
+        return Err(GitError::RecoveryConflict);
+    }
+    git.ensure_full_index()?;
+    let stable_path = candidate_bundle_stable_path_v5(&git.root, &reference.bundle_basename)?;
+    held_inventory_matches_path_v5(&stable_path, &reference.bundle_basename, inventory)?;
+    let before =
+        verified_live_stage_map_v5(git, &inventory.manifest.old_index, expected_stage_map)?;
+    let candidate_git = git.with_index_file(stable_path.join(CANDIDATE_BUNDLE_INDEX_V5))?;
+    verify_candidate_index(&candidate_git, &inventory.manifest.transaction, &before)?;
+    held_inventory_matches_path_v5(&stable_path, &reference.bundle_basename, inventory)?;
+    if !guard.is_for_root(&git.root) {
+        return Err(GitError::RecoveryConflict);
+    }
+    verified_live_stage_map_v5(git, &inventory.manifest.old_index, Some(&before))?;
+    verify_candidate_index(&candidate_git, &inventory.manifest.transaction, &before)?;
+    held_inventory_matches_path_v5(&stable_path, &reference.bundle_basename, inventory)?;
+    if !guard.is_for_root(&git.root) {
+        return Err(GitError::RecoveryConflict);
+    }
+    Ok(before)
+}
+
 /// Reopens a stable bundle and binds it to the current repository's exact old
 /// index and expected final stage map without mutating Git or the worktree.
 #[allow(
@@ -650,46 +812,395 @@ pub(super) fn load_candidate_bundle_for_git_v5(
     git: &Git,
     reference: &CandidateBundleTransactionReferenceV5,
 ) -> Result<InventoryVerifiedCandidateBundleV5, GitError> {
-    validate_candidate_bundle_transaction_reference_v5(reference)?;
     if !guard.is_for_root(&git.root) {
         return Err(GitError::RecoveryConflict);
     }
-    git.ensure_full_index()?;
     let inventory = validate_candidate_bundle_inventory_v5(
         &git.root,
         &reference.bundle_basename,
         Some(&reference.manifest),
     )?;
-    if reference.object_format != git.object_format
-        || inventory.manifest.object_format != reference.object_format
-        || inventory.manifest.token != reference.token
+    verify_bundle_git_semantics_v5(guard, git, reference, &inventory, None)?;
+    Ok(inventory)
+}
+
+fn verify_candidate_publish_namespace_v5(
+    root: &Path,
+    reference: &CandidateBundleTransactionReferenceV5,
+    published: bool,
+) -> Result<(), GitError> {
+    let namespace = inspect_candidate_bundle_namespace_v5(root)?;
+    if namespace.stable_bundle_basename.as_deref() != Some(&reference.bundle_basename)
+        || namespace.publish_staging_basename.as_deref()
+            != published.then_some(reference.publish_staging_basename.as_str())
     {
-        return Err(GitError::InvalidJournal);
+        return Err(GitError::RecoveryConflict);
     }
-    let live = read_index_snapshot(&index_path(&git.root))?;
-    if live.size != inventory.manifest.old_index.size
-        || live.sha256 != inventory.manifest.old_index.sha256
+    let mut expected = BTreeSet::from([reference.bundle_basename.clone()]);
+    if published {
+        expected.insert(reference.publish_staging_basename.clone());
+    }
+    if exact_reserved_private_names(root)? != expected {
+        return Err(GitError::RecoveryConflict);
+    }
+    Ok(())
+}
+
+fn create_private_publish_scratch_file_v5<H: CandidatePublishStagingHooksV5>(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    local: &Path,
+    hooks: &mut H,
+) -> Result<(String, PathBuf, File), GitError> {
+    for _ in 0..MAX_SCRATCH_TOKEN_ATTEMPTS_V5 {
+        let token = hooks.next_token();
+        let scratch_basename = candidate_bundle_scratch_basename_v5(&token)?;
+        let scratch_path = candidate_bundle_scratch_path_v5(&git.root, &scratch_basename)?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let file = match options.open(&scratch_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(io_error(GitIoOperation::WriteJournal, &error)),
+        };
+        restrict_file_permissions_best_effort(&file);
+        #[cfg(unix)]
+        {
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(|error| io_error(GitIoOperation::WriteJournal, &error))?;
+            let mode = file
+                .metadata()
+                .map_err(|error| io_error(GitIoOperation::InspectMetadata, &error))?
+                .permissions()
+                .mode()
+                & 0o777;
+            if mode != 0o600 {
+                return Err(GitError::DurabilityNotConfirmed);
+            }
+        }
+        file.sync_all()
+            .map_err(|error| io_error(GitIoOperation::WriteJournal, &error))?;
+        if !guard.is_for_root(&git.root)
+            || !exact_child_name_is_unique(local, &scratch_basename)?
+            || !open_file_matches_path_and_is_single_link(&scratch_path, &file)
+                .map_err(|error| io_error(GitIoOperation::InspectMetadata, &error))?
+        {
+            return Err(GitError::RecoveryConflict);
+        }
+        sync_directory(local).map_err(|_| GitError::DurabilityNotConfirmed)?;
+        return Ok((scratch_basename, scratch_path, file));
+    }
+    Err(GitError::RecoveryConflict)
+}
+
+fn copy_held_candidate_v5(
+    inventory: &InventoryVerifiedCandidateBundleV5,
+    destination: &mut File,
+) -> Result<(), GitError> {
+    let mut source = inventory
+        .seal
+        .candidate_file
+        .try_clone()
+        .map_err(|error| io_error(GitIoOperation::ReadMetadata, &error))?;
+    source
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| io_error(GitIoOperation::ReadMetadata, &error))?;
+    let expected_size = inventory.manifest.final_index.size;
+    let copied = io::copy(
+        &mut source.take(expected_size.saturating_add(1)),
+        destination,
+    )
+    .map_err(|error| io_error(GitIoOperation::WriteJournal, &error))?;
+    if copied != expected_size {
+        return Err(GitError::RecoveryConflict);
+    }
+    destination
+        .flush()
+        .and_then(|()| destination.sync_all())
+        .map_err(|error| io_error(GitIoOperation::WriteJournal, &error))
+}
+
+fn verify_candidate_publish_file_v5(
+    git: &Git,
+    path: &Path,
+    file: &File,
+    manifest: &CandidateBundleManifestV5,
+    before: &BTreeMap<(String, u8), super::StageEntry>,
+) -> Result<(), GitError> {
+    if !open_file_matches_path_and_is_single_link(path, file)
+        .map_err(|error| io_error(GitIoOperation::InspectMetadata, &error))?
     {
-        return Err(GitError::IndexChanged);
+        return Err(GitError::RecoveryConflict);
     }
-    let before = index_entry_map(git)?;
-    let stable_path = candidate_bundle_stable_path_v5(&git.root, &reference.bundle_basename)?;
-    let candidate_git = git.with_index_file(stable_path.join(CANDIDATE_BUNDLE_INDEX_V5))?;
-    verify_candidate_index(&candidate_git, &inventory.manifest.transaction, &before)?;
-    held_inventory_matches_path_v5(&stable_path, &reference.bundle_basename, &inventory)?;
+    let snapshot = read_index_snapshot(path)?;
+    if snapshot.size != manifest.final_index.size || snapshot.sha256 != manifest.final_index.sha256
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    let staging_git = git.with_index_file(path.to_path_buf())?;
+    verify_candidate_index(&staging_git, &manifest.transaction, before)?;
+    if !open_file_matches_path_and_is_single_link(path, file)
+        .map_err(|error| io_error(GitIoOperation::InspectMetadata, &error))?
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    let rebound = read_index_snapshot(path)?;
+    if rebound.size != manifest.final_index.size || rebound.sha256 != manifest.final_index.sha256 {
+        return Err(GitError::RecoveryConflict);
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the audit binds every independent held and namespace proof at one checkpoint"
+)]
+fn audit_candidate_publish_staging_v5(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+    inventory: &InventoryVerifiedCandidateBundleV5,
+    path: &Path,
+    file: &File,
+    before: &BTreeMap<(String, u8), super::StageEntry>,
+    published: bool,
+) -> Result<(), GitError> {
     if !guard.is_for_root(&git.root) {
         return Err(GitError::RecoveryConflict);
     }
-    let rebound_live = read_index_snapshot(&index_path(&git.root))?;
-    if rebound_live.size != inventory.manifest.old_index.size
-        || rebound_live.sha256 != inventory.manifest.old_index.sha256
-        || index_entry_map(git)? != before
-    {
-        return Err(GitError::IndexChanged);
+    verify_candidate_publish_namespace_v5(&git.root, reference, published)?;
+    verify_bundle_git_semantics_v5(guard, git, reference, inventory, Some(before))?;
+    verify_candidate_publish_file_v5(git, path, file, &inventory.manifest, before)?;
+    if !guard.is_for_root(&git.root) {
+        return Err(GitError::RecoveryConflict);
     }
-    verify_candidate_index(&candidate_git, &inventory.manifest.transaction, &before)?;
-    held_inventory_matches_path_v5(&stable_path, &reference.bundle_basename, &inventory)?;
-    Ok(inventory)
+    Ok(())
+}
+
+fn reconcile_publish_move_error_v5(
+    local: &Path,
+    scratch_path: &Path,
+    publish_path: &Path,
+    file: &File,
+    error: &io::Error,
+) -> GitError {
+    let source_matches =
+        open_file_matches_path_and_is_single_link(scratch_path, file).unwrap_or(false);
+    let destination_matches =
+        open_file_matches_path_and_is_single_link(publish_path, file).unwrap_or(false);
+    let source_absent = path_entry_is_absent(scratch_path).unwrap_or(false);
+    let destination_absent = path_entry_is_absent(publish_path).unwrap_or(false);
+    if destination_matches && source_absent {
+        let _ = sync_directory(local);
+        GitError::DurabilityNotConfirmed
+    } else if source_matches && destination_absent {
+        io_error(GitIoOperation::WriteJournal, error)
+    } else {
+        GitError::RecoveryConflict
+    }
+}
+
+/// Copies one sealed immutable candidate to its token-derived publish staging.
+///
+/// The random scratch file is deliberately retained on every failure. This
+/// helper never touches the real Git index lock, journal, worktree, or live
+/// index and its result remains pre-lock state.
+#[allow(
+    dead_code,
+    reason = "the next writer slice consumes the publish-staging helper"
+)]
+pub(super) fn prepare_candidate_publish_staging_v5(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+    inventory: &InventoryVerifiedCandidateBundleV5,
+) -> Result<PreparedCandidatePublishStagingV5, GitError> {
+    let mut hooks = ProductionCandidatePublishStagingHooksV5;
+    prepare_candidate_publish_staging_v5_impl(guard, git, reference, inventory, &mut hooks)
+}
+
+#[cfg(test)]
+pub(super) fn prepare_candidate_publish_staging_v5_with_hooks<H: CandidatePublishStagingHooksV5>(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+    inventory: &InventoryVerifiedCandidateBundleV5,
+    hooks: &mut H,
+) -> Result<PreparedCandidatePublishStagingV5, GitError> {
+    prepare_candidate_publish_staging_v5_impl(guard, git, reference, inventory, hooks)
+}
+
+#[allow(clippy::too_many_lines)]
+fn prepare_candidate_publish_staging_v5_impl<H: CandidatePublishStagingHooksV5>(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+    inventory: &InventoryVerifiedCandidateBundleV5,
+    hooks: &mut H,
+) -> Result<PreparedCandidatePublishStagingV5, GitError> {
+    validate_reference_inventory_binding_v5(reference, inventory)?;
+    verify_candidate_publish_namespace_v5(&git.root, reference, false)?;
+    let before = verify_bundle_git_semantics_v5(guard, git, reference, inventory, None)?;
+    let local = git.root.join(VAULT_LOCAL_DIRECTORY);
+    validate_local_directory(&local)?;
+    let stable_path = candidate_bundle_stable_path_v5(&git.root, &reference.bundle_basename)?;
+    let publish_path =
+        candidate_bundle_publish_path_v5(&git.root, &reference.publish_staging_basename)?;
+    let (_scratch_basename, scratch_path, mut scratch_file) =
+        create_private_publish_scratch_file_v5(guard, git, &local, hooks)?;
+    let context = CandidatePublishStagingContextV5 {
+        root: &git.root,
+        local: &local,
+        stable_path: &stable_path,
+        scratch_path: &scratch_path,
+        publish_path: &publish_path,
+    };
+    hooks.checkpoint(
+        CandidatePublishStagingCheckpointV5::ScratchCreated,
+        &context,
+    )?;
+
+    copy_held_candidate_v5(inventory, &mut scratch_file)?;
+    verify_candidate_publish_file_v5(
+        git,
+        &scratch_path,
+        &scratch_file,
+        &inventory.manifest,
+        &before,
+    )?;
+    held_inventory_matches_path_v5(&stable_path, &reference.bundle_basename, inventory)?;
+    hooks.checkpoint(
+        CandidatePublishStagingCheckpointV5::CandidateCopied,
+        &context,
+    )?;
+    sync_directory(&local).map_err(|_| GitError::DurabilityNotConfirmed)?;
+    hooks.checkpoint(CandidatePublishStagingCheckpointV5::BeforePublish, &context)?;
+    hooks.checkpoint(CandidatePublishStagingCheckpointV5::CriticalAudit, &context)?;
+    audit_candidate_publish_staging_v5(
+        guard,
+        git,
+        reference,
+        inventory,
+        &scratch_path,
+        &scratch_file,
+        &before,
+        false,
+    )?;
+
+    let outcome =
+        match atomic_move_verified_file_no_replace(&scratch_path, &scratch_file, &publish_path) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                return Err(reconcile_publish_move_error_v5(
+                    &local,
+                    &scratch_path,
+                    &publish_path,
+                    &scratch_file,
+                    &error,
+                ));
+            }
+        };
+    hooks.checkpoint(CandidatePublishStagingCheckpointV5::AfterPublish, &context)?;
+    if !path_entry_is_absent(&scratch_path)? {
+        return Err(GitError::RecoveryConflict);
+    }
+    audit_candidate_publish_staging_v5(
+        guard,
+        git,
+        reference,
+        inventory,
+        &publish_path,
+        &scratch_file,
+        &before,
+        true,
+    )?;
+    if outcome.source_parent_sync != ParentSyncStatus::Synced
+        || outcome.destination_parent_sync != ParentSyncStatus::Synced
+    {
+        return Err(GitError::DurabilityNotConfirmed);
+    }
+    Ok(PreparedCandidatePublishStagingV5 {
+        publish_staging_basename: reference.publish_staging_basename.clone(),
+        candidate: inventory.manifest.final_index.clone(),
+        file: scratch_file,
+    })
+}
+
+#[allow(
+    dead_code,
+    reason = "the next writer slice revalidates the held publish staging before lock acquisition"
+)]
+pub(super) fn revalidate_candidate_publish_staging_v5(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+    inventory: &InventoryVerifiedCandidateBundleV5,
+    prepared: &PreparedCandidatePublishStagingV5,
+) -> Result<(), GitError> {
+    if prepared.publish_staging_basename != reference.publish_staging_basename
+        || prepared.candidate != inventory.manifest.final_index
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    let before = verify_bundle_git_semantics_v5(guard, git, reference, inventory, None)?;
+    let publish_path =
+        candidate_bundle_publish_path_v5(&git.root, &prepared.publish_staging_basename)?;
+    audit_candidate_publish_staging_v5(
+        guard,
+        git,
+        reference,
+        inventory,
+        &publish_path,
+        &prepared.file,
+        &before,
+        true,
+    )
+}
+
+/// Reopens and fully revalidates an already-published token-derived staging
+/// file for crash recovery.
+///
+/// The exact namespace, immutable bundle, live expected-old stage map, and
+/// publish candidate are each checked again using newly opened file handles.
+#[allow(
+    dead_code,
+    reason = "the next recovery slice consumes the fresh-process publish-staging loader"
+)]
+pub(super) fn load_candidate_publish_staging_v5(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+) -> Result<LoadedCandidatePublishStagingV5, GitError> {
+    if !guard.is_for_root(&git.root) {
+        return Err(GitError::RecoveryConflict);
+    }
+    validate_candidate_bundle_transaction_reference_v5(reference)?;
+    verify_candidate_publish_namespace_v5(&git.root, reference, true)?;
+    let inventory = load_candidate_bundle_for_git_v5(guard, git, reference)?;
+    let before = verify_bundle_git_semantics_v5(guard, git, reference, &inventory, None)?;
+    let publish_path =
+        candidate_bundle_publish_path_v5(&git.root, &reference.publish_staging_basename)?;
+    let (_, publish_file) = read_single_link_regular(&publish_path, MAX_GIT_OUTPUT_BYTES, false)?;
+    audit_candidate_publish_staging_v5(
+        guard,
+        git,
+        reference,
+        &inventory,
+        &publish_path,
+        &publish_file,
+        &before,
+        true,
+    )?;
+    Ok(LoadedCandidatePublishStagingV5 {
+        staging: PreparedCandidatePublishStagingV5 {
+            publish_staging_basename: reference.publish_staging_basename.clone(),
+            candidate: inventory.manifest.final_index.clone(),
+            file: publish_file,
+        },
+        inventory,
+    })
 }
 
 const MAX_SCRATCH_TOKEN_ATTEMPTS_V5: usize = 64;
@@ -849,6 +1360,7 @@ fn prepare_candidate_bundle_v5_impl<H: CandidateBundlePrepareHooksV5>(
     validate_local_directory(&local)?;
     let namespace = inspect_candidate_bundle_namespace_v5(&git.root)?;
     if namespace.stable_bundle_basename.is_some()
+        || namespace.publish_staging_basename.is_some()
         || !exact_reserved_private_names(&git.root)?.is_empty()
     {
         return Err(GitError::RecoveryConflict);
@@ -979,6 +1491,7 @@ fn prepare_candidate_bundle_v5_impl<H: CandidateBundlePrepareHooksV5>(
             let namespace = inspect_candidate_bundle_namespace_v5(&git.root)
                 .map_err(|_| io::Error::other("candidate namespace could not be rebound"))?;
             if namespace.stable_bundle_basename.is_some()
+                || namespace.publish_staging_basename.is_some()
                 || !exact_reserved_private_names(&git.root)
                     .map_err(|_| io::Error::other("legacy candidate namespace changed"))?
                     .is_empty()
@@ -1014,7 +1527,9 @@ fn prepare_candidate_bundle_v5_impl<H: CandidateBundlePrepareHooksV5>(
     }
     held_inventory_matches_path_v5(&stable_path, &stable_basename, &sealed_scratch)?;
     let namespace = inspect_candidate_bundle_namespace_v5(&git.root)?;
-    if namespace.stable_bundle_basename.as_deref() != Some(stable_basename.as_str()) {
+    if namespace.stable_bundle_basename.as_deref() != Some(stable_basename.as_str())
+        || namespace.publish_staging_basename.is_some()
+    {
         return Err(GitError::RecoveryConflict);
     }
     let live_after = read_index_snapshot(&index_path(&git.root))?;
@@ -1067,6 +1582,7 @@ pub(super) fn inspect_candidate_bundle_namespace_v5(
         fs::read_dir(&local).map_err(|error| io_error(GitIoOperation::InspectMetadata, &error))?;
     let mut retained_scratch_count = 0_usize;
     let mut stable_bundle_basenames = Vec::new();
+    let mut publish_staging_basenames = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|error| io_error(GitIoOperation::InspectMetadata, &error))?;
         let name = entry
@@ -1088,9 +1604,18 @@ pub(super) fn inspect_candidate_bundle_namespace_v5(
             parse_candidate_bundle_stable_basename_v5(&name)
                 .map_err(|_| GitError::RecoveryConflict)?;
             stable_bundle_basenames.push(name);
+            continue;
+        }
+        if ascii_casefold_starts_with(&name, CANDIDATE_BUNDLE_PUBLISH_PREFIX_V5) {
+            if !name.starts_with(CANDIDATE_BUNDLE_PUBLISH_PREFIX_V5) {
+                return Err(GitError::RecoveryConflict);
+            }
+            parse_candidate_bundle_publish_basename_v5(&name)
+                .map_err(|_| GitError::RecoveryConflict)?;
+            publish_staging_basenames.push(name);
         }
     }
-    if stable_bundle_basenames.len() > 1 {
+    if stable_bundle_basenames.len() > 1 || publish_staging_basenames.len() > 1 {
         return Err(GitError::RecoveryConflict);
     }
     if let Some(basename) = stable_bundle_basenames.first() {
@@ -1101,6 +1626,7 @@ pub(super) fn inspect_candidate_bundle_namespace_v5(
     }
     Ok(CandidateBundleNamespaceStatusV5 {
         stable_bundle_basename: stable_bundle_basenames.pop(),
+        publish_staging_basename: publish_staging_basenames.pop(),
         retained_scratch_count,
     })
 }
@@ -1427,6 +1953,7 @@ mod tests {
         let root = TestRoot::new();
         let stable = candidate_bundle_stable_basename_v5(TOKEN).expect("stable basename builds");
         let scratch = candidate_bundle_scratch_basename_v5(TOKEN).expect("scratch basename builds");
+        let publish = candidate_bundle_publish_basename_v5(TOKEN).expect("publish basename builds");
         assert_eq!(
             candidate_bundle_stable_path_v5(root.path(), &stable).expect("stable path validates"),
             root.local().join(&stable)
@@ -1436,11 +1963,18 @@ mod tests {
                 .expect("scratch path validates"),
             root.local().join(&scratch)
         );
+        assert_eq!(
+            candidate_bundle_publish_path_v5(root.path(), &publish)
+                .expect("publish path validates"),
+            root.local().join(&publish)
+        );
         assert!(stable.starts_with(crate::INDEX_CANDIDATE_PREFIX));
+        assert!(publish.starts_with(crate::INDEX_CANDIDATE_PREFIX));
         assert!(candidate_bundle_stable_basename_v5(&TOKEN.to_uppercase()).is_err());
         assert!(candidate_bundle_scratch_basename_v5("../candidate").is_err());
         assert!(candidate_bundle_stable_path_v5(root.path(), &scratch).is_err());
         assert!(candidate_bundle_scratch_path_v5(root.path(), &stable).is_err());
+        assert!(candidate_bundle_publish_path_v5(root.path(), &stable).is_err());
 
         let (installed, _, _) = install_bundle(&root, TOKEN);
         assert_eq!(installed, stable);
@@ -1660,6 +2194,101 @@ mod tests {
             assert!(recovery_status(root.path()).is_err());
             assert!(path.is_file(), "invalid scratch is retained fail closed");
         }
+    }
+
+    #[test]
+    fn publish_namespace_reports_one_exact_name_and_rejects_aliases_or_multiples() {
+        let root = TestRoot::new();
+        let publish = candidate_bundle_publish_basename_v5(TOKEN).expect("publish name builds");
+        fs::write(root.local().join(&publish), b"publish candidate").expect("publish file writes");
+        let namespace = inspect_candidate_bundle_namespace_v5(root.path())
+            .expect("one exact publish name inspects");
+        assert_eq!(
+            namespace.publish_staging_basename.as_deref(),
+            Some(publish.as_str())
+        );
+
+        let second = candidate_bundle_publish_basename_v5("11111111111111111111111111111111")
+            .expect("second publish name builds");
+        fs::write(root.local().join(second), b"second publish").expect("second publish writes");
+        assert!(inspect_candidate_bundle_namespace_v5(root.path()).is_err());
+
+        for name in [
+            format!("git-index-candidate-v4-PUBLISH-v5-{}", "2".repeat(32)),
+            format!("{CANDIDATE_BUNDLE_PUBLISH_PREFIX_V5}short"),
+        ] {
+            let root = TestRoot::new();
+            let path = root.local().join(&name);
+            fs::write(&path, b"foreign publish alias").expect("publish alias writes");
+            assert!(inspect_candidate_bundle_namespace_v5(root.path()).is_err());
+            assert!(path.is_file());
+        }
+    }
+
+    #[test]
+    fn publish_move_error_reconciliation_distinguishes_retained_moved_and_ambiguous_state() {
+        let injected = io::Error::new(io::ErrorKind::PermissionDenied, "injected move failure");
+
+        let root = TestRoot::new();
+        let source = root.local().join("retained-source");
+        let destination = root.local().join("absent-destination");
+        let retained = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&source)
+            .expect("retained source creates");
+        assert!(matches!(
+            reconcile_publish_move_error_v5(
+                &root.local(),
+                &source,
+                &destination,
+                &retained,
+                &injected,
+            ),
+            GitError::Io {
+                operation: GitIoOperation::WriteJournal,
+                kind: io::ErrorKind::PermissionDenied,
+            }
+        ));
+
+        fs::rename(&source, &destination).expect("source moves to exact destination");
+        assert!(matches!(
+            reconcile_publish_move_error_v5(
+                &root.local(),
+                &source,
+                &destination,
+                &retained,
+                &injected,
+            ),
+            GitError::DurabilityNotConfirmed
+        ));
+
+        let root = TestRoot::new();
+        let source = root.local().join("exact-source");
+        let destination = root.local().join("foreign-destination");
+        let exact = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&source)
+            .expect("exact source creates");
+        fs::write(&destination, b"foreign owner").expect("foreign destination creates");
+        assert!(matches!(
+            reconcile_publish_move_error_v5(
+                &root.local(),
+                &source,
+                &destination,
+                &exact,
+                &injected,
+            ),
+            GitError::RecoveryConflict
+        ));
+        assert!(source.is_file());
+        assert_eq!(
+            fs::read(destination).expect("foreign destination reads"),
+            b"foreign owner"
+        );
     }
 
     #[test]
