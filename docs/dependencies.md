@@ -126,11 +126,13 @@ path/workspace dependencies are rejected. That policy is explicitly
 engineering collection metadata, not legal approval. The helper also collects
 the referenced complete license/NOTICE files and their SHA-256 digests into
 `THIRD_PARTY_LICENSE_TEXTS/` and fails if a resolved component has no acceptable
-text. The Linux x64 graph currently contains 77 Cargo components, 146 Cargo
-license/NOTICE files, and the bundled libsodium 1.0.22 ISC file: 147 collected
-texts total. The policy separately pins that ISC text's SHA-256. Strict
-release-set audit additionally requires all three artifacts to contain the
-same inventory bytes and the same `inexd` bytes.
+text. The helper reports the exact Cargo component count, collected
+license/NOTICE text count, and bundled libsodium ISC entry for each candidate.
+Those counts and the libsodium version must come from the external report
+matching its manifests and checksums; this source document does not freeze
+them. The policy separately pins the ISC text's SHA-256. Strict release-set
+audit additionally requires all three artifacts to contain the same inventory
+bytes and the same `inexd` bytes.
 
 `inex runtime-info` and `inexd --runtime-info` expose a fixed machine-readable
 report. Package smoke requires the platform's fixed Rust target triple,
@@ -156,9 +158,9 @@ release owner must still:
    <https://github.com/JekYUlll/Inex> only after the private security-reporting
    and supported-version policies exist.
 
-The engineering collection gate passes for the local Linux x64 checkpoint;
-independent legal review and public-release approval remain pending. This
-section is an engineering checklist, not legal advice.
+Require the external report for an exact candidate to show that the engineering
+collection gate passed. Independent legal review and public-release approval
+remain pending. This section is an engineering checklist, not legal advice.
 
 ## Git for Windows preflight
 

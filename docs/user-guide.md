@@ -78,16 +78,17 @@ only those bytes to VS Code's backup destination. On restore:
   overwrite confirmation at Save; the current ciphertext etag is still used;
 - a corrupted or wrong-vault draft is rejected without returning plaintext.
 
-The automated Extension Host gates on the current local build and 1.125.0
+The automated Extension Host source gates on a controlled 1.125.0 host
 exercise real backup scheduling and this exact recovery code path. They also
 drive the production create/folder-create/file-rename/file-delete actions
 directly against the daemon and custom editor, including close refusal, rename
 collision, delete I/O failure recovery, and residue scanning. They verify the
 commands are registered, but do not mouse-drive the InputBox/QuickPick UI. Test
 mode forces workbench storage to be in-memory, so persistent-profile
-cross-process tab restore and Local History remain release gates. A local
-system-GCC Linux x64 VSIX install/bundled-sidecar smoke passed, but does not
-close those gates.
+cross-process tab restore and Local History remain release gates. For an exact
+packaged VSIX, separately require an external record matching its manifest and
+checksums for install/bundled-sidecar smoke; even that does not close those
+gates.
 
 ### Current VS Code limitations
 

@@ -154,9 +154,10 @@ rewrite the backup manually.
 
 Inex uses a custom document and writes only EDRY through its backup provider;
 it does not register plaintext as a `TextDocument`. Automated tests validate
-the provider backup path and direct production CRUD actions on the current
-local build and 1.125.0; a local Linux x64 VSIX also passed install/bundled
-sidecar smoke. None proves the final persistent-profile cross-process matrix.
+the provider backup path and direct production CRUD actions in a controlled
+Extension Host. For an exact packaged VSIX, require a matching external report
+for install/bundled-sidecar smoke. Neither source tests nor package smoke proves
+the final persistent-profile cross-process matrix.
 If evaluating stronger assurance, use an isolated profile, run a unique
 synthetic canary flow, scan all roots from
 [the acceptance matrix](acceptance-matrix.md), and treat the checkpoint as

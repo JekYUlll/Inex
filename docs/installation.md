@@ -28,10 +28,11 @@ The implementation currently targets:
 - Python 3.13.14 for the release helpers; Sublime's embedded plugin runtime is
   separately pinned to Python 3.8 syntax by `.python-version`.
 
-Linux and Windows x64 are the first intended release targets. Local system-GCC
-Linux x64 package/audit/smoke evidence exists, including a VS Code 1.125.0
-install with bundled sidecar. Native Windows and Linux/Windows arm64 remain
-release gates; a successful Linux or Wine run is not evidence for them.
+Linux and Windows x64 are the first intended release targets. A Linux x64
+candidate is acceptable only when a separately preserved report matching its
+manifest and checksums records system-GCC package/audit/smoke plus an isolated
+VS Code install with bundled sidecar. Native Windows and Linux/Windows arm64
+remain release gates; a successful Linux or Wine run is not evidence for them.
 
 Do not place a vault inside a cloud-provider virtual filesystem or a directory
 that contains symlinks/junctions. A normal local directory that is synchronized
@@ -69,10 +70,10 @@ The default build uses the pinned `libsodium-sys-stable` path and committed
 for a release candidate. See [dependencies.md](dependencies.md) for the supply
 chain and license policy.
 
-On this development machine, the xlings-default linker produces an ELF whose
-interpreter/RUNPATH refers to the local xlings home. It is not portable. The
-release helper correctly rejects that binary. The successful local Linux x64
-artifact run rebuilt with system GCC, for example:
+The xlings-default linker on some development machines can produce an ELF whose
+interpreter/RUNPATH refers to a local toolchain home. It is not portable, and
+the release helper rejects it. A Linux x64 candidate must instead use a
+reviewed system toolchain, for example:
 
 ```sh
 env CC=/usr/bin/gcc CXX=/usr/bin/g++ \
@@ -257,11 +258,11 @@ regular daemon is not a complete install.
 ### Candidate VSIX shape
 
 The release tooling creates a platform-specific VSIX rather than one universal
-extension. Its current audit binds the manifest, Content Types, package identity,
+extension. Its audit binds the manifest, Content Types, package identity,
 version, publisher, target platform, engine, entry point, assets, and matching
-sidecar. A local system-GCC Linux x64 repackage passed that audit, VS Code
-1.125.0 CLI install, and bundled-sidecar smoke. An isolated development profile
-can install an audited candidate with:
+sidecar. The external record for an exact candidate must additionally show a
+successful isolated VS Code CLI install and bundled-sidecar smoke. An isolated
+development profile can install an audited candidate with:
 
 ```sh
 PLATFORM=linux-x64
@@ -350,11 +351,11 @@ matrix passes for the exact packaged artifact and platform.
 ### Candidate Sublime archive shape
 
 The release tooling produces an `inex-sublime-...zip` containing an unpacked
-`Inex/` directory, not a compressed `.sublime-package`. The local Linux x64
-archive passed content audit and bundled-sidecar smoke. Extract the directory
-into the isolated profile's `Packages` directory so `Inex/bin/inexd[.exe]` is a
-real regular executable. Installing the ZIP does not promote the experimental
-client or replace the exact-package matrix.
+`Inex/` directory, not a compressed `.sublime-package`. Require the exact
+candidate's external record to show content audit and bundled-sidecar smoke.
+Extract the directory into the isolated profile's `Packages` directory so
+`Inex/bin/inexd[.exe]` is a real regular executable. Installing the ZIP does not
+promote the experimental client or replace the exact-package matrix.
 
 ## CI configuration status
 

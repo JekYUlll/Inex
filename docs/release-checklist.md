@@ -77,18 +77,19 @@ These are not documentation polish items; each changes the release decision:
 6. Build and smoke all four intended platform artifacts on their native target:
    Linux x64/arm64 and Windows x64/arm64. Verify executable architecture and
    dynamic/static native-library expectations, not only archive names.
-7. Repeat the verified Linux x64 normal-path lifecycle on every native final
-   artifact, then add
+7. Run the Linux x64 normal-path lifecycle on every native final artifact and
+   preserve its matching external report, then add
    publication/recovery fault-state preservation and a true two-version
    upgrade/rollback drill. A frozen-v1 read is compatibility evidence, not a
    substitute for two released program versions.
-8. Complete independent legal review of the collected 77-component inventory,
-   147 license/NOTICE texts, license-expression choices, and distribution
-   obligations; collection is implemented but is not legal approval.
+8. Complete independent legal review of the exact candidate's collected
+   component inventory, license/NOTICE texts, license-expression choices, and
+   distribution obligations; collection is implemented but is not legal
+   approval. Counts and digests come from the matching external report.
 9. Push the exact clean source and pass the configured four-platform CI/package
-   matrices. The local byte-identical Linux x64 pair establishes that checkpoint
-   only; it does not establish hosted-runner availability or a native
-   multi-platform release matrix.
+   matrices. A byte-identical local Linux x64 pair establishes only the scope
+   recorded by its matching external report; it does not establish
+   hosted-runner availability or a native multi-platform release matrix.
 10. Keep password-slot documentation explicit that rewrapping does not revoke
     an old password held with historical `vault.json`; master-key rotation is a
     separate unimplemented migration, not a hidden property of `password
@@ -135,10 +136,11 @@ target/tools/actionlint .github/workflows/*.yml
 
 ## CLI, import, and backup gate
 
-Maintainers can reproduce the verified Linux-only normal-path gate from a source
-checkout. The tool first audits clean artifact provenance, creates only an
-isolated disposable tree, never accepts a password in argv/environment, and
-prints a body-free JSON summary:
+Maintainers can generate Linux-only normal-path evidence from a source checkout.
+The tool first audits clean artifact provenance, creates only an isolated
+disposable tree, never accepts a password in argv/environment, and prints a
+body-free JSON summary. The resulting external report is binding only when its
+source and artifact hashes match the candidate manifests and checksums:
 
 ```sh
 ARTIFACT_DIR=/absolute/path/to/final/linux-x64
