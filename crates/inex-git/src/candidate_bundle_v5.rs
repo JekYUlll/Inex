@@ -5,10 +5,13 @@ use std::path::{Path, PathBuf};
 
 use inex_core::atomic::{
     AtomicDirectoryPublishError, AtomicFileMoveOutcome, FilesystemDirectoryIdentity,
-    ParentSyncStatus, VAULT_LOCAL_DIRECTORY, VaultMutationGuard,
+    FilesystemFileIdentity, ParentSyncStatus, VAULT_LOCAL_DIRECTORY, VaultMutationGuard,
     atomic_move_verified_directory_no_replace_checked, atomic_move_verified_file_no_replace,
-    filesystem_directory_identity, open_file_matches_path_and_is_single_link, sync_directory,
+    atomic_replace_verified_file, filesystem_directory_identity, filesystem_file_identity,
+    open_file_matches_path_and_is_single_link, path_matches_file_identity_and_is_single_link,
+    sync_directory,
 };
+use inex_core::path::raw_portable_case_fold_key;
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -204,6 +207,79 @@ pub(super) struct AcquiredIndexLockMarkerV5 {
     scratch_basename: Option<String>,
     file: File,
 }
+
+/// Fresh-process proof that the immutable final candidate occupies the real
+/// Git index-lock pathname while the live index is still the exact old index.
+#[derive(Debug)]
+pub(super) struct LoadedCandidateIndexLockV5 {
+    pub(super) inventory: InventoryVerifiedCandidateBundleV5,
+    file: File,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CompletedLiveIndexStateV5 {
+    ExactFinal,
+    LaterUnrelated,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PostJournalIndexCheckpointV5 {
+    BeforePublishOverMarker,
+    AfterPublishOverMarker,
+    BeforePublishOverIndex,
+    AfterPublishOverIndex,
+}
+
+pub(super) struct PostJournalIndexAuthorizationV5<'a, F> {
+    journal_file: &'a File,
+    critical_audit: F,
+}
+
+impl<'a, F> PostJournalIndexAuthorizationV5<'a, F> {
+    pub(super) fn new(journal_file: &'a File, critical_audit: F) -> Self {
+        Self {
+            journal_file,
+            critical_audit,
+        }
+    }
+}
+
+#[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "fault-injection tests inspect the post-journal mutation paths"
+)]
+pub(super) struct PostJournalIndexContextV5<'a> {
+    pub(super) root: &'a Path,
+    pub(super) stable_path: &'a Path,
+    pub(super) publish_path: &'a Path,
+    pub(super) lock_path: &'a Path,
+    pub(super) index_path: &'a Path,
+}
+
+pub(super) trait PostJournalIndexHooksV5 {
+    fn checkpoint(
+        &mut self,
+        _checkpoint: PostJournalIndexCheckpointV5,
+        _context: &PostJournalIndexContextV5<'_>,
+    ) -> Result<(), GitError> {
+        Ok(())
+    }
+
+    fn replace(
+        &mut self,
+        source: &Path,
+        source_file: File,
+        destination: &Path,
+        destination_file: File,
+    ) -> io::Result<AtomicFileMoveOutcome> {
+        atomic_replace_verified_file(source, source_file, destination, destination_file)
+    }
+}
+
+struct ProductionPostJournalIndexHooksV5;
+
+impl PostJournalIndexHooksV5 for ProductionPostJournalIndexHooksV5 {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CandidatePublishStagingCheckpointV5 {
@@ -1869,6 +1945,741 @@ pub(super) fn revalidate_acquired_index_lock_marker_with_journal_v5(
     Ok(())
 }
 
+fn load_stable_bundle_with_journal_v5(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+    publish_present: bool,
+) -> Result<InventoryVerifiedCandidateBundleV5, GitError> {
+    if !guard.is_for_root(&git.root) || reference.object_format != git.object_format {
+        return Err(GitError::RecoveryConflict);
+    }
+    verify_candidate_publish_namespace_v5(&git.root, reference, publish_present, true)?;
+    let inventory = validate_candidate_bundle_inventory_v5(
+        &git.root,
+        &reference.bundle_basename,
+        Some(&reference.manifest),
+    )?;
+    validate_reference_inventory_binding_v5(reference, &inventory)?;
+    let stable_path = candidate_bundle_stable_path_v5(&git.root, &reference.bundle_basename)?;
+    held_inventory_matches_path_v5(&stable_path, &reference.bundle_basename, &inventory)?;
+    git.ensure_full_index()?;
+    if !guard.is_for_root(&git.root) {
+        return Err(GitError::RecoveryConflict);
+    }
+    Ok(inventory)
+}
+
+fn verify_held_active_journal_identity_v5(git: &Git, journal_file: &File) -> Result<(), GitError> {
+    let path = git.root.join(VAULT_LOCAL_DIRECTORY).join(JOURNAL_FILE);
+    if !required_open_file_matches_path_v5(&path, journal_file)? {
+        return Err(GitError::RecoveryConflict);
+    }
+    Ok(())
+}
+
+fn required_open_file_matches_path_v5(path: &Path, file: &File) -> Result<bool, GitError> {
+    match open_file_matches_path_and_is_single_link(path, file) {
+        Ok(matches) => Ok(matches),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(io_error(GitIoOperation::InspectMetadata, &error)),
+    }
+}
+
+fn required_path_matches_file_identity_v5(
+    path: &Path,
+    identity: &FilesystemFileIdentity,
+) -> Result<bool, GitError> {
+    match path_matches_file_identity_and_is_single_link(path, identity) {
+        Ok(matches) => Ok(matches),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(io_error(GitIoOperation::InspectMetadata, &error)),
+    }
+}
+
+fn stable_candidate_stage_map_v5(
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+    inventory: &InventoryVerifiedCandidateBundleV5,
+) -> Result<BTreeMap<(String, u8), super::StageEntry>, GitError> {
+    let stable_path = candidate_bundle_stable_path_v5(&git.root, &reference.bundle_basename)?;
+    held_inventory_matches_path_v5(&stable_path, &reference.bundle_basename, inventory)?;
+    let candidate_git = git.with_index_file(stable_path.join(CANDIDATE_BUNDLE_INDEX_V5))?;
+    candidate_git.ensure_full_index()?;
+    let map = index_entry_map(&candidate_git)?;
+    held_inventory_matches_path_v5(&stable_path, &reference.bundle_basename, inventory)?;
+    Ok(map)
+}
+
+fn expected_transaction_projection_v5(
+    payload: &MergeJournalPayload,
+) -> BTreeMap<(String, u8), super::StageEntry> {
+    let (path, mode, oid) = match payload {
+        MergeJournalPayload::InPlace(journal) => (
+            journal.physical_path.as_str(),
+            journal.result_mode.as_str(),
+            journal.result_oid.as_str(),
+        ),
+        MergeJournalPayload::DetectedRename(journal) => (
+            journal.destination_physical_path.as_str(),
+            journal.result_mode.as_str(),
+            journal.result_oid.as_str(),
+        ),
+        MergeJournalPayload::Rename(journal) => (
+            journal.destination_physical_path.as_str(),
+            journal.result_mode.as_str(),
+            journal.result_oid.as_str(),
+        ),
+    };
+    BTreeMap::from([(
+        (path.to_owned(), 0),
+        super::StageEntry {
+            mode: mode.to_owned(),
+            oid: oid.to_owned(),
+        },
+    )])
+}
+
+fn transaction_raw_fold_keys_v5(
+    payload: &MergeJournalPayload,
+) -> BTreeSet<inex_core::path::CaseFoldKey> {
+    let mut keys = BTreeSet::new();
+    match payload {
+        MergeJournalPayload::InPlace(journal) => {
+            keys.insert(raw_portable_case_fold_key(&journal.physical_path));
+        }
+        MergeJournalPayload::DetectedRename(journal) => {
+            keys.insert(raw_portable_case_fold_key(&journal.source_physical_path));
+            keys.insert(raw_portable_case_fold_key(
+                &journal.destination_physical_path,
+            ));
+        }
+        MergeJournalPayload::Rename(journal) => {
+            keys.insert(raw_portable_case_fold_key(&journal.source_physical_path));
+            keys.insert(raw_portable_case_fold_key(
+                &journal.destination_physical_path,
+            ));
+        }
+    }
+    keys
+}
+
+fn protected_stage_projection_v5(
+    map: &BTreeMap<(String, u8), super::StageEntry>,
+    protected: &BTreeSet<inex_core::path::CaseFoldKey>,
+) -> BTreeMap<(String, u8), super::StageEntry> {
+    map.iter()
+        .filter(|((path, _), _)| protected.contains(&raw_portable_case_fold_key(path)))
+        .map(|(key, entry)| (key.clone(), entry.clone()))
+        .collect()
+}
+
+fn verify_final_candidate_projection_v5(
+    payload: &MergeJournalPayload,
+    candidate: &BTreeMap<(String, u8), super::StageEntry>,
+) -> Result<BTreeSet<inex_core::path::CaseFoldKey>, GitError> {
+    let protected = transaction_raw_fold_keys_v5(payload);
+    if protected_stage_projection_v5(candidate, &protected)
+        != expected_transaction_projection_v5(payload)
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    Ok(protected)
+}
+
+/// Classifies a consumed-lock live index after the immutable v5 journal. Exact
+/// final bytes and later semantic changes outside the protected transaction
+/// keys are accepted; every raw Unicode/case-fold alias of a protected path is
+/// part of the protected projection and therefore fails on spelling drift.
+pub(super) fn classify_completed_live_index_with_journal_v5(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+) -> Result<
+    (
+        InventoryVerifiedCandidateBundleV5,
+        CompletedLiveIndexStateV5,
+    ),
+    GitError,
+> {
+    let inventory = load_stable_bundle_with_journal_v5(guard, git, reference, false)?;
+    if classify_index_lock_v5(&git.root, reference, &inventory)? != IndexLockStateV5::Absent {
+        return Err(GitError::RecoveryConflict);
+    }
+    let first = read_index_snapshot(&index_path(&git.root))?;
+    let current = index_entry_map(git)?;
+    let second = read_index_snapshot(&index_path(&git.root))?;
+    if first.size != second.size
+        || first.sha256 != second.sha256
+        || classify_index_lock_v5(&git.root, reference, &inventory)? != IndexLockStateV5::Absent
+    {
+        return Err(GitError::IndexChanged);
+    }
+    let candidate = stable_candidate_stage_map_v5(git, reference, &inventory)?;
+    let protected =
+        verify_final_candidate_projection_v5(&inventory.manifest.transaction, &candidate)?;
+    if protected_stage_projection_v5(&current, &protected)
+        != protected_stage_projection_v5(&candidate, &protected)
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    held_inventory_matches_path_v5(
+        &candidate_bundle_stable_path_v5(&git.root, &reference.bundle_basename)?,
+        &reference.bundle_basename,
+        &inventory,
+    )?;
+    if !guard.is_for_root(&git.root) {
+        return Err(GitError::RecoveryConflict);
+    }
+    let state = if first.size == inventory.manifest.final_index.size
+        && first.sha256 == inventory.manifest.final_index.sha256
+        && current == candidate
+    {
+        CompletedLiveIndexStateV5::ExactFinal
+    } else {
+        CompletedLiveIndexStateV5::LaterUnrelated
+    };
+    Ok((inventory, state))
+}
+
+fn verify_held_candidate_index_lock_v5(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+    inventory: &InventoryVerifiedCandidateBundleV5,
+    file: &File,
+) -> Result<(), GitError> {
+    let lock_path = index_lock_path(&git.root);
+    if !required_open_file_matches_path_v5(&lock_path, file)?
+        || classify_index_lock_v5(&git.root, reference, inventory)? != IndexLockStateV5::Candidate
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    let before = verify_bundle_git_semantics_v5(guard, git, reference, inventory, None)?;
+    let lock_git = git.with_index_file(lock_path.clone())?;
+    verify_candidate_index(&lock_git, &inventory.manifest.transaction, &before)?;
+    if index_entry_map(&lock_git)? != stable_candidate_stage_map_v5(git, reference, inventory)?
+        || !required_open_file_matches_path_v5(&lock_path, file)?
+        || classify_index_lock_v5(&git.root, reference, inventory)? != IndexLockStateV5::Candidate
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    Ok(())
+}
+
+/// Reopens the candidate occupying `.git/index.lock` and binds it to the exact
+/// live-old index, immutable bundle, final stage map, and held lock identity.
+pub(super) fn load_candidate_index_lock_with_journal_v5(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+) -> Result<LoadedCandidateIndexLockV5, GitError> {
+    let inventory = load_stable_bundle_with_journal_v5(guard, git, reference, false)?;
+    let lock_path = index_lock_path(&git.root);
+    let file =
+        File::open(&lock_path).map_err(|error| io_error(GitIoOperation::ReadMetadata, &error))?;
+    verify_held_candidate_index_lock_v5(guard, git, reference, &inventory, &file)?;
+    Ok(LoadedCandidateIndexLockV5 { inventory, file })
+}
+
+fn audit_candidate_over_marker_post_v5(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+    inventory: &InventoryVerifiedCandidateBundleV5,
+    publish_identity: &FilesystemFileIdentity,
+    marker_identity: &FilesystemFileIdentity,
+    journal_file: &File,
+) -> Result<(), GitError> {
+    verify_candidate_publish_namespace_v5(&git.root, reference, false, true)?;
+    verify_held_active_journal_identity_v5(git, journal_file)?;
+    let publish_path =
+        candidate_bundle_publish_path_v5(&git.root, &reference.publish_staging_basename)?;
+    let lock_path = index_lock_path(&git.root);
+    if !path_entry_is_absent(&publish_path)?
+        || !required_path_matches_file_identity_v5(&lock_path, publish_identity)?
+        || required_path_matches_file_identity_v5(&lock_path, marker_identity)?
+        || classify_index_lock_v5(&git.root, reference, inventory)? != IndexLockStateV5::Candidate
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    let before = verify_bundle_git_semantics_v5(guard, git, reference, inventory, None)?;
+    let lock_git = git.with_index_file(lock_path)?;
+    verify_candidate_index(&lock_git, &inventory.manifest.transaction, &before)?;
+    if index_entry_map(&lock_git)? != stable_candidate_stage_map_v5(git, reference, inventory)? {
+        return Err(GitError::RecoveryConflict);
+    }
+    sync_directory(&git.root.join(VAULT_LOCAL_DIRECTORY))
+        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+    sync_directory(&git.root.join(".git")).map_err(|_| GitError::DurabilityNotConfirmed)
+}
+
+fn audit_candidate_over_marker_pre_v5(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+    publish_identity: &FilesystemFileIdentity,
+    marker_identity: &FilesystemFileIdentity,
+    journal_file: &File,
+) -> Result<(), GitError> {
+    verify_held_active_journal_identity_v5(git, journal_file)?;
+    let loaded = load_candidate_publish_staging_with_journal_v5(guard, git, reference)?;
+    let publish_path =
+        candidate_bundle_publish_path_v5(&git.root, &reference.publish_staging_basename)?;
+    let lock_path = index_lock_path(&git.root);
+    if !required_path_matches_file_identity_v5(&publish_path, publish_identity)?
+        || !required_path_matches_file_identity_v5(&lock_path, marker_identity)?
+        || classify_index_lock_v5(&git.root, reference, &loaded.inventory)?
+            != IndexLockStateV5::Marker
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    Ok(())
+}
+
+fn is_postjournal_semantic_conflict_v5(error: &GitError) -> bool {
+    matches!(
+        error,
+        GitError::RecoveryConflict
+            | GitError::IndexChanged
+            | GitError::WorktreeChanged
+            | GitError::InvalidJournal
+    )
+}
+
+fn reconcile_postjournal_replace_error_v5<F>(
+    move_error: &io::Error,
+    post_error: GitError,
+    pre_audit: F,
+) -> Result<(), GitError>
+where
+    F: FnOnce() -> Result<(), GitError>,
+{
+    if !is_postjournal_semantic_conflict_v5(&post_error) {
+        return Err(post_error);
+    }
+    match pre_audit() {
+        Ok(()) => Err(io_error(GitIoOperation::SyncGitState, move_error)),
+        Err(error) if is_postjournal_semantic_conflict_v5(&error) => {
+            Err(GitError::RecoveryConflict)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn verify_synced_postjournal_replace_v5(outcome: AtomicFileMoveOutcome) -> Result<(), GitError> {
+    if outcome.source_parent_sync != ParentSyncStatus::Synced
+        || outcome.destination_parent_sync != ParentSyncStatus::Synced
+    {
+        return Err(GitError::DurabilityNotConfirmed);
+    }
+    Ok(())
+}
+
+/// Atomically consumes the publish staging file over the held v5 marker. Both
+/// path handles are consumed before the Windows namespace move; opaque file-ID
+/// receipts distinguish the moved inode from byte-identical replacements.
+pub(super) fn publish_staging_over_marker_with_journal_v5<F>(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+    loaded: LoadedCandidatePublishStagingV5,
+    marker: AcquiredIndexLockMarkerV5,
+    journal_file: &File,
+    critical_audit: F,
+) -> Result<(), GitError>
+where
+    F: FnMut() -> Result<(), GitError>,
+{
+    let mut hooks = ProductionPostJournalIndexHooksV5;
+    publish_staging_over_marker_with_journal_v5_impl(
+        guard,
+        git,
+        reference,
+        loaded,
+        marker,
+        PostJournalIndexAuthorizationV5::new(journal_file, critical_audit),
+        &mut hooks,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn publish_staging_over_marker_with_journal_v5_with_hooks<
+    H: PostJournalIndexHooksV5,
+    F: FnMut() -> Result<(), GitError>,
+>(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+    loaded: LoadedCandidatePublishStagingV5,
+    marker: AcquiredIndexLockMarkerV5,
+    authorization: PostJournalIndexAuthorizationV5<'_, F>,
+    hooks: &mut H,
+) -> Result<(), GitError> {
+    publish_staging_over_marker_with_journal_v5_impl(
+        guard,
+        git,
+        reference,
+        loaded,
+        marker,
+        authorization,
+        hooks,
+    )
+}
+
+fn publish_staging_over_marker_with_journal_v5_impl<
+    H: PostJournalIndexHooksV5,
+    F: FnMut() -> Result<(), GitError>,
+>(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+    loaded: LoadedCandidatePublishStagingV5,
+    marker: AcquiredIndexLockMarkerV5,
+    authorization: PostJournalIndexAuthorizationV5<'_, F>,
+    hooks: &mut H,
+) -> Result<(), GitError> {
+    let PostJournalIndexAuthorizationV5 {
+        journal_file,
+        mut critical_audit,
+    } = authorization;
+    verify_held_active_journal_identity_v5(git, journal_file)?;
+    revalidate_acquired_index_lock_marker_with_journal_v5(
+        guard,
+        git,
+        reference,
+        &loaded.inventory,
+        &loaded.staging,
+        &marker,
+    )?;
+    let stable_path = candidate_bundle_stable_path_v5(&git.root, &reference.bundle_basename)?;
+    let publish_path =
+        candidate_bundle_publish_path_v5(&git.root, &reference.publish_staging_basename)?;
+    let lock_path = index_lock_path(&git.root);
+    let live_path = index_path(&git.root);
+    let context = PostJournalIndexContextV5 {
+        root: &git.root,
+        stable_path: &stable_path,
+        publish_path: &publish_path,
+        lock_path: &lock_path,
+        index_path: &live_path,
+    };
+    hooks.checkpoint(
+        PostJournalIndexCheckpointV5::BeforePublishOverMarker,
+        &context,
+    )?;
+    revalidate_acquired_index_lock_marker_with_journal_v5(
+        guard,
+        git,
+        reference,
+        &loaded.inventory,
+        &loaded.staging,
+        &marker,
+    )?;
+    verify_held_active_journal_identity_v5(git, journal_file)?;
+    critical_audit()?;
+    verify_held_active_journal_identity_v5(git, journal_file)?;
+    let publish_identity = filesystem_file_identity(&loaded.staging.file)
+        .map_err(|error| io_error(GitIoOperation::SyncGitState, &error))?;
+    let marker_identity = filesystem_file_identity(&marker.file)
+        .map_err(|error| io_error(GitIoOperation::SyncGitState, &error))?;
+    let LoadedCandidatePublishStagingV5 { inventory, staging } = loaded;
+    let PreparedCandidatePublishStagingV5 {
+        file: source,
+        publish_staging_basename: _,
+        candidate: _,
+    } = staging;
+    let AcquiredIndexLockMarkerV5 {
+        file: destination,
+        marker: _,
+        scratch_basename: _,
+    } = marker;
+    let move_result = hooks.replace(&publish_path, source, &lock_path, destination);
+    let post = audit_candidate_over_marker_post_v5(
+        guard,
+        git,
+        reference,
+        &inventory,
+        &publish_identity,
+        &marker_identity,
+        journal_file,
+    );
+    match (move_result, post) {
+        (Ok(outcome), Ok(())) => verify_synced_postjournal_replace_v5(outcome)?,
+        (Err(_), Ok(())) => {}
+        (Err(error), Err(post_error)) => {
+            return reconcile_postjournal_replace_error_v5(&error, post_error, || {
+                audit_candidate_over_marker_pre_v5(
+                    guard,
+                    git,
+                    reference,
+                    &publish_identity,
+                    &marker_identity,
+                    journal_file,
+                )
+            });
+        }
+        (Ok(_), Err(error)) => return Err(error),
+    }
+    hooks.checkpoint(
+        PostJournalIndexCheckpointV5::AfterPublishOverMarker,
+        &context,
+    )?;
+    audit_candidate_over_marker_post_v5(
+        guard,
+        git,
+        reference,
+        &inventory,
+        &publish_identity,
+        &marker_identity,
+        journal_file,
+    )
+}
+
+fn open_held_live_old_index_v5(
+    git: &Git,
+    inventory: &InventoryVerifiedCandidateBundleV5,
+) -> Result<File, GitError> {
+    let path = index_path(&git.root);
+    let file = File::open(&path).map_err(|error| io_error(GitIoOperation::ReadMetadata, &error))?;
+    let snapshot = read_index_snapshot(&path)?;
+    if snapshot.size != inventory.manifest.old_index.size
+        || snapshot.sha256 != inventory.manifest.old_index.sha256
+        || !required_open_file_matches_path_v5(&path, &file)?
+    {
+        return Err(GitError::IndexChanged);
+    }
+    Ok(file)
+}
+
+fn audit_candidate_lock_before_index_v5(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+    loaded: &LoadedCandidateIndexLockV5,
+    live_file: &File,
+) -> Result<(), GitError> {
+    verify_candidate_publish_namespace_v5(&git.root, reference, false, true)?;
+    verify_held_candidate_index_lock_v5(guard, git, reference, &loaded.inventory, &loaded.file)?;
+    let path = index_path(&git.root);
+    let snapshot = read_index_snapshot(&path)?;
+    if snapshot.size != loaded.inventory.manifest.old_index.size
+        || snapshot.sha256 != loaded.inventory.manifest.old_index.sha256
+        || !required_open_file_matches_path_v5(&path, live_file)?
+    {
+        return Err(GitError::IndexChanged);
+    }
+    Ok(())
+}
+
+fn audit_candidate_over_live_index_post_v5(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+    candidate_identity: &FilesystemFileIdentity,
+    old_live_identity: &FilesystemFileIdentity,
+    journal_file: &File,
+) -> Result<(), GitError> {
+    verify_candidate_publish_namespace_v5(&git.root, reference, false, true)?;
+    verify_held_active_journal_identity_v5(git, journal_file)?;
+    let lock_path = index_lock_path(&git.root);
+    let live_path = index_path(&git.root);
+    if !path_entry_is_absent(&lock_path)?
+        || !required_path_matches_file_identity_v5(&live_path, candidate_identity)?
+        || required_path_matches_file_identity_v5(&live_path, old_live_identity)?
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    let (_, completed) = classify_completed_live_index_with_journal_v5(guard, git, reference)?;
+    verify_held_active_journal_identity_v5(git, journal_file)?;
+    if completed != CompletedLiveIndexStateV5::ExactFinal {
+        return Err(GitError::RecoveryConflict);
+    }
+    sync_directory(&git.root.join(".git")).map_err(|_| GitError::DurabilityNotConfirmed)?;
+    Ok(())
+}
+
+fn audit_candidate_over_live_index_final_v5(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+    candidate_identity: &FilesystemFileIdentity,
+    old_live_identity: &FilesystemFileIdentity,
+    journal_file: &File,
+) -> Result<CompletedLiveIndexStateV5, GitError> {
+    verify_candidate_publish_namespace_v5(&git.root, reference, false, true)?;
+    verify_held_active_journal_identity_v5(git, journal_file)?;
+    let live_path = index_path(&git.root);
+    if required_path_matches_file_identity_v5(&live_path, old_live_identity)? {
+        return Err(GitError::RecoveryConflict);
+    }
+    let candidate_matches = required_path_matches_file_identity_v5(&live_path, candidate_identity)?;
+    let (_, completed) = classify_completed_live_index_with_journal_v5(guard, git, reference)?;
+    verify_held_active_journal_identity_v5(git, journal_file)?;
+    if !matches!(
+        (completed, candidate_matches),
+        (CompletedLiveIndexStateV5::ExactFinal, true)
+            | (CompletedLiveIndexStateV5::LaterUnrelated, false)
+    ) {
+        return Err(GitError::RecoveryConflict);
+    }
+    sync_directory(&git.root.join(".git")).map_err(|_| GitError::DurabilityNotConfirmed)?;
+    Ok(completed)
+}
+
+fn audit_candidate_lock_before_index_by_identity_v5(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+    candidate_identity: &FilesystemFileIdentity,
+    old_live_identity: &FilesystemFileIdentity,
+    journal_file: &File,
+) -> Result<(), GitError> {
+    verify_held_active_journal_identity_v5(git, journal_file)?;
+    let loaded = load_candidate_index_lock_with_journal_v5(guard, git, reference)?;
+    let lock_path = index_lock_path(&git.root);
+    let live_path = index_path(&git.root);
+    if !required_path_matches_file_identity_v5(&lock_path, candidate_identity)?
+        || !required_path_matches_file_identity_v5(&live_path, old_live_identity)?
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    drop(loaded);
+    Ok(())
+}
+
+pub(super) fn publish_candidate_lock_over_live_index_with_journal_v5<F>(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+    loaded: LoadedCandidateIndexLockV5,
+    journal_file: &File,
+    critical_audit: F,
+) -> Result<(), GitError>
+where
+    F: FnMut() -> Result<(), GitError>,
+{
+    let mut hooks = ProductionPostJournalIndexHooksV5;
+    publish_candidate_lock_over_live_index_with_journal_v5_impl(
+        guard,
+        git,
+        reference,
+        loaded,
+        journal_file,
+        critical_audit,
+        &mut hooks,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn publish_candidate_lock_over_live_index_with_journal_v5_with_hooks<
+    H: PostJournalIndexHooksV5,
+    F: FnMut() -> Result<(), GitError>,
+>(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+    loaded: LoadedCandidateIndexLockV5,
+    journal_file: &File,
+    critical_audit: F,
+    hooks: &mut H,
+) -> Result<(), GitError> {
+    publish_candidate_lock_over_live_index_with_journal_v5_impl(
+        guard,
+        git,
+        reference,
+        loaded,
+        journal_file,
+        critical_audit,
+        hooks,
+    )
+}
+
+fn publish_candidate_lock_over_live_index_with_journal_v5_impl<
+    H: PostJournalIndexHooksV5,
+    F: FnMut() -> Result<(), GitError>,
+>(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+    loaded: LoadedCandidateIndexLockV5,
+    journal_file: &File,
+    mut critical_audit: F,
+    hooks: &mut H,
+) -> Result<(), GitError> {
+    verify_held_active_journal_identity_v5(git, journal_file)?;
+    let live_file = open_held_live_old_index_v5(git, &loaded.inventory)?;
+    audit_candidate_lock_before_index_v5(guard, git, reference, &loaded, &live_file)?;
+    let stable_path = candidate_bundle_stable_path_v5(&git.root, &reference.bundle_basename)?;
+    let publish_path =
+        candidate_bundle_publish_path_v5(&git.root, &reference.publish_staging_basename)?;
+    let lock_path = index_lock_path(&git.root);
+    let live_path = index_path(&git.root);
+    let context = PostJournalIndexContextV5 {
+        root: &git.root,
+        stable_path: &stable_path,
+        publish_path: &publish_path,
+        lock_path: &lock_path,
+        index_path: &live_path,
+    };
+    hooks.checkpoint(
+        PostJournalIndexCheckpointV5::BeforePublishOverIndex,
+        &context,
+    )?;
+    audit_candidate_lock_before_index_v5(guard, git, reference, &loaded, &live_file)?;
+    verify_held_active_journal_identity_v5(git, journal_file)?;
+    critical_audit()?;
+    verify_held_active_journal_identity_v5(git, journal_file)?;
+    let candidate_identity = filesystem_file_identity(&loaded.file)
+        .map_err(|error| io_error(GitIoOperation::SyncGitState, &error))?;
+    let old_live_identity = filesystem_file_identity(&live_file)
+        .map_err(|error| io_error(GitIoOperation::SyncGitState, &error))?;
+    let LoadedCandidateIndexLockV5 {
+        inventory: _,
+        file: source,
+    } = loaded;
+    let destination = live_file;
+    let move_result = hooks.replace(&lock_path, source, &live_path, destination);
+    let post = audit_candidate_over_live_index_post_v5(
+        guard,
+        git,
+        reference,
+        &candidate_identity,
+        &old_live_identity,
+        journal_file,
+    );
+    match (move_result, post) {
+        (Ok(outcome), Ok(())) => verify_synced_postjournal_replace_v5(outcome)?,
+        (Err(_), Ok(())) => {}
+        (Err(error), Err(post_error)) => {
+            return reconcile_postjournal_replace_error_v5(&error, post_error, || {
+                audit_candidate_lock_before_index_by_identity_v5(
+                    guard,
+                    git,
+                    reference,
+                    &candidate_identity,
+                    &old_live_identity,
+                    journal_file,
+                )
+            });
+        }
+        (Ok(_), Err(error)) => return Err(error),
+    }
+    hooks.checkpoint(
+        PostJournalIndexCheckpointV5::AfterPublishOverIndex,
+        &context,
+    )?;
+    audit_candidate_over_live_index_final_v5(
+        guard,
+        git,
+        reference,
+        &candidate_identity,
+        &old_live_identity,
+        journal_file,
+    )
+    .map(|_| ())
+}
+
 const MAX_SCRATCH_TOKEN_ATTEMPTS_V5: usize = 64;
 
 fn exact_child_name_is_unique(parent: &Path, expected: &str) -> Result<bool, GitError> {
@@ -2997,5 +3808,43 @@ mod tests {
         .expect("legacy journal writes");
         assert!(recovery_status(root.path()).is_err());
         assert!(root.local().join(JOURNAL_FILE).is_file());
+    }
+
+    #[test]
+    fn postjournal_projection_protects_noncanonical_raw_unicode_aliases() {
+        for (protected_path, alias) in [
+            ("Å/Entry.md.enc", "A\u{30a}/entry.MD.ENC"),
+            ("Straße/Entry.md.enc", "STRASSE/entry.md.enc"),
+            ("Οσ/Entry.md.enc", "ος/ENTRY.MD.ENC"),
+        ] {
+            assert_eq!(
+                raw_portable_case_fold_key(protected_path),
+                raw_portable_case_fold_key(alias),
+                "fixture must exercise one portable collision key"
+            );
+            let payload = MergeJournalPayload::InPlace(MergeJournal {
+                version: 1,
+                physical_path: protected_path.to_owned(),
+                result_mode: "100644".to_owned(),
+                stages: [None, None, None],
+                expected_worktree_sha256: "00".repeat(32),
+                result_oid: "11".repeat(20),
+                result_sha256: "22".repeat(32),
+            });
+            let result = StageEntry {
+                mode: "100644".to_owned(),
+                oid: "11".repeat(20),
+            };
+            let candidate = BTreeMap::from([((protected_path.to_owned(), 0), result.clone())]);
+            let protected = verify_final_candidate_projection_v5(&payload, &candidate)
+                .expect("canonical final projection validates");
+            let mut current = candidate.clone();
+            current.insert((alias.to_owned(), 0), result);
+            assert_ne!(
+                protected_stage_projection_v5(&current, &protected),
+                protected_stage_projection_v5(&candidate, &protected),
+                "raw alias must remain inside the protected transaction projection"
+            );
+        }
     }
 }

@@ -454,6 +454,16 @@ impl CaseFoldKey {
     }
 }
 
+/// Return the portable Unicode case-fold key for an unvalidated raw spelling.
+///
+/// This narrow primitive exists for fail-closed namespace collision checks
+/// that must also recognize non-canonical aliases before parsing them. It does
+/// not validate a logical or physical path and must not be used to accept one.
+#[must_use]
+pub fn raw_portable_case_fold_key(input: &str) -> CaseFoldKey {
+    CaseFoldKey(portable_case_fold(input))
+}
+
 fn require_single_component(name: &str) -> Result<(), PathError> {
     if name.is_empty() || name.contains('/') || name.contains('\\') {
         return Err(PathError::ExpectedSingleComponent);

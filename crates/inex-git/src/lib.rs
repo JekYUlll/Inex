@@ -30,7 +30,7 @@ use inex_core::atomic::{
 use inex_core::crypto::{DecryptedDocument, EncryptedDocument};
 use inex_core::format;
 use inex_core::path::{LogicalPath, MAX_LOGICAL_PATH_BYTES};
-use inex_core::tree::{self, TreeEntryKind};
+use inex_core::tree::{self, TreeEntryKind, TreeError};
 use inex_core::vault::{MAX_EDRY_ENVELOPE_BYTES, Vault, VaultError};
 use inex_core::vault_config::{KdfPolicy, MAX_VAULT_JSON_BYTES, VaultConfig};
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
@@ -120,6 +120,22 @@ enum V5PreJournalState {
     ForeignLock,
     LiveIndexDrift,
     Conflict,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum V5PostJournalState {
+    JournalReady,
+    CandidateInLock,
+    ExactFinal,
+    LaterUnrelated,
+    Conflict,
+}
+
+#[derive(Debug)]
+struct HeldBundleJournalV5 {
+    journal: BundleMergeJournalV5,
+    bytes: Vec<u8>,
+    file: File,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -420,6 +436,17 @@ pub fn recovery_status(vault_root: &Path) -> Result<RecoveryStatus, GitError> {
     let guard = VaultMutationGuard::acquire(vault_root).map_err(map_atomic_error)?;
     let v5 = candidate_bundle_v5::inspect_candidate_bundle_namespace_v5(vault_root)?;
     let pending = read_journal(vault_root)?;
+    if matches!(pending, Some(PendingMergeJournal::BundleV5(_))) {
+        let state =
+            inspect_v5_postjournal_state(&guard, vault_root)?.ok_or(GitError::RecoveryConflict)?;
+        if state == V5PostJournalState::Conflict {
+            return Err(GitError::RecoveryConflict);
+        }
+        return Ok(RecoveryStatus {
+            pending_transaction: true,
+            retained_candidate_scratch_count: v5.retained_scratch_count,
+        });
+    }
     let v5_state = inspect_v5_prejournal_state(&guard, vault_root, &v5, pending.as_ref())?;
     let pending_transaction = match v5_state {
         Some(
@@ -613,6 +640,142 @@ fn load_v5_reference_from_disk(
         inventory.manifest_reference.clone(),
     )?;
     Ok(reference)
+}
+
+fn load_held_bundle_journal_v5(
+    root: &Path,
+    expected_reference: &candidate_bundle_v5::CandidateBundleTransactionReferenceV5,
+) -> Result<HeldBundleJournalV5, GitError> {
+    let pending = read_journal(root)?.ok_or(GitError::RecoveryConflict)?;
+    let PendingMergeJournal::BundleV5(journal) = pending else {
+        return Err(GitError::RecoveryConflict);
+    };
+    if &journal.reference != expected_reference {
+        return Err(GitError::RecoveryConflict);
+    }
+    let bytes = serialize_bundle_journal_v5(&journal)?;
+    let path = journal_path(root);
+    let file = File::open(&path).map_err(|error| io_error(GitIoOperation::ReadJournal, &error))?;
+    verify_held_durable_journal_v5(&path, &file, &bytes, &journal)?;
+    Ok(HeldBundleJournalV5 {
+        journal,
+        bytes,
+        file,
+    })
+}
+
+fn revalidate_held_bundle_journal_v5(
+    root: &Path,
+    held: &HeldBundleJournalV5,
+) -> Result<(), GitError> {
+    verify_held_durable_journal_v5(&journal_path(root), &held.file, &held.bytes, &held.journal)
+}
+
+fn v5_post_conflict_or_propagate(error: GitError) -> Result<V5PostJournalState, GitError> {
+    match error {
+        GitError::InvalidJournal
+        | GitError::RecoveryConflict
+        | GitError::IndexChanged
+        | GitError::WorktreeChanged => Ok(V5PostJournalState::Conflict),
+        other => Err(other),
+    }
+}
+
+fn inspect_v5_postjournal_state(
+    guard: &VaultMutationGuard,
+    root: &Path,
+) -> Result<Option<V5PostJournalState>, GitError> {
+    let namespace = candidate_bundle_v5::inspect_candidate_bundle_namespace_v5(root)?;
+    let pending = read_journal(root)?;
+    let Some(PendingMergeJournal::BundleV5(journal)) = pending else {
+        return Ok(None);
+    };
+    let Some(stable_basename) = namespace.stable_bundle_basename.as_deref() else {
+        return Ok(Some(V5PostJournalState::Conflict));
+    };
+    if journal.reference.bundle_basename != stable_basename {
+        return Ok(Some(V5PostJournalState::Conflict));
+    }
+    if let Err(error) = validate_v5_journal_stable_bundle(root, stable_basename, &journal) {
+        return v5_post_conflict_or_propagate(error).map(Some);
+    }
+    let held = load_held_bundle_journal_v5(root, &journal.reference)?;
+    let git = Git::open(root)?;
+    let state = if namespace.publish_staging_basename.as_deref()
+        == Some(journal.reference.publish_staging_basename.as_str())
+    {
+        let loaded = candidate_bundle_v5::load_candidate_publish_staging_with_journal_v5(
+            guard,
+            &git,
+            &journal.reference,
+        );
+        match loaded {
+            Ok(loaded)
+                if candidate_bundle_v5::classify_index_lock_v5(
+                    root,
+                    &journal.reference,
+                    &loaded.inventory,
+                )? == candidate_bundle_v5::IndexLockStateV5::Marker =>
+            {
+                match candidate_bundle_v5::load_acquired_index_lock_marker_with_journal_v5(
+                    guard,
+                    &git,
+                    &journal.reference,
+                    &loaded.inventory,
+                    &loaded.staging,
+                ) {
+                    Ok(_) => V5PostJournalState::JournalReady,
+                    Err(error) => v5_post_conflict_or_propagate(error)?,
+                }
+            }
+            Ok(_) => V5PostJournalState::Conflict,
+            Err(error) => v5_post_conflict_or_propagate(error)?,
+        }
+    } else if namespace.publish_staging_basename.is_some() {
+        V5PostJournalState::Conflict
+    } else {
+        let inventory = candidate_bundle_v5::validate_candidate_bundle_inventory_v5(
+            root,
+            stable_basename,
+            Some(&journal.reference.manifest),
+        )?;
+        match candidate_bundle_v5::classify_index_lock_v5(root, &journal.reference, &inventory)? {
+            candidate_bundle_v5::IndexLockStateV5::Candidate => {
+                match candidate_bundle_v5::load_candidate_index_lock_with_journal_v5(
+                    guard,
+                    &git,
+                    &journal.reference,
+                ) {
+                    Ok(_) => V5PostJournalState::CandidateInLock,
+                    Err(error) => v5_post_conflict_or_propagate(error)?,
+                }
+            }
+            candidate_bundle_v5::IndexLockStateV5::Absent => {
+                match candidate_bundle_v5::classify_completed_live_index_with_journal_v5(
+                    guard,
+                    &git,
+                    &journal.reference,
+                ) {
+                    Ok((_, candidate_bundle_v5::CompletedLiveIndexStateV5::ExactFinal)) => {
+                        V5PostJournalState::ExactFinal
+                    }
+                    Ok((_, candidate_bundle_v5::CompletedLiveIndexStateV5::LaterUnrelated)) => {
+                        V5PostJournalState::LaterUnrelated
+                    }
+                    Err(error) => v5_post_conflict_or_propagate(error)?,
+                }
+            }
+            candidate_bundle_v5::IndexLockStateV5::Marker
+            | candidate_bundle_v5::IndexLockStateV5::Foreign => V5PostJournalState::Conflict,
+        }
+    };
+    if let Err(error) = revalidate_held_bundle_journal_v5(root, &held) {
+        return v5_post_conflict_or_propagate(error).map(Some);
+    }
+    if !guard.is_for_root(root) {
+        return Ok(Some(V5PostJournalState::Conflict));
+    }
+    Ok(Some(state))
 }
 
 /// Advances only the recoverable v5 prefix through durable journal creation.
@@ -2872,7 +3035,8 @@ fn verify_worktree_identity_owner(
         .map(|path| validate_physical_path(path).map(|logical| logical.case_fold_key()))
         .collect::<Result<BTreeSet<_>, _>>()?;
     let unmerged = git.unmerged_entries()?;
-    let tree = tree::scan_vault_tree(vault.root()).map_err(|_| GitError::WorktreeChanged)?;
+    let tree =
+        tree::scan_vault_tree(vault.root()).map_err(|error| map_worktree_tree_error(&error))?;
     for entry in tree.entries() {
         if entry.kind() != TreeEntryKind::File {
             continue;
@@ -2910,12 +3074,34 @@ fn verify_worktree_identity_owner(
         }
         let document = vault
             .read(&logical_path)
-            .map_err(|_| GitError::WorktreeChanged)?;
+            .map_err(|error| map_worktree_vault_error(&error))?;
         if document.header.file_id.to_string() == file_id {
             return Err(GitError::WorktreeChanged);
         }
     }
     Ok(())
+}
+
+fn map_worktree_tree_error(error: &TreeError) -> GitError {
+    match error {
+        TreeError::Io { kind, .. } => GitError::Io {
+            operation: GitIoOperation::InspectMetadata,
+            kind: *kind,
+        },
+        _ => GitError::WorktreeChanged,
+    }
+}
+
+fn map_worktree_vault_error(error: &VaultError) -> GitError {
+    match error {
+        VaultError::Io { kind, .. } | VaultError::Tree(TreeError::Io { kind, .. }) => {
+            GitError::Io {
+                operation: GitIoOperation::InspectMetadata,
+                kind: *kind,
+            }
+        }
+        _ => GitError::WorktreeChanged,
+    }
 }
 
 fn verify_merge_identity_owners(
@@ -3244,6 +3430,20 @@ fn validate_rename_provenance(git: &Git, provenance: &RenameProvenance) -> Resul
         return Err(GitError::UnsupportedConflictEntry);
     }
     Ok(())
+}
+
+fn map_recorded_provenance_journal_error(error: GitError) -> GitError {
+    match error {
+        GitError::UnsupportedConflictEntry => GitError::InvalidJournal,
+        error => error,
+    }
+}
+
+fn map_recorded_provenance_state_error(error: GitError) -> GitError {
+    match error {
+        GitError::UnsupportedConflictEntry => GitError::RecoveryConflict,
+        error => error,
+    }
 }
 
 fn verify_active_rename_provenance(git: &Git, expected: &RenameProvenance) -> Result<(), GitError> {
@@ -5892,6 +6092,114 @@ fn recover_cas_pending(
     Err(GitError::RecoveryConflict)
 }
 
+fn v5_payload_from_reference(
+    root: &Path,
+    reference: &candidate_bundle_v5::CandidateBundleTransactionReferenceV5,
+) -> Result<MergeJournalPayload, GitError> {
+    let inventory = candidate_bundle_v5::validate_candidate_bundle_inventory_v5(
+        root,
+        &reference.bundle_basename,
+        Some(&reference.manifest),
+    )?;
+    if inventory.manifest.object_format != reference.object_format
+        || inventory.manifest.token != reference.token
+        || inventory.manifest.bundle_basename != reference.bundle_basename
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    Ok(inventory.manifest.transaction)
+}
+
+fn recover_bundle_v5_pending(
+    vault: &Vault,
+    git: &Git,
+    guard: &VaultMutationGuard,
+) -> Result<V5PostJournalState, GitError> {
+    if vault.root() != git.root || !guard.is_for_root(vault.root()) {
+        return Err(GitError::RecoveryConflict);
+    }
+    let reference = load_v5_reference_from_disk(vault.root())?;
+    let held_journal = load_held_bundle_journal_v5(vault.root(), &reference)?;
+    let mut state =
+        inspect_v5_postjournal_state(guard, vault.root())?.ok_or(GitError::RecoveryConflict)?;
+    for _ in 0..3 {
+        let expected = match state {
+            V5PostJournalState::JournalReady => {
+                let payload = v5_payload_from_reference(vault.root(), &reference)?;
+                revalidate_held_bundle_journal_v5(vault.root(), &held_journal)?;
+                prepare_payload_worktree_for_v5_index(vault, git, guard, &payload)?;
+                revalidate_held_bundle_journal_v5(vault.root(), &held_journal)?;
+                let loaded = candidate_bundle_v5::load_candidate_publish_staging_with_journal_v5(
+                    guard, git, &reference,
+                )?;
+                let marker = candidate_bundle_v5::load_acquired_index_lock_marker_with_journal_v5(
+                    guard,
+                    git,
+                    &reference,
+                    &loaded.inventory,
+                    &loaded.staging,
+                )?;
+                verify_payload_ready_for_v5_index(vault, git, guard, &payload)?;
+                revalidate_held_bundle_journal_v5(vault.root(), &held_journal)?;
+                candidate_bundle_v5::publish_staging_over_marker_with_journal_v5(
+                    guard,
+                    git,
+                    &reference,
+                    loaded,
+                    marker,
+                    &held_journal.file,
+                    || {
+                        revalidate_held_bundle_journal_v5(vault.root(), &held_journal)?;
+                        verify_payload_ready_for_v5_index(vault, git, guard, &payload)?;
+                        revalidate_held_bundle_journal_v5(vault.root(), &held_journal)
+                    },
+                )?;
+                revalidate_held_bundle_journal_v5(vault.root(), &held_journal)?;
+                V5PostJournalState::CandidateInLock
+            }
+            V5PostJournalState::CandidateInLock => {
+                let payload = v5_payload_from_reference(vault.root(), &reference)?;
+                let loaded = candidate_bundle_v5::load_candidate_index_lock_with_journal_v5(
+                    guard, git, &reference,
+                )?;
+                revalidate_held_bundle_journal_v5(vault.root(), &held_journal)?;
+                verify_payload_ready_for_v5_index(vault, git, guard, &payload)?;
+                candidate_bundle_v5::publish_candidate_lock_over_live_index_with_journal_v5(
+                    guard,
+                    git,
+                    &reference,
+                    loaded,
+                    &held_journal.file,
+                    || {
+                        revalidate_held_bundle_journal_v5(vault.root(), &held_journal)?;
+                        verify_payload_ready_for_v5_index(vault, git, guard, &payload)?;
+                        revalidate_held_bundle_journal_v5(vault.root(), &held_journal)
+                    },
+                )?;
+                revalidate_held_bundle_journal_v5(vault.root(), &held_journal)?;
+                V5PostJournalState::ExactFinal
+            }
+            V5PostJournalState::ExactFinal | V5PostJournalState::LaterUnrelated => {
+                let payload = v5_payload_from_reference(vault.root(), &reference)?;
+                revalidate_held_bundle_journal_v5(vault.root(), &held_journal)?;
+                verify_payload_completed_v5(vault, git, guard, &payload)?;
+                revalidate_held_bundle_journal_v5(vault.root(), &held_journal)?;
+                return Ok(state);
+            }
+            V5PostJournalState::Conflict => return Err(GitError::RecoveryConflict),
+        };
+        state =
+            inspect_v5_postjournal_state(guard, vault.root())?.ok_or(GitError::RecoveryConflict)?;
+        if state != expected
+            && !(expected == V5PostJournalState::ExactFinal
+                && state == V5PostJournalState::LaterUnrelated)
+        {
+            return Err(GitError::RecoveryConflict);
+        }
+    }
+    Err(GitError::RecoveryConflict)
+}
+
 fn recover_pending(vault: &Vault, git: &Git) -> Result<bool, GitError> {
     let guard = VaultMutationGuard::acquire(vault.root()).map_err(map_atomic_error)?;
     let v5_namespace = candidate_bundle_v5::inspect_candidate_bundle_namespace_v5(vault.root())?;
@@ -5900,11 +6208,20 @@ fn recover_pending(vault: &Vault, git: &Git) -> Result<bool, GitError> {
         || v5_namespace.publish_staging_basename.is_some()
         || matches!(v5_pending, Some(PendingMergeJournal::BundleV5(_)))
     {
-        if advance_v5_to_durable_journal(vault, git, &guard)? != V5PreJournalState::JournalReady {
+        if !matches!(v5_pending, Some(PendingMergeJournal::BundleV5(_)))
+            && advance_v5_to_durable_journal(vault, git, &guard)? != V5PreJournalState::JournalReady
+        {
             return Err(GitError::RecoveryConflict);
         }
-        // Journal publication is durable, but worktree/index recovery is a
-        // later slice. Do not report this prefix-only advance as recovered.
+        let completed = recover_bundle_v5_pending(vault, git, &guard)?;
+        if !matches!(
+            completed,
+            V5PostJournalState::ExactFinal | V5PostJournalState::LaterUnrelated
+        ) {
+            return Err(GitError::RecoveryConflict);
+        }
+        // Cleanup is a later slice. Do not report the transaction as recovered
+        // while its immutable bundle and reference-only journal remain active.
         return Err(GitError::RecoveryConflict);
     }
     let reserved_names = exact_reserved_private_names(vault.root())?;
@@ -6276,7 +6593,8 @@ fn authenticate_detected_rename_recovery(
         git.validate_oid(&stage.oid)
             .map_err(|_| GitError::InvalidJournal)?;
     }
-    validate_rename_provenance(git, &journal.provenance).map_err(|_| GitError::InvalidJournal)?;
+    validate_rename_provenance(git, &journal.provenance)
+        .map_err(map_recorded_provenance_journal_error)?;
     let source_logical_path = validate_physical_path(&journal.source_physical_path)?;
     let destination_logical_path = validate_physical_path(&journal.destination_physical_path)?;
     let mut identities: [Option<AuthenticatedStageIdentity>; 3] = std::array::from_fn(|_| None);
@@ -6325,7 +6643,7 @@ fn authenticate_detected_rename_recovery(
         ],
         journal.renamed_side,
     )
-    .map_err(|_| GitError::RecoveryConflict)?;
+    .map_err(map_recorded_provenance_state_error)?;
 
     let result = git.read_object(&journal.result_oid)?;
     let result_digest = digest(&result);
@@ -6495,7 +6813,8 @@ fn authenticate_rename_recovery(
         git.validate_oid(&stage.oid)
             .map_err(|_| GitError::InvalidJournal)?;
     }
-    validate_rename_provenance(git, &journal.provenance).map_err(|_| GitError::InvalidJournal)?;
+    validate_rename_provenance(git, &journal.provenance)
+        .map_err(map_recorded_provenance_journal_error)?;
     let source_logical = validate_physical_path(&journal.source_physical_path)?;
     let destination_logical = validate_physical_path(&journal.destination_physical_path)?;
     let result = git.read_object(&journal.result_oid)?;
@@ -6556,7 +6875,7 @@ fn authenticate_rename_recovery(
         ],
         journal.renamed_side,
     )
-    .map_err(|_| GitError::RecoveryConflict)?;
+    .map_err(map_recorded_provenance_state_error)?;
     let expected_source_digest = source_ciphertexts[1]
         .as_ref()
         .or(source_ciphertexts[2].as_ref())
@@ -6841,18 +7160,408 @@ fn authorize_payload_before_v5_journal(
     verify_authenticated_payload_original_v5(vault, git, guard, &authenticated)
 }
 
+fn verify_authenticated_payload_old_index_v5(
+    vault: &Vault,
+    git: &Git,
+    guard: &VaultMutationGuard,
+    payload: &AuthenticatedMergePayloadV5<'_>,
+) -> Result<(), GitError> {
+    match payload {
+        AuthenticatedMergePayloadV5::InPlace {
+            journal,
+            authenticated,
+        } => {
+            if !in_place_index_is_original(git, &authenticated.conflict)? {
+                return Err(GitError::IndexChanged);
+            }
+            verify_merge_identity_owners(
+                vault,
+                git,
+                guard,
+                &authenticated.file_id,
+                None,
+                &[&journal.physical_path],
+            )?;
+        }
+        AuthenticatedMergePayloadV5::DetectedRename {
+            journal,
+            authenticated,
+        } => {
+            if !detected_index_is_original(
+                git,
+                &authenticated.conflict,
+                &journal.source_physical_path,
+            )? {
+                return Err(GitError::IndexChanged);
+            }
+            verify_merge_identity_owners(
+                vault,
+                git,
+                guard,
+                &authenticated.file_id,
+                None,
+                &[
+                    &journal.source_physical_path,
+                    &journal.destination_physical_path,
+                ],
+            )?;
+        }
+        AuthenticatedMergePayloadV5::SplitRename {
+            journal,
+            authenticated,
+        } => {
+            if !split_index_is_original(git, &authenticated.source, &authenticated.destination)? {
+                return Err(GitError::IndexChanged);
+            }
+            verify_merge_identity_owners(
+                vault,
+                git,
+                guard,
+                &authenticated.file_id,
+                Some(&journal.destination_physical_path),
+                &[
+                    &journal.source_physical_path,
+                    &journal.destination_physical_path,
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn verify_authenticated_worktree_final_v5(
+    vault: &Vault,
+    guard: &VaultMutationGuard,
+    payload: &AuthenticatedMergePayloadV5<'_>,
+) -> Result<(), GitError> {
+    match payload {
+        AuthenticatedMergePayloadV5::InPlace { authenticated, .. } => {
+            let target = vault.root().join(
+                authenticated
+                    .conflict
+                    .logical_path
+                    .to_ciphertext_relative_path(),
+            );
+            if guard.inspect(&target).map_err(map_atomic_error)?
+                != CurrentTarget::File(authenticated.result_digest)
+            {
+                return Err(GitError::WorktreeChanged);
+            }
+            sync_directory(target.parent().ok_or(GitError::DurabilityNotConfirmed)?)
+                .map_err(|_| GitError::DurabilityNotConfirmed)?;
+        }
+        AuthenticatedMergePayloadV5::DetectedRename { authenticated, .. } => {
+            let source = vault.root().join(
+                authenticated
+                    .source_logical_path
+                    .to_ciphertext_relative_path(),
+            );
+            let destination = vault.root().join(
+                authenticated
+                    .conflict
+                    .logical_path
+                    .to_ciphertext_relative_path(),
+            );
+            if guard.inspect(&source).map_err(map_atomic_error)? != CurrentTarget::Absent
+                || guard.inspect(&destination).map_err(map_atomic_error)?
+                    != CurrentTarget::File(authenticated.result_digest)
+            {
+                return Err(GitError::WorktreeChanged);
+            }
+            for target in [&source, &destination] {
+                sync_directory(target.parent().ok_or(GitError::DurabilityNotConfirmed)?)
+                    .map_err(|_| GitError::DurabilityNotConfirmed)?;
+            }
+        }
+        AuthenticatedMergePayloadV5::SplitRename { authenticated, .. } => {
+            let source = vault.root().join(
+                authenticated
+                    .source
+                    .logical_path
+                    .to_ciphertext_relative_path(),
+            );
+            let destination = vault.root().join(
+                authenticated
+                    .destination
+                    .logical_path
+                    .to_ciphertext_relative_path(),
+            );
+            if guard.inspect(&source).map_err(map_atomic_error)? != CurrentTarget::Absent
+                || guard.inspect(&destination).map_err(map_atomic_error)?
+                    != CurrentTarget::File(authenticated.result_digest)
+            {
+                return Err(GitError::WorktreeChanged);
+            }
+            for target in [&source, &destination] {
+                sync_directory(target.parent().ok_or(GitError::DurabilityNotConfirmed)?)
+                    .map_err(|_| GitError::DurabilityNotConfirmed)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn advance_in_place_worktree_v5(
+    root: &Path,
+    guard: &VaultMutationGuard,
+    authenticated: &AuthenticatedInPlaceRecovery,
+) -> Result<(), GitError> {
+    let target = root.join(
+        authenticated
+            .conflict
+            .logical_path
+            .to_ciphertext_relative_path(),
+    );
+    match guard.inspect(&target).map_err(map_atomic_error)? {
+        CurrentTarget::File(actual) if actual == authenticated.expected_worktree_digest => {
+            let outcome = guard
+                .write(
+                    &target,
+                    &authenticated.result,
+                    WriteCondition::IfMatch(actual),
+                )
+                .map_err(map_atomic_error)?;
+            if outcome.parent_sync != ParentSyncStatus::Synced {
+                return Err(GitError::DurabilityNotConfirmed);
+            }
+        }
+        CurrentTarget::File(actual) if actual == authenticated.result_digest => {
+            sync_directory(target.parent().ok_or(GitError::DurabilityNotConfirmed)?)
+                .map_err(|_| GitError::DurabilityNotConfirmed)?;
+        }
+        CurrentTarget::Absent | CurrentTarget::File(_) | CurrentTarget::Other => {
+            return Err(GitError::WorktreeChanged);
+        }
+    }
+    Ok(())
+}
+
+fn advance_detected_rename_worktree_v5(
+    root: &Path,
+    guard: &VaultMutationGuard,
+    authenticated: &AuthenticatedDetectedRenameRecovery,
+) -> Result<(), GitError> {
+    let source = root.join(
+        authenticated
+            .source_logical_path
+            .to_ciphertext_relative_path(),
+    );
+    if guard.inspect(&source).map_err(map_atomic_error)? != CurrentTarget::Absent {
+        return Err(GitError::WorktreeChanged);
+    }
+    sync_directory(source.parent().ok_or(GitError::DurabilityNotConfirmed)?)
+        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+    let destination = root.join(
+        authenticated
+            .conflict
+            .logical_path
+            .to_ciphertext_relative_path(),
+    );
+    match guard.inspect(&destination).map_err(map_atomic_error)? {
+        CurrentTarget::File(actual) if actual == authenticated.expected_destination_digest => {
+            let outcome = guard
+                .write(
+                    &destination,
+                    &authenticated.result,
+                    WriteCondition::IfMatch(actual),
+                )
+                .map_err(map_atomic_error)?;
+            if outcome.parent_sync != ParentSyncStatus::Synced {
+                return Err(GitError::DurabilityNotConfirmed);
+            }
+        }
+        CurrentTarget::File(actual) if actual == authenticated.result_digest => {
+            sync_directory(
+                destination
+                    .parent()
+                    .ok_or(GitError::DurabilityNotConfirmed)?,
+            )
+            .map_err(|_| GitError::DurabilityNotConfirmed)?;
+        }
+        CurrentTarget::Absent | CurrentTarget::File(_) | CurrentTarget::Other => {
+            return Err(GitError::WorktreeChanged);
+        }
+    }
+    Ok(())
+}
+
+fn advance_split_rename_worktree_v5(
+    root: &Path,
+    guard: &VaultMutationGuard,
+    authenticated: &AuthenticatedRenameRecovery,
+) -> Result<(), GitError> {
+    let source = root.join(
+        authenticated
+            .source
+            .logical_path
+            .to_ciphertext_relative_path(),
+    );
+    let destination = root.join(
+        authenticated
+            .destination
+            .logical_path
+            .to_ciphertext_relative_path(),
+    );
+    let source_state = guard.inspect(&source).map_err(map_atomic_error)?;
+    let destination_state = guard.inspect(&destination).map_err(map_atomic_error)?;
+    advance_split_rename_worktree(
+        guard,
+        &source,
+        &destination,
+        source_state,
+        destination_state,
+        authenticated,
+    )
+}
+
+fn advance_authenticated_worktree_v5(
+    vault: &Vault,
+    guard: &VaultMutationGuard,
+    payload: &AuthenticatedMergePayloadV5<'_>,
+) -> Result<(), GitError> {
+    match payload {
+        AuthenticatedMergePayloadV5::InPlace { authenticated, .. } => {
+            advance_in_place_worktree_v5(vault.root(), guard, authenticated)?;
+        }
+        AuthenticatedMergePayloadV5::DetectedRename { authenticated, .. } => {
+            advance_detected_rename_worktree_v5(vault.root(), guard, authenticated)?;
+        }
+        AuthenticatedMergePayloadV5::SplitRename { authenticated, .. } => {
+            advance_split_rename_worktree_v5(vault.root(), guard, authenticated)?;
+        }
+    }
+    verify_authenticated_worktree_final_v5(vault, guard, payload)
+}
+
+fn prepare_payload_worktree_for_v5_index(
+    vault: &Vault,
+    git: &Git,
+    guard: &VaultMutationGuard,
+    payload: &MergeJournalPayload,
+) -> Result<(), GitError> {
+    let authenticated = authenticate_merge_payload_v5(vault, git, payload)?;
+    verify_authenticated_payload_old_index_v5(vault, git, guard, &authenticated)?;
+    advance_authenticated_worktree_v5(vault, guard, &authenticated)?;
+    verify_authenticated_payload_old_index_v5(vault, git, guard, &authenticated)?;
+    verify_authenticated_worktree_final_v5(vault, guard, &authenticated)
+}
+
+fn verify_payload_ready_for_v5_index(
+    vault: &Vault,
+    git: &Git,
+    guard: &VaultMutationGuard,
+    payload: &MergeJournalPayload,
+) -> Result<(), GitError> {
+    let authenticated = authenticate_merge_payload_v5(vault, git, payload)?;
+    verify_authenticated_payload_old_index_v5(vault, git, guard, &authenticated)?;
+    verify_authenticated_worktree_final_v5(vault, guard, &authenticated)
+}
+
+fn verify_payload_completed_v5(
+    vault: &Vault,
+    git: &Git,
+    guard: &VaultMutationGuard,
+    payload: &MergeJournalPayload,
+) -> Result<(), GitError> {
+    let authenticated = authenticate_merge_payload_v5(vault, git, payload)?;
+    verify_authenticated_worktree_final_v5(vault, guard, &authenticated)?;
+    match (&authenticated, payload) {
+        (
+            AuthenticatedMergePayloadV5::InPlace { authenticated, .. },
+            MergeJournalPayload::InPlace(journal),
+        ) => {
+            verify_merge_identity_owners(
+                vault,
+                git,
+                guard,
+                &authenticated.file_id,
+                Some(&journal.physical_path),
+                &[&journal.physical_path],
+            )?;
+            let target = vault.root().join(
+                authenticated
+                    .conflict
+                    .logical_path
+                    .to_ciphertext_relative_path(),
+            );
+            verify_committed_state(git, guard, &target, journal, authenticated.result_digest)
+        }
+        (
+            AuthenticatedMergePayloadV5::DetectedRename { authenticated, .. },
+            MergeJournalPayload::DetectedRename(journal),
+        ) => {
+            let source = vault.root().join(
+                authenticated
+                    .source_logical_path
+                    .to_ciphertext_relative_path(),
+            );
+            let destination = vault.root().join(
+                authenticated
+                    .conflict
+                    .logical_path
+                    .to_ciphertext_relative_path(),
+            );
+            verify_detected_rename_committed_state(
+                vault,
+                git,
+                guard,
+                &source,
+                &destination,
+                journal,
+                authenticated.result_digest,
+            )
+        }
+        (
+            AuthenticatedMergePayloadV5::SplitRename { authenticated, .. },
+            MergeJournalPayload::Rename(journal),
+        ) => {
+            let source = vault.root().join(
+                authenticated
+                    .source
+                    .logical_path
+                    .to_ciphertext_relative_path(),
+            );
+            let destination = vault.root().join(
+                authenticated
+                    .destination
+                    .logical_path
+                    .to_ciphertext_relative_path(),
+            );
+            verify_split_rename_committed_state(
+                vault,
+                git,
+                guard,
+                &source,
+                &destination,
+                journal,
+                authenticated.result_digest,
+            )
+        }
+        _ => Err(GitError::RecoveryConflict),
+    }
+}
+
 fn verify_held_durable_journal_v5(
     path: &Path,
     file: &File,
     bytes: &[u8],
     journal: &BundleMergeJournalV5,
 ) -> Result<(), GitError> {
-    if !open_file_matches_path_and_is_single_link(path, file)
-        .map_err(|_| GitError::RecoveryConflict)?
-        || read_regular_exact(path, bytes.len()).map_err(|_| GitError::RecoveryConflict)? != bytes
+    let held_matches =
+        |path: &Path, file: &File| match open_file_matches_path_and_is_single_link(path, file) {
+            Ok(matches) => Ok(matches),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(io_error(GitIoOperation::ReadJournal, &error)),
+        };
+    let actual = match read_regular_exact(path, bytes.len()) {
+        Ok(actual) => actual,
+        Err(GitError::IndexChanged) => return Err(GitError::RecoveryConflict),
+        Err(error) => return Err(error),
+    };
+    if !held_matches(path, file)?
+        || actual != bytes
         || read_journal_file(path)? != PendingMergeJournal::BundleV5(journal.clone())
-        || !open_file_matches_path_and_is_single_link(path, file)
-            .map_err(|_| GitError::RecoveryConflict)?
+        || !held_matches(path, file)?
     {
         return Err(GitError::RecoveryConflict);
     }
@@ -7815,6 +8524,48 @@ mod tests {
             max_unlock_ops_limit: 4,
             max_unlock_mem_limit_bytes: 64 * 1024 * 1024,
         }
+    }
+
+    #[test]
+    fn worktree_owner_error_mapping_preserves_only_operational_io() {
+        let tree_io = map_worktree_tree_error(&TreeError::Io {
+            operation: inex_core::tree::TreeIoOperation::ReadDirectory,
+            kind: io::ErrorKind::PermissionDenied,
+        });
+        assert!(matches!(
+            tree_io,
+            GitError::Io {
+                operation: GitIoOperation::InspectMetadata,
+                kind: io::ErrorKind::PermissionDenied
+            }
+        ));
+
+        for vault_io in [
+            VaultError::Io {
+                operation: inex_core::vault::VaultIoOperation::Read,
+                kind: io::ErrorKind::Interrupted,
+            },
+            VaultError::Tree(TreeError::Io {
+                operation: inex_core::tree::TreeIoOperation::InspectEntry,
+                kind: io::ErrorKind::Interrupted,
+            }),
+        ] {
+            assert!(matches!(
+                map_worktree_vault_error(&vault_io),
+                GitError::Io {
+                    operation: GitIoOperation::InspectMetadata,
+                    kind: io::ErrorKind::Interrupted
+                }
+            ));
+        }
+        assert!(matches!(
+            map_worktree_tree_error(&TreeError::LinkLikeRoot),
+            GitError::WorktreeChanged
+        ));
+        assert!(matches!(
+            map_worktree_vault_error(&VaultError::DocumentNotFound),
+            GitError::WorktreeChanged
+        ));
     }
 
     fn test_git<const N: usize>(root: &Path, arguments: [&str; N]) -> bool {
@@ -9274,6 +10025,217 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum PostJournalIndexTestActionV5 {
+        MoveThenError,
+        MoveWithUnsyncedParent,
+        MoveErrorBeforeMove,
+        ForeignDuringMove,
+        SourceCloneDuringMove,
+        DestinationCloneDuringMove,
+        JournalCloneDuringMove,
+        FailAfterMove,
+        WorktreeDriftBeforeMove,
+        OwnerDriftBeforeMove,
+        LiveIndexDriftBeforeMove,
+        LaterUnrelatedAfterMove,
+    }
+
+    #[derive(Debug)]
+    struct PostJournalIndexTestHooksV5 {
+        action: PostJournalIndexTestActionV5,
+        action_fired: bool,
+        replace_called: bool,
+        root: Option<PathBuf>,
+        retained_path: Option<PathBuf>,
+    }
+
+    impl PostJournalIndexTestHooksV5 {
+        fn new(action: PostJournalIndexTestActionV5) -> Self {
+            Self {
+                action,
+                action_fired: false,
+                replace_called: false,
+                root: None,
+                retained_path: None,
+            }
+        }
+    }
+
+    impl candidate_bundle_v5::PostJournalIndexHooksV5 for PostJournalIndexTestHooksV5 {
+        fn checkpoint(
+            &mut self,
+            checkpoint: candidate_bundle_v5::PostJournalIndexCheckpointV5,
+            context: &candidate_bundle_v5::PostJournalIndexContextV5<'_>,
+        ) -> Result<(), GitError> {
+            self.root = Some(context.root.to_path_buf());
+            let before = matches!(
+                checkpoint,
+                candidate_bundle_v5::PostJournalIndexCheckpointV5::BeforePublishOverMarker
+                    | candidate_bundle_v5::PostJournalIndexCheckpointV5::BeforePublishOverIndex
+            );
+            let after = matches!(
+                checkpoint,
+                candidate_bundle_v5::PostJournalIndexCheckpointV5::AfterPublishOverMarker
+                    | candidate_bundle_v5::PostJournalIndexCheckpointV5::AfterPublishOverIndex
+            );
+            match self.action {
+                PostJournalIndexTestActionV5::WorktreeDriftBeforeMove if before => {
+                    self.action_fired = true;
+                    fs::write(
+                        context.root.join("entry.md.enc"),
+                        b"foreign post-journal worktree owner",
+                    )
+                    .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                }
+                PostJournalIndexTestActionV5::OwnerDriftBeforeMove if before => {
+                    self.action_fired = true;
+                    fs::copy(
+                        context.root.join("entry.md.enc"),
+                        context.root.join("duplicate.md.enc"),
+                    )
+                    .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                }
+                PostJournalIndexTestActionV5::LiveIndexDriftBeforeMove if before => {
+                    self.action_fired = true;
+                    let mut bytes = fs::read(context.index_path)
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    bytes[0] ^= 1;
+                    fs::write(context.index_path, bytes)
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                }
+                PostJournalIndexTestActionV5::LaterUnrelatedAfterMove
+                    if checkpoint
+                        == candidate_bundle_v5::PostJournalIndexCheckpointV5::AfterPublishOverIndex =>
+                {
+                    self.action_fired = true;
+                    fs::write(
+                        context.root.join("after-live-move.bin"),
+                        b"later unrelated post-move owner",
+                    )
+                    .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    if !test_git(context.root, ["add", "after-live-move.bin"]) {
+                        return Err(GitError::DurabilityNotConfirmed);
+                    }
+                }
+                PostJournalIndexTestActionV5::FailAfterMove if after => {
+                    self.action_fired = true;
+                    return Err(GitError::DurabilityNotConfirmed);
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+
+        fn replace(
+            &mut self,
+            source: &Path,
+            source_file: File,
+            destination: &Path,
+            destination_file: File,
+        ) -> io::Result<AtomicFileMoveOutcome> {
+            self.replace_called = true;
+            match self.action {
+                PostJournalIndexTestActionV5::MoveThenError => {
+                    self.action_fired = true;
+                    atomic_replace_verified_file(
+                        source,
+                        source_file,
+                        destination,
+                        destination_file,
+                    )?;
+                    Err(io::Error::other("injected error after post-journal move"))
+                }
+                PostJournalIndexTestActionV5::MoveWithUnsyncedParent => {
+                    self.action_fired = true;
+                    let outcome = atomic_replace_verified_file(
+                        source,
+                        source_file,
+                        destination,
+                        destination_file,
+                    )?;
+                    Ok(AtomicFileMoveOutcome {
+                        source_parent_sync: ParentSyncStatus::NotSynced,
+                        destination_parent_sync: outcome.destination_parent_sync,
+                    })
+                }
+                PostJournalIndexTestActionV5::MoveErrorBeforeMove => {
+                    self.action_fired = true;
+                    drop(source_file);
+                    drop(destination_file);
+                    Err(io::Error::other("injected error before post-journal move"))
+                }
+                PostJournalIndexTestActionV5::ForeignDuringMove => {
+                    self.action_fired = true;
+                    drop(source_file);
+                    drop(destination_file);
+                    fs::remove_file(destination)?;
+                    fs::write(destination, b"foreign post-journal namespace owner")?;
+                    Err(io::Error::other(
+                        "injected foreign post-journal destination",
+                    ))
+                }
+                PostJournalIndexTestActionV5::SourceCloneDuringMove => {
+                    self.action_fired = true;
+                    drop(source_file);
+                    drop(destination_file);
+                    let root = self.root.as_ref().ok_or_else(|| {
+                        io::Error::other("post-journal hook root was not captured")
+                    })?;
+                    let retained = root.join(format!(
+                        "held-post-journal-source-{}",
+                        Uuid::new_v4().simple()
+                    ));
+                    fs::rename(source, &retained)?;
+                    fs::copy(&retained, source)?;
+                    self.retained_path = Some(retained);
+                    Err(io::Error::other("injected byte-identical source clone"))
+                }
+                PostJournalIndexTestActionV5::DestinationCloneDuringMove => {
+                    self.action_fired = true;
+                    drop(source_file);
+                    drop(destination_file);
+                    let root = self.root.as_ref().ok_or_else(|| {
+                        io::Error::other("post-journal hook root was not captured")
+                    })?;
+                    let retained = root.join(format!(
+                        "held-post-journal-destination-{}",
+                        Uuid::new_v4().simple()
+                    ));
+                    fs::rename(destination, &retained)?;
+                    fs::copy(&retained, destination)?;
+                    self.retained_path = Some(retained);
+                    Err(io::Error::other(
+                        "injected byte-identical destination clone",
+                    ))
+                }
+                PostJournalIndexTestActionV5::JournalCloneDuringMove => {
+                    self.action_fired = true;
+                    let root = self.root.as_ref().ok_or_else(|| {
+                        io::Error::other("post-journal hook root was not captured")
+                    })?;
+                    let journal = journal_path(root);
+                    let retained = root.join(format!(
+                        "held-post-journal-journal-{}",
+                        Uuid::new_v4().simple()
+                    ));
+                    let bytes = fs::read(&journal)?;
+                    fs::rename(&journal, &retained)?;
+                    fs::write(&journal, bytes)?;
+                    self.retained_path = Some(retained);
+                    atomic_replace_verified_file(source, source_file, destination, destination_file)
+                }
+                PostJournalIndexTestActionV5::FailAfterMove
+                | PostJournalIndexTestActionV5::WorktreeDriftBeforeMove
+                | PostJournalIndexTestActionV5::OwnerDriftBeforeMove
+                | PostJournalIndexTestActionV5::LiveIndexDriftBeforeMove
+                | PostJournalIndexTestActionV5::LaterUnrelatedAfterMove => {
+                    atomic_replace_verified_file(source, source_file, destination, destination_file)
+                }
+            }
+        }
+    }
+
     fn prepare_test_marker_state(
         fixture: &CandidateBundlePreparationFixture,
     ) -> (
@@ -9333,6 +10295,27 @@ mod tests {
         (prepared, loaded, marker)
     }
 
+    fn prepare_test_postjournal_state(
+        fixture: &CandidateBundlePreparationFixture,
+    ) -> candidate_bundle_v5::PreparedCandidateBundleV5 {
+        let (prepared, loaded, marker) = prepare_test_durable_journal_state(fixture);
+        let guard =
+            VaultMutationGuard::acquire(fixture.vault.root()).expect("post-journal guard acquires");
+        let mut hooks = DurableJournalTestHooksV5::new(None);
+        publish_durable_journal_v5_with_hooks(
+            &fixture.vault,
+            &fixture.git,
+            &guard,
+            &prepared.transaction_reference,
+            &loaded.inventory,
+            &loaded.staging,
+            &marker,
+            &mut hooks,
+        )
+        .expect("durable journal publishes for post-journal test");
+        prepared
+    }
+
     fn bundle_journal_v5(
         prepared: &candidate_bundle_v5::PreparedCandidateBundleV5,
     ) -> BundleMergeJournalV5 {
@@ -9343,32 +10326,59 @@ mod tests {
         }
     }
 
-    fn payload_worktree_snapshot_v5(
-        root: &Path,
-        payload: &MergeJournalPayload,
-    ) -> BTreeMap<String, Option<Vec<u8>>> {
-        let paths = match payload {
-            MergeJournalPayload::InPlace(journal) => vec![journal.physical_path.as_str()],
-            MergeJournalPayload::DetectedRename(journal) => vec![
-                journal.source_physical_path.as_str(),
+    #[derive(Clone, Copy, Debug)]
+    enum PostJournalWorktreePrefixV5 {
+        Original,
+        DestinationFinal,
+        Final,
+    }
+
+    fn materialize_postjournal_worktree_prefix_v5(
+        fixture: &CandidateBundlePreparationFixture,
+        prefix: PostJournalWorktreePrefixV5,
+    ) {
+        if matches!(prefix, PostJournalWorktreePrefixV5::Original) {
+            return;
+        }
+        let (result_oid, source, destination) = match &fixture.transaction {
+            MergeJournalPayload::InPlace(journal) => (
+                journal.result_oid.as_str(),
+                None,
+                journal.physical_path.as_str(),
+            ),
+            MergeJournalPayload::DetectedRename(journal) => (
+                journal.result_oid.as_str(),
+                Some(journal.source_physical_path.as_str()),
                 journal.destination_physical_path.as_str(),
-            ],
-            MergeJournalPayload::Rename(journal) => vec![
-                journal.source_physical_path.as_str(),
+            ),
+            MergeJournalPayload::Rename(journal) => (
+                journal.result_oid.as_str(),
+                Some(journal.source_physical_path.as_str()),
                 journal.destination_physical_path.as_str(),
-            ],
+            ),
         };
-        paths
-            .into_iter()
-            .map(|path| {
-                let bytes = match fs::read(root.join(path)) {
-                    Ok(bytes) => Some(bytes),
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-                    Err(error) => panic!("worktree snapshot failed: {error:?}"),
-                };
-                (path.to_owned(), bytes)
-            })
-            .collect()
+        let result = fixture
+            .git
+            .read_object(result_oid)
+            .expect("post-journal result object reads");
+        let destination = fixture.vault.root().join(destination);
+        fs::write(&destination, &result).expect("post-journal destination prefix writes");
+        sync_regular_file(&destination, MAX_EDRY_ENVELOPE_BYTES)
+            .expect("post-journal destination prefix syncs");
+        sync_directory(destination.parent().expect("destination parent exists"))
+            .expect("destination parent syncs");
+        if matches!(prefix, PostJournalWorktreePrefixV5::Final)
+            && let Some(source) = source
+        {
+            let source = fixture.vault.root().join(source);
+            match fs::remove_file(&source) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => panic!("post-journal source prefix delete failed: {error:?}"),
+            }
+            sync_directory(source.parent().expect("source parent exists"))
+                .expect("source parent syncs");
+        }
     }
 
     fn prepare_test_candidate_publish(
@@ -9393,6 +10403,13 @@ mod tests {
         let namespace = candidate_bundle_v5::inspect_candidate_bundle_namespace_v5(root)?;
         let pending = read_journal(root)?;
         inspect_v5_prejournal_state(&guard, root, &namespace, pending.as_ref())
+    }
+
+    fn inspect_test_v5_postjournal_state(
+        root: &Path,
+    ) -> Result<Option<V5PostJournalState>, GitError> {
+        let guard = VaultMutationGuard::acquire(root).map_err(map_atomic_error)?;
+        inspect_v5_postjournal_state(&guard, root)
     }
 
     struct DetectedRenameRecoveryFixture {
@@ -13908,7 +14925,7 @@ mod tests {
     }
 
     #[test]
-    fn v5_recovery_advances_all_payloads_and_object_formats_only_to_durable_journal() {
+    fn v5_recovery_advances_all_payloads_and_object_formats_to_exact_final() {
         for object_format in [GitObjectFormat::Sha1, GitObjectFormat::Sha256] {
             for kind in [
                 CandidatePayloadKindV5::InPlace,
@@ -13917,9 +14934,6 @@ mod tests {
             ] {
                 let fixture = create_candidate_payload_fixture_v5(object_format, kind);
                 let root = fixture.vault.root();
-                let live_before = read_index_snapshot(&index_path(root))
-                    .expect("pre-journal live index snapshots");
-                let worktree_before = payload_worktree_snapshot_v5(root, &fixture.transaction);
                 let mut prepare_hooks = CandidateBundleTestHooks::new(None);
                 let prepared = prepare_test_candidate_bundle(&fixture, &mut prepare_hooks)
                     .expect("v5 stable bundle prepares");
@@ -13933,8 +14947,8 @@ mod tests {
                     Err(GitError::RecoveryConflict)
                 ));
                 assert_eq!(
-                    inspect_test_v5_prejournal_state(root).expect("journal-ready state inspects"),
-                    Some(V5PreJournalState::JournalReady),
+                    inspect_test_v5_postjournal_state(root).expect("final state inspects"),
+                    Some(V5PostJournalState::ExactFinal),
                     "{object_format:?} {kind:?}"
                 );
                 let expected = PendingMergeJournal::BundleV5(bundle_journal_v5(&prepared));
@@ -13946,12 +14960,21 @@ mod tests {
                     read_index_snapshot(&index_path(root)).expect("live index re-snapshots");
                 assert_eq!(
                     (live_after.size, live_after.sha256),
-                    (live_before.size, live_before.sha256)
+                    (
+                        prepared.inventory.manifest.final_index.size,
+                        prepared.inventory.manifest.final_index.sha256.clone()
+                    )
                 );
-                assert_eq!(
-                    payload_worktree_snapshot_v5(root, &fixture.transaction),
-                    worktree_before
-                );
+                let guard =
+                    VaultMutationGuard::acquire(root).expect("final verifier guard acquires");
+                verify_payload_completed_v5(
+                    &fixture.vault,
+                    &fixture.git,
+                    &guard,
+                    &fixture.transaction,
+                )
+                .expect("payload worktree/index are final");
+                drop(guard);
 
                 let journal_bytes = fs::read(journal_path(root)).expect("journal bytes snapshot");
                 let scratch_count =
@@ -13962,6 +14985,10 @@ mod tests {
                     recover_pending(&fixture.vault, &fixture.git),
                     Err(GitError::RecoveryConflict)
                 ));
+                assert_eq!(
+                    inspect_test_v5_postjournal_state(root).expect("final state re-inspects"),
+                    Some(V5PostJournalState::ExactFinal)
+                );
                 assert_eq!(
                     fs::read(journal_path(root)).expect("journal remains byte exact"),
                     journal_bytes
@@ -13977,6 +15004,532 @@ mod tests {
     }
 
     #[test]
+    fn v5_postjournal_worktree_prefixes_and_inactive_rename_refs_resume() {
+        for object_format in [GitObjectFormat::Sha1, GitObjectFormat::Sha256] {
+            for kind in [
+                CandidatePayloadKindV5::InPlace,
+                CandidatePayloadKindV5::DetectedRename,
+                CandidatePayloadKindV5::SplitRename,
+            ] {
+                let prefixes: &[PostJournalWorktreePrefixV5] = match kind {
+                    CandidatePayloadKindV5::InPlace | CandidatePayloadKindV5::DetectedRename => &[
+                        PostJournalWorktreePrefixV5::Original,
+                        PostJournalWorktreePrefixV5::Final,
+                    ],
+                    CandidatePayloadKindV5::SplitRename => &[
+                        PostJournalWorktreePrefixV5::Original,
+                        PostJournalWorktreePrefixV5::DestinationFinal,
+                        PostJournalWorktreePrefixV5::Final,
+                    ],
+                };
+                for prefix in prefixes {
+                    let fixture = create_candidate_payload_fixture_v5(object_format, kind);
+                    let root = fixture.vault.root();
+                    let prepared = prepare_test_postjournal_state(&fixture);
+                    materialize_postjournal_worktree_prefix_v5(&fixture, *prefix);
+                    if !matches!(kind, CandidatePayloadKindV5::InPlace) {
+                        let active = root.join(".git").join("MERGE_HEAD");
+                        match fs::remove_file(&active) {
+                            Ok(()) => sync_directory(&root.join(".git"))
+                                .expect("inactive rename refs sync"),
+                            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                            Err(error) => panic!("active rename ref removal failed: {error:?}"),
+                        }
+                    }
+
+                    let recovery = recover_pending(&fixture.vault, &fixture.git);
+                    assert!(
+                        matches!(recovery, Err(GitError::RecoveryConflict)),
+                        "{object_format:?} {kind:?} {prefix:?}: {recovery:?}"
+                    );
+                    assert_eq!(
+                        inspect_test_v5_postjournal_state(root)
+                            .expect("post-journal prefix final state inspects"),
+                        Some(V5PostJournalState::ExactFinal),
+                        "{object_format:?} {kind:?} {prefix:?}"
+                    );
+                    let final_index = read_index_snapshot(&index_path(root))
+                        .expect("post-journal prefix final index snapshots");
+                    assert_eq!(
+                        (final_index.size, final_index.sha256),
+                        (
+                            prepared.inventory.manifest.final_index.size,
+                            prepared.inventory.manifest.final_index.sha256
+                        )
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn v5_rename_final_recovery_survives_real_merge_commit() {
+        for object_format in [GitObjectFormat::Sha1, GitObjectFormat::Sha256] {
+            for kind in [
+                CandidatePayloadKindV5::DetectedRename,
+                CandidatePayloadKindV5::SplitRename,
+            ] {
+                let fixture = create_candidate_payload_fixture_v5(object_format, kind);
+                let root = fixture.vault.root();
+                prepare_test_postjournal_state(&fixture);
+                let original_head = fixture
+                    .git
+                    .resolve_commit("HEAD")
+                    .expect("pre-commit HEAD resolves");
+                assert!(root.join(".git").join("MERGE_HEAD").is_file());
+                assert!(matches!(
+                    recover_pending(&fixture.vault, &fixture.git),
+                    Err(GitError::RecoveryConflict)
+                ));
+                assert_eq!(
+                    inspect_test_v5_postjournal_state(root)
+                        .expect("pre-commit final state inspects"),
+                    Some(V5PostJournalState::ExactFinal)
+                );
+                assert!(test_git(
+                    root,
+                    ["commit", "-q", "-m", "resolved v5 encrypted rename"]
+                ));
+                assert!(!root.join(".git").join("MERGE_HEAD").exists());
+                assert_ne!(
+                    fixture
+                        .git
+                        .resolve_commit("HEAD")
+                        .expect("post-commit HEAD resolves"),
+                    original_head
+                );
+                assert!(test_git(root, ["rev-parse", "--verify", "HEAD^2"]));
+
+                let guard = VaultMutationGuard::acquire(root)
+                    .expect("post-commit v5 recovery guard acquires");
+                let recovered = recover_bundle_v5_pending(&fixture.vault, &fixture.git, &guard)
+                    .expect("recorded rename provenance survives real merge commit");
+                assert!(matches!(
+                    recovered,
+                    V5PostJournalState::ExactFinal | V5PostJournalState::LaterUnrelated
+                ));
+                drop(guard);
+                assert!(journal_path(root).is_file());
+                assert_eq!(
+                    inspect_test_v5_postjournal_state(root).expect("post-commit v5 state inspects"),
+                    Some(recovered),
+                    "{object_format:?} {kind:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn v5_later_unrelated_accepts_only_transaction_external_stage_changes() {
+        for object_format in [GitObjectFormat::Sha1, GitObjectFormat::Sha256] {
+            let fixture =
+                create_candidate_payload_fixture_v5(object_format, CandidatePayloadKindV5::InPlace);
+            let root = fixture.vault.root();
+            prepare_test_postjournal_state(&fixture);
+            assert!(matches!(
+                recover_pending(&fixture.vault, &fixture.git),
+                Err(GitError::RecoveryConflict)
+            ));
+            fs::write(
+                root.join("later-unrelated.bin"),
+                b"unrelated ciphertext owner",
+            )
+            .expect("later unrelated worktree file writes");
+            assert!(test_git(root, ["add", "later-unrelated.bin"]));
+            assert_eq!(
+                inspect_test_v5_postjournal_state(root).expect("later unrelated state inspects"),
+                Some(V5PostJournalState::LaterUnrelated)
+            );
+            assert!(matches!(
+                recover_pending(&fixture.vault, &fixture.git),
+                Err(GitError::RecoveryConflict)
+            ));
+            assert_eq!(
+                inspect_test_v5_postjournal_state(root)
+                    .expect("later unrelated state remains stable"),
+                Some(V5PostJournalState::LaterUnrelated)
+            );
+
+            let MergeJournalPayload::InPlace(journal) = &fixture.transaction else {
+                unreachable!();
+            };
+            let cache_info = format!(
+                "{},{},ENTRY.MD.ENC",
+                journal.result_mode, journal.result_oid
+            );
+            assert!(test_git(
+                root,
+                ["update-index", "--add", "--cacheinfo", &cache_info]
+            ));
+            assert_eq!(
+                inspect_test_v5_postjournal_state(root)
+                    .expect("protected raw alias state inspects"),
+                Some(V5PostJournalState::Conflict)
+            );
+        }
+    }
+
+    fn prepare_postjournal_index_fault_fixture_v5() -> (
+        CandidateBundlePreparationFixture,
+        candidate_bundle_v5::PreparedCandidateBundleV5,
+    ) {
+        let fixture = create_candidate_payload_fixture_v5(
+            GitObjectFormat::Sha1,
+            CandidatePayloadKindV5::InPlace,
+        );
+        let prepared = prepare_test_postjournal_state(&fixture);
+        let guard = VaultMutationGuard::acquire(fixture.vault.root())
+            .expect("post-journal fault guard acquires");
+        prepare_payload_worktree_for_v5_index(
+            &fixture.vault,
+            &fixture.git,
+            &guard,
+            &fixture.transaction,
+        )
+        .expect("post-journal fault worktree reaches final");
+        drop(guard);
+        (fixture, prepared)
+    }
+
+    fn run_v5_marker_fault_action(
+        action: PostJournalIndexTestActionV5,
+    ) -> (
+        CandidateBundlePreparationFixture,
+        candidate_bundle_v5::PreparedCandidateBundleV5,
+        PostJournalIndexTestHooksV5,
+        Result<(), GitError>,
+    ) {
+        let (fixture, prepared) = prepare_postjournal_index_fault_fixture_v5();
+        let root = fixture.vault.root();
+        let guard = VaultMutationGuard::acquire(root).expect("marker fault guard acquires");
+        let held = load_held_bundle_journal_v5(root, &prepared.transaction_reference)
+            .expect("marker fault journal holds");
+        let loaded = candidate_bundle_v5::load_candidate_publish_staging_with_journal_v5(
+            &guard,
+            &fixture.git,
+            &prepared.transaction_reference,
+        )
+        .expect("marker fault publish reloads");
+        let marker = candidate_bundle_v5::load_acquired_index_lock_marker_with_journal_v5(
+            &guard,
+            &fixture.git,
+            &prepared.transaction_reference,
+            &loaded.inventory,
+            &loaded.staging,
+        )
+        .expect("marker fault marker reloads");
+        let mut hooks = PostJournalIndexTestHooksV5::new(action);
+        let authorization =
+            candidate_bundle_v5::PostJournalIndexAuthorizationV5::new(&held.file, || {
+                revalidate_held_bundle_journal_v5(root, &held)?;
+                verify_payload_ready_for_v5_index(
+                    &fixture.vault,
+                    &fixture.git,
+                    &guard,
+                    &fixture.transaction,
+                )?;
+                revalidate_held_bundle_journal_v5(root, &held)
+            });
+        let result = candidate_bundle_v5::publish_staging_over_marker_with_journal_v5_with_hooks(
+            &guard,
+            &fixture.git,
+            &prepared.transaction_reference,
+            loaded,
+            marker,
+            authorization,
+            &mut hooks,
+        );
+        drop(held);
+        drop(guard);
+        (fixture, prepared, hooks, result)
+    }
+
+    fn assert_v5_marker_fault_action(
+        action: PostJournalIndexTestActionV5,
+        fixture: &CandidateBundlePreparationFixture,
+        prepared: &candidate_bundle_v5::PreparedCandidateBundleV5,
+        hooks: &PostJournalIndexTestHooksV5,
+        result: &Result<(), GitError>,
+    ) {
+        let root = fixture.vault.root();
+        assert!(hooks.action_fired, "{action:?} fault must fire");
+        assert_eq!(
+            hooks.replace_called,
+            !matches!(
+                action,
+                PostJournalIndexTestActionV5::WorktreeDriftBeforeMove
+                    | PostJournalIndexTestActionV5::OwnerDriftBeforeMove
+                    | PostJournalIndexTestActionV5::LiveIndexDriftBeforeMove
+            ),
+            "{action:?} critical audit must run before replace"
+        );
+        match action {
+            PostJournalIndexTestActionV5::MoveThenError => {
+                assert!(result.is_ok(), "moved error must reconcile: {result:?}");
+            }
+            PostJournalIndexTestActionV5::MoveWithUnsyncedParent => {
+                assert!(matches!(result, Err(GitError::DurabilityNotConfirmed)));
+            }
+            _ => assert!(result.is_err(), "{action:?} must surface its boundary"),
+        }
+        if action == PostJournalIndexTestActionV5::LiveIndexDriftBeforeMove {
+            assert!(matches!(
+                result,
+                Err(GitError::GitCommandFailed {
+                    operation: GitOperation::ReadIndex
+                })
+            ));
+            assert!(index_lock_path(root).is_file());
+            assert!(
+                candidate_bundle_v5::candidate_bundle_publish_path_v5(
+                    root,
+                    &prepared.transaction_reference.publish_staging_basename
+                )
+                .expect("live-drift publish path resolves")
+                .is_file()
+            );
+            return;
+        }
+        let expected = match action {
+            PostJournalIndexTestActionV5::MoveThenError
+            | PostJournalIndexTestActionV5::MoveWithUnsyncedParent
+            | PostJournalIndexTestActionV5::JournalCloneDuringMove
+            | PostJournalIndexTestActionV5::FailAfterMove => V5PostJournalState::CandidateInLock,
+            PostJournalIndexTestActionV5::ForeignDuringMove => V5PostJournalState::Conflict,
+            PostJournalIndexTestActionV5::MoveErrorBeforeMove
+            | PostJournalIndexTestActionV5::SourceCloneDuringMove
+            | PostJournalIndexTestActionV5::DestinationCloneDuringMove
+            | PostJournalIndexTestActionV5::WorktreeDriftBeforeMove
+            | PostJournalIndexTestActionV5::OwnerDriftBeforeMove => {
+                V5PostJournalState::JournalReady
+            }
+            PostJournalIndexTestActionV5::LiveIndexDriftBeforeMove
+            | PostJournalIndexTestActionV5::LaterUnrelatedAfterMove => unreachable!(),
+        };
+        assert_eq!(
+            inspect_test_v5_postjournal_state(root).expect("marker fault physical state inspects"),
+            Some(expected),
+            "{action:?}: {result:?}"
+        );
+        if action == PostJournalIndexTestActionV5::MoveWithUnsyncedParent {
+            assert!(matches!(
+                recover_pending(&fixture.vault, &fixture.git),
+                Err(GitError::RecoveryConflict)
+            ));
+            assert_eq!(
+                inspect_test_v5_postjournal_state(root)
+                    .expect("unsynced marker retry state inspects"),
+                Some(V5PostJournalState::ExactFinal)
+            );
+        }
+    }
+
+    #[test]
+    fn v5_publish_over_marker_faults_reconcile_by_identity_and_critical_audit() {
+        for action in [
+            PostJournalIndexTestActionV5::MoveThenError,
+            PostJournalIndexTestActionV5::MoveWithUnsyncedParent,
+            PostJournalIndexTestActionV5::MoveErrorBeforeMove,
+            PostJournalIndexTestActionV5::ForeignDuringMove,
+            PostJournalIndexTestActionV5::SourceCloneDuringMove,
+            PostJournalIndexTestActionV5::DestinationCloneDuringMove,
+            PostJournalIndexTestActionV5::JournalCloneDuringMove,
+            PostJournalIndexTestActionV5::FailAfterMove,
+            PostJournalIndexTestActionV5::WorktreeDriftBeforeMove,
+            PostJournalIndexTestActionV5::OwnerDriftBeforeMove,
+            PostJournalIndexTestActionV5::LiveIndexDriftBeforeMove,
+        ] {
+            let (fixture, prepared, hooks, result) = run_v5_marker_fault_action(action);
+            assert_v5_marker_fault_action(action, &fixture, &prepared, &hooks, &result);
+        }
+    }
+
+    fn run_v5_live_index_fault_action(
+        action: PostJournalIndexTestActionV5,
+    ) -> (
+        CandidateBundlePreparationFixture,
+        PostJournalIndexTestHooksV5,
+        Result<(), GitError>,
+    ) {
+        let (fixture, prepared) = prepare_postjournal_index_fault_fixture_v5();
+        let root = fixture.vault.root();
+        let guard = VaultMutationGuard::acquire(root).expect("index fault guard acquires");
+        let held = load_held_bundle_journal_v5(root, &prepared.transaction_reference)
+            .expect("index fault journal holds");
+        let loaded = candidate_bundle_v5::load_candidate_publish_staging_with_journal_v5(
+            &guard,
+            &fixture.git,
+            &prepared.transaction_reference,
+        )
+        .expect("index fault publish reloads");
+        let marker = candidate_bundle_v5::load_acquired_index_lock_marker_with_journal_v5(
+            &guard,
+            &fixture.git,
+            &prepared.transaction_reference,
+            &loaded.inventory,
+            &loaded.staging,
+        )
+        .expect("index fault marker reloads");
+        candidate_bundle_v5::publish_staging_over_marker_with_journal_v5(
+            &guard,
+            &fixture.git,
+            &prepared.transaction_reference,
+            loaded,
+            marker,
+            &held.file,
+            || {
+                revalidate_held_bundle_journal_v5(root, &held)?;
+                verify_payload_ready_for_v5_index(
+                    &fixture.vault,
+                    &fixture.git,
+                    &guard,
+                    &fixture.transaction,
+                )?;
+                revalidate_held_bundle_journal_v5(root, &held)
+            },
+        )
+        .expect("index fault candidate reaches index lock");
+        let loaded = candidate_bundle_v5::load_candidate_index_lock_with_journal_v5(
+            &guard,
+            &fixture.git,
+            &prepared.transaction_reference,
+        )
+        .expect("index fault candidate lock reloads");
+        let mut hooks = PostJournalIndexTestHooksV5::new(action);
+        let result =
+            candidate_bundle_v5::publish_candidate_lock_over_live_index_with_journal_v5_with_hooks(
+                &guard,
+                &fixture.git,
+                &prepared.transaction_reference,
+                loaded,
+                &held.file,
+                || {
+                    revalidate_held_bundle_journal_v5(root, &held)?;
+                    verify_payload_ready_for_v5_index(
+                        &fixture.vault,
+                        &fixture.git,
+                        &guard,
+                        &fixture.transaction,
+                    )?;
+                    revalidate_held_bundle_journal_v5(root, &held)
+                },
+                &mut hooks,
+            );
+        drop(held);
+        drop(guard);
+        (fixture, hooks, result)
+    }
+
+    fn assert_v5_live_index_fault_action(
+        action: PostJournalIndexTestActionV5,
+        fixture: &CandidateBundlePreparationFixture,
+        hooks: &PostJournalIndexTestHooksV5,
+        result: &Result<(), GitError>,
+    ) {
+        let root = fixture.vault.root();
+        assert!(hooks.action_fired, "{action:?} fault must fire");
+        assert_eq!(
+            hooks.replace_called,
+            !matches!(
+                action,
+                PostJournalIndexTestActionV5::WorktreeDriftBeforeMove
+                    | PostJournalIndexTestActionV5::OwnerDriftBeforeMove
+                    | PostJournalIndexTestActionV5::LiveIndexDriftBeforeMove
+            ),
+            "{action:?} critical audit must run before replace"
+        );
+        match action {
+            PostJournalIndexTestActionV5::MoveThenError
+            | PostJournalIndexTestActionV5::LaterUnrelatedAfterMove => {
+                assert!(result.is_ok(), "moved error must reconcile: {result:?}");
+            }
+            PostJournalIndexTestActionV5::MoveWithUnsyncedParent => {
+                assert!(matches!(result, Err(GitError::DurabilityNotConfirmed)));
+            }
+            _ => assert!(result.is_err(), "{action:?} must surface its boundary"),
+        }
+        if action == PostJournalIndexTestActionV5::LiveIndexDriftBeforeMove {
+            assert!(matches!(
+                result,
+                Err(GitError::GitCommandFailed {
+                    operation: GitOperation::ReadIndex
+                })
+            ));
+            assert!(index_lock_path(root).is_file());
+            return;
+        }
+        let expected = match action {
+            PostJournalIndexTestActionV5::MoveThenError
+            | PostJournalIndexTestActionV5::MoveWithUnsyncedParent
+            | PostJournalIndexTestActionV5::JournalCloneDuringMove
+            | PostJournalIndexTestActionV5::FailAfterMove => V5PostJournalState::ExactFinal,
+            PostJournalIndexTestActionV5::LaterUnrelatedAfterMove => {
+                V5PostJournalState::LaterUnrelated
+            }
+            PostJournalIndexTestActionV5::ForeignDuringMove => V5PostJournalState::Conflict,
+            PostJournalIndexTestActionV5::MoveErrorBeforeMove
+            | PostJournalIndexTestActionV5::SourceCloneDuringMove
+            | PostJournalIndexTestActionV5::DestinationCloneDuringMove
+            | PostJournalIndexTestActionV5::WorktreeDriftBeforeMove
+            | PostJournalIndexTestActionV5::OwnerDriftBeforeMove => {
+                V5PostJournalState::CandidateInLock
+            }
+            PostJournalIndexTestActionV5::LiveIndexDriftBeforeMove => unreachable!(),
+        };
+        let inspected = inspect_test_v5_postjournal_state(root);
+        if action == PostJournalIndexTestActionV5::ForeignDuringMove {
+            assert!(matches!(
+                inspected,
+                Err(GitError::GitCommandFailed {
+                    operation: GitOperation::ReadIndex
+                })
+            ));
+            assert_eq!(
+                fs::read(index_path(root)).expect("foreign live index remains readable"),
+                b"foreign post-journal namespace owner"
+            );
+            assert!(index_lock_path(root).is_file());
+            return;
+        }
+        match inspected {
+            Ok(actual) => assert_eq!(actual, Some(expected), "{action:?}: {result:?}"),
+            Err(error) => panic!("{action:?}: state inspection failed: {error:?}"),
+        }
+        if action == PostJournalIndexTestActionV5::MoveWithUnsyncedParent {
+            assert!(matches!(
+                recover_pending(&fixture.vault, &fixture.git),
+                Err(GitError::RecoveryConflict)
+            ));
+            assert_eq!(
+                inspect_test_v5_postjournal_state(root)
+                    .expect("unsynced live-index retry state inspects"),
+                Some(V5PostJournalState::ExactFinal)
+            );
+        }
+    }
+
+    #[test]
+    fn v5_publish_over_live_index_faults_reconcile_by_identity_and_critical_audit() {
+        for action in [
+            PostJournalIndexTestActionV5::MoveThenError,
+            PostJournalIndexTestActionV5::MoveWithUnsyncedParent,
+            PostJournalIndexTestActionV5::MoveErrorBeforeMove,
+            PostJournalIndexTestActionV5::ForeignDuringMove,
+            PostJournalIndexTestActionV5::SourceCloneDuringMove,
+            PostJournalIndexTestActionV5::DestinationCloneDuringMove,
+            PostJournalIndexTestActionV5::JournalCloneDuringMove,
+            PostJournalIndexTestActionV5::FailAfterMove,
+            PostJournalIndexTestActionV5::WorktreeDriftBeforeMove,
+            PostJournalIndexTestActionV5::OwnerDriftBeforeMove,
+            PostJournalIndexTestActionV5::LiveIndexDriftBeforeMove,
+            PostJournalIndexTestActionV5::LaterUnrelatedAfterMove,
+        ] {
+            let (fixture, hooks, result) = run_v5_live_index_fault_action(action);
+            assert_v5_live_index_fault_action(action, &fixture, &hooks, &result);
+        }
+    }
+
+    #[test]
     fn v5_recovery_fresh_entries_resume_publish_ready_and_marker_no_journal() {
         for start_with_marker in [false, true] {
             for object_format in [GitObjectFormat::Sha1, GitObjectFormat::Sha256] {
@@ -13987,9 +15540,6 @@ mod tests {
                 ] {
                     let fixture = create_candidate_payload_fixture_v5(object_format, kind);
                     let root = fixture.vault.root();
-                    let live_before = read_index_snapshot(&index_path(root))
-                        .expect("fresh-entry live index snapshots");
-                    let worktree_before = payload_worktree_snapshot_v5(root, &fixture.transaction);
                     let mut prepare_hooks = CandidateBundleTestHooks::new(None);
                     let prepared = prepare_test_candidate_bundle(&fixture, &mut prepare_hooks)
                         .expect("fresh-entry stable bundle prepares");
@@ -14034,20 +15584,19 @@ mod tests {
                         Err(GitError::RecoveryConflict)
                     ));
                     assert_eq!(
-                        inspect_test_v5_prejournal_state(root)
-                            .expect("fresh-entry journal state inspects"),
-                        Some(V5PreJournalState::JournalReady),
+                        inspect_test_v5_postjournal_state(root)
+                            .expect("fresh-entry final state inspects"),
+                        Some(V5PostJournalState::ExactFinal),
                         "marker={start_with_marker} {object_format:?} {kind:?}"
                     );
                     let live_after = read_index_snapshot(&index_path(root))
                         .expect("fresh-entry live index re-snapshots");
                     assert_eq!(
                         (live_after.size, live_after.sha256),
-                        (live_before.size, live_before.sha256)
-                    );
-                    assert_eq!(
-                        payload_worktree_snapshot_v5(root, &fixture.transaction),
-                        worktree_before
+                        (
+                            prepared.inventory.manifest.final_index.size,
+                            prepared.inventory.manifest.final_index.sha256.clone()
+                        )
                     );
                 }
             }
@@ -14155,9 +15704,9 @@ mod tests {
                 Err(GitError::RecoveryConflict)
             ));
             assert_eq!(
-                inspect_test_v5_prejournal_state(root)
+                inspect_test_v5_postjournal_state(root)
                     .expect("partial scratch does not block fresh recovery"),
-                Some(V5PreJournalState::JournalReady)
+                Some(V5PostJournalState::ExactFinal)
             );
             assert_eq!(
                 fs::read(&retained[0]).expect("partial scratch remains retained"),
@@ -14369,7 +15918,7 @@ mod tests {
     }
 
     #[test]
-    fn v5_stable_journal_round_trips_and_blocks_unwired_index_publication() {
+    fn v5_stable_journal_round_trips_and_blocks_direct_index_publication() {
         let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
         let root = fixture.vault.root();
         let old = read_index_snapshot(&index_path(root)).expect("live old index snapshots");
@@ -14421,7 +15970,11 @@ mod tests {
         ));
         assert!(journal_path(root).is_file());
         candidate_bundle_v5::revalidate_prepared_candidate_bundle_v5(root, &prepared)
-            .expect("unwired recovery preserves stable bundle");
+            .expect("post-journal recovery preserves stable bundle");
+        assert_eq!(
+            inspect_test_v5_postjournal_state(root).expect("recovered final state inspects"),
+            Some(V5PostJournalState::ExactFinal)
+        );
 
         let MergeJournalPayload::InPlace(transaction) = &prepared.inventory.manifest.transaction
         else {
@@ -14445,11 +15998,15 @@ mod tests {
             Err(GitError::RecoveryConflict)
         ));
         let live = read_index_snapshot(&index_path(root)).expect("live index re-reads");
-        assert_eq!((live.size, live.sha256), (old.size, old.sha256));
+        assert_ne!((live.size, live.sha256.clone()), (old.size, old.sha256));
         assert_eq!(
-            fs::read(index_lock_path(root)).expect("v5 marker lock remains"),
-            prepared.index_lock_marker
+            (live.size, live.sha256),
+            (
+                prepared.inventory.manifest.final_index.size,
+                prepared.inventory.manifest.final_index.sha256.clone()
+            )
         );
+        assert!(!index_lock_path(root).exists());
     }
 
     #[test]
