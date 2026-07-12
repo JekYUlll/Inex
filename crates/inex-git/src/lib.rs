@@ -385,16 +385,29 @@ pub fn recovery_status(vault_root: &Path) -> Result<RecoveryStatus, GitError> {
     })
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "keep the exact namespace, proof, lock, and phase decision table in one audit unit"
-)]
 fn inspect_v5_prejournal_state(
     guard: &VaultMutationGuard,
     vault_root: &Path,
     namespace: &candidate_bundle_v5::CandidateBundleNamespaceStatusV5,
     pending: Option<&PendingMergeJournal>,
 ) -> Result<Option<V5PreJournalState>, GitError> {
+    inspect_v5_prejournal_state_with_hook(guard, vault_root, namespace, pending, || Ok(()))
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "keep the exact namespace, proof, lock, and phase decision table in one audit unit"
+)]
+fn inspect_v5_prejournal_state_with_hook<F>(
+    guard: &VaultMutationGuard,
+    vault_root: &Path,
+    namespace: &candidate_bundle_v5::CandidateBundleNamespaceStatusV5,
+    pending: Option<&PendingMergeJournal>,
+    after_first_lock_classification: F,
+) -> Result<Option<V5PreJournalState>, GitError>
+where
+    F: FnOnce() -> Result<(), GitError>,
+{
     let Some(stable_basename) = namespace.stable_bundle_basename.as_deref() else {
         return Ok(
             if namespace.publish_staging_basename.is_some()
@@ -457,6 +470,7 @@ fn inspect_v5_prejournal_state(
 
     let lock_state =
         candidate_bundle_v5::classify_index_lock_v5(vault_root, &reference, &inventory)?;
+    after_first_lock_classification()?;
     let git = Git::open(vault_root)?;
     let semantic_result = if published {
         if journal.is_some() {
@@ -471,6 +485,11 @@ fn inspect_v5_prejournal_state(
     } else {
         candidate_bundle_v5::load_candidate_bundle_for_git_v5(guard, &git, &reference).map(drop)
     };
+    let rebound_lock_state =
+        candidate_bundle_v5::classify_index_lock_v5(vault_root, &reference, &inventory)?;
+    if rebound_lock_state != lock_state {
+        return Ok(Some(V5PreJournalState::Conflict));
+    }
     let live_index_drift = match semantic_result {
         Ok(()) => false,
         Err(GitError::IndexChanged) => true,
@@ -10904,6 +10923,55 @@ mod tests {
             fs::read(marker_root.join("entry.md.enc")).expect("worktree re-reads"),
             worktree
         );
+    }
+
+    #[test]
+    fn v5_prejournal_inspector_rejects_index_lock_change_during_semantic_snapshot() {
+        for initial_marker in [false, true] {
+            let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+            let root = fixture.vault.root();
+            let live_index = fs::read(index_path(root)).expect("live index snapshots");
+            let worktree = fs::read(root.join("entry.md.enc")).expect("worktree snapshots");
+            let mut hooks = CandidateBundleTestHooks::new(None);
+            let prepared = prepare_test_candidate_bundle(&fixture, &mut hooks)
+                .expect("v5 stable bundle prepares");
+            prepare_test_candidate_publish(&fixture, &prepared);
+            if initial_marker {
+                fs::write(index_lock_path(root), &prepared.index_lock_marker)
+                    .expect("initial exact marker writes");
+            }
+            let foreign = b"concurrent ordinary Git-owned lock";
+            let guard = VaultMutationGuard::acquire(root).expect("inspection guard acquires");
+            let namespace = candidate_bundle_v5::inspect_candidate_bundle_namespace_v5(root)
+                .expect("v5 namespace inspects");
+            let pending = read_journal(root).expect("journal absence inspects");
+
+            let state = inspect_v5_prejournal_state_with_hook(
+                &guard,
+                root,
+                &namespace,
+                pending.as_ref(),
+                || {
+                    fs::write(index_lock_path(root), foreign)
+                        .map_err(|error| io_error(GitIoOperation::SyncGitState, &error))
+                },
+            )
+            .expect("changed lock state inspects");
+            assert_eq!(state, Some(V5PreJournalState::Conflict));
+            assert_eq!(
+                fs::read(index_lock_path(root)).expect("foreign lock remains"),
+                foreign
+            );
+            assert_eq!(
+                fs::read(index_path(root)).expect("live index re-reads"),
+                live_index
+            );
+            assert_eq!(
+                fs::read(root.join("entry.md.enc")).expect("worktree re-reads"),
+                worktree
+            );
+            assert!(!journal_path(root).exists());
+        }
     }
 
     #[test]
