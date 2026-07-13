@@ -44,12 +44,16 @@ vault/
   .gitignore
   2026/07/2026-07-10.md.enc
   topics/example.md.enc
+  images/station.png.asset.enc
   .vault-local/          ignored; plaintext-free locks/recovery metadata/tombstones
 ```
 
 Logical `2026/07/2026-07-10.md` maps to physical
 `2026/07/2026-07-10.md.enc`. The core performs this mapping only after strict
-cross-platform normalization. A physical path is never accepted from RPC.
+cross-platform normalization. In a required-feature-1 vault, logical
+`images/station.png` maps to `images/station.png.asset.enc` and is authenticated
+as a distinct opaque-asset plaintext kind. A physical path is never accepted
+from RPC.
 
 ## Key hierarchy
 
@@ -206,12 +210,15 @@ snippet. v1 writes no index to `.vault-local`.
 
 Git sees each `*.md.enc` as non-text and invokes a canonical absolute Inex
 executable as `'<absolute-inex>' merge-driver`, with no path placeholders.
-The compatibility CLI form remains `inex merge-driver %O %A %B %P`. Without a safe unlock channel the driver
-does not open or stat any of the four paths, leaves `%A` byte-for-byte and
-metadata-for-metadata unchanged, returns nonzero, and preserves Git index
-stages 1/2/3. Installation is explicit per clone with
-`inex git install-driver <vault>`; it appends tracked `-text -diff merge=inex`
-and `/.vault-local/` rules by atomic metadata replacement and writes only
+Opaque `*.asset.enc` entries are binary and never invoke the Markdown merge
+driver.
+The compatibility CLI form remains `inex merge-driver %O %A %B %P`. Without a
+safe unlock channel the driver does not open or stat any of the four paths,
+leaves `%A` byte-for-byte and metadata-for-metadata unchanged, returns nonzero,
+and preserves Git index stages 1/2/3. Installation is explicit per clone with
+`inex git install-driver <vault>`; it appends the tracked
+`*.md.enc -text -diff merge=inex` and `*.asset.enc binary` attribute rules plus
+the `/.vault-local/` ignore rule by atomic metadata replacement, and writes only
 `git config --local` values.
 
 `inex git merge <vault>` is the separate unlocked path. It reads stages through

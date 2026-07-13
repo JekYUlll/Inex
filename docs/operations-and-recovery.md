@@ -17,7 +17,8 @@ Maintain at least two independent ciphertext copies, one outside the working
 machine. A useful backup must include:
 
 - `vault.json`;
-- every committed `*.md.enc` file;
+- every committed EDRY content file, including `*.md.enc` and, for feature-1
+  vaults, `*.asset.enc`;
 - `.gitattributes` and `.gitignore` after driver installation; and
 - enough Git objects/refs to recover the intended history, if Git is the backup
   mechanism.
@@ -29,8 +30,8 @@ help if every valid password is lost.
 ### Clean routine backup
 
 1. Save all documents, lock every editor client, and stop any manual `inexd`.
-2. Run `git status`. Do not proceed if a plaintext `.md`, an unexpected link,
-   or an unknown entry exists in the vault.
+2. Run `git status`. Do not proceed if a plaintext `.md`, a plaintext
+   attachment, an unexpected link, or an unknown entry exists in the vault.
 3. Run `inex verify <vault>` and read its scope/output. It takes the mutation
    lock and may recover a core ciphertext transaction; it does not prove the
    password or authenticate content.
@@ -100,6 +101,53 @@ journal needed to reconcile a transaction. It can expose already-visible paths,
 object IDs, and digests, but not a decrypted body. Deleting it to make
 `git status` look clean can destroy recovery evidence. Work from a copy and do
 not rename staging or replace a destination manually.
+
+## Repository snapshot import
+
+The Linux engineering-preview path for an existing tracked Markdown repository
+is:
+
+```text
+inex import-repository <source-repository> <new-vault> [--dry-run]
+```
+
+The source must be one clean top-level ordinary SHA-1 worktree. Dry-run binds
+and revalidates its current tracked `HEAD` snapshot without prompting for a
+password or writing product state. The real run accepts only tracked stage-zero
+`100644` files: exact lowercase `.md` paths become Markdown and the remainder
+become opaque assets. Unsupported modes or source states abort instead of being
+skipped. It then builds the complete vault and a fresh parentless ciphertext Git
+commit in one hidden sibling staging root. One checked no-replace directory
+publication exposes the target. Source commits, refs, objects, and remotes remain
+only in the unchanged plaintext source repository.
+
+After a trustworthy source plan, every nonzero exit prints four stable terminal
+fields before its scrubbed diagnostic:
+
+```text
+candidate-root: not-created | retained | publication-indeterminate | published
+vault-publication: not-published | indeterminate | published
+git-repository: not-created | staging-incomplete | staging-audited | published
+recovery-required: prepublication-cleanup | publication-reconcile | none
+```
+
+- `not-created`/`none` means no candidate was created.
+- `retained` means preserve the exact `.inex-import-staging-*` sibling and the
+  source. Do not rename the candidate into place; rerun only to a fresh absent
+  destination after investigating the fixed error category.
+- `publication-indeterminate` or `publication-reconcile` means stop all manual
+  cleanup. Preserve the destination, sibling staging entries, and parent
+  directory state before deciding which complete root is authoritative.
+- `published` on a nonzero exit means a complete target was observed, but its
+  cleanup, final audit, or parent durability was not confirmed. Do not rerun
+  over it or delete markers merely to make Git look clean.
+
+Always retain the original repository and import report. The current Linux
+implementation is suitable for a trusted-local engineering demo, not a GA
+claim against adversarial concurrent source mutation, OS force-kill at every
+boundary, native Windows filesystems, or physical power loss. The exact frozen
+contract and remaining acceptance matrix are in
+[`spec/import-repository-v1.md`](spec/import-repository-v1.md).
 
 ## Copy import
 

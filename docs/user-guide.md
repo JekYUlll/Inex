@@ -1,8 +1,9 @@
 # User Guide
 
 This guide describes the current pre-alpha checkpoint. It assumes a vault has
-already been created or copy-imported and that the matching CLI, daemon, and
-editor client are configured according to [installation.md](installation.md).
+already been created, copy-imported, or repository-imported and that the
+matching CLI, daemon, and editor client are configured according to
+[installation.md](installation.md).
 
 ## Understand the vault
 
@@ -27,6 +28,31 @@ authenticated, so opening the moved blob fails closed.
 `vault.json` contains password-slot wrapping metadata, not a plaintext master
 key. Losing `vault.json`, every valid password, or all valid password slots is
 not recoverable. Inex has no reset password, escrow, or backdoor.
+
+## First use from an existing Git repository
+
+On Linux, the locked **Encrypted Vault** view offers **Import an Existing
+Markdown Repository**. Use it only with a backed-up, clean local Git worktree:
+
+1. Confirm `git status --short` is empty in the source repository.
+2. Select that repository, an existing target parent directory, and a new target
+   folder name. The target must not already exist or be inside the source.
+3. Enter and confirm a new vault password in the dedicated Inex task terminal.
+   The extension does not put the password in command arguments, settings, or
+   environment variables.
+4. After the task reports a complete repository import, choose **Open New
+   Vault**. VS Code reloads on the ciphertext repository; then run **Unlock
+   Vault** and enter the same password in the hidden input.
+5. Keep the original repository. It remains the plaintext history archive; the
+   new Inex repository contains one parentless encrypted current-snapshot
+   commit, not a copy of the old commits.
+
+Every accepted tracked stage-zero `100644` file is imported. Exact lowercase
+`.md` paths become encrypted documents and the remainder become encrypted opaque
+assets; unsupported modes or source states abort instead of being skipped. This
+is currently a Linux engineering-preview path: preserve the source and the
+dry-run/import reports until native cross-platform and force-kill evidence is
+complete.
 
 ## Daily VS Code workflow
 
@@ -57,7 +83,14 @@ not recoverable. Inex has no reset password, escrow, or backdoor.
    cursor in a relative Markdown/wiki link and Ctrl/Cmd-click it, or press
    Ctrl/Cmd+Enter, to follow it. Absolute, traversal, encoded, command, and web
    targets are rejected by the controlled navigator.
-9. Before switching vaults, pulling Git changes, or leaving the machine, save
+9. Relative inline Markdown images that resolve to same-vault PNG, JPEG, or
+   non-animated WebP assets are decrypted in bounded 1 MiB chunks and rendered
+   only as revocable webview `blob:` URLs. External URLs, vault escape, encoded
+   separators, oversized images, malformed dimensions, animation, fenced code,
+   and raw HTML references remain inert. Hiding the panel, editing the source,
+   locking, or losing the session revokes the preview and closes its daemon
+   handle; no plaintext image file or ordinary `TextDocument` is created.
+10. Before switching vaults, pulling Git changes, or leaving the machine, save
    and run **Inex: Lock Vault**. Dirty documents offer save-all, explicit
    discard, or cancel.
 
@@ -78,17 +111,17 @@ only those bytes to VS Code's backup destination. On restore:
   overwrite confirmation at Save; the current ciphertext etag is still used;
 - a corrupted or wrong-vault draft is rejected without returning plaintext.
 
-The automated Extension Host source gates on a controlled 1.125.0 host
-exercise real backup scheduling and this exact recovery code path. They also
-drive the production create/folder-create/file-rename/file-delete actions
-directly against the daemon and custom editor, including close refusal, rename
-collision, delete I/O failure recovery, and residue scanning. They verify the
-commands are registered, but do not mouse-drive the InputBox/QuickPick UI. Test
-mode forces workbench storage to be in-memory, so persistent-profile
-cross-process tab restore and Local History remain release gates. For an exact
-packaged VSIX, separately require an external record matching its manifest and
-checksums for install/bundled-sidecar smoke; even that does not close those
-gates.
+The automated Extension Host source gates on the local host plus controlled
+1.125.0 and 1.126.0 hosts exercise real CLI repository import, daemon asset
+open/chunk/close, backup scheduling, and this exact recovery code path. They
+also drive the production create/folder-create/file-rename/file-delete actions,
+including close refusal, rename collision, delete I/O failure recovery, and
+residue scanning. They do not mouse-drive the first-use folder/name prompts or
+hidden task-terminal password UI. Test mode forces workbench storage to be
+in-memory, so persistent-profile cross-process tab restore and Local History
+remain release gates. For an exact packaged VSIX, separately require an
+external record matching its manifest and checksums for install/bundled
+executable smoke; even that does not close those gates.
 
 ### Current VS Code limitations
 
@@ -307,8 +340,10 @@ add, commit, fetch, and push can operate on the real repository. Prefer this
 sequence:
 
 1. Save all Inex documents and lock the editor.
-2. Run `git status` and verify that no plaintext `.md` file exists.
-3. Commit `vault.json`, `.gitattributes`, `.gitignore`, and `*.md.enc` changes.
+2. Run `git status` and verify that no plaintext `.md` or attachment file
+   exists.
+3. Commit `vault.json`, `.gitattributes`, `.gitignore`, `*.md.enc`, and
+   `*.asset.enc` changes.
 4. Pull/fetch/merge only with a complete backup or recoverable remote history.
 
 The installed locked merge driver intentionally returns a conflict without

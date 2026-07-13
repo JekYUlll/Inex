@@ -13,10 +13,11 @@ In particular:
 
 - a cross-compiled Windows binary or Wine run is not native MSVC/NTFS/ReFS
   atomicity, long-path, crash, or residue evidence;
-- the VS Code Extension Host harness proves encrypted backup/recovery and
-  production CRUD-action behavior against a real daemon/custom editor, but its
-  workbench storage is forced in-memory, and InputBox/QuickPick mouse interaction
-  is not automated; it does not prove persistent cross-process Hot Exit or
+- the VS Code Extension Host harness uses the real CLI/daemon to prove
+  feature-1 repository import, bounded asset RPC lifecycle, encrypted
+  backup/recovery, and production CRUD behavior, but its workbench storage is
+  forced in-memory and the first-use InputBox/folder/task-terminal interaction
+  is not mouse-driven; it does not prove persistent cross-process Hot Exit or
   Local History behavior;
 - the Sublime Python suite passes 84/84: 61 product tests plus 23
   runner/evidence tests. On Linux, separately preserved canonical reports bind
@@ -32,11 +33,11 @@ In particular:
   persistent-profile evidence. Keyboard/menu Save, other kill variants,
   Hot Exit/history/sync behavior, other platforms, and the complete canary
   matrix remain unproven, so the client remains experimental; and
-- release-tool tests pass 85/85, `actionlint` and pedantic/all-features Clippy
+- release-tool tests pass 86/86, `actionlint` and pedantic/all-features Clippy
   pass, and independent release-tool code review is GO. The binding artifact
   workflow requires two standalone clean system-GCC builds to be byte-identical
   and pass strict archive/native-dependency plus isolated VS Code
-  install/bundled-sidecar smoke. A third standalone clean clone must bind the
+  install/bundled-executable smoke. A third standalone clean clone must bind the
   exact artifact hashes while checking authenticated import/password/restore,
   Git bundle, frozen-v1 compatibility, CLI/RPC/locked-Git negative
   nondisclosure, exact body comparison, and bounded residue. This bundled
@@ -51,10 +52,11 @@ only copy of important data.
 
 ## Intended security goal
 
-An Inex vault protects Markdown bodies at rest from ordinary local access by a
-person who does not know the vault password. Before unlock, filesystem tools,
-plain text editors, sync clients, and normal Git tooling see only EDRY
-ciphertext. A normal save produces ciphertext before touching the vault.
+An Inex vault protects Markdown and imported opaque-asset bodies at rest from
+ordinary local access by a person who does not know the vault password. Before
+unlock, filesystem tools, plain text editors, sync clients, and normal Git
+tooling see only EDRY ciphertext. A normal save or repository import produces
+ciphertext before publishing content in the vault.
 
 Directory names and file basenames are intentionally visible in v1. File
 length, timestamps, the number of files, Git history shape, and access timing
@@ -90,7 +92,8 @@ generated binaries or editor bundles were built from that commit.
 
 ## Storage invariants
 
-1. Core and clients never create a temporary plaintext `.md` file.
+1. Core and clients never create a temporary plaintext Markdown or attachment
+   file.
 2. Atomic-write staging files contain complete authenticated ciphertext.
 3. Search indexes and decrypted document caches are memory-only in v1.
 4. Lock, idle expiry, editor close, EOF, and shutdown invalidate sessions and

@@ -1,8 +1,11 @@
 # Copy import v1
 
-`inex import <plaintext-source> <new-vault> [--dry-run]` is the only import
-mode in v1. Destructive in-place conversion and import into an existing vault
-are intentionally unsupported.
+`inex import <plaintext-source> <new-vault> [--dry-run]` is the frozen
+Markdown-only plaintext-tree import mode. Clean tracked Git repositories use
+the separate [`import-repository` contract](import-repository-v1.md), which
+also creates a fresh ciphertext Git history and supports opaque assets.
+Destructive in-place conversion and import into an existing vault are
+intentionally unsupported in both modes.
 
 ## Safety contract
 

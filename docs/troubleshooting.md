@@ -156,7 +156,7 @@ Inex uses a custom document and writes only EDRY through its backup provider;
 it does not register plaintext as a `TextDocument`. Automated tests validate
 the provider backup path and direct production CRUD actions in a controlled
 Extension Host. For an exact packaged VSIX, require a matching external report
-for install/bundled-sidecar smoke. Neither source tests nor package smoke proves
+for install/bundled-executable smoke. Neither source tests nor package smoke proves
 the final persistent-profile cross-process matrix.
 If evaluating stronger assurance, use an isolated profile, run a unique
 synthetic canary flow, scan all roots from
@@ -297,12 +297,16 @@ fresh absent destination. If the existing path came from an earlier failed run,
 classify it using [operations-and-recovery.md](operations-and-recovery.md)
 before touching it.
 
-### Import skipped files
+### Copy import skipped files
 
 Only exact lowercase `.md` regular files are copied. Attachments and other
 regular files are counted but not encrypted. Keep the plaintext source, account
 for every skipped file separately, and do not declare migration complete until
 an independently restored encrypted vault has been compared.
+
+`import-repository` is different: every accepted tracked stage-zero `100644`
+file is imported as Markdown or an opaque asset, while unsupported modes or
+source states abort the operation instead of producing a skipped-file result.
 
 ## If a plaintext canary is found on disk
 

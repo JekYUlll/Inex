@@ -72,7 +72,10 @@ on isolated-profile black-box residue tests, not on an in-memory wipe claim.
 - `default-src 'none'`; explicitly add only nonce-bearing bundled script/style
   sources required by the packaged editor.
 - `localResourceRoots` contains only immutable packaged media (or is empty).
-- No network requests, remote fonts/assets, dynamic code, or telemetry.
+- No network requests, remote fonts/assets, dynamic code, or telemetry. The
+  only image source is a revocable `blob:` URL assembled from an authenticated,
+  bounded same-vault opaque asset; `data:`, `file:`, web, and extension-resource
+  image sources remain disabled.
 - Platform/Chromium spellcheck is disabled by default.
 - Markdown preview HTML and links are sanitized; command URIs are not enabled.
 - `retainContextWhenHidden` remains false. The extension model, not webview
@@ -108,10 +111,12 @@ on isolated-profile black-box residue tests, not on an in-memory wipe claim.
 - Release tests launch VS Code with isolated `--user-data-dir` and
   `--extensions-dir`, exercise dirty/crash/recovery flows, then scan all backup,
   history, storage, log, temp, and vault roots for a unique canary.
-- Current and 1.125.0 Extension Hosts also exercise create/folder-create,
-  close-refused rename, collision, delete I/O failure recovery, successful
-  rename/delete, and tree/tab cleanup. This is checkpoint evidence only because
-  test-mode workbench state is memory-backed and UI widgets are not mouse-driven.
+- The local, 1.125.0, and 1.126.0 Extension Hosts also use the real CLI/daemon
+  for feature-1 import and asset open/chunk/close, then exercise
+  create/folder-create, close-refused rename, collision, delete I/O failure
+  recovery, successful rename/delete, and tree/tab cleanup. This is checkpoint
+  evidence only because test-mode workbench state is memory-backed and the
+  first-use UI widgets/task-terminal are not mouse-driven.
 - Until that exact black-box matrix passes for the packaged VS Code/VSIX pair,
   documentation must label disk-residue assurance as pending rather than
   inferred from the API design.

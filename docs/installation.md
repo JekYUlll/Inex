@@ -100,10 +100,10 @@ The implemented release tooling creates `inex-rust-<version>-<platform>.zip`
 with `bin/inex[.exe]`, `bin/inexd[.exe]`, bundled documentation, manifests,
 checksums, a target-bound resolved license inventory, the canonical engineering
 license policy, and complete collected license/NOTICE texts. Current strict
-release-tool source tests pass 85/85. Two clean-source system-GCC Linux x64
+release-tool source tests pass 86/86. Two clean-source system-GCC Linux x64
 builds are required to be byte-for-byte identical across both binaries and all
 four output files. Both must pass strict release-set/native audit, isolated VS
-Code install, and executable/bundled-sidecar smoke; their manifests must record
+Code install, and bundled-executable smoke; their manifests must record
 the canonical repository, the same exact commit, and `dirtySourceTree=false`.
 That source identity is provenance
 metadata, not an independent attestation that generated binaries or editor
@@ -152,7 +152,55 @@ Windows GNU/debug binary from being mislabeled as the MSVC release package.
 
 ## Create a disposable vault
 
-### Recommended: import an existing Markdown tree
+### Recommended on Linux: import an existing Markdown Git repository
+
+`import-repository` is the first-use path for a long-maintained repository that
+contains Markdown, images, and other tracked attachments. This checkpoint is a
+Linux engineering preview; non-Linux source traversal fails closed until the
+native handle/FileId implementation and fault matrix are complete.
+
+The source must be the top level of a clean ordinary SHA-1 Git worktree. Back it
+up first, then confirm that `git status --short` prints nothing. The destination
+must not exist, and its parent must already be a supported local directory.
+
+```sh
+git -C /absolute/plaintext-repository status --short
+"$INEX" import-repository \
+  /absolute/plaintext-repository /absolute/inex-vault --dry-run
+"$INEX" import-repository \
+  /absolute/plaintext-repository /absolute/inex-vault
+```
+
+Dry-run reads and revalidates the complete tracked snapshot but performs no
+password prompt, KDF, staging creation, Git initialization, or product-state
+write. Review the exact Markdown, asset, byte, directory, and normalization
+counts. The real run prompts for and confirms a new password.
+
+Exact lowercase UTF-8 `.md` files become encrypted Markdown. Every other
+tracked stage-zero `100644` regular file becomes an encrypted opaque asset;
+nothing is silently skipped. Links, hard links, submodules, LFS pointers,
+content filters, untracked/ignored entries, empty directories, dirty index or
+worktree state, portable-path collisions, and resource-bound violations abort
+before publication. Markdown remains limited to 16 MiB per file and 256 MiB in
+aggregate; assets are limited to 64 MiB per file and the complete import to
+4 GiB.
+
+The target is a new vault and a new Git object database with one parentless
+encrypted snapshot commit. The source's plaintext commits, refs, objects, and
+remote configuration are deliberately not copied. Keep the original repository
+unchanged as the readable history archive; encrypted full-history rewriting is
+not implemented.
+
+The packaged Linux VS Code extension exposes the same flow from the locked
+**Encrypted Vault** welcome view through **Import an Existing Markdown
+Repository**. It launches the bundled audited `inex` executable with an argv
+array and collects the new password only in the dedicated task terminal. On
+success choose **Open New Vault**: VS Code reloads with the ciphertext target as
+the real workspace, after which you explicitly unlock it. Inex does not unlock
+the target while Explorer, Search, and Git still point at the plaintext source
+repository.
+
+### Plain non-Git Markdown tree
 
 The destination must not exist, and its parent must already be a supported
 local directory. The source is read-only from Inex's perspective.
@@ -162,8 +210,9 @@ local directory. The source is read-only from Inex's perspective.
 "$INEX" import /absolute/plaintext-source /absolute/inex-vault
 ```
 
-PowerShell uses ordinary non-secret path variables; the password still belongs
-only in Inex's later hidden prompt:
+On Windows, this older Markdown-only copy flow remains available while
+repository snapshot import is fail-closed. PowerShell uses ordinary non-secret
+path variables; the password still belongs only in Inex's later hidden prompt:
 
 ```powershell
 $source = 'C:\Users\me\Journal-Plaintext'
@@ -238,9 +287,16 @@ strict reports. Do not copy the dynamic JSON into any package input. Peak
 resource observations and the 120-second harness termination timeout are
 capture controls, not product performance or latency SLAs.
 
-## Initialize Git in each clone
+## Initialize or reconnect Git
 
-After import or init:
+`import-repository` already creates and audits a complete Git repository with
+one parentless encrypted snapshot commit, the tracked attributes/ignore files,
+and repository-local merge-driver configuration. Do **not** run `git init` over
+that imported target. Run `inex git install-driver` again only after cloning the
+target or moving/replacing the reviewed `inex` executable.
+
+After `inex init` or the Markdown-only `inex import` copy flow, initialize Git
+explicitly:
 
 ```sh
 git -C /absolute/inex-vault init
@@ -251,13 +307,17 @@ git -C /absolute/inex-vault status
 The installer requires the exact top-level worktree and writes only:
 
 - the managed `*.md.enc -text -diff merge=inex` line in `.gitattributes`;
+- the managed `*.asset.enc binary` line in `.gitattributes`;
 - the managed `/.vault-local/` line in `.gitignore`;
 - repository-local `merge.inex.*` configuration containing the canonical
   absolute path of the current `inex` executable; and
 - repository-local `core.longPaths=true` on Windows.
 
-Commit `vault.json`, `.gitattributes`, `.gitignore`, directories as represented
-by their files, and every `*.md.enc` file. Never commit `.vault-local/`. Run
+For an `init` or copy-imported vault, commit `vault.json`, `.gitattributes`,
+`.gitignore`, directories as represented by their files, and every `*.md.enc`
+file. The repository snapshot importer has already created its initial commit,
+including every `*.asset.enc` file; keep those asset ciphertexts tracked in
+every later clone and backup. Never commit `.vault-local/`. Run
 `inex git install-driver` explicitly in every clone and again after moving or
 replacing the `inex` executable, because local Git config and its absolute
 driver path do not travel with the repository.
@@ -274,8 +334,10 @@ pnpm test
 pnpm build
 ```
 
-Set the machine-scoped `inex.sidecarPath` setting to the absolute path of the
-matching regular `inexd` binary. With the extension directory loaded through an
+Set the machine-scoped `inex.sidecarPath` and `inex.cliPath` settings to the
+absolute paths of the matching regular `inexd` and `inex` binaries. The CLI
+setting is required for the repository-import action; the sidecar setting is
+required for vault sessions. With the extension directory loaded through an
 Extension Development Host, open the **real ciphertext vault directory** as the
 workspace. The extension does not support virtual or untrusted workspaces.
 
@@ -288,31 +350,34 @@ code --extensionDevelopmentPath="$PWD" /absolute/inex-vault
 Use an otherwise clean editor profile while evaluating the checkpoint. Inex
 does not globally disable Hot Exit or Local History: its custom editor writes
 EDRY ciphertext for its own backup, and the real workspace resource is already
-ciphertext. The automated Extension Host tests on the current local build and
-1.125.0 validate that controlled backup path and directly drive the production
-create/folder-create/file-rename/file-delete actions against the daemon/custom
-editor. They include close refusal, rename collision, delete I/O failure
-recovery, and isolated-root residue checks. They do not mouse-drive the
-InputBox/QuickPick UI, and a persistent-profile cross-restart residue matrix
-remains pending. Installing the checkpoint into a profile that contains
-untrusted extensions is outside the security model.
+ciphertext. The automated Extension Host tests on the local build plus
+controlled 1.125.0 and 1.126.0 hosts use the real CLI/daemon to import a clean
+Git fixture, unlock the resulting feature-1 vault, exercise bounded image
+open/chunk/close and hide/reveal/lock ordering, then drive encrypted CRUD and
+backup/recovery. They include close refusal, rename collision, delete I/O
+failure recovery, and isolated-root residue checks. They do not mouse-drive the
+first-use folder, name, or hidden task-terminal password UI, and a
+persistent-profile cross-restart residue matrix remains pending. Installing
+the checkpoint into a profile that contains untrusted extensions is outside
+the security model.
 
-A packaged extension contains the platform daemon at:
+A packaged extension contains the matching platform executable pair at:
 
 ```text
+bin/<node-platform>-<node-architecture>/inex[.exe]
 bin/<node-platform>-<node-architecture>/inexd[.exe]
 ```
 
 No current VSIX has been designated supported. A bundle without the correct
-regular daemon is not a complete install.
+regular CLI and daemon is not a complete install.
 
 ### Candidate VSIX shape
 
 The release tooling creates a platform-specific VSIX rather than one universal
 extension. Its audit binds the manifest, Content Types, package identity,
 version, publisher, target platform, engine, entry point, assets, and matching
-sidecar. The external record for an exact candidate must additionally show a
-successful isolated VS Code CLI install and bundled-sidecar smoke. An isolated
+CLI/sidecar pair. The external record for an exact candidate must additionally
+show a successful isolated VS Code CLI install and bundled executable smoke. An isolated
 development profile can install an audited candidate with:
 
 ```sh
@@ -322,7 +387,7 @@ code --install-extension "/path/to/inex-vscode-0.1.0-${PLATFORM}.vsix" \
   --extensions-dir /path/to/disposable-extensions
 ```
 
-The VSIX target, host OS/architecture, and bundled daemon directory must match.
+The VSIX target, host OS/architecture, and bundled executable directory must match.
 This command only installs an artifact; it does not make the persistent-profile
 residue gate pass.
 
@@ -424,7 +489,7 @@ remains experimental.
 
 The release tooling produces an `inex-sublime-...zip` containing an unpacked
 `Inex/` directory, not a compressed `.sublime-package`. Require the exact
-candidate's external record to show content audit and bundled-sidecar smoke.
+candidate's external record to show content audit and bundled-executable smoke.
 Extract the directory into the isolated profile's `Packages` directory so
 `Inex/bin/inexd[.exe]` is a real regular executable. Installing the ZIP does not
 promote the experimental client or replace the exact-package matrix.

@@ -83,7 +83,7 @@ enumeration are implemented and verified; both Windows rows remain required.
   size/SHA-256 pins before the crate verifies both official minisign signatures.
 - Linux/Windows x64 are the first blocking matrix; Linux/Windows arm64 join
   before GA. Format fixtures must be byte-identical on every target.
-- The current strict release-tool source suite passes 85/85; `actionlint`,
+- The current strict release-tool source suite passes 86/86; `actionlint`,
   pedantic/all-features Clippy, warnings-as-errors rustdoc, and the Windows GNU
   cross-check pass. A binding Linux x64 candidate requires two standalone clean
   system-GCC builds to be byte-identical and pass strict

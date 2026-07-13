@@ -22,6 +22,18 @@
 - Markdown bodies are stored as authenticated XChaCha20-Poly1305 ciphertext;
   Inex-owned save, import, backup, merge, and recovery paths do not create a
   plaintext Markdown mirror.
+- Required feature 1 adds authenticated opaque assets up to 64 MiB, distinct
+  `.asset.enc` physical names, typed tree/RPC entries, and bounded same-vault
+  PNG/JPEG/non-animated-WebP previews through revocable webview blob URLs. The
+  current implementation uses authenticated whole-file asset encryption and a
+  sequential 1 MiB RPC read surface; it does not promise streaming encryption.
+- Linux `import-repository` can bind one clean tracked SHA-1 `HEAD` snapshot,
+  accept every stage-zero `100644` file as lowercase Markdown or an opaque
+  asset, construct one fresh parentless ciphertext Git commit, and publish the
+  complete vault and `.git` as a single absent-root transaction. Unsupported
+  modes abort instead of being skipped. The importer deliberately leaves the
+  source and its plaintext history unchanged instead of copying plaintext
+  objects.
 - Password slots use Argon2id-derived wrapping keys around a stable random
   vault master key. Adding, changing, or removing a password slot does not
   rewrite EDRY bodies and is not master-key rotation. This describes the key
@@ -50,16 +62,17 @@
   noncanonical identifiers, invalid UTF-8 passwords, malformed framing, and
   unsupported future states.
 - Release artifacts use an allowlisted package layout, fixed native target,
-  shared sidecar and license-inventory bindings, canonical evidence reports,
+  shared Rust/VSIX CLI, shared sidecar and license-inventory bindings, canonical evidence reports,
   and dynamic secret-residue scans.
 
 ## Current evidence
 
 - The predecessor full Rust workspace aggregate passed 333/333 before Git v5;
   a current-HEAD aggregate is still required. The current default `inex-git`
-  suite passes 164 with 0 failures and 11 intentionally ignored child/shard
-  entries, and all six ignored full shards were executed separately for the
-  230-case matrix below. TypeScript, Sublime pure-Python, and strict
+  suite passes 171 with 0 failures and 12 intentionally ignored entries: six
+  child-only helpers plus six full shards. All six ignored full shards were
+  executed separately for the 230-case matrix below. TypeScript, Sublime
+  pure-Python, and strict
   release-tool suites pass on the local Linux x64 development host.
 - Linux subprocess force-kill tests prove atomic ciphertext writes expose only
   a complete old or new target at four commit boundaries. Separately, six
@@ -73,7 +86,7 @@
   open evidence rows.
 - The Linux x64 binding workflow requires two standalone clean system-GCC
   release builds to be byte-identical and pass strict release-set,
-  native-dependency, package, VSIX installation, and bundled-sidecar smoke
+  native-dependency, package, VSIX installation, and bundled-executable smoke
   checks.
 - A third standalone clean harness clone must bind the exact source and artifact
   hashes while passing lifecycle, restore, frozen-v1, and negative
@@ -94,6 +107,13 @@
 
 These are engineering checkpoints, not evidence for native Windows, arm64,
 ReFS, physical power loss, signed distribution, or independent legal review.
+The repository importer additionally remains a trusted-local Linux engineering
+demo until its full source-race, force-kill/publication-ambiguity, resource, and
+native Windows acceptance matrix is complete. A normal full-size MyBlog run has
+passed with 323 tracked files, 306 Markdown documents, 17 assets, and the exact
+25,074,521-byte image while preserving the clean 728-commit source. That does
+not close post-move kill retry/reconciliation, independent raw-tree
+serialization, streaming object comparison, or artifact-bound residue gates.
 
 ## Deferred or unsupported states
 
@@ -114,7 +134,7 @@ ReFS, physical power loss, signed distribution, or independent legal review.
   persistent-profile, Hot Exit/history/sync,
   export/macro/clipboard/draft/additional-kill, platform, and signing matrix
   passes.
-- Directory rename/delete, attachment streaming, filename encryption,
+- Directory rename/delete, streaming asset encryption, filename encryption,
   master-key rotation, in-place plaintext conversion, shared daemon sessions,
   and native Search-sidebar integration are not supported in v1.
 - Deliberately concurrent Git porcelain, ref-only concurrency during recovery,

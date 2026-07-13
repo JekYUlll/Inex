@@ -2,15 +2,16 @@
 
 Inex is a cross-platform encrypted Markdown journal for Windows and Linux. A
 vault is a normal Git repository containing `vault.json`, visible directory and
-file names, and authenticated `*.md.enc` ciphertext. The editor clients ask a
-local Rust `inexd` child process for controlled plaintext views; they do not use
-a plaintext mirror directory.
+file names, authenticated `*.md.enc` Markdown ciphertext, and, in feature-1
+vaults, authenticated `*.asset.enc` opaque-asset ciphertext. The editor clients
+ask a local Rust `inexd` child process for controlled plaintext views; they do
+not use a plaintext mirror directory.
 
 > **Project status: pre-alpha development checkpoint (`0.1.0`).** The EDRY v1
-> format, RPC v1, Rust core/CLI, copy import, encrypted Git merge, and both
-> editor clients are implemented far enough for development testing. There is
-> no supported release artifact or GA assurance yet. Do not use Inex as the
-> only copy of important data.
+> format, RPC v1, Rust core/CLI, copy import, Linux repository snapshot import,
+> opaque assets, encrypted Git merge, and both editor clients are implemented
+> far enough for development testing. There is no supported release artifact or
+> GA assurance yet. Do not use Inex as the only copy of important data.
 
 Canonical repository: <https://github.com/JekYUlll/Inex>. The development VS
 Code extension identifier continues to use publisher `horeb`.
@@ -20,15 +21,24 @@ Code extension identifier continues to use publisher `horeb`.
 | Surface | Current evidence | Release limitation |
 |---------|------------------|--------------------|
 | Rust core, CLI, daemon, import, and Git | Linux tests and strict static gates pass, including authenticated detected/split rename/modify, legacy v1-v4 recovery, and the production v5 immutable candidate-bundle writer. Six native Linux SHA-1/SHA-256 shards cover 230 InPlace/DetectedRename/SplitRename OS force-kill cases spanning the durable state matrix; active transaction capabilities converge through fresh-process recovery and durable cleanup. Windows GNU compiles, and the Windows source rejects unexpected ADS on every v5 transaction owner; Wine fails closed where its backing filesystem cannot query streams | A kill before any scratch entry's no-replace publication may retain one orthogonal nonblocking entry for audit: a directory during bundle preparation or a regular file during publish/marker/journal preparation. Active cleanup intentionally does not guess-delete it. The ADS adversarial matrix still needs native NTFS/ReFS execution. Native Windows also needs the same 230-case matrix with Job Object active-process-zero and handle-release proof, plus separate NTFS/ReFS write-through and power-loss evidence. OS force-kill is not power-loss evidence. Deliberate parallel Git remains outside supported use until native evidence and ref-mutation/legacy-recovery boundaries are closed |
-| VS Code | 23 unit tests pass; the current local build and VS Code 1.125.0 Extension Hosts directly exercise the production CRUD actions plus encrypted backup/recovery and isolated-root residue scan | UI InputBox/QuickPick mouse interaction, persistent-profile cross-process Hot Exit/Local History/crash restore, and native Windows residue tests are pending |
+| VS Code | 39 unit tests pass; the local VS Code host plus controlled 1.125.0 and 1.126.0 hosts use the real CLI/daemon to import a clean feature-1 repository, open/chunk/close a same-vault image, prove hide/reveal and lock/shutdown ordering, exercise production CRUD and encrypted backup/recovery, and scan isolated roots for residue | The locked first-use folder/input/task-terminal UI is not mouse-driven; persistent-profile cross-process Hot Exit/Local History/crash restore, exact delivery-VSIX lifecycle, and native Windows residue tests are pending |
 | Sublime Text | 84/84 Python tests pass: 61 product tests plus 23 runner/evidence tests. On Linux, separately preserved canonical reports bind exact packaged Build 4200 normal v2, plugin-host SIGKILL v2, and full-application SIGKILL/restart v4 scenarios. Each starts from a fresh isolated profile and the same audited package bytes; restart v4 alone reuses its profile/install across both launches. It binds a subreaper/pidfd process closure, rejects root-bound survivors or mounts, scans every view continuously for two seconds before the second unlock, then reopens the same encrypted saved-content fingerprint | The plugin-host SIGKILL leaves the visible buffer copyable, cannot restart the host in-process, and requires a full Sublime restart. That is boundary evidence, not plaintext-erasure success. The passed restart is one isolated harness path, not a real-user persistent-profile result. Keyboard/menu Save and the remaining kill, profile/history/sync, full-platform, and signed-release matrix remain pending, so the client remains experimental |
-| Packaging | Strict release-tool tests pass 85/85. The binding workflow requires two standalone clean builds, byte-identical binaries/packages, target-bound license and native audits, isolated editor smoke, and a third clean-clone lifecycle drill with dynamic secret scanning | Bundled documentation is intentionally non-self-attesting: accept an archive only when an external evidence record matches its `PACKAGE-MANIFEST.json` and `SHA256SUMS`. Native Windows/arm64, injected failure/two-version drills, persistent editor profiles, signatures, publication, hosted CI, and independent legal review remain pending |
+| Packaging | Strict release-tool tests pass 86/86. The binding workflow requires two standalone clean builds, byte-identical binaries/packages, target-bound license and native audits, isolated editor smoke, and a third clean-clone lifecycle drill with dynamic secret scanning | Bundled documentation is intentionally non-self-attesting: accept an archive only when an external evidence record matches its `PACKAGE-MANIFEST.json` and `SHA256SUMS`. Native Windows/arm64, injected failure/two-version drills, persistent editor profiles, signatures, publication, hosted CI, and independent legal review remain pending |
 
 The editor clients browse, create and edit encrypted Markdown, create folders,
-search, and navigate. VS Code can rename/delete files from its encrypted tree;
+search, and navigate. VS Code can initialize a clean tracked Markdown Git
+snapshot on Linux, display bounded same-vault images, and rename/delete files from its encrypted tree;
 Sublime can rename/delete only the active clean managed file. Directory
 rename/delete is not exposed. These are checkpoint capabilities, not release
 assurance.
+
+The current Linux importer has also completed a full read-only migration of a
+clean 728-commit source repository: 306 Markdown files and 17 assets were
+authenticated into one new parentless ciphertext commit, including one
+25,074,521-byte image. The source HEAD and history remained unchanged. This is
+normal-completion evidence only; post-move process-kill retry/reconciliation,
+independently serialized raw Git trees, streaming object comparison, and the
+native Windows matrix remain release blockers.
 
 The binding evidence and remaining gates are listed in the
 [release checklist](docs/release-checklist.md) and
@@ -67,22 +77,32 @@ Build the matched CLI and daemon from the repository root with Rust 1.97:
 cargo build --release --locked -p inex-cli -p inex-daemon
 ```
 
-Start with a disposable plaintext Markdown tree and an absent destination:
+On Linux, start with a disposable, clean Markdown Git repository and an absent
+destination:
 
 ```sh
-target/release/inex import /absolute/plaintext-source /absolute/inex-vault --dry-run
-target/release/inex import /absolute/plaintext-source /absolute/inex-vault
-git -C /absolute/inex-vault init
-target/release/inex git install-driver /absolute/inex-vault
-git -C /absolute/inex-vault add vault.json .gitattributes .gitignore '*.md.enc'
-git -C /absolute/inex-vault commit -m 'Initialize encrypted Inex vault'
+git -C /absolute/plaintext-repository status --short
+target/release/inex import-repository \
+  /absolute/plaintext-repository /absolute/inex-vault --dry-run
+target/release/inex import-repository \
+  /absolute/plaintext-repository /absolute/inex-vault
 ```
 
-The real import prompts twice for a new password, never changes the source, and
-publishes only to an absent destination after authenticating the complete
-staging vault. Review skipped-file counts before treating the import as
-complete. Do not put a password in argv, a shell variable, or an environment
-value.
+The repository importer reads one clean tracked `HEAD` snapshot. Every accepted
+stage-zero `100644` file is imported: exact lowercase `.md` files become
+encrypted Markdown and the remainder become encrypted opaque assets. Unsupported
+Git modes and source states abort instead of being skipped. It builds a fresh
+parentless ciphertext Git history and never copies the source repository's
+plaintext commits, objects, or refs. The real import prompts twice for a new
+password, never changes the source, and publishes only to an absent destination
+after auditing the complete vault and Git candidate. Preserve the original
+repository as the history archive. Do not put a password in argv, a shell
+variable, or an environment value.
+
+For a plain non-Git Markdown tree, the older `inex import` copy flow remains
+available, but it imports only exact lowercase `.md` files and reports other
+files as skipped. See the installation guide before choosing between the two
+flows.
 
 `inex kdf-calibration-info` exposes the fixed public-dummy Argon2id selection
 observation for release diagnostics. It accepts no arguments, vault, password,
@@ -102,8 +122,8 @@ Sublime setup. The quick start is not a release installation procedure.
   encrypted drafts, search, and repository operations.
 - `inexd`: strict Content-Length JSON-RPC sidecar with capability sessions,
   idle expiry, and memory-only plaintext state.
-- `inex`: vault creation/verification, password slots, search, copy import, and
-  explicit encrypted Git merge/recovery commands.
+- `inex`: vault creation/verification, password slots, search, copy/repository
+  import, and explicit encrypted Git merge/recovery commands.
 - `inex-git`: bounded system-Git plumbing, locked-safe driver installation,
   in-memory diff3, encrypted conflicts, and plaintext-free recovery journals.
 - `editors/vscode`: primary custom-editor client for real `*.md.enc` resources.
