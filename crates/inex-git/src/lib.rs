@@ -1200,44 +1200,117 @@ where
         git,
         guard,
         state,
+        |_, _| V5CleanupPhysicalDirective::Run,
+        after_physical,
         |_, _| Ok(()),
-        move |state, root| after_physical(state, root).map(|()| None),
     )
+}
+
+enum V5CleanupPhysicalDirective {
+    Run,
+    #[cfg(test)]
+    ErrorBefore(GitError),
+    #[cfg(test)]
+    ErrorAfter(GitError),
+    #[cfg(test)]
+    NotSynced,
+}
+
+struct DrivenV5CleanupPhysical {
+    attempted: bool,
+    completed: bool,
+    result: Result<ParentSyncStatus, GitError>,
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "test-only error directives transfer owned scrubbed Git errors into the coordinator"
+)]
+fn drive_v5_cleanup_physical<F>(
+    directive: V5CleanupPhysicalDirective,
+    physical: F,
+) -> DrivenV5CleanupPhysical
+where
+    F: FnOnce() -> Result<ParentSyncStatus, GitError>,
+{
+    #[cfg(test)]
+    if let V5CleanupPhysicalDirective::ErrorBefore(error) = directive {
+        return DrivenV5CleanupPhysical {
+            attempted: false,
+            completed: false,
+            result: Err(error),
+        };
+    }
+    let physical = physical();
+    let completed = physical.is_ok();
+    let result = match directive {
+        V5CleanupPhysicalDirective::Run => physical,
+        #[cfg(test)]
+        V5CleanupPhysicalDirective::ErrorAfter(error) => match physical {
+            Ok(_) => Err(error),
+            Err(physical_error) => Err(physical_error),
+        },
+        #[cfg(test)]
+        V5CleanupPhysicalDirective::NotSynced => physical.map(|_| ParentSyncStatus::NotSynced),
+        #[cfg(test)]
+        V5CleanupPhysicalDirective::ErrorBefore(_) => unreachable!(),
+    };
+    DrivenV5CleanupPhysical {
+        attempted: true,
+        completed,
+        result,
+    }
 }
 
 fn finish_v5_cleanup_physical(
     physical: Result<ParentSyncStatus, GitError>,
     post_proof: Result<(), GitError>,
-    after_physical: Result<Option<ParentSyncStatus>, GitError>,
+    after_physical: Result<(), GitError>,
 ) -> Result<ParentSyncStatus, GitError> {
     post_proof?;
     let status = physical?;
-    Ok(after_physical?.unwrap_or(status))
+    after_physical?;
+    Ok(status)
+}
+
+fn coordinator_sync_v5_cleanup_state<S>(
+    root: &Path,
+    state: &HeldV5CleanupState,
+    physical_status: Option<ParentSyncStatus>,
+    before_sync: &mut S,
+) -> Result<(), GitError>
+where
+    S: FnMut(V5CleanupState, Option<ParentSyncStatus>) -> Result<(), GitError>,
+{
+    before_sync(state.kind(), physical_status)?;
+    sync_held_v5_cleanup_state(root, state)
 }
 
 #[allow(
     clippy::too_many_lines,
     reason = "keep each physical edge adjacent to its pre/post fault seam and capability audit"
 )]
-fn advance_v5_cleanup_one_with_hooks<B, F>(
+fn advance_v5_cleanup_one_with_hooks<D, F, S>(
     vault: &Vault,
     git: &Git,
     guard: &VaultMutationGuard,
     state: HeldV5CleanupState,
-    before_physical: B,
+    physical_directive: D,
     after_physical: F,
+    mut before_sync: S,
 ) -> Result<HeldV5CleanupState, GitError>
 where
-    B: FnOnce(V5CleanupState, &Path) -> Result<(), GitError>,
-    F: FnOnce(V5CleanupState, &Path) -> Result<Option<ParentSyncStatus>, GitError>,
+    D: FnOnce(V5CleanupState, &Path) -> V5CleanupPhysicalDirective,
+    F: FnOnce(V5CleanupState, &Path) -> Result<(), GitError>,
+    S: FnMut(V5CleanupState, Option<ParentSyncStatus>) -> Result<(), GitError>,
 {
     let root = vault.root();
     if root != git.root || !guard.is_for_root(root) {
         return Err(GitError::RecoveryConflict);
     }
-    sync_held_v5_cleanup_state(root, &state)?;
     let old = state.kind();
-    let mut before_physical = Some(before_physical);
+    coordinator_sync_v5_cleanup_state(root, &state, None, &mut before_sync)?;
+    let mut physical_directive = Some(physical_directive);
     let mut after_physical = Some(after_physical);
     let expected = match old {
         V5CleanupState::StableJ => V5CleanupState::CleanupFullJ,
@@ -1265,42 +1338,50 @@ where
                 &inventory,
                 &live_identity,
             )?;
-            before_physical.take().ok_or(GitError::RecoveryConflict)?(old, root)?;
-            let physical = candidate_bundle_v5::retire_stable_bundle_to_cleanup_v5(
-                root,
-                &reference,
-                &inventory,
-                || {
-                    revalidate_held_bundle_journal_v5(root, &journal)?;
-                    let (_, _, live_identity) =
-                        candidate_bundle_v5::classify_completed_live_index_with_journal_v5(
-                            guard, git, &reference,
+            let directive = physical_directive
+                .take()
+                .ok_or(GitError::RecoveryConflict)?(old, root);
+            let physical = drive_v5_cleanup_physical(directive, || {
+                candidate_bundle_v5::retire_stable_bundle_to_cleanup_v5(
+                    root,
+                    &reference,
+                    &inventory,
+                    || {
+                        revalidate_held_bundle_journal_v5(root, &journal)?;
+                        let (_, _, live_identity) =
+                            candidate_bundle_v5::classify_completed_live_index_with_journal_v5(
+                                guard, git, &reference,
+                            )?;
+                        verify_payload_completed_v5(
+                            vault,
+                            git,
+                            guard,
+                            &inventory.manifest.transaction,
                         )?;
-                    verify_payload_completed_v5(
-                        vault,
-                        git,
-                        guard,
-                        &inventory.manifest.transaction,
-                    )?;
-                    revalidate_held_bundle_journal_v5(root, &journal)?;
-                    candidate_bundle_v5::revalidate_held_stable_inventory_v5(
-                        root, &reference, &inventory,
-                    )?;
-                    candidate_bundle_v5::revalidate_completed_live_index_capability_v5(
-                        guard,
-                        git,
-                        &reference,
-                        &inventory,
-                        &live_identity,
-                    )?;
-                    revalidate_held_bundle_journal_v5(root, &journal)?;
-                    candidate_bundle_v5::revalidate_held_stable_inventory_v5(
-                        root, &reference, &inventory,
-                    )
-                },
-            );
-            let hook = after_physical.take().ok_or(GitError::RecoveryConflict)?(old, root);
-            let target = if physical.is_ok() {
+                        revalidate_held_bundle_journal_v5(root, &journal)?;
+                        candidate_bundle_v5::revalidate_held_stable_inventory_v5(
+                            root, &reference, &inventory,
+                        )?;
+                        candidate_bundle_v5::revalidate_completed_live_index_capability_v5(
+                            guard,
+                            git,
+                            &reference,
+                            &inventory,
+                            &live_identity,
+                        )?;
+                        revalidate_held_bundle_journal_v5(root, &journal)?;
+                        candidate_bundle_v5::revalidate_held_stable_inventory_v5(
+                            root, &reference, &inventory,
+                        )
+                    },
+                )
+            });
+            let hook = if physical.attempted {
+                after_physical.take().ok_or(GitError::RecoveryConflict)?(old, root)
+            } else {
+                Ok(())
+            };
+            let target = if physical.completed {
                 candidate_bundle_v5::revalidate_held_relocated_inventory_v5(
                     root, &reference, &inventory,
                 )
@@ -1308,7 +1389,7 @@ where
                 Ok(())
             };
             let post = target.and(revalidate_held_bundle_journal_v5(root, &journal));
-            finish_v5_cleanup_physical(physical, post, hook)
+            finish_v5_cleanup_physical(physical.result, post, hook)
         }
         HeldV5CleanupState::CleanupFullJ { journal, cleanup } => {
             let reference = journal.journal.reference.clone();
@@ -1326,7 +1407,6 @@ where
                 cleanup.inventory(),
                 &live_identity,
             )?;
-            before_physical.take().ok_or(GitError::RecoveryConflict)?(old, root)?;
             let (_, live_identity) =
                 candidate_bundle_v5::classify_completed_live_index_with_cleanup_v5(
                     guard, git, &reference, &cleanup,
@@ -1343,76 +1423,115 @@ where
             )?;
             revalidate_held_bundle_journal_v5(root, &journal)?;
             candidate_bundle_v5::revalidate_held_cleanup_full_v5(root, &reference, &cleanup)?;
-            let mut status_override = None;
-            let physical = move_cleanup_journal_to_receipt_v5(root, &journal, || {
-                status_override =
-                    after_physical.take().ok_or(GitError::RecoveryConflict)?(old, root)?;
-                Ok(())
+            let directive = physical_directive
+                .take()
+                .ok_or(GitError::RecoveryConflict)?(old, root);
+            let physical = drive_v5_cleanup_physical(directive, || {
+                move_cleanup_journal_to_receipt_v5(root, &journal, || {
+                    after_physical.take().ok_or(GitError::RecoveryConflict)?(old, root)
+                })
             });
             let post =
                 candidate_bundle_v5::revalidate_held_cleanup_full_v5(root, &reference, &cleanup);
-            finish_v5_cleanup_physical(physical, post, Ok(status_override))
+            finish_v5_cleanup_physical(physical.result, post, Ok(()))
         }
         HeldV5CleanupState::CleanupFullR { receipt, cleanup } => {
             let reference = receipt.journal.reference.clone();
             revalidate_held_bundle_cleanup_receipt_v5(root, &receipt).and_then(|()| {
                 candidate_bundle_v5::revalidate_held_cleanup_full_v5(root, &reference, &cleanup)
             })?;
-            before_physical.take().ok_or(GitError::RecoveryConflict)?(old, root)?;
-            let removal =
-                candidate_bundle_v5::remove_cleanup_candidate_v5(root, &reference, cleanup);
-            let hook = after_physical.take().ok_or(GitError::RecoveryConflict)?(old, root);
-            let target = match &removal {
-                Ok((_, manifest)) => candidate_bundle_v5::revalidate_held_cleanup_manifest_v5(
-                    root, &reference, manifest,
-                ),
-                Err(_) => Ok(()),
+            let directive = physical_directive
+                .take()
+                .ok_or(GitError::RecoveryConflict)?(old, root);
+            let mut manifest = None;
+            let physical = drive_v5_cleanup_physical(directive, || {
+                candidate_bundle_v5::remove_cleanup_candidate_v5(root, &reference, cleanup).map(
+                    |(status, held)| {
+                        manifest = Some(held);
+                        status
+                    },
+                )
+            });
+            let hook = if physical.attempted {
+                after_physical.take().ok_or(GitError::RecoveryConflict)?(old, root)
+            } else {
+                Ok(())
+            };
+            let target = if physical.completed {
+                candidate_bundle_v5::revalidate_held_cleanup_manifest_v5(
+                    root,
+                    &reference,
+                    manifest.as_ref().ok_or(GitError::RecoveryConflict)?,
+                )
+            } else {
+                Ok(())
             };
             let post = target.and(revalidate_held_bundle_cleanup_receipt_v5(root, &receipt));
-            let physical = removal.map(|(status, _)| status);
-            finish_v5_cleanup_physical(physical, post, hook)
+            finish_v5_cleanup_physical(physical.result, post, hook)
         }
         HeldV5CleanupState::CleanupManifestR { receipt, cleanup } => {
             let reference = receipt.journal.reference.clone();
             revalidate_held_bundle_cleanup_receipt_v5(root, &receipt).and_then(|()| {
                 candidate_bundle_v5::revalidate_held_cleanup_manifest_v5(root, &reference, &cleanup)
             })?;
-            before_physical.take().ok_or(GitError::RecoveryConflict)?(old, root)?;
-            let removal =
-                candidate_bundle_v5::remove_cleanup_manifest_v5(root, &reference, cleanup);
-            let hook = after_physical.take().ok_or(GitError::RecoveryConflict)?(old, root);
-            let target = match &removal {
-                Ok((_, empty)) => {
-                    candidate_bundle_v5::revalidate_held_cleanup_empty_v5(root, &reference, empty)
-                }
-                Err(_) => Ok(()),
+            let directive = physical_directive
+                .take()
+                .ok_or(GitError::RecoveryConflict)?(old, root);
+            let mut empty = None;
+            let physical = drive_v5_cleanup_physical(directive, || {
+                candidate_bundle_v5::remove_cleanup_manifest_v5(root, &reference, cleanup).map(
+                    |(status, held)| {
+                        empty = Some(held);
+                        status
+                    },
+                )
+            });
+            let hook = if physical.attempted {
+                after_physical.take().ok_or(GitError::RecoveryConflict)?(old, root)
+            } else {
+                Ok(())
+            };
+            let target = if physical.completed {
+                candidate_bundle_v5::revalidate_held_cleanup_empty_v5(
+                    root,
+                    &reference,
+                    empty.as_ref().ok_or(GitError::RecoveryConflict)?,
+                )
+            } else {
+                Ok(())
             };
             let post = target.and(revalidate_held_bundle_cleanup_receipt_v5(root, &receipt));
-            let physical = removal.map(|(status, _)| status);
-            finish_v5_cleanup_physical(physical, post, hook)
+            finish_v5_cleanup_physical(physical.result, post, hook)
         }
         HeldV5CleanupState::CleanupEmptyR { receipt, cleanup } => {
             let reference = receipt.journal.reference.clone();
             revalidate_held_bundle_cleanup_receipt_v5(root, &receipt).and_then(|()| {
                 candidate_bundle_v5::revalidate_held_cleanup_empty_v5(root, &reference, &cleanup)
             })?;
-            before_physical.take().ok_or(GitError::RecoveryConflict)?(old, root)?;
-            let physical =
-                candidate_bundle_v5::remove_empty_cleanup_directory_v5(root, &reference, cleanup);
-            let hook = after_physical.take().ok_or(GitError::RecoveryConflict)?(old, root);
+            let directive = physical_directive
+                .take()
+                .ok_or(GitError::RecoveryConflict)?(old, root);
+            let physical = drive_v5_cleanup_physical(directive, || {
+                candidate_bundle_v5::remove_empty_cleanup_directory_v5(root, &reference, cleanup)
+            });
+            let hook = if physical.attempted {
+                after_physical.take().ok_or(GitError::RecoveryConflict)?(old, root)
+            } else {
+                Ok(())
+            };
             let cleanup_basename =
                 candidate_bundle_v5::candidate_bundle_cleanup_basename_v5(&reference.token)?;
             let cleanup_path =
                 candidate_bundle_v5::candidate_bundle_cleanup_path_v5(root, &cleanup_basename)?;
-            let target = if physical.is_ok() && path_entry_is_absent(&cleanup_path)? {
+            let target = if physical.completed && path_entry_is_absent(&cleanup_path)? {
                 Ok(())
-            } else if physical.is_ok() {
+            } else if physical.completed {
                 Err(GitError::RecoveryConflict)
             } else {
                 Ok(())
             };
             let post = target.and(revalidate_held_bundle_cleanup_receipt_v5(root, &receipt));
-            finish_v5_cleanup_physical(physical, post, hook)
+            finish_v5_cleanup_physical(physical.result, post, hook)
         }
         HeldV5CleanupState::ReceiptOnly { receipt } => {
             revalidate_held_bundle_cleanup_receipt_v5(root, &receipt)?;
@@ -1424,19 +1543,27 @@ where
                 root,
                 &receipt_basename,
             )?;
-            before_physical.take().ok_or(GitError::RecoveryConflict)?(old, root)?;
-            let physical = atomic_remove_verified_file(&receipt_path, receipt.file)
-                .map_err(map_cleanup_remove_error_v5)
-                .map(|outcome| outcome.parent_sync);
-            let hook = after_physical.take().ok_or(GitError::RecoveryConflict)?(old, root);
-            let target = if physical.is_ok() && path_entry_is_absent(&receipt_path)? {
+            let directive = physical_directive
+                .take()
+                .ok_or(GitError::RecoveryConflict)?(old, root);
+            let physical = drive_v5_cleanup_physical(directive, || {
+                atomic_remove_verified_file(&receipt_path, receipt.file)
+                    .map_err(map_cleanup_remove_error_v5)
+                    .map(|outcome| outcome.parent_sync)
+            });
+            let hook = if physical.attempted {
+                after_physical.take().ok_or(GitError::RecoveryConflict)?(old, root)
+            } else {
                 Ok(())
-            } else if physical.is_ok() {
+            };
+            let target = if physical.completed && path_entry_is_absent(&receipt_path)? {
+                Ok(())
+            } else if physical.completed {
                 Err(GitError::RecoveryConflict)
             } else {
                 Ok(())
             };
-            finish_v5_cleanup_physical(physical, target, hook)
+            finish_v5_cleanup_physical(physical.result, target, hook)
         }
         HeldV5CleanupState::Clean => Ok(ParentSyncStatus::Synced),
     };
@@ -1446,8 +1573,9 @@ where
         return Err(GitError::RecoveryConflict);
     }
     if fresh_kind == expected {
+        let physical_status = operation.as_ref().ok().copied();
         let operation_error = operation.err();
-        sync_held_v5_cleanup_state(root, &fresh)?;
+        coordinator_sync_v5_cleanup_state(root, &fresh, physical_status, &mut before_sync)?;
         let rebound = inspect_held_v5_cleanup_state(root)?;
         if rebound.kind() != expected {
             return Err(GitError::RecoveryConflict);
@@ -1457,7 +1585,8 @@ where
         }
         return Ok(rebound);
     }
-    sync_held_v5_cleanup_state(root, &fresh)?;
+    let physical_status = operation.as_ref().ok().copied();
+    coordinator_sync_v5_cleanup_state(root, &fresh, physical_status, &mut before_sync)?;
     match operation {
         Err(error) => Err(error),
         Ok(_) => Err(GitError::RecoveryConflict),
@@ -9354,8 +9483,10 @@ fn restrict_file_permissions_best_effort(_file: &File) {}
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::process::Command as TestCommand;
+    use std::rc::Rc;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -11467,15 +11598,15 @@ mod tests {
         advance_v5_cleanup_one_with_hook(&fixture.vault, &fixture.git, &guard, state, hook)
     }
 
-    fn advance_test_cleanup_one_with_hooks<B, F>(
+    fn advance_test_cleanup_one_with_faults<D, S>(
         fixture: &CandidateBundlePreparationFixture,
         state: HeldV5CleanupState,
-        before_physical: B,
-        after_physical: F,
+        physical_directive: D,
+        before_sync: S,
     ) -> Result<HeldV5CleanupState, GitError>
     where
-        B: FnOnce(V5CleanupState, &Path) -> Result<(), GitError>,
-        F: FnOnce(V5CleanupState, &Path) -> Result<Option<ParentSyncStatus>, GitError>,
+        D: FnOnce(V5CleanupState, &Path) -> V5CleanupPhysicalDirective,
+        S: FnMut(V5CleanupState, Option<ParentSyncStatus>) -> Result<(), GitError>,
     {
         let guard = VaultMutationGuard::acquire(fixture.vault.root()).map_err(map_atomic_error)?;
         advance_v5_cleanup_one_with_hooks(
@@ -11483,8 +11614,9 @@ mod tests {
             &fixture.git,
             &guard,
             state,
-            before_physical,
-            after_physical,
+            physical_directive,
+            |_, _| Ok(()),
+            before_sync,
         )
     }
 
@@ -16208,7 +16340,7 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "keep all six cleanup edges and three fault outcomes in one auditable matrix"
+        reason = "keep all six cleanup edges and four physical/fence outcomes in one auditable matrix"
     )]
     fn v5_cleanup_coordinator_reconciles_all_edges_across_fault_outcomes() {
         #[derive(Clone, Copy, Debug)]
@@ -16216,12 +16348,20 @@ mod tests {
             ErrorBefore,
             ErrorAfter,
             NotSynced,
+            NotSyncedFenceFailure,
         }
 
         fn injected_edge_error() -> GitError {
             GitError::Io {
                 operation: GitIoOperation::SyncGitState,
                 kind: io::ErrorKind::Other,
+            }
+        }
+
+        fn injected_fence_error() -> GitError {
+            GitError::Io {
+                operation: GitIoOperation::InspectMetadata,
+                kind: io::ErrorKind::Interrupted,
             }
         }
 
@@ -16244,6 +16384,7 @@ mod tests {
             FaultOutcome::ErrorBefore,
             FaultOutcome::ErrorAfter,
             FaultOutcome::NotSynced,
+            FaultOutcome::NotSyncedFenceFailure,
         ] {
             let fixture = create_candidate_payload_fixture_v5(
                 GitObjectFormat::Sha1,
@@ -16256,41 +16397,37 @@ mod tests {
                 let state = inspect_held_v5_cleanup_state(root)
                     .expect("fault-matrix state obtains a fresh held proof");
                 assert_eq!(state.kind(), old, "{outcome:?} starts at {old:?}");
-                let result = match outcome {
-                    FaultOutcome::ErrorBefore => advance_test_cleanup_one_with_hooks(
-                        &fixture,
-                        state,
-                        |actual, _| {
-                            assert_eq!(actual, old);
-                            Err(injected_edge_error())
-                        },
-                        |_, _| panic!("after-physical hook must not run after a pre-edge error"),
-                    ),
-                    FaultOutcome::ErrorAfter => advance_test_cleanup_one_with_hooks(
-                        &fixture,
-                        state,
-                        |actual, _| {
-                            assert_eq!(actual, old);
-                            Ok(())
-                        },
-                        |actual, _| {
-                            assert_eq!(actual, old);
-                            Err(injected_edge_error())
-                        },
-                    ),
-                    FaultOutcome::NotSynced => advance_test_cleanup_one_with_hooks(
-                        &fixture,
-                        state,
-                        |actual, _| {
-                            assert_eq!(actual, old);
-                            Ok(())
-                        },
-                        |actual, _| {
-                            assert_eq!(actual, old);
-                            Ok(Some(ParentSyncStatus::NotSynced))
-                        },
-                    ),
-                };
+                let sync_events = Rc::new(RefCell::new(Vec::new()));
+                let recorded_sync_events = Rc::clone(&sync_events);
+                let result = advance_test_cleanup_one_with_faults(
+                    &fixture,
+                    state,
+                    move |actual, _| {
+                        assert_eq!(actual, old);
+                        match outcome {
+                            FaultOutcome::ErrorBefore => {
+                                V5CleanupPhysicalDirective::ErrorBefore(injected_edge_error())
+                            }
+                            FaultOutcome::ErrorAfter => {
+                                V5CleanupPhysicalDirective::ErrorAfter(injected_edge_error())
+                            }
+                            FaultOutcome::NotSynced | FaultOutcome::NotSyncedFenceFailure => {
+                                V5CleanupPhysicalDirective::NotSynced
+                            }
+                        }
+                    },
+                    move |state, physical_status| {
+                        recorded_sync_events
+                            .borrow_mut()
+                            .push((state, physical_status));
+                        if matches!(outcome, FaultOutcome::NotSyncedFenceFailure)
+                            && state == expected
+                        {
+                            return Err(injected_fence_error());
+                        }
+                        Ok(())
+                    },
+                );
 
                 match outcome {
                     FaultOutcome::ErrorBefore => {
@@ -16301,6 +16438,11 @@ mod tests {
                                 kind: io::ErrorKind::Other
                             })
                         ));
+                        assert_eq!(
+                            *sync_events.borrow(),
+                            [(old, None), (old, None)],
+                            "error-before must enter old-state reconciliation and re-fence it"
+                        );
                         let unchanged = inspect_held_v5_cleanup_state(root)
                             .expect("error-before state reclassifies after restart");
                         assert_eq!(unchanged.kind(), old);
@@ -16317,6 +16459,11 @@ mod tests {
                             })
                         ));
                         assert_eq!(
+                            *sync_events.borrow(),
+                            [(old, None), (expected, None)],
+                            "error-after must fence the physically completed adjacent state"
+                        );
+                        assert_eq!(
                             inspect_held_v5_cleanup_state(root)
                                 .expect("error-after state reclassifies after restart")
                                 .kind(),
@@ -16324,6 +16471,11 @@ mod tests {
                         );
                     }
                     FaultOutcome::NotSynced => {
+                        assert_eq!(
+                            *sync_events.borrow(),
+                            [(old, None), (expected, Some(ParentSyncStatus::NotSynced)),],
+                            "the physical NotSynced result must reach the explicit expected-state fence"
+                        );
                         assert_eq!(
                             result
                                 .expect("explicit coordinator fence closes NotSynced outcome")
@@ -16335,6 +16487,27 @@ mod tests {
                                 .expect("NotSynced state reclassifies after restart")
                                 .kind(),
                             expected
+                        );
+                    }
+                    FaultOutcome::NotSyncedFenceFailure => {
+                        assert!(matches!(
+                            result,
+                            Err(GitError::Io {
+                                operation: GitIoOperation::InspectMetadata,
+                                kind: io::ErrorKind::Interrupted,
+                            })
+                        ));
+                        assert_eq!(
+                            *sync_events.borrow(),
+                            [(old, None), (expected, Some(ParentSyncStatus::NotSynced)),],
+                            "failed explicit fence must still expose the real NotSynced outcome"
+                        );
+                        assert_eq!(
+                            inspect_held_v5_cleanup_state(root)
+                                .expect("failed fence leaves exactly the adjacent physical state")
+                                .kind(),
+                            expected,
+                            "fence failure must not execute the next cleanup edge"
                         );
                     }
                 }
