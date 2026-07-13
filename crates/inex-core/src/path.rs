@@ -28,6 +28,7 @@ pub const MAX_LOGICAL_COMPONENT_BYTES: usize = 255;
 
 const MARKDOWN_SUFFIX: &str = ".md";
 const CIPHERTEXT_SUFFIX: &str = ".enc";
+const ASSET_CIPHERTEXT_SUFFIX: &str = ".asset.enc";
 
 /// Maximum UTF-8 bytes in the final logical Markdown filename component.
 ///
@@ -36,6 +37,13 @@ const CIPHERTEXT_SUFFIX: &str = ".enc";
 /// profile.
 pub const MAX_LOGICAL_FILE_COMPONENT_BYTES: usize =
     MAX_LOGICAL_COMPONENT_BYTES - CIPHERTEXT_SUFFIX.len();
+
+/// Maximum UTF-8 bytes in the final logical opaque-asset filename component.
+///
+/// Ten bytes are reserved for the physical `.asset.enc` suffix so the
+/// resulting ciphertext component remains within the cross-platform profile.
+pub const MAX_LOGICAL_ASSET_COMPONENT_BYTES: usize =
+    MAX_LOGICAL_COMPONENT_BYTES - ASSET_CIPHERTEXT_SUFFIX.len();
 
 /// A failure to construct or map a cross-platform logical path.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -134,6 +142,10 @@ pub enum PathError {
     #[error("logical file path must end in lowercase `.md`")]
     MissingMarkdownSuffix,
 
+    /// An opaque asset path ended in exact lowercase `.md`.
+    #[error("opaque asset path must not end in lowercase `.md`")]
+    AssetUsesMarkdownSuffix,
+
     /// A join operation was given more than one component.
     #[error("a logical child name must be exactly one component")]
     ExpectedSingleComponent,
@@ -149,6 +161,10 @@ pub enum PathError {
     /// A physical path did not use the exact `.md.enc` suffix mapping.
     #[error("ciphertext path must end in lowercase `.md.enc`")]
     MissingCiphertextSuffix,
+
+    /// A physical path did not use the exact `.asset.enc` suffix mapping.
+    #[error("asset ciphertext path must end in lowercase `.asset.enc`")]
+    MissingAssetCiphertextSuffix,
 }
 
 /// A validated NFC logical path to one Markdown document.
@@ -305,6 +321,146 @@ impl LogicalPath {
     }
 
     /// Test whether two logical paths are aliases under case folding.
+    #[must_use]
+    pub fn case_collides_with(&self, other: &Self) -> bool {
+        self != other && self.case_fold_key() == other.case_fold_key()
+    }
+}
+
+/// A validated NFC logical path to one opaque asset.
+///
+/// The stored string excludes the physical `.asset.enc` suffix and cannot end
+/// in exact lowercase `.md`, which remains reserved for Markdown documents.
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct AssetPath(String);
+
+impl AssetPath {
+    /// Normalize user input to NFC and validate it against the asset profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PathError`] when the normalized path violates the portable
+    /// profile or belongs to the Markdown namespace.
+    pub fn parse(input: &str) -> Result<Self, PathError> {
+        let normalized: String = input.nfc().collect();
+        Self::validate(normalized)
+    }
+
+    /// Validate an opaque-asset path that must already be canonical NFC.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PathError::NotNfc`] for non-NFC text, or another
+    /// [`PathError`] when the path violates the asset profile.
+    pub fn parse_canonical(input: &str) -> Result<Self, PathError> {
+        if !is_nfc(input) {
+            return Err(PathError::NotNfc);
+        }
+        Self::validate(input.to_owned())
+    }
+
+    fn validate(path: String) -> Result<Self, PathError> {
+        validate_common(&path)?;
+        if path.ends_with(MARKDOWN_SUFFIX) {
+            return Err(PathError::AssetUsesMarkdownSuffix);
+        }
+        let file_name = path.rsplit('/').next().ok_or(PathError::Empty)?;
+        if file_name.len() > MAX_LOGICAL_ASSET_COMPONENT_BYTES {
+            return Err(PathError::ComponentTooLong {
+                component_index: path.matches('/').count(),
+                actual: file_name.len(),
+                maximum: MAX_LOGICAL_ASSET_COMPONENT_BYTES,
+            });
+        }
+        Ok(Self(path))
+    }
+
+    /// Convert a discovered physical `*.asset.enc` path back to a logical path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PathError`] if the physical path is not normal relative UTF-8,
+    /// lacks the exact suffix, or maps to an invalid/noncanonical asset path.
+    pub fn from_ciphertext_relative_path(path: &Path) -> Result<Self, PathError> {
+        let mut parts = Vec::new();
+        for component in path.components() {
+            match component {
+                Component::Normal(value) => {
+                    let value = value.to_str().ok_or(PathError::NonUtf8CiphertextPath)?;
+                    parts.push(value);
+                }
+                Component::Prefix(_)
+                | Component::RootDir
+                | Component::CurDir
+                | Component::ParentDir => return Err(PathError::InvalidCiphertextPath),
+            }
+        }
+
+        let Some(last) = parts.last_mut() else {
+            return Err(PathError::Empty);
+        };
+        let Some(logical_name) = last.strip_suffix(ASSET_CIPHERTEXT_SUFFIX) else {
+            return Err(PathError::MissingAssetCiphertextSuffix);
+        };
+        *last = logical_name;
+        Self::parse_canonical(&parts.join("/"))
+    }
+
+    /// Return the canonical logical path text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Consume this path and return its canonical logical path text.
+    #[must_use]
+    pub fn into_string(self) -> String {
+        self.0
+    }
+
+    /// Iterate over validated path components.
+    #[must_use]
+    pub fn components(&self) -> impl DoubleEndedIterator<Item = &str> {
+        self.0.split('/')
+    }
+
+    /// Return the final logical asset filename component.
+    #[must_use]
+    pub fn file_name(&self) -> &str {
+        self.0.rsplit('/').next().unwrap_or(self.0.as_str())
+    }
+
+    /// Return this asset's logical parent directory.
+    #[must_use]
+    pub fn parent(&self) -> LogicalDir {
+        match self.0.rsplit_once('/') {
+            Some((parent, _)) => LogicalDir(parent.to_owned()),
+            None => LogicalDir::root(),
+        }
+    }
+
+    /// Map this asset to its host-relative physical ciphertext path.
+    #[must_use]
+    pub fn to_ciphertext_relative_path(&self) -> PathBuf {
+        let mut result = PathBuf::new();
+        let mut components = self.components().peekable();
+        while let Some(component) = components.next() {
+            if components.peek().is_some() {
+                result.push(component);
+            } else {
+                result.push(format!("{component}{ASSET_CIPHERTEXT_SUFFIX}"));
+            }
+        }
+        result
+    }
+
+    /// Return a deterministic Unicode case-folded collision key.
+    #[must_use]
+    pub fn case_fold_key(&self) -> CaseFoldKey {
+        CaseFoldKey(portable_case_fold(&self.0))
+    }
+
+    /// Test whether two asset paths are aliases under case folding.
     #[must_use]
     pub fn case_collides_with(&self, other: &Self) -> bool {
         self != other && self.case_fold_key() == other.case_fold_key()
@@ -689,6 +845,57 @@ impl<'de> Deserialize<'de> for LogicalPath {
     }
 }
 
+impl fmt::Debug for AssetPath {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_tuple("AssetPath").field(&self.0).finish()
+    }
+}
+
+impl fmt::Display for AssetPath {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for AssetPath {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl Borrow<str> for AssetPath {
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl FromStr for AssetPath {
+    type Err = PathError;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        Self::parse(input)
+    }
+}
+
+impl Serialize for AssetPath {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for AssetPath {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse_canonical(&value).map_err(serde::de::Error::custom)
+    }
+}
+
 impl fmt::Debug for LogicalDir {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.debug_tuple("LogicalDir").field(&self.0).finish()
@@ -758,6 +965,13 @@ mod tests {
         }
     }
 
+    fn valid_asset(input: &str) -> AssetPath {
+        match AssetPath::parse(input) {
+            Ok(path) => path,
+            Err(error) => panic!("expected valid asset path `{input}`: {error}"),
+        }
+    }
+
     #[test]
     fn accepts_nested_chinese_and_maps_physical_suffix() {
         let logical = valid_path("日记/二〇二六/七月十一日.md");
@@ -775,6 +989,75 @@ mod tests {
             )),
             Ok(logical)
         );
+    }
+
+    #[test]
+    fn opaque_assets_map_exact_suffix_and_round_trip() {
+        let asset = valid_asset("图片/南极站 photo.png");
+        assert_eq!(asset.file_name(), "南极站 photo.png");
+        assert_eq!(asset.parent(), valid_dir("图片"));
+        assert_eq!(
+            asset.to_ciphertext_relative_path(),
+            PathBuf::from("图片/南极站 photo.png.asset.enc")
+        );
+        assert_eq!(
+            AssetPath::from_ciphertext_relative_path(Path::new("图片/南极站 photo.png.asset.enc")),
+            Ok(asset)
+        );
+    }
+
+    #[test]
+    fn opaque_assets_reserve_markdown_namespace_and_suffix_spelling() {
+        assert_eq!(
+            AssetPath::parse("notes/readme.md"),
+            Err(PathError::AssetUsesMarkdownSuffix)
+        );
+        assert!(AssetPath::parse("notes/readme.MD").is_ok());
+        assert_eq!(
+            AssetPath::from_ciphertext_relative_path(Path::new("image.png.ASSET.ENC")),
+            Err(PathError::MissingAssetCiphertextSuffix)
+        );
+        assert_eq!(
+            AssetPath::from_ciphertext_relative_path(Path::new("note.md.asset.enc")),
+            Err(PathError::AssetUsesMarkdownSuffix)
+        );
+    }
+
+    #[test]
+    fn opaque_asset_final_component_reserves_physical_suffix_bytes() {
+        let exact = "a".repeat(MAX_LOGICAL_ASSET_COMPONENT_BYTES);
+        assert!(AssetPath::parse(&exact).is_ok());
+        assert_eq!(
+            AssetPath::parse(&"a".repeat(MAX_LOGICAL_ASSET_COMPONENT_BYTES + 1)),
+            Err(PathError::ComponentTooLong {
+                component_index: 0,
+                actual: MAX_LOGICAL_ASSET_COMPONENT_BYTES + 1,
+                maximum: MAX_LOGICAL_ASSET_COMPONENT_BYTES,
+            })
+        );
+    }
+
+    #[test]
+    fn opaque_asset_canonical_parser_and_serde_reject_non_nfc() {
+        let normalized = valid_asset("images/cafe\u{301}.png");
+        assert_eq!(normalized.as_str(), "images/caf\u{e9}.png");
+        assert_eq!(
+            AssetPath::parse_canonical("images/cafe\u{301}.png"),
+            Err(PathError::NotNfc)
+        );
+        let json = serde_json::to_string(&normalized).expect("asset serializes");
+        assert_eq!(
+            serde_json::from_str::<AssetPath>(&json).expect("canonical asset deserializes"),
+            normalized
+        );
+        assert!(serde_json::from_str::<AssetPath>("\"cafe\\u0301.png\"").is_err());
+    }
+
+    #[test]
+    fn document_and_asset_paths_share_case_fold_domain() {
+        let document = valid_path("Notes/README.md");
+        let asset = valid_asset("notes/readme.MD");
+        assert_eq!(document.case_fold_key(), asset.case_fold_key());
     }
 
     #[test]

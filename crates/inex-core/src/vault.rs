@@ -18,19 +18,19 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::atomic::{
     AtomicRebindOutcome, AtomicWriteError, AtomicWriteOutcome, CurrentTarget, ParentSyncStatus,
     VaultMutationGuard, WriteCondition, open_file_matches_path_and_is_single_link,
-    paths_share_mount, recover_pending_rebind, sync_directory,
+    paths_share_mount, sync_directory,
 };
 use crate::crypto::{
-    self, CryptoError, DecryptedDocument, EncryptedDocument, EnvelopeKind, ExpectedEnvelopeKind,
-    FileIdentity, VaultMasterKey,
+    self, CryptoError, DecryptedAsset, DecryptedDocument, EncryptedAsset, EncryptedDocument,
+    EnvelopeKind, ExpectedEnvelopeKind, FileIdentity, VaultContentProfile, VaultMasterKey,
 };
 use crate::format::{self, ContentFlags, EdryHeader};
-use crate::path::{LogicalDir, LogicalPath, PathError, portable_case_fold};
+use crate::path::{AssetPath, LogicalDir, LogicalPath, PathError, portable_case_fold};
 use crate::search::{
     Document as SearchDocument, MemorySearchIndex, SearchError, SearchHit, SearchQuery,
 };
 use crate::sodium::Argon2idParams;
-use crate::tree::{self, TreeEntryKind, TreeError, VaultTree};
+use crate::tree::{self, TreeEntryKind, TreeError, VaultTree, VaultTreeProfile};
 use crate::vault_config::{
     ConfigError, ConfigWarning, KdfPolicy, MAX_VAULT_JSON_BYTES, VaultConfig,
 };
@@ -41,6 +41,9 @@ pub const VAULT_CONFIG_FILE: &str = "vault.json";
 /// Largest complete EDRY envelope accepted from disk.
 pub const MAX_EDRY_ENVELOPE_BYTES: usize =
     format::EDRY_PREFIX_LEN + format::MAX_HEADER_LEN + format::MAX_CIPHERTEXT_LEN;
+
+/// Largest complete opaque-asset EDRY envelope accepted from disk.
+pub const MAX_ASSET_EDRY_ENVELOPE_BYTES: usize = format::MAX_ASSET_ENVELOPE_BYTES;
 
 /// A repository I/O operation exposed without filesystem paths or OS text.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -127,6 +130,10 @@ pub enum VaultError {
     /// file.
     #[error("encrypted document does not exist")]
     DocumentNotFound,
+    /// The requested logical asset does not exist as a regular ciphertext
+    /// file.
+    #[error("encrypted asset does not exist")]
+    AssetNotFound,
     /// The expected ciphertext etag was malformed.
     #[error("ciphertext etag must use canonical `sha256:` lowercase hex")]
     InvalidEtag,
@@ -179,6 +186,17 @@ pub enum VaultError {
 /// Non-plaintext metadata returned after a committed document mutation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DocumentMetadata {
+    /// Authenticated EDRY header.
+    pub header: EdryHeader,
+    /// Canonical SHA-256 etag of the complete encrypted envelope.
+    pub etag: String,
+    /// Result of the platform namespace-durability checkpoint.
+    pub parent_sync: ParentSyncStatus,
+}
+
+/// Non-plaintext metadata returned after a create-only asset import.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssetMetadata {
     /// Authenticated EDRY header.
     pub header: EdryHeader,
     /// Canonical SHA-256 etag of the complete encrypted envelope.
@@ -253,7 +271,35 @@ impl Vault {
         password: &[u8],
         created_at_ms: i64,
     ) -> Result<Self, VaultError> {
-        Self::create_with_policy(root, password, created_at_ms, KdfPolicy::default())
+        Self::create_with_profile(
+            root,
+            password,
+            created_at_ms,
+            VaultContentProfile::DocumentsOnly,
+        )
+    }
+
+    /// Create a vault with one explicit authenticated content profile.
+    ///
+    /// This is only a creation-time decision for a new vault. It does not
+    /// upgrade an existing feature-free vault.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError`] under the same conditions as [`Self::create`].
+    pub fn create_with_profile(
+        root: impl AsRef<Path>,
+        password: &[u8],
+        created_at_ms: i64,
+        profile: VaultContentProfile,
+    ) -> Result<Self, VaultError> {
+        Self::create_with_profile_and_policy(
+            root,
+            password,
+            created_at_ms,
+            profile,
+            KdfPolicy::default(),
+        )
     }
 
     /// Create a vault using process-cached v1 calibration bounded by `policy`.
@@ -272,8 +318,30 @@ impl Vault {
         created_at_ms: i64,
         policy: KdfPolicy,
     ) -> Result<Self, VaultError> {
+        Self::create_with_profile_and_policy(
+            root,
+            password,
+            created_at_ms,
+            VaultContentProfile::DocumentsOnly,
+            policy,
+        )
+    }
+
+    /// Create a vault with an explicit content profile and calibrated policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError`] for invalid calibration, unsafe storage,
+    /// existing metadata, cryptographic failure, or failed verification.
+    pub fn create_with_profile_and_policy(
+        root: impl AsRef<Path>,
+        password: &[u8],
+        created_at_ms: i64,
+        profile: VaultContentProfile,
+        policy: KdfPolicy,
+    ) -> Result<Self, VaultError> {
         let params = crypto::calibrated_creation_params(policy)?;
-        Self::create_with_params(root, password, created_at_ms, params, policy)
+        Self::create_with_profile_and_params(root, password, created_at_ms, profile, params, policy)
     }
 
     /// Create a vault with explicit KDF parameters and policy.
@@ -293,10 +361,43 @@ impl Vault {
         params: Argon2idParams,
         policy: KdfPolicy,
     ) -> Result<Self, VaultError> {
+        Self::create_with_profile_and_params(
+            root,
+            password,
+            created_at_ms,
+            VaultContentProfile::DocumentsOnly,
+            params,
+            policy,
+        )
+    }
+
+    /// Create a vault with an explicit content profile and KDF parameters.
+    ///
+    /// This deterministic entry point is intended for new-vault import and
+    /// tests. It never mutates an existing vault's required features.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError`] for invalid input/policy, unsafe storage,
+    /// existing metadata, cryptographic failure, or failed verification.
+    pub fn create_with_profile_and_params(
+        root: impl AsRef<Path>,
+        password: &[u8],
+        created_at_ms: i64,
+        profile: VaultContentProfile,
+        params: Argon2idParams,
+        policy: KdfPolicy,
+    ) -> Result<Self, VaultError> {
         crypto::validate_vault_creation_request(password, created_at_ms, params, policy)?;
         let root = prepare_vault_root(root.as_ref())?;
-        ensure_uninitialized_root(&root)?;
-        let created = crypto::create_vault_with_params(password, created_at_ms, params, policy)?;
+        ensure_uninitialized_root(&root, content_profile_to_tree_profile(profile))?;
+        let created = crypto::create_vault_with_profile_and_params(
+            password,
+            created_at_ms,
+            profile,
+            params,
+            policy,
+        )?;
         Self::commit_created(&root, created, password, policy)
     }
 
@@ -306,10 +407,11 @@ impl Vault {
         password: &[u8],
         policy: KdfPolicy,
     ) -> Result<Self, VaultError> {
+        let tree_profile = tree_profile_for_config(&created.config);
         let metadata = created.config.to_json_bytes(policy)?;
         let target = root.join(VAULT_CONFIG_FILE);
         let guard = VaultMutationGuard::acquire(root).map_err(map_atomic_error)?;
-        ensure_uninitialized_root(root)?;
+        ensure_uninitialized_root(root, tree_profile)?;
         let outcome = guard
             .write(&target, &metadata, WriteCondition::IfNoneMatch)
             .map_err(map_atomic_error)?;
@@ -352,7 +454,8 @@ impl Vault {
         let config_etag = digest(&metadata);
         let (config, _) = VaultConfig::parse_untrusted(&metadata, policy)?;
         let unlocked = crypto::unlock_vault(&config, password, slot_id, policy)?;
-        recover_pending_rebind(&root).map_err(map_atomic_error)?;
+        let _guard = VaultMutationGuard::acquire(&root).map_err(map_atomic_error)?;
+        tree::scan_vault_tree_with_profile(&root, tree_profile_for_config(&config))?;
 
         Ok(Self {
             root,
@@ -405,7 +508,7 @@ impl Vault {
     /// noncanonical, colliding, or resource-exhausting entry.
     pub fn list(&mut self) -> Result<VaultTree, VaultError> {
         let _guard = self.acquire_mutation_guard()?;
-        Ok(tree::scan_vault_tree(&self.root)?)
+        self.scan_tree()
     }
 
     /// Read and authenticate one committed encrypted Markdown document.
@@ -417,6 +520,100 @@ impl Vault {
     /// document belongs to a different vault/path/epoch.
     pub fn read(&self, logical_path: &LogicalPath) -> Result<DecryptedDocument, VaultError> {
         self.read_kind(logical_path, ExpectedEnvelopeKind::Committed)
+    }
+
+    /// Read and fully authenticate one committed opaque asset.
+    ///
+    /// The in-memory Markdown search index is cleared before allocating the
+    /// bounded whole-file asset plaintext. No plaintext byte is returned until
+    /// complete AEAD authentication succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError`] when feature 1 is unavailable, the target is
+    /// missing or unsafe, the envelope exceeds the asset bound, or framing,
+    /// context, or authentication fails.
+    pub fn read_asset(&mut self, logical_path: &AssetPath) -> Result<DecryptedAsset, VaultError> {
+        self.invalidate_search_index();
+        if !self.config.supports_opaque_assets() {
+            return Err(CryptoError::OpaqueAssetsNotEnabled.into());
+        }
+        let target = self.asset_target(logical_path)?;
+        let envelope = read_regular_bounded(&target, MAX_ASSET_EDRY_ENVELOPE_BYTES)
+            .map_err(map_asset_not_found)?;
+        Ok(crypto::decrypt_asset(
+            &self.master_key,
+            &self.config,
+            logical_path,
+            &envelope,
+        )?)
+    }
+
+    /// Create-only import of one bounded opaque asset into a feature-1 vault.
+    ///
+    /// This API exists for new-vault import population. It never replaces an
+    /// asset and is intentionally not exposed as a general asset-write RPC.
+    /// It takes ownership of a zeroizing plaintext allocation and wipes it
+    /// immediately after encryption, before the synchronized ciphertext is
+    /// reopened and authenticated. Verification compares the planned length
+    /// and digest, so the importer never retains two complete plaintext
+    /// allocations concurrently.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError`] for a feature mismatch, unsafe/colliding path,
+    /// oversized body, cryptographic failure, create-only conflict, or failed
+    /// post-commit verification.
+    pub fn create_import_asset(
+        &mut self,
+        logical_path: &AssetPath,
+        mut plaintext: Zeroizing<Vec<u8>>,
+        modified_at_ms: i64,
+    ) -> Result<AssetMetadata, VaultError> {
+        self.invalidate_search_index();
+        let planned_plaintext_len = plaintext.len();
+        let planned_plaintext_digest = Zeroizing::new(digest(plaintext.as_slice()));
+        let encrypted = crypto::encrypt_asset(
+            &self.master_key,
+            &self.config,
+            logical_path,
+            None,
+            plaintext.as_slice(),
+            modified_at_ms,
+        )?;
+        plaintext.zeroize();
+        drop(plaintext);
+        let guard = self.acquire_mutation_guard()?;
+        let tree = self.scan_tree()?;
+        ensure_directory_spelling(&tree, &logical_path.parent())?;
+        ensure_logical_name_available(&tree, logical_path.as_str())?;
+        let target = self.asset_target_allow_absent(logical_path)?;
+        match self.asset_entry_state(logical_path)? {
+            EntryState::Absent => {}
+            EntryState::Regular => return Err(VaultError::AlreadyExists),
+            EntryState::Unsafe => return Err(VaultError::UnsafeFilesystemEntry),
+        }
+        let outcome = guard
+            .write(&target, &encrypted.bytes, WriteCondition::IfNoneMatch)
+            .map_err(map_atomic_error)?;
+
+        let committed = read_regular_bounded(&target, MAX_ASSET_EDRY_ENVELOPE_BYTES)
+            .map_err(map_asset_not_found)?;
+        if digest(&committed) != outcome.etag || committed != encrypted.bytes {
+            return Err(VaultError::AtomicVerificationFailed);
+        }
+        let verified =
+            crypto::decrypt_asset(&self.master_key, &self.config, logical_path, &committed)?;
+        if verified.header != encrypted.header
+            || verified.etag != encrypted.etag
+            || verified.plaintext.len() != planned_plaintext_len
+            || digest(verified.plaintext.as_slice()) != *planned_plaintext_digest
+        {
+            return Err(VaultError::AtomicVerificationFailed);
+        }
+        drop(verified);
+        drop(guard);
+        Ok(asset_metadata(encrypted, outcome))
     }
 
     /// Authenticate one committed EDRY envelope supplied from an external
@@ -626,18 +823,20 @@ impl Vault {
             return Err(VaultError::AlreadyExists);
         }
         let _guard = self.acquire_mutation_guard()?;
-        let tree = tree::scan_vault_tree(&self.root)?;
+        let tree = self.scan_tree()?;
         let parent = logical_dir
             .parent()
             .ok_or(VaultError::ParentDirectoryMissing)?;
         ensure_directory_spelling(&tree, &parent)?;
         ensure_logical_name_available(&tree, logical_dir.as_str())?;
         let physical_parent = self.directory_target(&parent, true)?;
-        let target = physical_parent.join(
-            logical_dir
-                .name()
-                .ok_or(VaultError::ParentDirectoryMissing)?,
-        );
+        let name = logical_dir
+            .name()
+            .ok_or(VaultError::ParentDirectoryMissing)?;
+        if exact_child_exists(&physical_parent, std::ffi::OsStr::new(name))? {
+            return Err(VaultError::AlreadyExists);
+        }
+        let target = physical_parent.join(name);
         reject_existing_entry(&target)?;
         fs::create_dir(&target).map_err(|error| {
             if error.kind() == io::ErrorKind::AlreadyExists {
@@ -744,7 +943,7 @@ impl Vault {
     /// UTF-8 conversion, or configured index limits fail.
     pub fn rebuild_search_index(&mut self) -> Result<usize, VaultError> {
         let guard = self.acquire_mutation_guard()?;
-        let tree = tree::scan_vault_tree(&self.root)?;
+        let tree = self.scan_tree()?;
         let fingerprint = self.repository_fingerprint(&guard, &tree)?;
         self.invalidate_search_index();
         let mut replacement = MemorySearchIndex::new();
@@ -765,7 +964,7 @@ impl Vault {
             };
             replacement.upsert(SearchDocument::new(logical_path, plaintext)?)?;
         }
-        let current_tree = tree::scan_vault_tree(&self.root)?;
+        let current_tree = self.scan_tree()?;
         let current_fingerprint = self.repository_fingerprint(&guard, &current_tree)?;
         if fingerprint != current_fingerprint {
             return Err(VaultError::Conflict { current_etag: None });
@@ -788,7 +987,7 @@ impl Vault {
         if !self.search_index_ready {
             return Err(VaultError::SearchIndexNotReady);
         }
-        let tree = tree::scan_vault_tree(&self.root)?;
+        let tree = self.scan_tree()?;
         let current_fingerprint = self.repository_fingerprint(&guard, &tree)?;
         if self.search_fingerprint != Some(current_fingerprint) {
             drop(guard);
@@ -996,15 +1195,17 @@ impl Vault {
         drop(current);
 
         let guard = self.acquire_mutation_guard()?;
-        let tree = tree::scan_vault_tree(&self.root)?;
+        let tree = self.scan_tree()?;
         ensure_directory_spelling(&tree, &destination.parent())?;
         ensure_logical_name_available(&tree, destination.as_str())?;
         let source_target = self.document_target(source)?;
         ensure_regular_file_bounded(&source_target, MAX_EDRY_ENVELOPE_BYTES)?;
-        let destination_target = self.document_target_allow_absent(destination)?;
-        if entry_state(&destination_target)? != EntryState::Absent {
-            return Err(VaultError::AlreadyExists);
+        match self.document_entry_state(destination)? {
+            EntryState::Absent => {}
+            EntryState::Regular => return Err(VaultError::AlreadyExists),
+            EntryState::Unsafe => return Err(VaultError::UnsafeFilesystemEntry),
         }
+        let destination_target = self.document_target_allow_absent(destination)?;
         let atomic = guard
             .rebind(
                 &source_target,
@@ -1098,6 +1299,54 @@ impl Vault {
         ))
     }
 
+    fn asset_target(&self, logical_path: &AssetPath) -> Result<PathBuf, VaultError> {
+        let target = self.asset_target_allow_absent(logical_path)?;
+        match entry_state(&target)? {
+            EntryState::Regular => {
+                ensure_exact_entry_name(
+                    target.parent().ok_or(VaultError::UnsafeFilesystemEntry)?,
+                    target
+                        .file_name()
+                        .ok_or(VaultError::UnsafeFilesystemEntry)?,
+                )?;
+                ensure_same_mount(&self.root, &target)?;
+                Ok(target)
+            }
+            EntryState::Absent => Err(VaultError::AssetNotFound),
+            EntryState::Unsafe => Err(VaultError::UnsafeFilesystemEntry),
+        }
+    }
+
+    fn asset_target_allow_absent(&self, logical_path: &AssetPath) -> Result<PathBuf, VaultError> {
+        let parent = self.directory_target(&logical_path.parent(), true)?;
+        Ok(parent.join(
+            logical_path
+                .to_ciphertext_relative_path()
+                .file_name()
+                .ok_or(VaultError::UnsafeFilesystemEntry)?,
+        ))
+    }
+
+    fn asset_entry_state(&self, logical_path: &AssetPath) -> Result<EntryState, VaultError> {
+        let target = self.asset_target_allow_absent(logical_path)?;
+        let parent = target.parent().ok_or(VaultError::UnsafeFilesystemEntry)?;
+        let name = target
+            .file_name()
+            .ok_or(VaultError::UnsafeFilesystemEntry)?;
+        if exact_child_exists(parent, name)? {
+            entry_state(&target)
+        } else {
+            Ok(EntryState::Absent)
+        }
+    }
+
+    fn scan_tree(&self) -> Result<VaultTree, VaultError> {
+        Ok(tree::scan_vault_tree_with_profile(
+            &self.root,
+            tree_profile_for_config(&self.config),
+        )?)
+    }
+
     fn directory_target(
         &self,
         logical_dir: &LogicalDir,
@@ -1138,7 +1387,7 @@ impl Vault {
         &self,
         logical_path: &LogicalPath,
     ) -> Result<(), VaultError> {
-        let tree = tree::scan_vault_tree(&self.root)?;
+        let tree = self.scan_tree()?;
         ensure_directory_spelling(&tree, &logical_path.parent())?;
         ensure_logical_name_available(&tree, logical_path.as_str())?;
         match self.document_entry_state(logical_path)? {
@@ -1186,15 +1435,26 @@ impl Vault {
             hasher.update([match entry.kind() {
                 TreeEntryKind::Directory => 0,
                 TreeEntryKind::File => 1,
+                TreeEntryKind::Asset => 2,
             }]);
             let path = entry.logical_path().as_bytes();
             hasher.update(u32::try_from(path.len()).unwrap_or(u32::MAX).to_be_bytes());
             hasher.update(path);
-            if entry.kind() == TreeEntryKind::File {
-                let logical_path = LogicalPath::parse_canonical(entry.logical_path())?;
-                let target = self.document_target(&logical_path)?;
+            let target = match entry.kind() {
+                TreeEntryKind::Directory => None,
+                TreeEntryKind::File => {
+                    let logical_path = LogicalPath::parse_canonical(entry.logical_path())?;
+                    Some((self.document_target(&logical_path)?, false))
+                }
+                TreeEntryKind::Asset => {
+                    let logical_path = AssetPath::parse_canonical(entry.logical_path())?;
+                    Some((self.asset_target(&logical_path)?, true))
+                }
+            };
+            if let Some((target, asset)) = target {
                 match guard.inspect(&target).map_err(map_atomic_error)? {
                     CurrentTarget::File(etag) => hasher.update(etag),
+                    CurrentTarget::Absent if asset => return Err(VaultError::AssetNotFound),
                     CurrentTarget::Absent => return Err(VaultError::DocumentNotFound),
                     CurrentTarget::Other => return Err(VaultError::UnsafeFilesystemEntry),
                 }
@@ -1212,6 +1472,36 @@ fn document_metadata(
         header: encrypted.header,
         etag: encrypted.etag,
         parent_sync: outcome.parent_sync,
+    }
+}
+
+fn asset_metadata(encrypted: EncryptedAsset, outcome: AtomicWriteOutcome) -> AssetMetadata {
+    AssetMetadata {
+        header: encrypted.header,
+        etag: encrypted.etag,
+        parent_sync: outcome.parent_sync,
+    }
+}
+
+fn tree_profile_for_config(config: &VaultConfig) -> VaultTreeProfile {
+    if config.supports_opaque_assets() {
+        VaultTreeProfile::OpaqueAssetsV1
+    } else {
+        VaultTreeProfile::DocumentsOnly
+    }
+}
+
+const fn content_profile_to_tree_profile(profile: VaultContentProfile) -> VaultTreeProfile {
+    match profile {
+        VaultContentProfile::DocumentsOnly => VaultTreeProfile::DocumentsOnly,
+        VaultContentProfile::OpaqueAssetsV1 => VaultTreeProfile::OpaqueAssetsV1,
+    }
+}
+
+fn map_asset_not_found(error: VaultError) -> VaultError {
+    match error {
+        VaultError::DocumentNotFound => VaultError::AssetNotFound,
+        other => other,
     }
 }
 
@@ -1274,7 +1564,7 @@ fn validate_directory_metadata(metadata: &Metadata) -> Result<(), VaultError> {
     }
 }
 
-fn ensure_uninitialized_root(root: &Path) -> Result<(), VaultError> {
+fn ensure_uninitialized_root(root: &Path, profile: VaultTreeProfile) -> Result<(), VaultError> {
     for entry in fs::read_dir(root).map_err(|error| io_error(VaultIoOperation::Inspect, &error))? {
         let entry = entry.map_err(|error| io_error(VaultIoOperation::Inspect, &error))?;
         let name = entry.file_name();
@@ -1290,7 +1580,7 @@ fn ensure_uninitialized_root(root: &Path) -> Result<(), VaultError> {
             return Err(VaultError::UnsafeFilesystemEntry);
         }
     }
-    tree::scan_vault_tree(root)?;
+    tree::scan_vault_tree_with_profile(root, profile)?;
     Ok(())
 }
 
@@ -1388,10 +1678,16 @@ fn configure_no_follow_read(_options: &mut OpenOptions) {}
 
 fn ensure_logical_name_available(tree: &VaultTree, candidate: &str) -> Result<(), VaultError> {
     let candidate_file = LogicalPath::parse_canonical(candidate).ok();
+    let candidate_asset = AssetPath::parse_canonical(candidate).ok();
     let candidate_dir = LogicalDir::parse_canonical(candidate).ok();
     let candidate_fold = candidate_file
         .as_ref()
         .map(|path| path.case_fold_key().as_str().to_owned())
+        .or_else(|| {
+            candidate_asset
+                .as_ref()
+                .map(|path| path.case_fold_key().as_str().to_owned())
+        })
         .or_else(|| {
             candidate_dir
                 .as_ref()
@@ -1405,6 +1701,10 @@ fn ensure_logical_name_available(tree: &VaultTree, candidate: &str) -> Result<()
         }
         let existing_fold = match entry.kind() {
             TreeEntryKind::File => LogicalPath::parse_canonical(entry.logical_path())?
+                .case_fold_key()
+                .as_str()
+                .to_owned(),
+            TreeEntryKind::Asset => AssetPath::parse_canonical(entry.logical_path())?
                 .case_fold_key()
                 .as_str()
                 .to_owned(),
@@ -1587,9 +1887,9 @@ fn map_atomic_error(error: AtomicWriteError) -> VaultError {
                 CurrentTarget::Absent | CurrentTarget::Other => None,
             },
         },
-        AtomicWriteError::InvalidTarget | AtomicWriteError::UnsafeLockPath => {
-            VaultError::UnsafeFilesystemEntry
-        }
+        AtomicWriteError::InvalidTarget
+        | AtomicWriteError::UnsafeLockPath
+        | AtomicWriteError::UnsafeStagingPath => VaultError::UnsafeFilesystemEntry,
         AtomicWriteError::StagingVerificationFailed => VaultError::AtomicVerificationFailed,
         AtomicWriteError::TargetTooLarge => VaultError::FileTooLarge,
         AtomicWriteError::NamespaceCommitIndeterminate { expected_etag } => {
@@ -1708,6 +2008,15 @@ mod tests {
             .unwrap_or_else(|error| panic!("invalid test logical path: {error}"))
     }
 
+    fn asset(value: &str) -> AssetPath {
+        AssetPath::parse_canonical(value)
+            .unwrap_or_else(|error| panic!("invalid test asset path: {error}"))
+    }
+
+    fn asset_plaintext(value: &[u8]) -> Zeroizing<Vec<u8>> {
+        Zeroizing::new(value.to_vec())
+    }
+
     fn create_test_vault(directory: &TestDirectory) -> Vault {
         Vault::create_with_params(
             directory.path(),
@@ -1717,6 +2026,18 @@ mod tests {
             test_policy(),
         )
         .unwrap_or_else(|error| panic!("test vault creation failed: {error}"))
+    }
+
+    fn create_test_asset_vault(directory: &TestDirectory) -> Vault {
+        Vault::create_with_profile_and_params(
+            directory.path(),
+            b"old password",
+            1_783_699_200_000,
+            VaultContentProfile::OpaqueAssetsV1,
+            test_params(),
+            test_policy(),
+        )
+        .unwrap_or_else(|error| panic!("test asset vault creation failed: {error}"))
     }
 
     #[test]
@@ -1751,6 +2072,232 @@ mod tests {
             .read(&path)
             .unwrap_or_else(|error| panic!("read failed: {error}"));
         assert_eq!(plaintext.plaintext.as_slice(), "# 初稿\r\n".as_bytes());
+    }
+
+    #[test]
+    fn unlock_recovers_safe_partial_ciphertext_staging_before_tree_scan() {
+        let directory = TestDirectory::new();
+        drop(create_test_vault(&directory));
+        let staging = directory
+            .path()
+            .join(crate::atomic::VAULT_LOCAL_DIRECTORY)
+            .join(format!(
+                "{}{}{}",
+                crate::atomic::CIPHERTEXT_STAGING_PREFIX,
+                "0".repeat(32),
+                crate::atomic::CIPHERTEXT_STAGING_SUFFIX
+            ));
+        fs::write(&staging, b"EDRY-partial")
+            .unwrap_or_else(|error| panic!("partial staging write failed: {error}"));
+
+        let reopened = Vault::unlock(directory.path(), b"old password", None, test_policy())
+            .unwrap_or_else(|error| panic!("unlock recovery failed: {error}"));
+
+        assert_eq!(reopened.root(), directory.path());
+        assert!(!staging.exists());
+    }
+
+    #[test]
+    fn asset_profile_create_import_list_read_and_reopen_round_trip() {
+        let directory = TestDirectory::new();
+        let mut vault = create_test_asset_vault(&directory);
+        assert_eq!(vault.config().required_features.as_slice(), [1]);
+
+        let path = asset("images/station.png");
+        let images = LogicalDir::parse_canonical("images")
+            .unwrap_or_else(|error| panic!("directory failed: {error}"));
+        vault
+            .create_directory(&images)
+            .unwrap_or_else(|error| panic!("mkdir failed: {error}"));
+        let bytes = [0_u8, 0xff, 0x89, b'P', b'N', b'G'];
+        let created = vault
+            .create_import_asset(&path, asset_plaintext(&bytes), 1_783_699_201_000)
+            .unwrap_or_else(|error| panic!("asset import failed: {error}"));
+        assert_eq!(created.header.logical_path, path.as_str());
+        assert_eq!(created.header.required_features.as_slice(), [1]);
+
+        let tree = vault
+            .list()
+            .unwrap_or_else(|error| panic!("list failed: {error}"));
+        assert!(tree.entries().iter().any(|entry| {
+            entry.kind() == TreeEntryKind::Asset && entry.logical_path() == path.as_str()
+        }));
+        let opened = vault
+            .read_asset(&path)
+            .unwrap_or_else(|error| panic!("asset read failed: {error}"));
+        assert_eq!(opened.plaintext.as_slice(), bytes);
+        assert_eq!(opened.etag, created.etag);
+        drop(opened);
+        assert!(matches!(
+            vault.create_import_asset(&path, asset_plaintext(&bytes), 1_783_699_202_000),
+            Err(VaultError::AlreadyExists)
+        ));
+
+        drop(vault);
+        let mut reopened = Vault::unlock(directory.path(), b"old password", None, test_policy())
+            .unwrap_or_else(|error| panic!("unlock failed: {error}"));
+        assert_eq!(
+            reopened
+                .read_asset(&path)
+                .unwrap_or_else(|error| panic!("reopened asset read failed: {error}"))
+                .plaintext
+                .as_slice(),
+            bytes
+        );
+    }
+
+    #[test]
+    fn feature_free_vault_rejects_asset_import_before_writing() {
+        let directory = TestDirectory::new();
+        let mut vault = create_test_vault(&directory);
+        assert!(vault.config().required_features.is_empty());
+        let path = asset("image.bin");
+        assert!(matches!(
+            vault.create_import_asset(&path, asset_plaintext(b"opaque"), 1_783_699_201_000),
+            Err(VaultError::Crypto(CryptoError::OpaqueAssetsNotEnabled))
+        ));
+        assert!(!directory.path().join("image.bin.asset.enc").exists());
+    }
+
+    #[test]
+    fn asset_profile_creation_rejects_plaintext_before_metadata_commit() {
+        let directory = TestDirectory::new();
+        fs::create_dir_all(directory.path())
+            .unwrap_or_else(|error| panic!("fixture root create failed: {error}"));
+        fs::write(directory.path().join("image.png"), b"plaintext")
+            .unwrap_or_else(|error| panic!("plaintext fixture write failed: {error}"));
+        assert!(matches!(
+            Vault::create_with_profile_and_params(
+                directory.path(),
+                b"old password",
+                1_783_699_200_000,
+                VaultContentProfile::OpaqueAssetsV1,
+                test_params(),
+                test_policy(),
+            ),
+            Err(VaultError::Tree(TreeError::UnexpectedRegularFile { .. }))
+        ));
+        assert!(!directory.path().join(VAULT_CONFIG_FILE).exists());
+    }
+
+    #[test]
+    fn asset_ciphertext_changes_invalidate_search_without_indexing_asset() {
+        let directory = TestDirectory::new();
+        let mut vault = create_test_asset_vault(&directory);
+        vault
+            .create_document(&logical("note.md"), b"searchable", 1_783_699_201_000)
+            .unwrap_or_else(|error| panic!("document create failed: {error}"));
+        vault
+            .create_import_asset(
+                &asset("image.bin"),
+                asset_plaintext(b"not searchable"),
+                1_783_699_201_000,
+            )
+            .unwrap_or_else(|error| panic!("asset import failed: {error}"));
+        assert_eq!(
+            vault
+                .rebuild_search_index()
+                .unwrap_or_else(|error| panic!("search rebuild failed: {error}")),
+            1
+        );
+
+        let target = directory.path().join("image.bin.asset.enc");
+        let mut ciphertext = fs::read(&target)
+            .unwrap_or_else(|error| panic!("asset ciphertext read failed: {error}"));
+        let last = ciphertext
+            .last_mut()
+            .unwrap_or_else(|| panic!("asset ciphertext unexpectedly empty"));
+        *last ^= 1;
+        fs::write(&target, ciphertext)
+            .unwrap_or_else(|error| panic!("asset ciphertext mutation failed: {error}"));
+
+        let query = SearchQuery::with_defaults(
+            Zeroizing::new("searchable".to_owned()),
+            CaseSensitivity::Sensitive,
+        )
+        .unwrap_or_else(|error| panic!("query failed: {error}"));
+        assert!(matches!(
+            vault.search(&query),
+            Err(VaultError::SearchIndexNotReady)
+        ));
+    }
+
+    #[test]
+    fn asset_and_document_names_share_the_portable_collision_domain() {
+        let directory = TestDirectory::new();
+        let mut vault = create_test_asset_vault(&directory);
+        vault
+            .create_import_asset(
+                &asset("FOO.MD"),
+                asset_plaintext(b"opaque"),
+                1_783_699_201_000,
+            )
+            .unwrap_or_else(|error| panic!("asset import failed: {error}"));
+        assert!(matches!(
+            vault.create_document(&logical("foo.md"), b"markdown", 1_783_699_202_000),
+            Err(VaultError::CaseFoldCollision)
+        ));
+    }
+
+    #[test]
+    fn asset_import_rejects_a_directory_alias_of_its_physical_mapping() {
+        let directory = TestDirectory::new();
+        let mut vault = create_test_asset_vault(&directory);
+        fs::create_dir(directory.path().join("FOO.ASSET.ENC"))
+            .unwrap_or_else(|error| panic!("physical alias directory failed: {error}"));
+        assert!(matches!(
+            vault
+                .create_import_asset(&asset("foo"), asset_plaintext(b"opaque"), 1_783_699_201_000,),
+            Err(VaultError::CaseFoldCollision)
+        ));
+        assert!(!directory.path().join("foo.asset.enc").exists());
+    }
+
+    #[test]
+    fn directory_creation_rejects_document_and_asset_physical_aliases() {
+        let asset_directory = TestDirectory::new();
+        let mut asset_vault = create_test_asset_vault(&asset_directory);
+        asset_vault
+            .create_import_asset(&asset("foo"), asset_plaintext(b"opaque"), 1_783_699_201_000)
+            .unwrap_or_else(|error| panic!("asset import failed: {error}"));
+        let asset_alias = LogicalDir::parse_canonical("FOO.ASSET.ENC")
+            .unwrap_or_else(|error| panic!("asset alias directory failed: {error}"));
+        assert!(matches!(
+            asset_vault.create_directory(&asset_alias),
+            Err(VaultError::CaseFoldCollision)
+        ));
+
+        let document_directory = TestDirectory::new();
+        let mut document_vault = create_test_vault(&document_directory);
+        document_vault
+            .create_document(&logical("foo.md"), b"markdown", 1_783_699_201_000)
+            .unwrap_or_else(|error| panic!("document create failed: {error}"));
+        let document_alias = LogicalDir::parse_canonical("FOO.MD.ENC")
+            .unwrap_or_else(|error| panic!("document alias directory failed: {error}"));
+        assert!(matches!(
+            document_vault.create_directory(&document_alias),
+            Err(VaultError::CaseFoldCollision)
+        ));
+    }
+
+    #[test]
+    fn oversized_asset_envelope_is_rejected_before_read_allocation() {
+        let directory = TestDirectory::new();
+        let mut vault = create_test_asset_vault(&directory);
+        let target = directory.path().join("large.bin.asset.enc");
+        let file = File::create(&target)
+            .unwrap_or_else(|error| panic!("oversized fixture create failed: {error}"));
+        file.set_len(
+            u64::try_from(MAX_ASSET_EDRY_ENVELOPE_BYTES)
+                .unwrap_or(u64::MAX)
+                .saturating_add(1),
+        )
+        .unwrap_or_else(|error| panic!("oversized fixture resize failed: {error}"));
+        drop(file);
+        assert!(matches!(
+            vault.read_asset(&asset("large.bin")),
+            Err(VaultError::FileTooLarge)
+        ));
     }
 
     #[test]
@@ -2174,6 +2721,28 @@ mod tests {
             vault.read(&destination),
             Err(VaultError::DocumentNotFound)
         ));
+    }
+
+    #[test]
+    fn rename_rejects_a_directory_alias_of_the_destination_ciphertext() {
+        let directory = TestDirectory::new();
+        let mut vault = create_test_vault(&directory);
+        let source = logical("source.md");
+        let created = vault
+            .create_document(&source, b"rename secret", 1_783_699_201_000)
+            .unwrap_or_else(|error| panic!("source create failed: {error}"));
+        fs::create_dir(directory.path().join("TARGET.MD.ENC"))
+            .unwrap_or_else(|error| panic!("destination alias failed: {error}"));
+        assert!(matches!(
+            vault.rename_document(
+                &source,
+                &logical("target.md"),
+                &created.etag,
+                1_783_699_202_000,
+            ),
+            Err(VaultError::CaseFoldCollision)
+        ));
+        assert!(vault.read(&source).is_ok());
     }
 
     #[test]

@@ -13,10 +13,11 @@ use thiserror::Error;
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::features::OPAQUE_ASSETS_V1;
 use crate::format::{
     self, CipherSuite, ContentFlags, EdryHeader, FileKeyDerivation, FormatError, PlaintextKind,
 };
-use crate::path::LogicalPath;
+use crate::path::{AssetPath, LogicalPath};
 use crate::sodium::{
     self, Argon2idCalibration, Argon2idLimits, Argon2idParams, LockedBytes, SecureMemoryHealth,
     SodiumError,
@@ -76,6 +77,25 @@ pub struct CreatedVault {
     pub config: VaultConfig,
     pub master_key: VaultMasterKey,
     pub slot_id: Uuid,
+}
+
+/// Required-feature profile fixed when a new vault identity is created.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum VaultContentProfile {
+    /// A legacy-compatible vault containing Markdown documents only.
+    #[default]
+    DocumentsOnly,
+    /// A vault that may contain bounded opaque assets under required feature 1.
+    OpaqueAssetsV1,
+}
+
+impl VaultContentProfile {
+    fn required_features(self) -> Vec<u32> {
+        match self {
+            Self::DocumentsOnly => Vec::new(),
+            Self::OpaqueAssetsV1 => vec![OPAQUE_ASSETS_V1],
+        }
+    }
 }
 
 /// Result of authenticating one password slot and the complete vault metadata.
@@ -156,6 +176,43 @@ impl fmt::Debug for DecryptedDocument {
     }
 }
 
+/// Complete encrypted opaque asset ready for ciphertext-only persistence.
+pub struct EncryptedAsset {
+    pub header: EdryHeader,
+    pub bytes: Vec<u8>,
+    pub etag: String,
+}
+
+impl fmt::Debug for EncryptedAsset {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EncryptedAsset")
+            .field("header", &self.header)
+            .field("ciphertext_bytes", &self.bytes.len())
+            .field("etag", &self.etag)
+            .finish()
+    }
+}
+
+/// Authenticated opaque asset bytes held in a zeroizing owned allocation.
+pub struct DecryptedAsset {
+    pub header: EdryHeader,
+    pub plaintext: Zeroizing<Vec<u8>>,
+    pub etag: String,
+}
+
+impl fmt::Debug for DecryptedAsset {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DecryptedAsset")
+            .field("header", &self.header)
+            .field("plaintext", &"<redacted>")
+            .field("plaintext_bytes", &self.plaintext.len())
+            .field("etag", &self.etag)
+            .finish()
+    }
+}
+
 /// Errors from authenticated vault and document cryptographic operations.
 #[derive(Debug, Error)]
 pub enum CryptoError {
@@ -183,6 +240,14 @@ pub enum CryptoError {
     InvalidMarkdownUtf8,
     #[error("document plaintext exceeds the EDRY v1 size limit")]
     PlaintextTooLarge,
+    #[error("opaque asset plaintext exceeds the EDRY feature-1 size limit")]
+    AssetPlaintextTooLarge,
+    #[error("EDRY asset does not match the expected vault, epoch, path, or kind")]
+    AssetContextMismatch,
+    #[error("EDRY asset authentication failed")]
+    AssetAuthenticationFailed,
+    #[error("opaque assets are not enabled by authenticated vault metadata")]
+    OpaqueAssetsNotEnabled,
 }
 
 /// Create a new vault using the production v1 KDF policy and defaults.
@@ -194,6 +259,19 @@ pub enum CryptoError {
 /// authentication failure.
 pub fn create_vault(password: &[u8], created_at_ms: i64) -> Result<CreatedVault, CryptoError> {
     create_vault_with_policy(password, created_at_ms, KdfPolicy::default())
+}
+
+/// Create a new vault with one explicit content profile and production policy.
+///
+/// # Errors
+///
+/// Returns [`CryptoError`] under the same conditions as [`create_vault`].
+pub fn create_vault_with_profile(
+    password: &[u8],
+    created_at_ms: i64,
+    profile: VaultContentProfile,
+) -> Result<CreatedVault, CryptoError> {
+    create_vault_with_profile_and_policy(password, created_at_ms, profile, KdfPolicy::default())
 }
 
 /// Create a new vault using process-cached v1 calibration bounded by `policy`.
@@ -211,8 +289,27 @@ pub fn create_vault_with_policy(
     created_at_ms: i64,
     policy: KdfPolicy,
 ) -> Result<CreatedVault, CryptoError> {
+    create_vault_with_profile_and_policy(
+        password,
+        created_at_ms,
+        VaultContentProfile::DocumentsOnly,
+        policy,
+    )
+}
+
+/// Create a new vault with an explicit content profile and KDF policy.
+///
+/// # Errors
+///
+/// Returns [`CryptoError`] when calibration or creation fails.
+pub fn create_vault_with_profile_and_policy(
+    password: &[u8],
+    created_at_ms: i64,
+    profile: VaultContentProfile,
+    policy: KdfPolicy,
+) -> Result<CreatedVault, CryptoError> {
     let params = calibrated_creation_params(policy)?;
-    create_vault_with_params(password, created_at_ms, params, policy)
+    create_vault_with_profile_and_params(password, created_at_ms, profile, params, policy)
 }
 
 /// Create a new vault with explicit parameters and policy.
@@ -227,6 +324,32 @@ pub fn create_vault_with_policy(
 pub fn create_vault_with_params(
     password: &[u8],
     created_at_ms: i64,
+    params: Argon2idParams,
+    policy: KdfPolicy,
+) -> Result<CreatedVault, CryptoError> {
+    create_vault_with_profile_and_params(
+        password,
+        created_at_ms,
+        VaultContentProfile::DocumentsOnly,
+        params,
+        policy,
+    )
+}
+
+/// Create a new vault with an explicit content profile, KDF parameters, and policy.
+///
+/// This is the deterministic entry point used by authenticated repository
+/// import and low-cost tests. Existing callers should keep using
+/// [`create_vault_with_params`] for a feature-free vault.
+///
+/// # Errors
+///
+/// Returns [`CryptoError`] when request validation, key generation, wrapping,
+/// metadata authentication, or profile validation fails.
+pub fn create_vault_with_profile_and_params(
+    password: &[u8],
+    created_at_ms: i64,
+    profile: VaultContentProfile,
     params: Argon2idParams,
     policy: KdfPolicy,
 ) -> Result<CreatedVault, CryptoError> {
@@ -258,7 +381,7 @@ pub fn create_vault_with_params(
         vault_id,
         key_epoch: 0,
         created_at: created_at_ms,
-        required_features: Vec::new(),
+        required_features: profile.required_features(),
         key_slots: vec![slot],
         features: VaultFeatures::default(),
         metadata_mac: EncodedBytes::new([0_u8; 32]),
@@ -492,6 +615,7 @@ pub fn decrypt_document(
     if parts.header.vault_id != expected_vault_id
         || parts.header.key_epoch != expected_key_epoch
         || parts.header.logical_path != expected_path.as_str()
+        || parts.header.plaintext_kind != PlaintextKind::Utf8Markdown
         || !kind_matches(expected_kind, parts.header.is_draft())
     {
         return Err(CryptoError::DocumentContextMismatch);
@@ -521,11 +645,139 @@ pub fn decrypt_document(
     })
 }
 
+/// Encrypt exact opaque bytes into one committed EDRY asset envelope.
+///
+/// `identity` is `None` for a new asset and preserves file id/creation time for
+/// a later whole-file replacement or rename. `config` must authenticate with
+/// `master_key` and declare exact required feature `[1]`. Every call uses a
+/// fresh nonce.
+///
+/// # Errors
+///
+/// Returns [`CryptoError`] for an oversized body, invalid time/path/header, or
+/// any random, derivation, secure-memory, AEAD, or framing failure.
+#[allow(clippy::too_many_arguments)]
+pub fn encrypt_asset(
+    master_key: &VaultMasterKey,
+    config: &VaultConfig,
+    logical_path: &AssetPath,
+    identity: Option<FileIdentity>,
+    plaintext: &[u8],
+    modified_at_ms: i64,
+) -> Result<EncryptedAsset, CryptoError> {
+    require_opaque_assets(config, master_key)?;
+    if plaintext.len() > format::MAX_ASSET_PLAINTEXT_LEN {
+        return Err(CryptoError::AssetPlaintextTooLarge);
+    }
+    let identity = match identity {
+        Some(identity) => identity,
+        None => FileIdentity {
+            file_id: random_uuid_v4()?,
+            created_at_ms: modified_at_ms,
+        },
+    };
+    let header = EdryHeader {
+        vault_id: config.vault_id,
+        file_id: identity.file_id,
+        logical_path: logical_path.as_str().to_owned(),
+        key_epoch: config.key_epoch,
+        key_derivation: FileKeyDerivation::Blake2b256V1,
+        cipher: CipherSuite::XChaCha20Poly1305Ietf,
+        nonce: sodium::random_array()?,
+        plaintext_kind: PlaintextKind::OpaqueAsset,
+        created_at_ms: identity.created_at_ms,
+        modified_at_ms,
+        content_flags: ContentFlags::NONE,
+        required_features: vec![OPAQUE_ASSETS_V1],
+        base_etag: None,
+    };
+    let (header, bytes, etag) = encrypt_envelope(master_key, header, plaintext)?;
+    Ok(EncryptedAsset {
+        header,
+        bytes,
+        etag,
+    })
+}
+
+/// Authenticate and decrypt one committed EDRY asset in an expected context.
+///
+/// No plaintext byte is returned until whole-envelope authentication succeeds.
+/// Asset bytes are not interpreted as UTF-8. Authenticated vault metadata must
+/// declare exact required feature `[1]` before envelope parsing proceeds.
+///
+/// # Errors
+///
+/// Returns [`CryptoError`] for malformed/noncanonical framing, kind or context
+/// mismatch, authentication failure, or key-derivation failure.
+pub fn decrypt_asset(
+    master_key: &VaultMasterKey,
+    config: &VaultConfig,
+    expected_path: &AssetPath,
+    envelope: &[u8],
+) -> Result<DecryptedAsset, CryptoError> {
+    require_opaque_assets(config, master_key)?;
+    let parts = format::split_envelope(envelope)?;
+    if parts.header.vault_id != config.vault_id
+        || parts.header.key_epoch != config.key_epoch
+        || parts.header.logical_path != expected_path.as_str()
+        || parts.header.plaintext_kind != PlaintextKind::OpaqueAsset
+        || parts.header.is_draft()
+    {
+        return Err(CryptoError::AssetContextMismatch);
+    }
+
+    let file_key = derive_file_key(
+        master_key,
+        parts.header.vault_id,
+        parts.header.key_epoch,
+        parts.header.file_id,
+    )?;
+    let aad = parts.associated_data()?;
+    let plaintext = file_key
+        .with_read(|key| {
+            sodium::xchacha20poly1305_decrypt(parts.ciphertext, &aad, &parts.header.nonce, key)
+        })?
+        .map_err(|error| match error {
+            SodiumError::AuthenticationFailed => CryptoError::AssetAuthenticationFailed,
+            other => CryptoError::Sodium(other),
+        })?;
+
+    Ok(DecryptedAsset {
+        header: parts.header,
+        plaintext,
+        etag: format::etag(envelope),
+    })
+}
+
+fn require_opaque_assets(
+    config: &VaultConfig,
+    master_key: &VaultMasterKey,
+) -> Result<(), CryptoError> {
+    verify_metadata_mac(config, master_key)?;
+    if config.required_features.as_slice() != [OPAQUE_ASSETS_V1] {
+        return Err(CryptoError::OpaqueAssetsNotEnabled);
+    }
+    Ok(())
+}
+
 fn encrypt_with_header(
     master_key: &VaultMasterKey,
     header: EdryHeader,
     plaintext: &[u8],
 ) -> Result<EncryptedDocument, CryptoError> {
+    let (header, bytes, etag) = encrypt_envelope(master_key, header, plaintext)?;
+    Ok(EncryptedDocument {
+        header,
+        bytes,
+        etag,
+    })
+}
+
+fn encrypt_envelope(
+    master_key: &VaultMasterKey,
+    header: EdryHeader,
+    plaintext: &[u8],
+) -> Result<(EdryHeader, Vec<u8>, String), CryptoError> {
     let file_key = derive_file_key(
         master_key,
         header.vault_id,
@@ -538,11 +790,7 @@ fn encrypt_with_header(
     })??;
     let bytes = format::build_envelope(&header, &ciphertext)?;
     let etag = format::etag(&bytes);
-    Ok(EncryptedDocument {
-        header,
-        bytes,
-        etag,
-    })
+    Ok((header, bytes, etag))
 }
 
 fn derive_file_key(
@@ -942,10 +1190,28 @@ mod tests {
         }
     }
 
+    fn asset_capable_created() -> CreatedVault {
+        create_vault_with_profile_and_params(
+            b"correct horse",
+            1_783_699_200_000,
+            VaultContentProfile::OpaqueAssetsV1,
+            test_params(),
+            test_policy(),
+        )
+        .expect("asset-capable test vault creation succeeds")
+    }
+
     fn path() -> LogicalPath {
         match LogicalPath::parse_canonical("2026/07/日记.md") {
             Ok(path) => path,
             Err(error) => panic!("test path failed: {error}"),
+        }
+    }
+
+    fn asset_path() -> AssetPath {
+        match AssetPath::parse_canonical("images/南极站.png") {
+            Ok(path) => path,
+            Err(error) => panic!("test asset path failed: {error}"),
         }
     }
 
@@ -1613,5 +1879,289 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn opaque_asset_requires_authenticated_vault_feature_one() {
+        let feature_free = created();
+        assert!(matches!(
+            encrypt_asset(
+                &feature_free.master_key,
+                &feature_free.config,
+                &asset_path(),
+                None,
+                b"asset",
+                1_783_699_200_100,
+            ),
+            Err(CryptoError::OpaqueAssetsNotEnabled)
+        ));
+
+        let mut tampered = feature_free.config.clone();
+        tampered.required_features = vec![OPAQUE_ASSETS_V1];
+        assert!(matches!(
+            encrypt_asset(
+                &feature_free.master_key,
+                &tampered,
+                &asset_path(),
+                None,
+                b"asset",
+                1_783_699_200_100,
+            ),
+            Err(CryptoError::MetadataAuthenticationFailed)
+        ));
+
+        let capable = asset_capable_created();
+        assert_eq!(capable.config.required_features, vec![OPAQUE_ASSETS_V1]);
+        assert!(capable.config.supports_opaque_assets());
+        let json = capable
+            .config
+            .to_json_bytes(test_policy())
+            .expect("asset-capable metadata serializes");
+        let (parsed, _) = VaultConfig::parse_untrusted(&json, test_policy())
+            .expect("asset-capable metadata parses before KDF");
+        let unlocked = unlock_vault(&parsed, b"correct horse", None, test_policy())
+            .expect("asset-capable metadata MAC authenticates after unlock");
+        let encrypted = encrypt_asset(
+            &unlocked.master_key,
+            &parsed,
+            &asset_path(),
+            None,
+            b"asset",
+            1_783_699_200_100,
+        )
+        .expect("authenticated asset-capable vault encrypts assets");
+
+        let mut authenticated_feature_free = parsed.clone();
+        authenticated_feature_free.required_features.clear();
+        refresh_metadata_mac(&mut authenticated_feature_free, &unlocked.master_key)
+            .expect("feature-free negative config is authenticated");
+        assert!(matches!(
+            decrypt_asset(
+                &unlocked.master_key,
+                &authenticated_feature_free,
+                &asset_path(),
+                &encrypted.bytes,
+            ),
+            Err(CryptoError::OpaqueAssetsNotEnabled)
+        ));
+    }
+
+    #[test]
+    fn opaque_asset_round_trips_arbitrary_bytes_and_preserves_identity() {
+        let created = asset_capable_created();
+        let plaintext = [0x00, 0xff, 0xfe, 0x80, b'P', b'N', b'G'];
+        let first = encrypt_asset(
+            &created.master_key,
+            &created.config,
+            &asset_path(),
+            None,
+            &plaintext,
+            1_783_699_200_100,
+        )
+        .expect("opaque asset encrypts");
+        assert_eq!(first.header.plaintext_kind, PlaintextKind::OpaqueAsset);
+        assert_eq!(first.header.required_features, vec![OPAQUE_ASSETS_V1]);
+
+        let decrypted = decrypt_asset(
+            &created.master_key,
+            &created.config,
+            &asset_path(),
+            &first.bytes,
+        )
+        .expect("opaque asset decrypts");
+        assert_eq!(decrypted.plaintext.as_slice(), plaintext);
+        assert_eq!(decrypted.etag, first.etag);
+
+        let identity = FileIdentity::from_header(&first.header);
+        let renamed_path =
+            AssetPath::parse_canonical("images/renamed.png").expect("valid renamed asset path");
+        let second = encrypt_asset(
+            &created.master_key,
+            &created.config,
+            &renamed_path,
+            Some(identity),
+            &plaintext,
+            1_783_699_200_200,
+        )
+        .expect("opaque asset replacement encrypts");
+        assert_eq!(FileIdentity::from_header(&second.header), identity);
+        assert_ne!(second.header.nonce, first.header.nonce);
+        assert_ne!(second.etag, first.etag);
+        assert!(matches!(
+            decrypt_asset(
+                &created.master_key,
+                &created.config,
+                &asset_path(),
+                &second.bytes,
+            ),
+            Err(CryptoError::AssetContextMismatch)
+        ));
+        assert_eq!(
+            decrypt_asset(
+                &created.master_key,
+                &created.config,
+                &renamed_path,
+                &second.bytes,
+            )
+            .expect("renamed asset decrypts only at its new path")
+            .plaintext
+            .as_slice(),
+            plaintext
+        );
+    }
+
+    #[test]
+    fn document_crypto_limit_remains_16_mib_after_asset_primitive_expansion() {
+        let created = created();
+        let mut plaintext = vec![b'a'; format::MAX_DOCUMENT_PLAINTEXT_LEN + 1];
+        assert!(matches!(
+            encrypt_document(
+                &created.master_key,
+                created.config.vault_id,
+                created.config.key_epoch,
+                &path(),
+                None,
+                &plaintext,
+                1_783_699_200_100,
+                ContentFlags::NONE,
+                EnvelopeKind::Committed,
+            ),
+            Err(CryptoError::PlaintextTooLarge)
+        ));
+
+        plaintext.truncate(format::MAX_DOCUMENT_PLAINTEXT_LEN);
+        let encrypted = encrypt_document(
+            &created.master_key,
+            created.config.vault_id,
+            created.config.key_epoch,
+            &path(),
+            None,
+            &plaintext,
+            1_783_699_200_100,
+            ContentFlags::NONE,
+            EnvelopeKind::Committed,
+        )
+        .expect("exact 16 MiB document encrypts");
+        let decrypted = decrypt_document(
+            &created.master_key,
+            created.config.vault_id,
+            created.config.key_epoch,
+            &path(),
+            ExpectedEnvelopeKind::Committed,
+            &encrypted.bytes,
+        )
+        .expect("exact 16 MiB document decrypts");
+        assert_eq!(
+            decrypted.plaintext.len(),
+            format::MAX_DOCUMENT_PLAINTEXT_LEN
+        );
+    }
+
+    #[test]
+    fn opaque_asset_context_and_tampering_fail_without_plaintext() {
+        let created = asset_capable_created();
+        let empty = encrypt_asset(
+            &created.master_key,
+            &created.config,
+            &asset_path(),
+            None,
+            b"",
+            1_783_699_200_100,
+        )
+        .expect("empty opaque asset encrypts");
+        assert!(
+            decrypt_asset(
+                &created.master_key,
+                &created.config,
+                &asset_path(),
+                &empty.bytes,
+            )
+            .expect("empty opaque asset decrypts")
+            .plaintext
+            .is_empty()
+        );
+        let mut truncated = empty.bytes.clone();
+        truncated.pop();
+        assert!(matches!(
+            decrypt_asset(
+                &created.master_key,
+                &created.config,
+                &asset_path(),
+                &truncated,
+            ),
+            Err(CryptoError::Format(_))
+        ));
+
+        let mut encrypted = encrypt_asset(
+            &created.master_key,
+            &created.config,
+            &asset_path(),
+            None,
+            b"secret asset canary",
+            1_783_699_200_100,
+        )
+        .expect("opaque asset encrypts");
+        let other = AssetPath::parse_canonical("images/other.png").expect("valid asset path");
+        assert!(matches!(
+            decrypt_asset(
+                &created.master_key,
+                &created.config,
+                &other,
+                &encrypted.bytes,
+            ),
+            Err(CryptoError::AssetContextMismatch)
+        ));
+
+        let last = encrypted.bytes.len() - 1;
+        encrypted.bytes[last] ^= 1;
+        assert!(matches!(
+            decrypt_asset(
+                &created.master_key,
+                &created.config,
+                &asset_path(),
+                &encrypted.bytes,
+            ),
+            Err(CryptoError::AssetAuthenticationFailed)
+        ));
+    }
+
+    #[test]
+    fn opaque_asset_exact_64_mib_boundary_succeeds_and_plus_one_fails() {
+        let created = asset_capable_created();
+        let mut plaintext = vec![0xa5; format::MAX_ASSET_PLAINTEXT_LEN + 1];
+        assert!(matches!(
+            encrypt_asset(
+                &created.master_key,
+                &created.config,
+                &asset_path(),
+                None,
+                &plaintext,
+                1_783_699_200_100,
+            ),
+            Err(CryptoError::AssetPlaintextTooLarge)
+        ));
+
+        plaintext.truncate(format::MAX_ASSET_PLAINTEXT_LEN);
+        let encrypted = encrypt_asset(
+            &created.master_key,
+            &created.config,
+            &asset_path(),
+            None,
+            &plaintext,
+            1_783_699_200_100,
+        )
+        .expect("64 MiB opaque asset encrypts");
+        drop(plaintext);
+        assert!(encrypted.bytes.len() <= format::MAX_ASSET_ENVELOPE_BYTES);
+
+        let decrypted = decrypt_asset(
+            &created.master_key,
+            &created.config,
+            &asset_path(),
+            &encrypted.bytes,
+        )
+        .expect("64 MiB opaque asset decrypts");
+        assert_eq!(decrypted.plaintext.len(), format::MAX_ASSET_PLAINTEXT_LEN);
+        assert!(decrypted.plaintext.iter().all(|byte| *byte == 0xa5));
     }
 }

@@ -9,6 +9,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::features::{OPAQUE_ASSETS_V1, is_supported_required_feature};
+use crate::path::{AssetPath, LogicalPath};
+
 /// Four-byte EDRY file signature.
 pub const EDRY_MAGIC: [u8; 4] = *b"EDRY";
 /// EDRY format major version implemented by this module.
@@ -25,11 +28,25 @@ const EDRY_HEADER_FIELD_COUNT_USIZE: usize = 13;
 /// Maximum accepted canonical header size.
 pub const MAX_HEADER_LEN: usize = 4_096;
 /// Maximum Markdown plaintext size in v1.
-pub const MAX_PLAINTEXT_LEN: usize = 16 * 1024 * 1024;
+pub const MAX_DOCUMENT_PLAINTEXT_LEN: usize = 16 * 1024 * 1024;
+/// Backward-compatible name for the Markdown plaintext ceiling.
+pub const MAX_PLAINTEXT_LEN: usize = MAX_DOCUMENT_PLAINTEXT_LEN;
+/// Maximum opaque-asset plaintext size under required feature 1.
+pub const MAX_ASSET_PLAINTEXT_LEN: usize = 64 * 1024 * 1024;
 /// XChaCha20-Poly1305 authentication tag size.
 pub const AEAD_TAG_LEN: usize = 16;
-/// Maximum accepted ciphertext (plaintext plus authentication tag) size.
-pub const MAX_CIPHERTEXT_LEN: usize = MAX_PLAINTEXT_LEN + AEAD_TAG_LEN;
+/// Maximum accepted Markdown ciphertext size.
+pub const MAX_DOCUMENT_CIPHERTEXT_LEN: usize = MAX_DOCUMENT_PLAINTEXT_LEN + AEAD_TAG_LEN;
+/// Backward-compatible name for the Markdown ciphertext ceiling.
+pub const MAX_CIPHERTEXT_LEN: usize = MAX_DOCUMENT_CIPHERTEXT_LEN;
+/// Maximum accepted opaque-asset ciphertext size.
+pub const MAX_ASSET_CIPHERTEXT_LEN: usize = MAX_ASSET_PLAINTEXT_LEN + AEAD_TAG_LEN;
+/// Exact upper bound for a complete Markdown EDRY envelope.
+pub const MAX_DOCUMENT_ENVELOPE_BYTES: usize =
+    EDRY_PREFIX_LEN + MAX_HEADER_LEN + MAX_DOCUMENT_CIPHERTEXT_LEN;
+/// Exact upper bound for a complete opaque-asset EDRY envelope.
+pub const MAX_ASSET_ENVELOPE_BYTES: usize =
+    EDRY_PREFIX_LEN + MAX_HEADER_LEN + MAX_ASSET_CIPHERTEXT_LEN;
 /// Domain separator prepended to EDRY v1 AEAD associated data.
 pub const EDRY_AAD_DOMAIN: &[u8] = b"INEX-EDRY-FILE\0";
 /// Prefix used by externally visible ciphertext etags.
@@ -98,6 +115,8 @@ impl TryFrom<u64> for CipherSuite {
 pub enum PlaintextKind {
     /// Exact UTF-8 Markdown bytes, without newline normalization.
     Utf8Markdown = 1,
+    /// Exact opaque asset bytes without UTF-8 interpretation.
+    OpaqueAsset = 2,
 }
 
 impl PlaintextKind {
@@ -114,6 +133,7 @@ impl TryFrom<u64> for PlaintextKind {
     fn try_from(value: u64) -> Result<Self, Self::Error> {
         match value {
             1 => Ok(Self::Utf8Markdown),
+            2 => Ok(Self::OpaqueAsset),
             id => Err(FormatError::UnsupportedPlaintextKind(id)),
         }
     }
@@ -184,7 +204,7 @@ pub struct EdryHeader {
     pub vault_id: Uuid,
     /// Stable random UUID for this logical file.
     pub file_id: Uuid,
-    /// Canonical logical path, including `.md` and excluding physical `.enc`.
+    /// Canonical logical document or asset path, excluding its physical suffix.
     pub logical_path: String,
     /// Master-key epoch used for file-key derivation.
     pub key_epoch: u32,
@@ -202,7 +222,7 @@ pub struct EdryHeader {
     pub modified_at_ms: i64,
     /// Authenticated content flags.
     pub content_flags: ContentFlags,
-    /// Sorted required feature identifiers; empty in EDRY v1.
+    /// Sorted required feature identifiers.
     pub required_features: Vec<u32>,
     /// Raw base ciphertext SHA-256 for a draft, or `None` for a new draft.
     pub base_etag: Option<[u8; 32]>,
@@ -232,19 +252,41 @@ impl EdryHeader {
             });
         }
 
-        crate::path::LogicalPath::parse_canonical(&self.logical_path).map_err(|error| {
-            FormatError::InvalidLogicalPath {
-                reason: error.to_string(),
-            }
-        })?;
-
         ContentFlags::from_bits(self.content_flags.bits())?;
 
         if !strictly_increasing(&self.required_features) {
             return Err(FormatError::RequiredFeaturesNotStrictlyIncreasing);
         }
-        if let Some(feature) = self.required_features.first() {
-            return Err(FormatError::UnknownRequiredFeature(*feature));
+        for feature in &self.required_features {
+            if !is_supported_required_feature(*feature) {
+                return Err(FormatError::UnknownRequiredFeature(*feature));
+            }
+        }
+
+        match self.plaintext_kind {
+            PlaintextKind::Utf8Markdown => {
+                LogicalPath::parse_canonical(&self.logical_path).map_err(|error| {
+                    FormatError::InvalidLogicalPath {
+                        reason: error.to_string(),
+                    }
+                })?;
+                if !self.required_features.is_empty() {
+                    return Err(FormatError::PlaintextProfileMismatch);
+                }
+            }
+            PlaintextKind::OpaqueAsset => {
+                AssetPath::parse_canonical(&self.logical_path).map_err(|error| {
+                    FormatError::InvalidLogicalPath {
+                        reason: error.to_string(),
+                    }
+                })?;
+                if self.required_features.as_slice() != [OPAQUE_ASSETS_V1]
+                    || !self.content_flags.is_empty()
+                    || self.base_etag.is_some()
+                {
+                    return Err(FormatError::PlaintextProfileMismatch);
+                }
+            }
         }
 
         if !self.is_draft() && self.base_etag.is_some() {
@@ -412,9 +454,13 @@ pub enum FormatError {
     #[error("EDRY required features must be strictly increasing")]
     RequiredFeaturesNotStrictlyIncreasing,
 
-    /// EDRY v1 has no supported nonempty required-feature identifiers.
+    /// A required-feature identifier is unknown to this implementation.
     #[error("unsupported required EDRY feature {0}")]
     UnknownRequiredFeature(u32),
+
+    /// Kind, path, feature, flags, or draft state do not form one valid profile.
+    #[error("EDRY plaintext kind does not match its path, features, flags, or draft state")]
+    PlaintextProfileMismatch,
 
     /// File-key derivation identifier is unknown in v1.
     #[error("unsupported EDRY file-key derivation id {0}")]
@@ -678,8 +724,8 @@ pub fn associated_data_for_header(header: &EdryHeader) -> Result<Vec<u8>, Format
 /// Returns a [`FormatError`] when the header is invalid, the ciphertext size
 /// is outside the v1 bound, or the resulting length overflows.
 pub fn build_envelope(header: &EdryHeader, ciphertext: &[u8]) -> Result<Vec<u8>, FormatError> {
-    validate_ciphertext_length(ciphertext.len())?;
     let header_bytes = encode_header(header)?;
+    validate_ciphertext_length(ciphertext.len(), header.plaintext_kind)?;
     let prefix = build_prefix(header_bytes.len())?;
     let capacity = EDRY_PREFIX_LEN
         .checked_add(header_bytes.len())
@@ -721,9 +767,9 @@ pub fn split_envelope(envelope: &[u8]) -> Result<EnvelopeParts<'_>, FormatError>
     }
 
     let header_bytes = &envelope[EDRY_PREFIX_LEN..header_end];
-    let ciphertext = &envelope[header_end..];
-    validate_ciphertext_length(ciphertext.len())?;
     let header = decode_header(header_bytes)?;
+    let ciphertext = &envelope[header_end..];
+    validate_ciphertext_length(ciphertext.len(), header.plaintext_kind)?;
 
     Ok(EnvelopeParts {
         prefix,
@@ -869,8 +915,10 @@ fn decode_required_features(decoder: &mut Decoder<'_>) -> Result<Vec<u32>, Forma
     if !strictly_increasing(&features) {
         return Err(FormatError::RequiredFeaturesNotStrictlyIncreasing);
     }
-    if let Some(feature) = features.first() {
-        return Err(FormatError::UnknownRequiredFeature(*feature));
+    for feature in &features {
+        if !is_supported_required_feature(*feature) {
+            return Err(FormatError::UnknownRequiredFeature(*feature));
+        }
     }
     Ok(features)
 }
@@ -933,12 +981,19 @@ fn validate_header_length(length: usize) -> Result<(), FormatError> {
     Ok(())
 }
 
-fn validate_ciphertext_length(length: usize) -> Result<(), FormatError> {
-    if !(AEAD_TAG_LEN..=MAX_CIPHERTEXT_LEN).contains(&length) {
+fn validate_ciphertext_length(
+    length: usize,
+    plaintext_kind: PlaintextKind,
+) -> Result<(), FormatError> {
+    let maximum = match plaintext_kind {
+        PlaintextKind::Utf8Markdown => MAX_DOCUMENT_CIPHERTEXT_LEN,
+        PlaintextKind::OpaqueAsset => MAX_ASSET_CIPHERTEXT_LEN,
+    };
+    if !(AEAD_TAG_LEN..=maximum).contains(&length) {
         return Err(FormatError::CiphertextLengthOutOfRange {
             actual: length,
             minimum: AEAD_TAG_LEN,
-            maximum: MAX_CIPHERTEXT_LEN,
+            maximum,
         });
     }
     Ok(())
@@ -998,6 +1053,14 @@ mod tests {
         header
     }
 
+    fn asset_header() -> EdryHeader {
+        let mut header = committed_header();
+        header.logical_path = "images/station.png".to_owned();
+        header.plaintext_kind = PlaintextKind::OpaqueAsset;
+        header.required_features = vec![OPAQUE_ASSETS_V1];
+        header
+    }
+
     fn encoded_header_with_mutation(mutator: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
         let mut bytes = match encode_header(&committed_header()) {
             Ok(bytes) => bytes,
@@ -1037,8 +1100,29 @@ mod tests {
     }
 
     #[test]
+    fn fixed_asset_header_vector_is_stable() {
+        // Independent literal fixture for the feature-1 wire extension. In
+        // particular, key 7 is plaintext kind 2 and key 11 is exact `[1]`.
+        const EXPECTED: &[u8] = &[
+            0xad, 0x00, 0x50, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a,
+            0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x01, 0x50, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16,
+            0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x02, 0x72, 0x69, 0x6d, 0x61,
+            0x67, 0x65, 0x73, 0x2f, 0x73, 0x74, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x2e, 0x70, 0x6e,
+            0x67, 0x03, 0x00, 0x04, 0x01, 0x05, 0x01, 0x06, 0x58, 0x18, 0x20, 0x21, 0x22, 0x23,
+            0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x30, 0x31,
+            0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x07, 0x02, 0x08, 0x1b, 0x00, 0x00, 0x01, 0x9f,
+            0x4c, 0xc1, 0xd8, 0x00, 0x09, 0x1b, 0x00, 0x00, 0x01, 0x9f, 0x4c, 0xc1, 0xd8, 0x7b,
+            0x0a, 0x00, 0x0b, 0x81, 0x01, 0x0c, 0xf6,
+        ];
+
+        let encoded = encode_header(&asset_header());
+        assert_eq!(encoded.as_deref(), Ok(EXPECTED));
+        assert_eq!(decode_header(EXPECTED), Ok(asset_header()));
+    }
+
+    #[test]
     fn committed_and_draft_headers_round_trip() {
-        for header in [committed_header(), draft_header()] {
+        for header in [committed_header(), draft_header(), asset_header()] {
             let encoded = encode_header(&header);
             assert!(encoded.is_ok());
             let decoded = encoded.and_then(|bytes| decode_header(&bytes));
@@ -1197,6 +1281,22 @@ mod tests {
             build_envelope(&header, &vec![0_u8; MAX_CIPHERTEXT_LEN + 1]),
             Err(FormatError::CiphertextLengthOutOfRange { .. })
         ));
+
+        assert_eq!(MAX_DOCUMENT_PLAINTEXT_LEN, 16_777_216);
+        assert_eq!(MAX_ASSET_PLAINTEXT_LEN, 67_108_864);
+        assert_eq!(MAX_ASSET_ENVELOPE_BYTES, 67_112_988);
+        assert!(
+            validate_ciphertext_length(MAX_ASSET_CIPHERTEXT_LEN, PlaintextKind::OpaqueAsset)
+                .is_ok()
+        );
+        assert_eq!(
+            validate_ciphertext_length(MAX_ASSET_CIPHERTEXT_LEN + 1, PlaintextKind::OpaqueAsset),
+            Err(FormatError::CiphertextLengthOutOfRange {
+                actual: MAX_ASSET_CIPHERTEXT_LEN + 1,
+                minimum: AEAD_TAG_LEN,
+                maximum: MAX_ASSET_CIPHERTEXT_LEN,
+            })
+        );
     }
 
     #[test]
@@ -1329,6 +1429,33 @@ mod tests {
         new_draft.content_flags = ContentFlags::DRAFT;
         new_draft.base_etag = None;
         assert!(encode_header(&new_draft).is_ok());
+
+        let mut document_with_asset_feature = committed_header();
+        document_with_asset_feature.required_features = vec![OPAQUE_ASSETS_V1];
+        assert_eq!(
+            encode_header(&document_with_asset_feature),
+            Err(FormatError::PlaintextProfileMismatch)
+        );
+
+        for mutate in [
+            |header: &mut EdryHeader| header.required_features.clear(),
+            |header: &mut EdryHeader| header.content_flags = ContentFlags::DRAFT,
+            |header: &mut EdryHeader| header.base_etag = Some([0; 32]),
+        ] {
+            let mut asset = asset_header();
+            mutate(&mut asset);
+            assert_eq!(
+                encode_header(&asset),
+                Err(FormatError::PlaintextProfileMismatch)
+            );
+        }
+
+        let mut asset_with_markdown_path = asset_header();
+        asset_with_markdown_path.logical_path = "notes/readme.md".to_owned();
+        assert!(matches!(
+            encode_header(&asset_with_markdown_path),
+            Err(FormatError::InvalidLogicalPath { .. })
+        ));
     }
 
     #[test]
@@ -1354,10 +1481,10 @@ mod tests {
         );
 
         let mut unknown_kind = encoded.clone();
-        unknown_kind[87] = 2;
+        unknown_kind[87] = 3;
         assert_eq!(
             decode_header(&unknown_kind),
-            Err(FormatError::UnsupportedPlaintextKind(2))
+            Err(FormatError::UnsupportedPlaintextKind(3))
         );
 
         let mut unknown_flags = encoded.clone();

@@ -383,6 +383,7 @@ fn command_verify(vault_path: &Path) -> Result<ExitCode, AppError> {
     println!("vault-metadata: structurally-valid-untrusted");
     println!("directories: {}", report.directories);
     println!("documents: {}", report.documents);
+    println!("assets: {}", report.assets);
     println!("weak-kdf-slots: {}", report.weak_kdf_slots);
     println!("authenticated-content: not-performed");
     println!(

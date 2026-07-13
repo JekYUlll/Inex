@@ -511,6 +511,7 @@ fn verify_observed_tree(vault: &mut Vault, plan: &ImportPlan) -> Result<(), Impo
         let expected = match entry.kind() {
             TreeEntryKind::Directory => &expected_directories,
             TreeEntryKind::File => &expected_files,
+            TreeEntryKind::Asset => return Err(ImportError::StagingVerificationFailed),
         };
         if !expected.contains(entry.logical_path()) {
             return Err(ImportError::StagingVerificationFailed);

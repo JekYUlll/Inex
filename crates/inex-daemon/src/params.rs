@@ -8,7 +8,7 @@
 
 use std::fmt;
 
-use inex_core::path::{LogicalDir, LogicalPath};
+use inex_core::path::{AssetPath, LogicalDir, LogicalPath};
 use serde_json::{Map, Value};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -466,6 +466,17 @@ impl ParamObject {
             .transpose()
     }
 
+    /// Remove and validate a required canonical opaque-asset path.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidParams` for a non-canonical path, a Markdown path, or
+    /// any value outside the opaque-asset path profile.
+    pub fn required_asset_path(&mut self, field: &'static str) -> Result<AssetPath, ParamError> {
+        let value = self.required_string(field, 1, inex_core::path::MAX_LOGICAL_PATH_BYTES)?;
+        AssetPath::parse_canonical(&value).map_err(|_| ParamError::invalid(Some(field)))
+    }
+
     /// Remove and validate a required canonical logical directory.
     ///
     /// The empty string is accepted as the logical vault root.
@@ -901,9 +912,16 @@ mod tests {
     fn logical_paths_and_directories_must_already_be_canonical() {
         let mut params = object(json!({
             "logicalPath": "notes/café.md",
+            "assetPath": "images/café.png",
             "logicalDir": "notes",
             "root": ""
         }));
+        assert_eq!(
+            params
+                .required_asset_path("assetPath")
+                .map(inex_core::path::AssetPath::into_string),
+            Ok("images/café.png".to_owned())
+        );
         assert_eq!(
             params
                 .required_logical_path("logicalPath")
@@ -931,6 +949,16 @@ mod tests {
         assert!(
             object(json!({"path": "../secret.md"}))
                 .required_logical_path("path")
+                .is_err()
+        );
+        assert!(
+            object(json!({"path": "notes/café.md"}))
+                .required_asset_path("path")
+                .is_err()
+        );
+        assert!(
+            object(json!({"path": "images/cafe\u{301}.png"}))
+                .required_asset_path("path")
                 .is_err()
         );
     }

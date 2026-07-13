@@ -18,6 +18,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::features::{OPAQUE_ASSETS_V1, is_supported_required_feature};
+
 /// Maximum accepted `vault.json` size before JSON parsing.
 pub const MAX_VAULT_JSON_BYTES: usize = 1024 * 1024;
 /// New vaults must use at least 64 MiB for Argon2id.
@@ -317,7 +319,11 @@ impl VaultConfig {
         if !strictly_sorted_unique(&self.required_features) {
             return Err(ConfigError::NonCanonicalRequiredFeatures);
         }
-        if !self.required_features.is_empty() {
+        if self
+            .required_features
+            .iter()
+            .any(|feature| !is_supported_required_feature(*feature))
+        {
             return Err(ConfigError::UnsupportedRequiredFeature);
         }
         if self.features.filename_encryption || self.features.streaming_blobs {
@@ -354,6 +360,14 @@ impl VaultConfig {
             }
         }
         Ok(warnings)
+    }
+
+    /// Return whether authenticated metadata declares opaque-assets v1.
+    #[must_use]
+    pub fn supports_opaque_assets(&self) -> bool {
+        self.required_features
+            .binary_search(&OPAQUE_ASSETS_V1)
+            .is_ok()
     }
 
     /// Require every slot to satisfy the creation policy.
@@ -746,6 +760,44 @@ mod tests {
             value.validate_untrusted(KdfPolicy::default()),
             Err(ConfigError::KdfOutsideReaderBounds)
         ));
+    }
+
+    #[test]
+    fn required_feature_one_is_negotiated_and_unknown_features_fail_closed() {
+        let mut asset_capable = config();
+        asset_capable.required_features = vec![OPAQUE_ASSETS_V1];
+        assert!(
+            asset_capable
+                .validate_untrusted(KdfPolicy::default())
+                .is_ok()
+        );
+        assert!(asset_capable.supports_opaque_assets());
+        assert!(!config().supports_opaque_assets());
+
+        let mut unknown = config();
+        unknown.required_features = vec![2];
+        assert!(matches!(
+            unknown.validate_untrusted(KdfPolicy::default()),
+            Err(ConfigError::UnsupportedRequiredFeature)
+        ));
+
+        let mut duplicate = config();
+        duplicate.required_features = vec![OPAQUE_ASSETS_V1, OPAQUE_ASSETS_V1];
+        assert!(matches!(
+            duplicate.validate_untrusted(KdfPolicy::default()),
+            Err(ConfigError::NonCanonicalRequiredFeatures)
+        ));
+    }
+
+    #[test]
+    fn required_feature_one_is_covered_by_metadata_payload() {
+        let feature_free = config();
+        let mut asset_capable = feature_free.clone();
+        asset_capable.required_features = vec![OPAQUE_ASSETS_V1];
+        assert_ne!(
+            feature_free.metadata_payload().expect("payload encodes"),
+            asset_capable.metadata_payload().expect("payload encodes")
+        );
     }
 
     #[test]

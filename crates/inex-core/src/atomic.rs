@@ -1,9 +1,10 @@
 //! Atomic ciphertext persistence and the per-vault mutation lock.
 //!
-//! A save is staged beside its destination, fully written and synchronized,
-//! then committed while holding an OS-backed lock in `.vault-local`.  The
-//! compare condition is deliberately checked *after* the lock is acquired.
-//! No function in this module accepts or creates plaintext.
+//! A save first acquires an OS-backed lock in `.vault-local`, then is staged
+//! inside that private directory, fully written, synchronized, and committed
+//! to its destination while the lock remains held. The compare condition is
+//! deliberately checked under the same lock. No function in this module
+//! accepts or creates plaintext.
 //!
 //! The audited platform module at the end calls `flock(LOCK_EX)` on Linux and
 //! `LockFileEx` on Windows, and supplies Windows handle identity/link checks
@@ -29,7 +30,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::path::LogicalPath;
+use crate::path::{AssetPath, LogicalPath};
 
 /// Name of the vault-private directory used for process-local state.
 pub const VAULT_LOCAL_DIRECTORY: &str = ".vault-local";
@@ -66,7 +67,12 @@ const MAX_JOURNAL_PATH_BYTES: usize = 4 * 1024;
 
 const MAX_STAGING_NAME_ATTEMPTS: usize = 32;
 const ETAG_READ_BUFFER_SIZE: usize = 16 * 1024;
-const MAX_ATOMIC_TARGET_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_STAGING_RECOVERY_ENTRIES: usize = 100_000;
+const MAX_STAGING_RECOVERY_PATH_BYTES: usize = 32 * 1024 * 1024;
+// Opaque-assets v1 is a bounded whole-file format. Callers retain their
+// narrower per-kind limits, while the shared atomic writer must admit the
+// exact largest authenticated asset envelope.
+const MAX_ATOMIC_TARGET_BYTES: u64 = 67_112_988;
 
 /// Optimistic concurrency condition for one ciphertext commit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -94,7 +100,8 @@ pub enum ParentSyncStatus {
 pub struct AtomicWriteOutcome {
     /// SHA-256 digest of the complete committed ciphertext envelope.
     pub etag: [u8; 32],
-    /// Whether the best-effort parent-directory sync succeeded.
+    /// Whether both the private staging directory and target parent syncs
+    /// succeeded after the cross-directory namespace commit.
     pub parent_sync: ParentSyncStatus,
 }
 
@@ -231,7 +238,7 @@ pub enum CurrentTarget {
 /// I/O stage associated with a scrubbed atomic-write failure.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum AtomicWriteStage {
-    /// Creating the same-directory staging file.
+    /// Creating the vault-private staging file.
     CreateStaging,
     /// Writing the ciphertext staging file.
     WriteStaging,
@@ -245,6 +252,8 @@ pub enum AtomicWriteStage {
     PrepareLock,
     /// Acquiring the operating-system mutation lock.
     AcquireLock,
+    /// Auditing and removing safe crash-abandoned ciphertext staging files.
+    RecoverStaging,
     /// Reading the current target for the in-lock condition check.
     ReadCurrent,
     /// Preparing or reading the encrypted-only rebind recovery journal.
@@ -269,6 +278,7 @@ impl fmt::Display for AtomicWriteStage {
             Self::VerifyStaging => "staging verification",
             Self::PrepareLock => "vault lock preparation",
             Self::AcquireLock => "vault lock acquisition",
+            Self::RecoverStaging => "ciphertext staging recovery",
             Self::ReadCurrent => "in-lock target read",
             Self::RebindJournal => "rebind recovery journal",
             Self::Replace => "atomic replacement",
@@ -290,6 +300,9 @@ pub enum AtomicWriteError {
     /// `.vault-local` or its lock path was a symlink or unexpected file type.
     #[error("vault mutation lock path is not a regular local path")]
     UnsafeLockPath,
+    /// A staging-looking path could not be proven safe to remove.
+    #[error("ciphertext staging recovery found an unsafe filesystem entry")]
+    UnsafeStagingPath,
     /// The caller's compare condition did not match the in-lock target state.
     #[error("ciphertext write condition did not match current target")]
     Conflict {
@@ -378,9 +391,16 @@ impl VaultMutationGuard {
     /// Returns a scrubbed lock or recovery error. A conflicting recovery state
     /// is left untouched for explicit user inspection.
     pub fn acquire(vault_root: &Path) -> Result<Self, AtomicWriteError> {
+        Self::acquire_with_faults(vault_root, &NoFaults)
+    }
+
+    fn acquire_with_faults<F: FaultInjector>(
+        vault_root: &Path,
+        faults: &F,
+    ) -> Result<Self, AtomicWriteError> {
         let root_identity = filesystem_directory_identity(vault_root)
             .map_err(|source| AtomicWriteError::io(AtomicWriteStage::PrepareLock, source))?;
-        let lock = VaultMutationLock::acquire(vault_root)?;
+        let lock = VaultMutationLock::acquire_with_faults(vault_root, faults)?;
         let locked_root_identity = filesystem_directory_identity(vault_root)
             .map_err(|source| AtomicWriteError::io(AtomicWriteStage::PrepareLock, source))?;
         if locked_root_identity != root_identity {
@@ -398,6 +418,7 @@ impl VaultMutationGuard {
         {
             return Err(AtomicWriteError::UnsafeLockPath);
         }
+        recover_ciphertext_staging_locked(vault_root)?;
         let recovery_changed_repository = recover_pending_rebind_locked(vault_root)?;
         Ok(Self {
             root: vault_root.to_path_buf(),
@@ -463,7 +484,8 @@ impl VaultMutationGuard {
     ) -> Result<AtomicWriteOutcome, AtomicWriteError> {
         ensure_write_target_in_root(&self.root, target)?;
         let parent = target_parent(target).ok_or(AtomicWriteError::InvalidTarget)?;
-        let (mut staging, etag) = stage_and_verify(parent, ciphertext, &NoFaults)?;
+        let staging_parent = self.root.join(VAULT_LOCAL_DIRECTORY);
+        let (mut staging, etag) = stage_and_verify(&staging_parent, ciphertext, &NoFaults)?;
         let current = inspect_current_target(target)?;
         enforce_condition(condition, current)?;
         if let Err(source) = namespace_move(
@@ -471,13 +493,20 @@ impl VaultMutationGuard {
             target,
             matches!(condition, WriteCondition::IfMatch(_)),
         ) {
-            return reconcile_failed_namespace_commit(target, current, etag, source)
-                .map(|parent_sync| AtomicWriteOutcome { etag, parent_sync });
+            return reconcile_failed_namespace_commit(target, current, etag, source).map(
+                |target_parent_sync| AtomicWriteOutcome {
+                    etag,
+                    parent_sync: combine_parent_sync(
+                        target_parent_sync,
+                        sync_namespace_parent_status(&staging_parent),
+                    ),
+                },
+            );
         }
         staging.disarm();
         Ok(AtomicWriteOutcome {
             etag,
-            parent_sync: sync_namespace_parent_status(parent),
+            parent_sync: sync_staging_and_target_parents_status(&staging_parent, parent),
         })
     }
 
@@ -576,11 +605,12 @@ impl VaultMutationLock {
 
 /// Writes and atomically commits an already-encrypted byte envelope.
 ///
-/// `target` is never opened for writing. A random `create_new` staging file is
-/// created in the same directory, written, flushed, and synchronized first.
-/// The function then acquires the vault mutation lock, rechecks `condition`,
-/// and renames the complete staging file over `target`. Parent-directory sync
-/// is best effort and reported in the successful outcome.
+/// `target` is never opened for writing. The function first acquires the vault
+/// mutation lock and recovers safe crash-abandoned staging files. It then
+/// creates a random `create_new` staging file inside `.vault-local`, writes,
+/// flushes, synchronizes and verifies it, rechecks `condition`, and renames the
+/// complete staging file over `target`. Source and target parent-directory
+/// syncs are best effort and reported together in the successful outcome.
 ///
 /// The caller remains responsible for validating the EDRY envelope and for
 /// ensuring `target` is the filesystem path of a validated logical vault path.
@@ -1258,13 +1288,13 @@ fn atomic_write_ciphertext_with_faults<F: FaultInjector>(
 ) -> Result<AtomicWriteOutcome, AtomicWriteError> {
     ensure_write_target_in_root(vault_root, target)?;
     let parent = target_parent(target).ok_or(AtomicWriteError::InvalidTarget)?;
-    let (mut staging, new_etag) = stage_and_verify(parent, ciphertext, faults)?;
 
     faults
         .check(FaultPoint::BeforeLock)
         .map_err(|source| AtomicWriteError::io(AtomicWriteStage::AcquireLock, source))?;
-    let _lock = VaultMutationLock::acquire_with_faults(vault_root, faults)?;
-    let _ = recover_pending_rebind_locked(vault_root)?;
+    let _guard = VaultMutationGuard::acquire_with_faults(vault_root, faults)?;
+    let staging_parent = vault_root.join(VAULT_LOCAL_DIRECTORY);
+    let (mut staging, new_etag) = stage_and_verify(&staging_parent, ciphertext, faults)?;
 
     faults
         .check(FaultPoint::ReadCurrent)
@@ -1281,20 +1311,25 @@ fn atomic_write_ciphertext_with_faults<F: FaultInjector>(
         matches!(condition, WriteCondition::IfMatch(_)),
     ) {
         return reconcile_failed_namespace_commit(target, current, new_etag, source).map(
-            |parent_sync| AtomicWriteOutcome {
+            |target_parent_sync| AtomicWriteOutcome {
                 etag: new_etag,
-                parent_sync,
+                parent_sync: combine_parent_sync(
+                    target_parent_sync,
+                    sync_namespace_parent_status(&staging_parent),
+                ),
             },
         );
     }
     staging.disarm();
 
-    let parent_sync =
-        if faults.check(FaultPoint::SyncParent).is_ok() && sync_namespace_parent(parent).is_ok() {
-            ParentSyncStatus::Synced
-        } else {
-            ParentSyncStatus::NotSynced
-        };
+    let parent_sync = if faults.check(FaultPoint::SyncParent).is_ok()
+        && sync_namespace_parent(&staging_parent).is_ok()
+        && sync_namespace_parent(parent).is_ok()
+    {
+        ParentSyncStatus::Synced
+    } else {
+        ParentSyncStatus::NotSynced
+    };
 
     Ok(AtomicWriteOutcome {
         etag: new_etag,
@@ -1324,8 +1359,8 @@ pub fn atomic_delete_ciphertext(
 /// Re-encrypts a file under a new authenticated logical path, then removes the
 /// old path without risking loss of the source.
 ///
-/// The destination envelope is staged and verified before the vault lock is
-/// acquired. Under one lock, both source and destination conditions are
+/// Under one lock, crash-abandoned staging is recovered, the destination
+/// envelope is staged and verified, both source and destination conditions are
 /// checked, a synchronized recovery journal is installed, and the destination
 /// is committed and verified before source deletion. A crash or I/O failure
 /// after destination commit leaves a journal that the next mutation (or
@@ -1373,8 +1408,9 @@ fn rebind_locked(
     ensure_ciphertext_target_in_root(vault_root, destination)?;
     let source_parent = target_parent(source).ok_or(AtomicWriteError::InvalidTarget)?;
     let destination_parent = target_parent(destination).ok_or(AtomicWriteError::InvalidTarget)?;
+    let staging_parent = vault_root.join(VAULT_LOCAL_DIRECTORY);
     let (mut staging, destination_etag) =
-        stage_and_verify(destination_parent, replacement_envelope, &NoFaults)?;
+        stage_and_verify(&staging_parent, replacement_envelope, &NoFaults)?;
 
     enforce_condition(source_condition, inspect_current_target(source)?)?;
     enforce_condition(destination_condition, inspect_current_target(destination)?)?;
@@ -1411,7 +1447,9 @@ fn rebind_locked(
     if inspect_current_target(destination)? != CurrentTarget::File(destination_etag) {
         return Err(AtomicWriteError::RebindPending { destination_etag });
     }
-    let Ok(destination_parent_sync) = sync_rebind_parent(destination_parent) else {
+    let Ok(destination_parent_sync) =
+        sync_rebind_commit_parents(&staging_parent, destination_parent)
+    else {
         return Err(AtomicWriteError::RebindPending { destination_etag });
     };
     if retire_ciphertext_entry(vault_root, source).is_err() {
@@ -1438,9 +1476,10 @@ fn rebind_locked(
 pub fn recover_pending_rebind(
     vault_root: &Path,
 ) -> Result<RebindRecoveryOutcome, AtomicWriteError> {
-    let _lock = VaultMutationLock::acquire(vault_root)?;
-    recover_pending_rebind_locked(vault_root)
-        .map(|changed_repository| RebindRecoveryOutcome { changed_repository })
+    let guard = VaultMutationGuard::acquire(vault_root)?;
+    Ok(RebindRecoveryOutcome {
+        changed_repository: guard.recovery_changed_repository(),
+    })
 }
 
 /// Checks that an already-open regular file still names the same current path
@@ -2716,11 +2755,37 @@ fn sync_namespace_parent_status(parent: &Path) -> ParentSyncStatus {
     }
 }
 
+fn combine_parent_sync(first: ParentSyncStatus, second: ParentSyncStatus) -> ParentSyncStatus {
+    if first == ParentSyncStatus::Synced && second == ParentSyncStatus::Synced {
+        ParentSyncStatus::Synced
+    } else {
+        ParentSyncStatus::NotSynced
+    }
+}
+
+fn sync_staging_and_target_parents_status(
+    staging_parent: &Path,
+    target_parent: &Path,
+) -> ParentSyncStatus {
+    combine_parent_sync(
+        sync_namespace_parent_status(staging_parent),
+        sync_namespace_parent_status(target_parent),
+    )
+}
+
 fn sync_rebind_parent(parent: &Path) -> Result<ParentSyncStatus, ()> {
     match sync_namespace_parent(parent) {
         Ok(()) => Ok(ParentSyncStatus::Synced),
         Err(_) => Err(()),
     }
+}
+
+fn sync_rebind_commit_parents(
+    staging_parent: &Path,
+    destination_parent: &Path,
+) -> Result<ParentSyncStatus, ()> {
+    sync_rebind_parent(staging_parent)?;
+    sync_rebind_parent(destination_parent)
 }
 
 #[derive(Debug)]
@@ -2840,6 +2905,193 @@ fn pending_rebind_path(vault_root: &Path) -> PathBuf {
         .join(PENDING_REBIND_FILE)
 }
 
+#[derive(Debug)]
+struct StagingRecoveryCandidate {
+    path: PathBuf,
+    identity: FilesystemFileIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StagingNameClass {
+    None,
+    Exact,
+    WrongCase,
+}
+
+#[derive(Debug, Default)]
+struct StagingRecoveryScan {
+    inspected_entries: usize,
+    inspected_path_bytes: usize,
+    candidates: Vec<StagingRecoveryCandidate>,
+}
+
+fn recover_ciphertext_staging_locked(vault_root: &Path) -> Result<(), AtomicWriteError> {
+    let root_identity = filesystem_directory_identity(vault_root).map_err(staging_recovery_io)?;
+    let root = fs::canonicalize(vault_root).map_err(staging_recovery_io)?;
+    if filesystem_directory_identity(&root).map_err(staging_recovery_io)? != root_identity {
+        return Err(AtomicWriteError::UnsafeStagingPath);
+    }
+    let local = root.join(VAULT_LOCAL_DIRECTORY);
+    let local_identity = filesystem_directory_identity(&local).map_err(staging_recovery_io)?;
+    if !paths_share_mount(&root, &local).map_err(staging_recovery_io)? {
+        return Err(AtomicWriteError::UnsafeStagingPath);
+    }
+
+    let mut scan = StagingRecoveryScan::default();
+    collect_staging_recovery_candidates(&root, &local, &mut scan)?;
+    verify_staging_recovery_directories(&root, &local, &root_identity, &local_identity)?;
+
+    for candidate in &scan.candidates {
+        remove_staging_recovery_candidate(&root, candidate)?;
+    }
+    verify_staging_recovery_directories(&root, &local, &root_identity, &local_identity)
+}
+
+fn collect_staging_recovery_candidates(
+    root: &Path,
+    local: &Path,
+    scan: &mut StagingRecoveryScan,
+) -> Result<(), AtomicWriteError> {
+    let entries = fs::read_dir(local).map_err(staging_recovery_io)?;
+    for entry in entries {
+        let entry = entry.map_err(staging_recovery_io)?;
+        let name = entry.file_name();
+        scan.inspected_entries = scan.inspected_entries.saturating_add(1);
+        scan.inspected_path_bytes = scan
+            .inspected_path_bytes
+            .saturating_add(name.as_encoded_bytes().len());
+        if scan.inspected_entries > MAX_STAGING_RECOVERY_ENTRIES
+            || scan.inspected_path_bytes > MAX_STAGING_RECOVERY_PATH_BYTES
+        {
+            return Err(AtomicWriteError::UnsafeStagingPath);
+        }
+
+        let path = local.join(&name);
+        let _metadata = fs::symlink_metadata(&path).map_err(staging_recovery_io)?;
+        match classify_staging_name(&name) {
+            StagingNameClass::WrongCase => return Err(AtomicWriteError::UnsafeStagingPath),
+            StagingNameClass::Exact => {
+                scan.candidates
+                    .push(audit_staging_recovery_candidate(root, &path)?);
+            }
+            StagingNameClass::None => {}
+        }
+    }
+    Ok(())
+}
+
+fn verify_staging_recovery_directories(
+    root: &Path,
+    local: &Path,
+    root_identity: &FilesystemDirectoryIdentity,
+    local_identity: &FilesystemDirectoryIdentity,
+) -> Result<(), AtomicWriteError> {
+    if filesystem_directory_identity(root).map_err(staging_recovery_io)? != *root_identity
+        || filesystem_directory_identity(local).map_err(staging_recovery_io)? != *local_identity
+        || !paths_share_mount(root, local).map_err(staging_recovery_io)?
+    {
+        return Err(AtomicWriteError::UnsafeStagingPath);
+    }
+    Ok(())
+}
+
+fn audit_staging_recovery_candidate(
+    root: &Path,
+    path: &Path,
+) -> Result<StagingRecoveryCandidate, AtomicWriteError> {
+    let metadata = fs::symlink_metadata(path).map_err(staging_recovery_io)?;
+    if is_link_or_reparse_point(&metadata)
+        || !metadata.file_type().is_file()
+        || metadata.len() > MAX_ATOMIC_TARGET_BYTES
+        || !paths_share_mount(root, path).map_err(staging_recovery_io)?
+    {
+        return Err(AtomicWriteError::UnsafeStagingPath);
+    }
+    let file = File::open(path).map_err(staging_recovery_io)?;
+    let held_metadata = file.metadata().map_err(staging_recovery_io)?;
+    if !held_metadata.file_type().is_file()
+        || held_metadata.len() > MAX_ATOMIC_TARGET_BYTES
+        || !open_file_matches_path_and_is_single_link(path, &file).map_err(staging_recovery_io)?
+    {
+        return Err(AtomicWriteError::UnsafeStagingPath);
+    }
+    verify_regular_file_has_no_alternate_data_streams(path, &file)
+        .map_err(|_| AtomicWriteError::UnsafeStagingPath)?;
+    let identity =
+        filesystem_file_identity(&file).map_err(|_| AtomicWriteError::UnsafeStagingPath)?;
+    if !open_file_matches_path_and_is_single_link(path, &file).map_err(staging_recovery_io)? {
+        return Err(AtomicWriteError::UnsafeStagingPath);
+    }
+    Ok(StagingRecoveryCandidate {
+        path: path.to_path_buf(),
+        identity,
+    })
+}
+
+fn remove_staging_recovery_candidate(
+    root: &Path,
+    candidate: &StagingRecoveryCandidate,
+) -> Result<(), AtomicWriteError> {
+    let metadata =
+        fs::symlink_metadata(&candidate.path).map_err(|_| AtomicWriteError::UnsafeStagingPath)?;
+    if is_link_or_reparse_point(&metadata)
+        || !metadata.file_type().is_file()
+        || metadata.len() > MAX_ATOMIC_TARGET_BYTES
+        || !paths_share_mount(root, &candidate.path).map_err(staging_recovery_io)?
+    {
+        return Err(AtomicWriteError::UnsafeStagingPath);
+    }
+    let file = File::open(&candidate.path).map_err(|_| AtomicWriteError::UnsafeStagingPath)?;
+    if filesystem_file_identity(&file).map_err(|_| AtomicWriteError::UnsafeStagingPath)?
+        != candidate.identity
+        || !open_file_matches_path_and_is_single_link(&candidate.path, &file)
+            .map_err(staging_recovery_io)?
+    {
+        return Err(AtomicWriteError::UnsafeStagingPath);
+    }
+    verify_regular_file_has_no_alternate_data_streams(&candidate.path, &file)
+        .map_err(|_| AtomicWriteError::UnsafeStagingPath)?;
+    atomic_remove_verified_file(&candidate.path, file)
+        .map_err(|_| AtomicWriteError::UnsafeStagingPath)?;
+    Ok(())
+}
+
+fn classify_staging_name(name: &std::ffi::OsStr) -> StagingNameClass {
+    let Some(name) = name.to_str() else {
+        return StagingNameClass::None;
+    };
+    let expected_length = CIPHERTEXT_STAGING_PREFIX.len() + 32 + CIPHERTEXT_STAGING_SUFFIX.len();
+    let bytes = name.as_bytes();
+    if bytes.len() != expected_length {
+        return StagingNameClass::None;
+    }
+    let prefix_end = CIPHERTEXT_STAGING_PREFIX.len();
+    let suffix_start = prefix_end + 32;
+    let prefix = &bytes[..prefix_end];
+    let random = &bytes[prefix_end..suffix_start];
+    let suffix = &bytes[suffix_start..];
+    if !prefix.eq_ignore_ascii_case(CIPHERTEXT_STAGING_PREFIX.as_bytes())
+        || !suffix.eq_ignore_ascii_case(CIPHERTEXT_STAGING_SUFFIX.as_bytes())
+        || !random.iter().all(u8::is_ascii_hexdigit)
+    {
+        return StagingNameClass::None;
+    }
+    if prefix == CIPHERTEXT_STAGING_PREFIX.as_bytes()
+        && suffix == CIPHERTEXT_STAGING_SUFFIX.as_bytes()
+        && random
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+    {
+        StagingNameClass::Exact
+    } else {
+        StagingNameClass::WrongCase
+    }
+}
+
+fn staging_recovery_io(source: io::Error) -> AtomicWriteError {
+    AtomicWriteError::io(AtomicWriteStage::RecoverStaging, source)
+}
+
 fn install_rebind_journal(
     vault_root: &Path,
     journal: &RebindJournal,
@@ -2932,7 +3184,8 @@ fn recover_pending_rebind_locked(vault_root: &Path) -> Result<bool, AtomicWriteE
         {
             let destination_parent =
                 target_parent(&destination).ok_or(AtomicWriteError::RebindRecoveryConflict)?;
-            if sync_rebind_parent(destination_parent).is_err() {
+            let staging_parent = vault_root.join(VAULT_LOCAL_DIRECTORY);
+            if sync_rebind_commit_parents(&staging_parent, destination_parent).is_err() {
                 return Err(AtomicWriteError::RebindPending {
                     destination_etag: journal.destination_etag,
                 });
@@ -2954,7 +3207,12 @@ fn recover_pending_rebind_locked(vault_root: &Path) -> Result<bool, AtomicWriteE
         (CurrentTarget::Absent, CurrentTarget::File(destination_etag))
             if destination_etag == journal.destination_etag =>
         {
-            for parent in [target_parent(&destination), target_parent(&source)] {
+            let staging_parent = vault_root.join(VAULT_LOCAL_DIRECTORY);
+            for parent in [
+                Some(staging_parent.as_path()),
+                target_parent(&destination),
+                target_parent(&source),
+            ] {
                 let parent = parent.ok_or(AtomicWriteError::RebindRecoveryConflict)?;
                 if sync_rebind_parent(parent).is_err() {
                     return Err(AtomicWriteError::RebindPending {
@@ -3039,9 +3297,13 @@ fn ensure_write_target_in_root(vault_root: &Path, target: &Path) -> Result<(), A
             Ok(())
         }
     } else {
-        LogicalPath::from_ciphertext_relative_path(relative)
-            .map(|_| ())
-            .map_err(|_| AtomicWriteError::InvalidTarget)
+        if LogicalPath::from_ciphertext_relative_path(relative).is_ok()
+            || AssetPath::from_ciphertext_relative_path(relative).is_ok()
+        {
+            Ok(())
+        } else {
+            Err(AtomicWriteError::InvalidTarget)
+        }
     }
 }
 
@@ -5943,7 +6205,7 @@ mod tests {
 
         assert_eq!(fs::read(&target)?, NEW_CIPHERTEXT);
         assert_eq!(outcome.etag, digest_bytes(NEW_CIPHERTEXT));
-        assert_no_staging_files(fixture.notes())?;
+        assert_no_staging_files(&fixture.local())?;
         assert!(
             fixture
                 .root()
@@ -5951,6 +6213,140 @@ mod tests {
                 .join(VAULT_MUTATION_LOCK_FILE)
                 .is_file()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn guard_acquire_removes_safe_partial_staging_from_private_namespace() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        drop(VaultMutationGuard::acquire(fixture.root()).map_err(io::Error::other)?);
+        let staging = exact_staging_path(&fixture.local(), '0');
+        fs::write(&staging, b"EDRY-partial")?;
+
+        drop(VaultMutationGuard::acquire(fixture.root()).map_err(io::Error::other)?);
+
+        assert!(!staging.exists());
+        assert_no_staging_files(&fixture.local())?;
+        Ok(())
+    }
+
+    #[test]
+    fn content_tree_exact_staging_names_are_never_recovered() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        let unrelated_file = exact_staging_path(fixture.notes(), '5');
+        let logical_directory = exact_staging_path(fixture.notes(), '6');
+        fs::write(&unrelated_file, b"legacy unrelated data")?;
+        fs::create_dir(&logical_directory)?;
+
+        drop(VaultMutationGuard::acquire(fixture.root()).map_err(io::Error::other)?);
+
+        assert_eq!(fs::read(unrelated_file)?, b"legacy unrelated data");
+        assert!(logical_directory.is_dir());
+        Ok(())
+    }
+
+    #[test]
+    fn staging_recovery_preserves_wrong_case_aliases_and_fails_closed() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        fs::create_dir(fixture.local())?;
+        let prefix_alias = fixture.local().join(format!(
+            ".INEX-CIPHERTEXT-STAGE-{}{}",
+            "0".repeat(32),
+            CIPHERTEXT_STAGING_SUFFIX
+        ));
+        let hex_alias = exact_staging_path(&fixture.local(), 'A');
+        fs::write(&prefix_alias, b"partial")?;
+        fs::write(&hex_alias, b"partial")?;
+
+        assert!(matches!(
+            VaultMutationGuard::acquire(fixture.root()),
+            Err(AtomicWriteError::UnsafeStagingPath)
+        ));
+        assert_eq!(fs::read(prefix_alias)?, b"partial");
+        assert_eq!(fs::read(hex_alias)?, b"partial");
+        Ok(())
+    }
+
+    #[test]
+    fn staging_recovery_preserves_exact_name_directories_and_fails_closed() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        fs::create_dir(fixture.local())?;
+        let staging_directory = exact_staging_path(&fixture.local(), '7');
+        fs::create_dir(&staging_directory)?;
+
+        assert!(matches!(
+            VaultMutationGuard::acquire(fixture.root()),
+            Err(AtomicWriteError::UnsafeStagingPath)
+        ));
+        assert!(staging_directory.is_dir());
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn staging_recovery_preserves_oversized_candidates_and_fails_closed() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        fs::create_dir(fixture.local())?;
+        let staging = exact_staging_path(&fixture.local(), '1');
+        let file = fs::File::create(&staging)?;
+        file.set_len(MAX_ATOMIC_TARGET_BYTES.saturating_add(1))?;
+        drop(file);
+
+        assert!(matches!(
+            VaultMutationGuard::acquire(fixture.root()),
+            Err(AtomicWriteError::UnsafeStagingPath)
+        ));
+        assert_eq!(fs::metadata(staging)?.len(), MAX_ATOMIC_TARGET_BYTES + 1);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_recovery_preserves_hardlinks_and_symlinks_and_fails_closed() -> io::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let hardlink_fixture = TestVault::new()?;
+        fs::create_dir(hardlink_fixture.local())?;
+        let hardlink_staging = exact_staging_path(&hardlink_fixture.local(), '2');
+        let hardlink_alias = hardlink_fixture.local().join("hardlink-alias");
+        fs::write(&hardlink_staging, b"partial")?;
+        fs::hard_link(&hardlink_staging, &hardlink_alias)?;
+        assert!(matches!(
+            VaultMutationGuard::acquire(hardlink_fixture.root()),
+            Err(AtomicWriteError::UnsafeStagingPath)
+        ));
+        assert_eq!(fs::read(&hardlink_staging)?, b"partial");
+        assert_eq!(fs::read(&hardlink_alias)?, b"partial");
+
+        let symlink_fixture = TestVault::new()?;
+        let outside = symlink_fixture.notes().join("outside");
+        fs::create_dir(symlink_fixture.local())?;
+        let symlink_staging = exact_staging_path(&symlink_fixture.local(), '3');
+        fs::write(&outside, b"do-not-remove")?;
+        symlink(&outside, &symlink_staging)?;
+        assert!(matches!(
+            VaultMutationGuard::acquire(symlink_fixture.root()),
+            Err(AtomicWriteError::UnsafeStagingPath)
+        ));
+        assert!(symlink_staging.is_symlink());
+        assert_eq!(fs::read(outside)?, b"do-not-remove");
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn staging_recovery_preserves_candidates_with_ads_and_fails_closed() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        fs::create_dir(fixture.local())?;
+        let staging = exact_staging_path(&fixture.local(), '4');
+        fs::write(&staging, b"partial")?;
+        fs::write(windows_stream_path(&staging, "hidden"), b"hidden")?;
+
+        assert!(matches!(
+            VaultMutationGuard::acquire(fixture.root()),
+            Err(AtomicWriteError::UnsafeStagingPath)
+        ));
+        assert_eq!(fs::read(staging)?, b"partial");
         Ok(())
     }
 
@@ -6009,7 +6405,7 @@ mod tests {
             Err(AtomicWriteError::TargetTooLarge)
         ));
         assert!(!target.exists());
-        assert_no_staging_files(fixture.notes())?;
+        assert_no_staging_files(&fixture.local())?;
         Ok(())
     }
 
@@ -6029,7 +6425,7 @@ mod tests {
 
         assert_eq!(fs::read(&target)?, NEW_CIPHERTEXT);
         assert_eq!(outcome.etag, digest_bytes(NEW_CIPHERTEXT));
-        assert_no_staging_files(fixture.notes())?;
+        assert_no_staging_files(&fixture.local())?;
         Ok(())
     }
 
@@ -6054,7 +6450,7 @@ mod tests {
             } if current == digest_bytes(OLD_CIPHERTEXT)
         ));
         assert_eq!(fs::read(&target)?, OLD_CIPHERTEXT);
-        assert_no_staging_files(fixture.notes())?;
+        assert_no_staging_files(&fixture.local())?;
         Ok(())
     }
 
@@ -6074,7 +6470,7 @@ mod tests {
 
         assert!(matches!(error, AtomicWriteError::Conflict { .. }));
         assert_eq!(fs::read(&target)?, OLD_CIPHERTEXT);
-        assert_no_staging_files(fixture.notes())?;
+        assert_no_staging_files(&fixture.local())?;
         Ok(())
     }
 
@@ -6111,7 +6507,7 @@ mod tests {
 
             assert!(matches!(error, AtomicWriteError::Io { .. }));
             assert_eq!(fs::read(&target)?, OLD_CIPHERTEXT, "fault: {point:?}");
-            assert_no_staging_files(fixture.notes())?;
+            assert_no_staging_files(&fixture.local())?;
         }
         Ok(())
     }
@@ -6155,7 +6551,7 @@ mod tests {
     fn native_force_kill_preserves_a_complete_atomic_write_state() -> io::Result<()> {
         let points = [
             ("verify-staging", OLD_CIPHERTEXT, true),
-            ("before-lock", OLD_CIPHERTEXT, true),
+            ("before-lock", OLD_CIPHERTEXT, false),
             ("replace", OLD_CIPHERTEXT, true),
             ("sync-parent", NEW_CIPHERTEXT, false),
         ];
@@ -6207,7 +6603,7 @@ mod tests {
             );
             assert_eq!(fs::read(&target)?, expected_target, "checkpoint: {point}");
 
-            let abandoned = ciphertext_staging_paths(fixture.notes())?;
+            let abandoned = ciphertext_staging_paths(&fixture.local())?;
             assert_eq!(
                 abandoned.len(),
                 usize::from(expected_abandoned_staging),
@@ -6216,6 +6612,9 @@ mod tests {
             for staging in &abandoned {
                 assert_eq!(fs::read(staging)?, NEW_CIPHERTEXT, "checkpoint: {point}");
             }
+
+            drop(VaultMutationGuard::acquire(fixture.root()).map_err(io::Error::other)?);
+            assert_no_staging_files(&fixture.local())?;
 
             fs::remove_file(&ready)?;
             let condition = WriteCondition::IfMatch(digest_bytes(expected_target));
@@ -6227,10 +6626,7 @@ mod tests {
             atomic_write_ciphertext(fixture.root(), &target, replacement, condition)
                 .map_err(io::Error::other)?;
             assert_eq!(fs::read(&target)?, replacement, "checkpoint: {point}");
-            for staging in abandoned {
-                fs::remove_file(staging)?;
-            }
-            assert_no_staging_files(fixture.notes())?;
+            assert_no_staging_files(&fixture.local())?;
         }
         Ok(())
     }
@@ -6252,7 +6648,7 @@ mod tests {
 
         assert_eq!(outcome.parent_sync, ParentSyncStatus::NotSynced);
         assert_eq!(fs::read(&target)?, NEW_CIPHERTEXT);
-        assert_no_staging_files(fixture.notes())?;
+        assert_no_staging_files(&fixture.local())?;
         Ok(())
     }
 
@@ -6313,7 +6709,7 @@ mod tests {
             committed == b"EDRY-first-competing-ciphertext"
                 || committed == b"EDRY-second-competing-ciphertext"
         );
-        assert_no_staging_files(fixture.notes())?;
+        assert_no_staging_files(&fixture.local())?;
         Ok(())
     }
 
@@ -6559,7 +6955,7 @@ mod tests {
         let debug = format!("{error:?}");
         assert!(!display.contains("super-secret"));
         assert!(!debug.contains("super-secret"));
-        assert_no_staging_files(fixture.notes())?;
+        assert_no_staging_files(&fixture.local())?;
         Ok(())
     }
 
@@ -6611,7 +7007,7 @@ mod tests {
         assert!(matches!(error, AtomicWriteError::UnsafeLockPath));
         assert_eq!(fs::read(&outside)?, b"do-not-change");
         assert_eq!(fs::read(&target)?, OLD_CIPHERTEXT);
-        assert_no_staging_files(fixture.notes())?;
+        assert_no_staging_files(&fixture.local())?;
         Ok(())
     }
 
@@ -6687,6 +7083,10 @@ mod tests {
             &self.notes
         }
 
+        fn local(&self) -> PathBuf {
+            self.root.join(VAULT_LOCAL_DIRECTORY)
+        }
+
         fn note(&self, name: &str) -> PathBuf {
             self.notes.join(name)
         }
@@ -6698,8 +7098,20 @@ mod tests {
         }
     }
 
+    fn exact_staging_path(directory: &Path, hex: char) -> PathBuf {
+        directory.join(format!(
+            "{CIPHERTEXT_STAGING_PREFIX}{}{CIPHERTEXT_STAGING_SUFFIX}",
+            hex.to_string().repeat(32)
+        ))
+    }
+
     fn assert_no_staging_files(directory: &Path) -> io::Result<()> {
-        let names = fs::read_dir(directory)?
+        let entries = match fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let names = entries
             .map(|entry| entry.map(|entry| entry.file_name()))
             .collect::<io::Result<HashSet<_>>>()?;
         assert!(names.iter().all(|name| {
@@ -6712,7 +7124,12 @@ mod tests {
 
     #[cfg(any(target_os = "linux", windows))]
     fn ciphertext_staging_paths(directory: &Path) -> io::Result<Vec<PathBuf>> {
-        fs::read_dir(directory)?
+        let entries = match fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        entries
             .filter_map(|entry| match entry {
                 Ok(entry) => {
                     let name = entry.file_name();

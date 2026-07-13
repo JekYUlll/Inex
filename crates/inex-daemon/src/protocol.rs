@@ -54,6 +54,9 @@ pub enum Method {
     FileDelete,
     DocumentOpen,
     DocumentClose,
+    AssetOpen,
+    AssetReadChunk,
+    AssetClose,
     DraftEncrypt,
     DraftDecrypt,
     SearchQuery,
@@ -61,7 +64,7 @@ pub enum Method {
 }
 
 impl Method {
-    const ALL: [Self; 20] = [
+    const ALL: [Self; 23] = [
         Self::SystemHello,
         Self::SystemPing,
         Self::SystemShutdown,
@@ -78,6 +81,9 @@ impl Method {
         Self::FileDelete,
         Self::DocumentOpen,
         Self::DocumentClose,
+        Self::AssetOpen,
+        Self::AssetReadChunk,
+        Self::AssetClose,
         Self::DraftEncrypt,
         Self::DraftDecrypt,
         Self::SearchQuery,
@@ -104,6 +110,9 @@ impl Method {
             Self::FileDelete => "file.delete",
             Self::DocumentOpen => "document.open",
             Self::DocumentClose => "document.close",
+            Self::AssetOpen => "asset.open",
+            Self::AssetReadChunk => "asset.readChunk",
+            Self::AssetClose => "asset.close",
             Self::DraftEncrypt => "draft.encrypt",
             Self::DraftDecrypt => "draft.decrypt",
             Self::SearchQuery => "search.query",

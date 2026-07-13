@@ -1,15 +1,18 @@
-//! Single-vault capability sessions and document-handle ownership.
+//! Single-vault capability sessions and bounded handle ownership.
 //!
 //! A daemon process owns at most one unlocked [`Vault`]. The active session is
 //! addressed by a random 256-bit capability, expires after fifteen minutes of
 //! inactivity, and is dropped on lock, expiry, replacement, shutdown, or store
-//! destruction. Document handles contain no plaintext; they only bind a random
-//! per-session identifier to a logical path and its base ciphertext etag.
+//! destruction. Document handles contain no plaintext; an optional asset
+//! handle owns one fully authenticated, zeroizing plaintext allocation for
+//! strictly sequential bounded reads.
 
 use std::fmt;
 use std::time::{Duration, Instant};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use inex_core::crypto::DecryptedAsset;
+use inex_core::format::MAX_ASSET_PLAINTEXT_LEN;
 use inex_core::path::LogicalPath;
 use inex_core::sodium;
 use inex_core::vault::Vault;
@@ -20,9 +23,12 @@ pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_mins(15);
 
 /// Maximum number of live document handles owned by one session.
 pub const MAX_DOCUMENT_HANDLES: usize = 128;
+/// Largest raw opaque-asset chunk returned by one sequential read.
+pub const MAX_ASSET_CHUNK_BYTES: usize = 1024 * 1024;
 
 const SESSION_TOKEN_BYTES: usize = 32;
 const DOCUMENT_HANDLE_BYTES: usize = 16;
+const ASSET_HANDLE_BYTES: usize = 16;
 const MAX_CAPABILITY_GENERATION_ATTEMPTS: usize = 32;
 
 /// Source of monotonic elapsed time used by [`SessionStore`].
@@ -147,6 +153,84 @@ impl fmt::Display for DocumentHandle {
     }
 }
 
+/// Random per-session identifier for one fully authenticated opaque asset.
+///
+/// The handle is valid only for the session generation that created it. Its
+/// allocation is zeroized on drop and formatting never reveals its value.
+#[derive(Clone)]
+pub struct AssetHandle {
+    encoded: Zeroizing<String>,
+}
+
+impl AssetHandle {
+    fn generate() -> Result<Self, SessionError> {
+        Ok(Self {
+            encoded: random_base64url::<ASSET_HANDLE_BYTES>()?,
+        })
+    }
+
+    fn matches(&self, presented: &str) -> Result<bool, SessionError> {
+        constant_time_text_eq(&self.encoded, presented)
+    }
+
+    /// Borrow the canonical handle text for protocol serialization.
+    #[must_use]
+    pub fn expose_secret(&self) -> &str {
+        self.encoded.as_str()
+    }
+}
+
+impl fmt::Debug for AssetHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AssetHandle([REDACTED])")
+    }
+}
+
+impl fmt::Display for AssetHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("[REDACTED ASSET HANDLE]")
+    }
+}
+
+/// One borrowed sequential chunk from the active authenticated asset.
+pub struct AssetChunk<'a> {
+    offset: u64,
+    bytes: &'a [u8],
+    eof: bool,
+}
+
+impl AssetChunk<'_> {
+    /// Echo the accepted byte offset.
+    #[must_use]
+    pub const fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Borrow the authenticated plaintext bytes for immediate encoding.
+    #[must_use]
+    pub const fn bytes(&self) -> &[u8] {
+        self.bytes
+    }
+
+    /// Return whether this chunk reaches the authenticated asset size.
+    #[must_use]
+    pub const fn eof(&self) -> bool {
+        self.eof
+    }
+}
+
+impl fmt::Debug for AssetChunk<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AssetChunk")
+            .field("offset", &self.offset)
+            .field("bytes", &"<redacted>")
+            .field("byte_count", &self.bytes.len())
+            .field("eof", &self.eof)
+            .finish()
+    }
+}
+
 /// Non-plaintext state bound to an open document handle.
 pub struct DocumentBinding {
     logical_path: LogicalPath,
@@ -190,6 +274,14 @@ pub enum SessionError {
     DocumentHandleLimit,
     /// A document handle was unknown or belonged to another session.
     InvalidDocumentHandle,
+    /// The active session already owns its one permitted asset handle.
+    AssetHandleLimit,
+    /// An asset handle was unknown or belonged to another session.
+    InvalidAssetHandle,
+    /// An asset read was repeated, skipped, stale, out of range, or post-EOF.
+    InvalidAssetRead,
+    /// A caller attempted to retain an asset above the authenticated v1 bound.
+    AssetPlaintextTooLarge,
 }
 
 impl fmt::Display for SessionError {
@@ -200,6 +292,10 @@ impl fmt::Display for SessionError {
             Self::SecurityUnavailable => "secure session operation is unavailable",
             Self::DocumentHandleLimit => "document handle limit reached",
             Self::InvalidDocumentHandle => "document handle is invalid",
+            Self::AssetHandleLimit => "asset handle limit reached",
+            Self::InvalidAssetHandle => "asset handle is invalid",
+            Self::InvalidAssetRead => "asset read position is invalid",
+            Self::AssetPlaintextTooLarge => "asset plaintext exceeds the session limit",
         })
     }
 }
@@ -211,16 +307,25 @@ struct OpenDocument {
     binding: DocumentBinding,
 }
 
+struct OpenAsset {
+    handle: AssetHandle,
+    asset: DecryptedAsset,
+    next_offset: usize,
+    eof_returned: bool,
+}
+
 struct ActiveSession {
     capability: SessionToken,
     vault: Vault,
     last_activity: Duration,
     documents: Vec<OpenDocument>,
+    asset: Option<OpenAsset>,
 }
 
 impl Drop for ActiveSession {
     fn drop(&mut self) {
         self.documents.clear();
+        drop(self.asset.take());
         self.vault.clear_search_index();
         // Field drop then wipes the capability, guarded master key, and all
         // remaining Vault-owned state.
@@ -229,10 +334,10 @@ impl Drop for ActiveSession {
 
 /// Owns at most one unlocked vault and its process-local capabilities.
 ///
-/// `SessionStore` contains no document plaintext cache. Closing or evicting a
-/// document therefore removes only its random handle, logical path, and base
-/// etag. Dropping an active session explicitly clears the Vault search index
-/// before the guarded master key is released by [`Vault`]'s field drops.
+/// `SessionStore` contains no document plaintext cache. It may own exactly one
+/// bounded opaque-asset plaintext allocation after complete authentication.
+/// Dropping an active session wipes that allocation, clears the Vault search
+/// index, and then releases the guarded master key through [`Vault`]'s drops.
 pub struct SessionStore<C = SystemClock> {
     clock: C,
     active: Option<ActiveSession>,
@@ -284,6 +389,7 @@ impl<C: MonotonicClock> SessionStore<C> {
             vault,
             last_activity: self.clock.now(),
             documents: Vec::new(),
+            asset: None,
         };
         self.active = Some(replacement);
         Ok(capability)
@@ -392,6 +498,139 @@ impl<C: MonotonicClock> SessionStore<C> {
     pub fn is_active(&mut self) -> bool {
         self.expire();
         self.active.is_some()
+    }
+
+    /// Validate that the session has room for one authenticated asset.
+    ///
+    /// Callers use this before decrypting a whole asset so a rejected second
+    /// open never creates a second plaintext allocation. The subsequent
+    /// [`Self::open_asset`] call repeats the check before taking ownership.
+    ///
+    /// # Errors
+    ///
+    /// Returns a session validation error or
+    /// [`SessionError::AssetHandleLimit`] while an asset is already open.
+    pub fn ensure_asset_slot(&mut self, presented: &str) -> Result<(), SessionError> {
+        let session = self.validated_session_mut(presented)?;
+        if session.asset.is_some() {
+            Err(SessionError::AssetHandleLimit)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Take ownership of one fully authenticated, zeroizing asset allocation.
+    ///
+    /// The handle and plaintext are destroyed together on close, lock, idle
+    /// expiry, session replacement, shutdown, transport-owned store drop, or
+    /// an explicit store drop.
+    ///
+    /// # Errors
+    ///
+    /// Returns a session validation error, [`SessionError::AssetHandleLimit`]
+    /// when another asset is open, or [`SessionError::SecurityUnavailable`] if
+    /// handle generation fails.
+    pub fn open_asset(
+        &mut self,
+        presented: &str,
+        asset: DecryptedAsset,
+    ) -> Result<AssetHandle, SessionError> {
+        let session = self.validated_session_mut(presented)?;
+        if session.asset.is_some() {
+            return Err(SessionError::AssetHandleLimit);
+        }
+        if asset.plaintext.len() > MAX_ASSET_PLAINTEXT_LEN {
+            return Err(SessionError::AssetPlaintextTooLarge);
+        }
+        let handle = AssetHandle::generate()?;
+        session.asset = Some(OpenAsset {
+            handle: handle.clone(),
+            asset,
+            next_offset: 0,
+            eof_returned: false,
+        });
+        Ok(handle)
+    }
+
+    /// Return the next strictly sequential slice of an authenticated asset.
+    ///
+    /// A successful EOF response is terminal for the handle. In particular,
+    /// a zero-byte asset permits exactly one read at offset zero, returning an
+    /// empty slice with EOF set.
+    ///
+    /// # Errors
+    ///
+    /// Returns a session validation error, [`SessionError::InvalidAssetHandle`]
+    /// for an unknown handle, or [`SessionError::InvalidAssetRead`] for a zero
+    /// chunk limit, a non-sequential/out-of-range offset, or a post-EOF read.
+    pub fn read_asset_chunk(
+        &mut self,
+        presented: &str,
+        handle: &str,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<AssetChunk<'_>, SessionError> {
+        let session = self.validated_session_mut(presented)?;
+        let open = session
+            .asset
+            .as_mut()
+            .ok_or(SessionError::InvalidAssetHandle)?;
+        if !open.handle.matches(handle)? {
+            return Err(SessionError::InvalidAssetHandle);
+        }
+        let start = usize::try_from(offset).map_err(|_| SessionError::InvalidAssetRead)?;
+        if !(1..=MAX_ASSET_CHUNK_BYTES).contains(&max_bytes)
+            || open.eof_returned
+            || start != open.next_offset
+        {
+            return Err(SessionError::InvalidAssetRead);
+        }
+        let end = start
+            .saturating_add(max_bytes)
+            .min(open.asset.plaintext.len());
+        if start > end {
+            return Err(SessionError::InvalidAssetRead);
+        }
+        let eof = end == open.asset.plaintext.len();
+        open.next_offset = end;
+        open.eof_returned = eof;
+        Ok(AssetChunk {
+            offset,
+            bytes: &open.asset.plaintext[start..end],
+            eof,
+        })
+    }
+
+    /// Close and wipe the active asset allocation and handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns a session validation error or
+    /// [`SessionError::InvalidAssetHandle`] for an unknown/stale handle.
+    pub fn close_asset(&mut self, presented: &str, handle: &str) -> Result<(), SessionError> {
+        let session = self.validated_session_mut(presented)?;
+        let open = session
+            .asset
+            .as_ref()
+            .ok_or(SessionError::InvalidAssetHandle)?;
+        if !open.handle.matches(handle)? {
+            return Err(SessionError::InvalidAssetHandle);
+        }
+        drop(session.asset.take());
+        Ok(())
+    }
+
+    /// Return whether the active session owns an asset allocation.
+    ///
+    /// This protected operation touches the session.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same safe errors as [`Self::validate`].
+    pub fn asset_count(&mut self, presented: &str) -> Result<usize, SessionError> {
+        Ok(usize::from(
+            self.validated_session_mut(presented)?.asset.is_some(),
+        ))
     }
 
     /// Create a random handle bound to one logical path and base etag.
@@ -545,6 +784,14 @@ impl<C> fmt::Debug for SessionStore<C> {
                     .as_ref()
                     .map_or(0, |active| active.documents.len()),
             )
+            .field(
+                "asset_handle_count",
+                &usize::from(
+                    self.active
+                        .as_ref()
+                        .is_some_and(|active| active.asset.is_some()),
+                ),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -600,13 +847,16 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-    use inex_core::path::LogicalPath;
+    use inex_core::crypto::VaultContentProfile;
+    use inex_core::path::{AssetPath, LogicalPath};
     use inex_core::sodium::Argon2idParams;
     use inex_core::vault::Vault;
     use inex_core::vault_config::KdfPolicy;
+    use zeroize::Zeroizing;
 
     use super::{
-        DEFAULT_IDLE_TIMEOUT, MAX_DOCUMENT_HANDLES, MonotonicClock, SessionError, SessionStore,
+        DEFAULT_IDLE_TIMEOUT, MAX_ASSET_CHUNK_BYTES, MAX_DOCUMENT_HANDLES, MonotonicClock,
+        SessionError, SessionStore,
     };
 
     #[derive(Clone, Default)]
@@ -681,9 +931,33 @@ mod tests {
         .unwrap_or_else(|error| panic!("test vault creation failed: {error}"))
     }
 
+    fn test_asset_vault(directory: &TestDirectory, path: &AssetPath, bytes: &[u8]) -> Vault {
+        let mut vault = Vault::create_with_profile_and_params(
+            directory.path(),
+            b"test password",
+            1_783_699_200_000,
+            VaultContentProfile::OpaqueAssetsV1,
+            Argon2idParams {
+                ops_limit: 1,
+                mem_limit_bytes: 8 * 1024,
+            },
+            test_policy(),
+        )
+        .unwrap_or_else(|error| panic!("test asset vault creation failed: {error}"));
+        vault
+            .create_import_asset(path, Zeroizing::new(bytes.to_vec()), 1_783_699_201_000)
+            .unwrap_or_else(|error| panic!("test asset import failed: {error}"));
+        vault
+    }
+
     fn logical(value: &str) -> LogicalPath {
         LogicalPath::parse_canonical(value)
             .unwrap_or_else(|error| panic!("logical path failed: {error}"))
+    }
+
+    fn asset(value: &str) -> AssetPath {
+        AssetPath::parse_canonical(value)
+            .unwrap_or_else(|error| panic!("asset path failed: {error}"))
     }
 
     #[test]
@@ -844,6 +1118,208 @@ mod tests {
     }
 
     #[test]
+    fn asset_handle_is_single_sequential_bounded_and_explicitly_closable() {
+        let directory = TestDirectory::new("asset-handle");
+        let path = asset("sample.bin");
+        let mut store = SessionStore::with_clock(ManualClock::default());
+        let token = store
+            .unlock(test_asset_vault(&directory, &path, b"abcdef"))
+            .unwrap_or_else(|error| panic!("session unlock failed: {error}"));
+        let decrypted = store
+            .vault_mut(token.expose_secret())
+            .and_then(|vault| {
+                vault
+                    .read_asset(&path)
+                    .map_err(|_| SessionError::InvalidAssetRead)
+            })
+            .unwrap_or_else(|error| panic!("asset decrypt failed: {error}"));
+        let handle = store
+            .open_asset(token.expose_secret(), decrypted)
+            .unwrap_or_else(|error| panic!("asset open failed: {error}"));
+        assert!(!format!("{handle:?}").contains(handle.expose_secret()));
+        assert_eq!(store.asset_count(token.expose_secret()), Ok(1));
+        assert_eq!(
+            store.ensure_asset_slot(token.expose_secret()),
+            Err(SessionError::AssetHandleLimit)
+        );
+        assert!(matches!(
+            store.read_asset_chunk(token.expose_secret(), handle.expose_secret(), 1, 2),
+            Err(SessionError::InvalidAssetRead)
+        ));
+        assert!(matches!(
+            store.read_asset_chunk(
+                token.expose_secret(),
+                handle.expose_secret(),
+                0,
+                MAX_ASSET_CHUNK_BYTES + 1,
+            ),
+            Err(SessionError::InvalidAssetRead)
+        ));
+
+        {
+            let first = store
+                .read_asset_chunk(token.expose_secret(), handle.expose_secret(), 0, 2)
+                .unwrap_or_else(|error| panic!("first chunk failed: {error}"));
+            assert_eq!(first.offset(), 0);
+            assert_eq!(first.bytes(), b"ab");
+            assert!(!first.eof());
+        }
+        assert!(matches!(
+            store.read_asset_chunk(token.expose_secret(), handle.expose_secret(), 0, 2),
+            Err(SessionError::InvalidAssetRead)
+        ));
+        {
+            let last = store
+                .read_asset_chunk(token.expose_secret(), handle.expose_secret(), 2, 4)
+                .unwrap_or_else(|error| panic!("last chunk failed: {error}"));
+            assert_eq!(last.bytes(), b"cdef");
+            assert!(last.eof());
+        }
+        assert!(matches!(
+            store.read_asset_chunk(token.expose_secret(), handle.expose_secret(), 6, 1),
+            Err(SessionError::InvalidAssetRead)
+        ));
+        store
+            .close_asset(token.expose_secret(), handle.expose_secret())
+            .unwrap_or_else(|error| panic!("asset close failed: {error}"));
+        assert_eq!(store.asset_count(token.expose_secret()), Ok(0));
+        assert!(matches!(
+            store.close_asset(token.expose_secret(), handle.expose_secret()),
+            Err(SessionError::InvalidAssetHandle)
+        ));
+    }
+
+    #[test]
+    fn zero_byte_asset_has_exactly_one_empty_eof_read() {
+        let directory = TestDirectory::new("zero-asset");
+        let path = asset("empty.bin");
+        let mut store = SessionStore::with_clock(ManualClock::default());
+        let token = store
+            .unlock(test_asset_vault(&directory, &path, b""))
+            .unwrap_or_else(|error| panic!("session unlock failed: {error}"));
+        let decrypted = store
+            .vault_mut(token.expose_secret())
+            .and_then(|vault| {
+                vault
+                    .read_asset(&path)
+                    .map_err(|_| SessionError::InvalidAssetRead)
+            })
+            .unwrap_or_else(|error| panic!("asset decrypt failed: {error}"));
+        let handle = store
+            .open_asset(token.expose_secret(), decrypted)
+            .unwrap_or_else(|error| panic!("asset open failed: {error}"));
+        let chunk = store
+            .read_asset_chunk(token.expose_secret(), handle.expose_secret(), 0, 1)
+            .unwrap_or_else(|error| panic!("empty chunk failed: {error}"));
+        assert!(chunk.bytes().is_empty());
+        assert!(chunk.eof());
+        assert!(matches!(
+            store.read_asset_chunk(token.expose_secret(), handle.expose_secret(), 0, 1),
+            Err(SessionError::InvalidAssetRead)
+        ));
+    }
+
+    #[test]
+    fn asset_allocation_is_bound_to_session_generation_and_idle_lifetime() {
+        let first_directory = TestDirectory::new("asset-lifetime-first");
+        let second_directory = TestDirectory::new("asset-lifetime-second");
+        let first_path = asset("first.bin");
+        let second_path = asset("second.bin");
+        let clock = ManualClock::default();
+        let mut store = SessionStore::with_clock(clock.clone());
+        let first = store
+            .unlock(test_asset_vault(&first_directory, &first_path, b"first"))
+            .unwrap_or_else(|error| panic!("first unlock failed: {error}"));
+        let decrypted = store
+            .vault_mut(first.expose_secret())
+            .and_then(|vault| {
+                vault
+                    .read_asset(&first_path)
+                    .map_err(|_| SessionError::InvalidAssetRead)
+            })
+            .unwrap_or_else(|error| panic!("first asset decrypt failed: {error}"));
+        let old_handle = store
+            .open_asset(first.expose_secret(), decrypted)
+            .unwrap_or_else(|error| panic!("first asset open failed: {error}"));
+
+        let second = store
+            .unlock(test_asset_vault(&second_directory, &second_path, b"second"))
+            .unwrap_or_else(|error| panic!("second unlock failed: {error}"));
+        assert_eq!(store.asset_count(second.expose_secret()), Ok(0));
+        assert!(matches!(
+            store.close_asset(second.expose_secret(), old_handle.expose_secret()),
+            Err(SessionError::InvalidAssetHandle)
+        ));
+        let decrypted = store
+            .vault_mut(second.expose_secret())
+            .and_then(|vault| {
+                vault
+                    .read_asset(&second_path)
+                    .map_err(|_| SessionError::InvalidAssetRead)
+            })
+            .unwrap_or_else(|error| panic!("second asset decrypt failed: {error}"));
+        let second_handle = store
+            .open_asset(second.expose_secret(), decrypted)
+            .unwrap_or_else(|error| panic!("second asset open failed: {error}"));
+        clock.advance(DEFAULT_IDLE_TIMEOUT);
+        assert!(store.expire());
+        assert!(matches!(
+            store.close_asset(second.expose_secret(), second_handle.expose_secret()),
+            Err(SessionError::InvalidSession)
+        ));
+    }
+
+    #[test]
+    fn lock_and_shutdown_drop_an_open_asset_with_the_session() {
+        let directory = TestDirectory::new("asset-lock-shutdown");
+        let path = asset("lifetime.bin");
+        let mut store = SessionStore::with_clock(ManualClock::default());
+        let token = store
+            .unlock(test_asset_vault(&directory, &path, b"lifetime"))
+            .unwrap_or_else(|error| panic!("initial unlock failed: {error}"));
+        let decrypted = store
+            .vault_mut(token.expose_secret())
+            .and_then(|vault| {
+                vault
+                    .read_asset(&path)
+                    .map_err(|_| SessionError::InvalidAssetRead)
+            })
+            .unwrap_or_else(|error| panic!("initial asset decrypt failed: {error}"));
+        store
+            .open_asset(token.expose_secret(), decrypted)
+            .unwrap_or_else(|error| panic!("initial asset open failed: {error}"));
+        store
+            .lock(token.expose_secret())
+            .unwrap_or_else(|error| panic!("lock failed: {error}"));
+        assert_eq!(
+            store.asset_count(token.expose_secret()),
+            Err(SessionError::InvalidSession)
+        );
+
+        let reopened = Vault::unlock(directory.path(), b"test password", None, test_policy())
+            .unwrap_or_else(|error| panic!("vault reopen failed: {error}"));
+        let replacement = store
+            .unlock(reopened)
+            .unwrap_or_else(|error| panic!("replacement unlock failed: {error}"));
+        let decrypted = store
+            .vault_mut(replacement.expose_secret())
+            .and_then(|vault| {
+                vault
+                    .read_asset(&path)
+                    .map_err(|_| SessionError::InvalidAssetRead)
+            })
+            .unwrap_or_else(|error| panic!("replacement asset decrypt failed: {error}"));
+        store
+            .open_asset(replacement.expose_secret(), decrypted)
+            .unwrap_or_else(|error| panic!("replacement asset open failed: {error}"));
+        assert!(store.shutdown());
+        assert_eq!(
+            store.asset_count(replacement.expose_secret()),
+            Err(SessionError::InvalidSession)
+        );
+    }
+
+    #[test]
     fn errors_never_echo_tokens_paths_or_passwords() {
         let path = "private/secret.md";
         let token = "token-canary";
@@ -854,6 +1330,9 @@ mod tests {
             SessionError::SecurityUnavailable,
             SessionError::DocumentHandleLimit,
             SessionError::InvalidDocumentHandle,
+            SessionError::AssetHandleLimit,
+            SessionError::InvalidAssetHandle,
+            SessionError::InvalidAssetRead,
         ] {
             let display = error.to_string();
             let debug = format!("{error:?}");

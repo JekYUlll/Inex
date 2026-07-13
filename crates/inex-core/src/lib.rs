@@ -15,6 +15,7 @@ pub const VAULT_VERSION: u32 = 1;
 
 pub mod atomic;
 pub mod crypto;
+pub mod features;
 pub mod format;
 pub mod path;
 pub mod search;

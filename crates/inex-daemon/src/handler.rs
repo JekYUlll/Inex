@@ -14,7 +14,7 @@ use inex_core::atomic::ParentSyncStatus;
 use inex_core::crypto::{
     CryptoError, DecryptedDocument, EncryptedDocument, calibrated_creation_params,
 };
-use inex_core::format::{EdryHeader, MAX_PLAINTEXT_LEN};
+use inex_core::format::{EdryHeader, MAX_ASSET_PLAINTEXT_LEN, MAX_PLAINTEXT_LEN};
 use inex_core::path::{LogicalDir, LogicalPath};
 use inex_core::search::{
     CaseSensitivity, DEFAULT_SEARCH_RESULTS, DEFAULT_SEARCH_SNIPPET_BYTES, MAX_SEARCH_QUERY_BYTES,
@@ -34,7 +34,9 @@ use crate::framing::{JsonObject, MAX_FRAME_BYTES};
 use crate::params::{CanonicalEtag, CanonicalUuid, ParamError, ParamObject};
 use crate::protocol::{ErrorCode, ErrorObject, Method, Params, Request, Response, parse_request};
 use crate::sensitive::encode_base64url;
-use crate::session::{MonotonicClock, SessionError, SessionStore, SystemClock};
+use crate::session::{
+    MAX_ASSET_CHUNK_BYTES, MonotonicClock, SessionError, SessionStore, SystemClock,
+};
 
 const MAX_PHYSICAL_PATH_BYTES: usize = 64 * 1024;
 const MAX_CLIENT_NAME_BYTES: usize = 256;
@@ -147,6 +149,9 @@ impl<C: MonotonicClock> RpcService<C> {
             Method::FileDelete => self.file_delete(params),
             Method::DocumentOpen => self.document_open(params),
             Method::DocumentClose => self.document_close(params),
+            Method::AssetOpen => self.asset_open(params),
+            Method::AssetReadChunk => self.asset_read_chunk(params),
+            Method::AssetClose => self.asset_close(params),
             Method::DraftEncrypt => self.draft_encrypt(params),
             Method::DraftDecrypt => self.draft_decrypt(params),
             Method::SearchQuery => self.search_query(params),
@@ -174,7 +179,7 @@ impl<C: MonotonicClock> RpcService<C> {
             "server": "inexd",
             "serverVersion": env!("CARGO_PKG_VERSION"),
             "protocolMajor": PROTOCOL_MAJOR,
-            "capabilities": ["vault", "files", "documents", "encryptedDrafts", "search", "authenticatedPing"],
+            "capabilities": ["vault", "files", "documents", "encryptedDrafts", "search", "authenticatedPing", "opaqueAssetsV1"],
         }))
     }
 
@@ -284,13 +289,14 @@ impl<C: MonotonicClock> RpcService<C> {
         let session = required_session(&mut params)?;
         params.finish()?;
 
-        let (vault_id, slots, entries, files, directories) = {
+        let (vault_id, slots, opaque_assets_v1, entries, files, assets, directories) = {
             let vault = self
                 .sessions
                 .vault_mut(session.as_str())
                 .map_err(map_session_error)?;
             let vault_id = vault.config().vault_id;
             let slots = vault.config().key_slots.len();
+            let opaque_assets_v1 = vault.config().supports_opaque_assets();
             let tree = vault
                 .list()
                 .map_err(|error| map_vault_error(error, ErrorContext::Document))?;
@@ -299,12 +305,33 @@ impl<C: MonotonicClock> RpcService<C> {
                 .iter()
                 .filter(|entry| entry.kind() == TreeEntryKind::File)
                 .count();
-            let directories = tree.len().saturating_sub(files);
-            (vault_id, slots, tree.len(), files, directories)
+            let assets = tree
+                .entries()
+                .iter()
+                .filter(|entry| entry.kind() == TreeEntryKind::Asset)
+                .count();
+            let directories = tree
+                .entries()
+                .iter()
+                .filter(|entry| entry.kind() == TreeEntryKind::Directory)
+                .count();
+            (
+                vault_id,
+                slots,
+                opaque_assets_v1,
+                tree.len(),
+                files,
+                assets,
+                directories,
+            )
         };
         let open_documents = self
             .sessions
             .document_count(session.as_str())
+            .map_err(map_session_error)?;
+        let open_assets = self
+            .sessions
+            .asset_count(session.as_str())
             .map_err(map_session_error)?;
         let remaining = self
             .sessions
@@ -315,8 +342,11 @@ impl<C: MonotonicClock> RpcService<C> {
             "keySlots": slots,
             "entries": entries,
             "files": files,
+            "assets": assets,
             "directories": directories,
+            "features": {"opaqueAssetsV1": opaque_assets_v1},
             "openDocuments": open_documents,
+            "openAssets": open_assets,
             "idleTimeoutMs": duration_ms(remaining),
         }))
     }
@@ -348,6 +378,7 @@ impl<C: MonotonicClock> RpcService<C> {
                 "kind": match entry.kind() {
                     TreeEntryKind::Directory => "directory",
                     TreeEntryKind::File => "file",
+                    TreeEntryKind::Asset => "asset",
                 },
                 "logicalPath": entry.logical_path(),
             }));
@@ -501,6 +532,78 @@ impl<C: MonotonicClock> RpcService<C> {
         Ok(acknowledgement())
     }
 
+    fn asset_open(&mut self, params: Params) -> RpcResult {
+        let mut params = ParamObject::new(params);
+        let session = required_session(&mut params)?;
+        let logical_path = params.required_asset_path("logicalPath")?;
+        params.finish()?;
+
+        // Reject a second open before whole-file authentication would allocate
+        // another large plaintext buffer. The store repeats this check when it
+        // takes ownership so the resource invariant remains local to it.
+        self.sessions
+            .ensure_asset_slot(session.as_str())
+            .map_err(map_session_error)?;
+        let asset = self
+            .sessions
+            .vault_mut(session.as_str())
+            .map_err(map_session_error)?
+            .read_asset(&logical_path)
+            .map_err(|error| map_vault_error(error, ErrorContext::Asset))?;
+        let size = asset.plaintext.len();
+        let etag = asset.etag.clone();
+        let metadata = header_metadata_value(&asset.header);
+        let handle = self
+            .sessions
+            .open_asset(session.as_str(), asset)
+            .map_err(map_session_error)?;
+        Ok(json!({
+            "handle": handle.expose_secret(),
+            "size": size,
+            "etag": etag,
+            "metadata": metadata,
+        }))
+    }
+
+    fn asset_read_chunk(&mut self, params: Params) -> RpcResult {
+        let mut params = ParamObject::new(params);
+        let session = required_session(&mut params)?;
+        let handle = params.required_sensitive_string("handle", 1, MAX_CAPABILITY_TEXT_BYTES)?;
+        let offset = params.required_u64(
+            "offset",
+            0,
+            u64::try_from(MAX_ASSET_PLAINTEXT_LEN).unwrap_or(u64::MAX),
+        )?;
+        let max_bytes = params.required_u64(
+            "maxBytes",
+            1,
+            u64::try_from(MAX_ASSET_CHUNK_BYTES).unwrap_or(u64::MAX),
+        )?;
+        params.finish()?;
+        let max_bytes =
+            usize::try_from(max_bytes).map_err(|_| ErrorObject::new(ErrorCode::LimitExceeded))?;
+        let chunk = self
+            .sessions
+            .read_asset_chunk(session.as_str(), handle.as_str(), offset, max_bytes)
+            .map_err(map_session_error)?;
+        Ok(json!({
+            "offset": chunk.offset(),
+            "contentBase64": encode_base64url(chunk.bytes()).as_str(),
+            "eof": chunk.eof(),
+        }))
+    }
+
+    fn asset_close(&mut self, params: Params) -> RpcResult {
+        let mut params = ParamObject::new(params);
+        let session = required_session(&mut params)?;
+        let handle = params.required_sensitive_string("handle", 1, MAX_CAPABILITY_TEXT_BYTES)?;
+        params.finish()?;
+        self.sessions
+            .close_asset(session.as_str(), handle.as_str())
+            .map_err(map_session_error)?;
+        Ok(acknowledgement())
+    }
+
     fn draft_encrypt(&mut self, params: Params) -> RpcResult {
         let mut params = ParamObject::new(params);
         let session = required_session(&mut params)?;
@@ -600,6 +703,14 @@ impl<C: MonotonicClock> RpcService<C> {
                 .map_err(|_| ErrorObject::new(ErrorCode::LimitExceeded))?,
         )
         .map_err(|_| ErrorObject::new(ErrorCode::LimitExceeded))?;
+        if self
+            .sessions
+            .asset_count(session.as_str())
+            .map_err(map_session_error)?
+            != 0
+        {
+            return Err(ErrorObject::new(ErrorCode::Busy));
+        }
         let vault = self
             .sessions
             .vault_mut(session.as_str())
@@ -843,14 +954,20 @@ fn etag_from_digest(digest: [u8; 32]) -> String {
 enum ErrorContext {
     Authentication,
     Document,
+    Asset,
 }
 
 fn map_session_error(error: SessionError) -> ErrorObject {
     let code = match error {
         SessionError::InvalidSession | SessionError::StoreShutdown => ErrorCode::SessionInvalid,
         SessionError::SecurityUnavailable => ErrorCode::InternalError,
-        SessionError::DocumentHandleLimit => ErrorCode::LimitExceeded,
-        SessionError::InvalidDocumentHandle => ErrorCode::InvalidParams,
+        SessionError::DocumentHandleLimit | SessionError::AssetHandleLimit => {
+            ErrorCode::LimitExceeded
+        }
+        SessionError::AssetPlaintextTooLarge => ErrorCode::LimitExceeded,
+        SessionError::InvalidDocumentHandle
+        | SessionError::InvalidAssetHandle
+        | SessionError::InvalidAssetRead => ErrorCode::InvalidParams,
     };
     ErrorObject::new(code)
 }
@@ -874,7 +991,8 @@ fn map_vault_error(error: VaultError, context: ErrorContext) -> ErrorObject {
         | VaultError::CaseFoldCollision => ErrorCode::AlreadyExists,
         VaultError::NotInitialized
         | VaultError::ParentDirectoryMissing
-        | VaultError::DocumentNotFound => ErrorCode::NotFound,
+        | VaultError::DocumentNotFound
+        | VaultError::AssetNotFound => ErrorCode::NotFound,
         VaultError::InvalidEtag => ErrorCode::InvalidParams,
         VaultError::Conflict { .. } => ErrorCode::EtagConflict,
         VaultError::SearchIndexNotReady | VaultError::RenameRecoveryPending { .. } => {
@@ -902,6 +1020,9 @@ fn map_tree_error(error: &TreeError) -> ErrorCode {
         | TreeError::FilesystemBoundary { .. }
         | TreeError::InvalidEntry { .. }
         | TreeError::NonCanonicalCiphertextName { .. }
+        | TreeError::NonCanonicalAssetCiphertextName { .. }
+        | TreeError::OpaqueAssetFeatureRequired { .. }
+        | TreeError::UnexpectedRegularFile { .. }
         | TreeError::PlaintextMarkdown { .. }
         | TreeError::DuplicateLogicalPath { .. }
         | TreeError::CaseFoldCollision { .. } => ErrorCode::VaultInvalid,
@@ -914,18 +1035,23 @@ fn map_crypto_error(error: CryptoError, context: ErrorContext) -> ErrorCode {
         CryptoError::InvalidMarkdownUtf8 | CryptoError::CannotRemoveLastSlot => {
             ErrorCode::InvalidParams
         }
-        CryptoError::PlaintextTooLarge => ErrorCode::LimitExceeded,
+        CryptoError::PlaintextTooLarge | CryptoError::AssetPlaintextTooLarge => {
+            ErrorCode::LimitExceeded
+        }
+        CryptoError::OpaqueAssetsNotEnabled => ErrorCode::Unsupported,
         CryptoError::Sodium(_) => ErrorCode::InternalError,
         CryptoError::VaultAuthenticationFailed
         | CryptoError::MetadataAuthenticationFailed
         | CryptoError::SlotSelectionRequired => match context {
             ErrorContext::Authentication => ErrorCode::AuthFailed,
-            ErrorContext::Document => ErrorCode::IntegrityFailed,
+            ErrorContext::Document | ErrorContext::Asset => ErrorCode::IntegrityFailed,
         },
         CryptoError::Format(_)
         | CryptoError::InvalidWrappedKeyLength
         | CryptoError::DocumentContextMismatch
-        | CryptoError::DocumentAuthenticationFailed => ErrorCode::IntegrityFailed,
+        | CryptoError::DocumentAuthenticationFailed
+        | CryptoError::AssetContextMismatch
+        | CryptoError::AssetAuthenticationFailed => ErrorCode::IntegrityFailed,
     }
 }
 
@@ -963,6 +1089,9 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use inex_core::crypto::VaultContentProfile;
+    use inex_core::path::AssetPath;
     use inex_core::sodium::{Argon2idParams, SodiumError};
     use serde_json::{Map, Value, json};
     use zeroize::{Zeroize, Zeroizing};
@@ -1005,6 +1134,33 @@ mod tests {
             max_unlock_ops_limit: 4,
             max_unlock_mem_limit_bytes: 64 * 1024 * 1024,
         }
+    }
+
+    fn create_asset_fixture(
+        directory: &TestDirectory,
+        password: &[u8],
+        logical_path: &AssetPath,
+        plaintext: &[u8],
+    ) {
+        let mut vault = Vault::create_with_profile_and_params(
+            directory.path(),
+            password,
+            1_783_699_200_000,
+            VaultContentProfile::OpaqueAssetsV1,
+            Argon2idParams {
+                ops_limit: 1,
+                mem_limit_bytes: 8 * 1024,
+            },
+            test_policy(),
+        )
+        .unwrap_or_else(|error| panic!("asset fixture vault failed: {error}"));
+        vault
+            .create_import_asset(
+                logical_path,
+                Zeroizing::new(plaintext.to_vec()),
+                1_783_699_201_000,
+            )
+            .unwrap_or_else(|error| panic!("asset fixture import failed: {error}"));
     }
 
     fn request(id: i64, method: &str, params: Value) -> JsonObject {
@@ -1394,6 +1550,423 @@ mod tests {
         assert_eq!(locked["result"]["ok"], true);
         assert!(!service.session_active());
         scrub_object(&mut locked);
+        session.zeroize();
+        handle.zeroize();
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One protocol lifecycle verifies the additive asset contract.
+    fn opaque_asset_capability_status_tree_and_sequential_rpc_flow() {
+        let directory = TestDirectory::new();
+        let password = b"asset handler password";
+        let logical_path = AssetPath::parse_canonical("payload.bin")
+            .unwrap_or_else(|error| panic!("asset path failed: {error}"));
+        let mut plaintext = vec![0x5a; MAX_ASSET_CHUNK_BYTES + 3];
+        plaintext[MAX_ASSET_CHUNK_BYTES] = 1;
+        plaintext[MAX_ASSET_CHUNK_BYTES + 1] = 2;
+        plaintext[MAX_ASSET_CHUNK_BYTES + 2] = 3;
+        create_asset_fixture(&directory, password, &logical_path, &plaintext);
+
+        let mut service = RpcService::with_clock_and_policy(SystemClock::new(), test_policy());
+        let mut hello_result = response(
+            &mut service,
+            1,
+            "system.hello",
+            json!({"client":"test", "clientVersion":"1", "protocolMajor":1}),
+        );
+        assert!(
+            hello_result["result"]["capabilities"]
+                .as_array()
+                .is_some_and(|capabilities| capabilities.contains(&json!("opaqueAssetsV1")))
+        );
+        scrub_object(&mut hello_result);
+
+        let mut unlocked = response(
+            &mut service,
+            2,
+            "vault.unlock",
+            json!({
+                "vaultPath": directory.path().to_string_lossy(),
+                "password": String::from_utf8_lossy(password),
+            }),
+        );
+        let mut session = Zeroizing::new(
+            unlocked["result"]["session"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+        );
+        assert!(!session.is_empty());
+        scrub_object(&mut unlocked);
+
+        let mut status = response(
+            &mut service,
+            3,
+            "vault.status",
+            json!({"session": session.as_str()}),
+        );
+        assert_eq!(status["result"]["features"]["opaqueAssetsV1"], true);
+        assert_eq!(status["result"]["entries"], 1);
+        assert_eq!(status["result"]["files"], 0);
+        assert_eq!(status["result"]["assets"], 1);
+        assert_eq!(status["result"]["directories"], 0);
+        assert_eq!(status["result"]["openAssets"], 0);
+        scrub_object(&mut status);
+
+        let mut tree = response(
+            &mut service,
+            4,
+            "vault.listTree",
+            json!({"session": session.as_str()}),
+        );
+        assert_eq!(tree["result"]["entries"][0]["kind"], "asset");
+        assert_eq!(
+            tree["result"]["entries"][0]["logicalPath"],
+            logical_path.as_str()
+        );
+        scrub_object(&mut tree);
+
+        let mut markdown_rejected = response(
+            &mut service,
+            5,
+            "asset.open",
+            json!({"session": session.as_str(), "logicalPath": "note.md"}),
+        );
+        assert_eq!(
+            markdown_rejected["error"]["code"],
+            ErrorCode::InvalidParams.number()
+        );
+        scrub_object(&mut markdown_rejected);
+        let mut missing = response(
+            &mut service,
+            6,
+            "asset.open",
+            json!({"session": session.as_str(), "logicalPath": "missing.bin"}),
+        );
+        assert_eq!(missing["error"]["code"], ErrorCode::NotFound.number());
+        scrub_object(&mut missing);
+
+        let mut opened = response(
+            &mut service,
+            7,
+            "asset.open",
+            json!({"session": session.as_str(), "logicalPath": logical_path.as_str()}),
+        );
+        assert_eq!(opened["result"]["size"], plaintext.len());
+        assert_eq!(
+            opened["result"]["metadata"]["logicalPath"],
+            logical_path.as_str()
+        );
+        assert!(
+            opened["result"]["etag"]
+                .as_str()
+                .is_some_and(|etag| etag.starts_with("sha256:"))
+        );
+        let mut handle = Zeroizing::new(
+            opened["result"]["handle"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+        );
+        assert!(!handle.is_empty());
+        scrub_object(&mut opened);
+
+        let mut second_open = response(
+            &mut service,
+            8,
+            "asset.open",
+            json!({"session": session.as_str(), "logicalPath": logical_path.as_str()}),
+        );
+        assert_eq!(
+            second_open["error"]["code"],
+            ErrorCode::LimitExceeded.number()
+        );
+        scrub_object(&mut second_open);
+        let mut search_while_open = response(
+            &mut service,
+            83,
+            "search.query",
+            json!({"session": session.as_str(), "query": "needle"}),
+        );
+        assert_eq!(search_while_open["error"]["code"], ErrorCode::Busy.number());
+        scrub_object(&mut search_while_open);
+        let mut zero_chunk = response(
+            &mut service,
+            81,
+            "asset.readChunk",
+            json!({
+                "session": session.as_str(),
+                "handle": handle.as_str(),
+                "offset": 0,
+                "maxBytes": 0,
+            }),
+        );
+        assert_eq!(
+            zero_chunk["error"]["code"],
+            ErrorCode::InvalidParams.number()
+        );
+        scrub_object(&mut zero_chunk);
+        let mut oversized_chunk = response(
+            &mut service,
+            82,
+            "asset.readChunk",
+            json!({
+                "session": session.as_str(),
+                "handle": handle.as_str(),
+                "offset": 0,
+                "maxBytes": MAX_ASSET_CHUNK_BYTES + 1,
+            }),
+        );
+        assert_eq!(
+            oversized_chunk["error"]["code"],
+            ErrorCode::LimitExceeded.number()
+        );
+        scrub_object(&mut oversized_chunk);
+        let mut skipped = response(
+            &mut service,
+            9,
+            "asset.readChunk",
+            json!({
+                "session": session.as_str(),
+                "handle": handle.as_str(),
+                "offset": 1,
+                "maxBytes": MAX_ASSET_CHUNK_BYTES,
+            }),
+        );
+        assert_eq!(skipped["error"]["code"], ErrorCode::InvalidParams.number());
+        scrub_object(&mut skipped);
+
+        let mut first_chunk = response(
+            &mut service,
+            10,
+            "asset.readChunk",
+            json!({
+                "session": session.as_str(),
+                "handle": handle.as_str(),
+                "offset": 0,
+                "maxBytes": MAX_ASSET_CHUNK_BYTES,
+            }),
+        );
+        assert_eq!(first_chunk["result"]["offset"], 0);
+        assert_eq!(first_chunk["result"]["eof"], false);
+        let encoded = first_chunk["result"]["contentBase64"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(!encoded.contains('='));
+        assert_eq!(
+            URL_SAFE_NO_PAD
+                .decode(encoded)
+                .unwrap_or_else(|error| panic!("chunk decode failed: {error}")),
+            plaintext[..MAX_ASSET_CHUNK_BYTES]
+        );
+        let serialized = serde_json::to_vec(&first_chunk)
+            .unwrap_or_else(|error| panic!("chunk response serialization failed: {error}"));
+        assert!(serialized.len() < MAX_FRAME_BYTES);
+        scrub_object(&mut first_chunk);
+
+        let mut final_chunk = response(
+            &mut service,
+            11,
+            "asset.readChunk",
+            json!({
+                "session": session.as_str(),
+                "handle": handle.as_str(),
+                "offset": MAX_ASSET_CHUNK_BYTES,
+                "maxBytes": MAX_ASSET_CHUNK_BYTES,
+            }),
+        );
+        assert_eq!(final_chunk["result"]["contentBase64"], "AQID");
+        assert_eq!(final_chunk["result"]["eof"], true);
+        scrub_object(&mut final_chunk);
+        let mut post_eof = response(
+            &mut service,
+            12,
+            "asset.readChunk",
+            json!({
+                "session": session.as_str(),
+                "handle": handle.as_str(),
+                "offset": plaintext.len(),
+                "maxBytes": 1,
+            }),
+        );
+        assert_eq!(post_eof["error"]["code"], ErrorCode::InvalidParams.number());
+        scrub_object(&mut post_eof);
+
+        let mut closed = response(
+            &mut service,
+            13,
+            "asset.close",
+            json!({"session": session.as_str(), "handle": handle.as_str()}),
+        );
+        assert_eq!(closed["result"]["ok"], true);
+        scrub_object(&mut closed);
+        let mut search_after_close = response(
+            &mut service,
+            84,
+            "search.query",
+            json!({"session": session.as_str(), "query": "needle"}),
+        );
+        assert_eq!(search_after_close["result"]["results"], json!([]));
+        scrub_object(&mut search_after_close);
+        let mut stale = response(
+            &mut service,
+            14,
+            "asset.readChunk",
+            json!({
+                "session": session.as_str(),
+                "handle": handle.as_str(),
+                "offset": 0,
+                "maxBytes": 1,
+            }),
+        );
+        assert_eq!(stale["error"]["code"], ErrorCode::InvalidParams.number());
+        scrub_object(&mut stale);
+
+        let ciphertext_path = directory.path().join("payload.bin.asset.enc");
+        let mut ciphertext = fs::read(&ciphertext_path)
+            .unwrap_or_else(|error| panic!("ciphertext fixture read failed: {error}"));
+        let last = ciphertext
+            .last_mut()
+            .unwrap_or_else(|| panic!("ciphertext fixture unexpectedly empty"));
+        *last ^= 1;
+        fs::write(&ciphertext_path, ciphertext)
+            .unwrap_or_else(|error| panic!("ciphertext fixture tamper failed: {error}"));
+        let mut tampered = response(
+            &mut service,
+            15,
+            "asset.open",
+            json!({"session": session.as_str(), "logicalPath": logical_path.as_str()}),
+        );
+        assert_eq!(
+            tampered["error"]["code"],
+            ErrorCode::IntegrityFailed.number()
+        );
+        scrub_object(&mut tampered);
+        session.zeroize();
+        handle.zeroize();
+    }
+
+    #[test]
+    fn feature_free_vault_rejects_asset_rpc_as_unsupported() {
+        let directory = TestDirectory::new();
+        let password = b"feature-free handler password";
+        drop(
+            Vault::create_with_params(
+                directory.path(),
+                password,
+                1_783_699_200_000,
+                Argon2idParams {
+                    ops_limit: 1,
+                    mem_limit_bytes: 8 * 1024,
+                },
+                test_policy(),
+            )
+            .unwrap_or_else(|error| panic!("fixture vault failed: {error}")),
+        );
+        let mut service = RpcService::with_clock_and_policy(SystemClock::new(), test_policy());
+        hello(&mut service);
+        let mut unlocked = response(
+            &mut service,
+            2,
+            "vault.unlock",
+            json!({
+                "vaultPath": directory.path().to_string_lossy(),
+                "password": String::from_utf8_lossy(password),
+            }),
+        );
+        let mut session = Zeroizing::new(
+            unlocked["result"]["session"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+        );
+        scrub_object(&mut unlocked);
+        let mut status = response(
+            &mut service,
+            3,
+            "vault.status",
+            json!({"session": session.as_str()}),
+        );
+        assert_eq!(status["result"]["features"]["opaqueAssetsV1"], false);
+        assert_eq!(status["result"]["assets"], 0);
+        scrub_object(&mut status);
+        let mut rejected = response(
+            &mut service,
+            4,
+            "asset.open",
+            json!({"session": session.as_str(), "logicalPath": "missing.bin"}),
+        );
+        assert_eq!(rejected["error"]["code"], ErrorCode::Unsupported.number());
+        scrub_object(&mut rejected);
+        session.zeroize();
+    }
+
+    #[test]
+    fn zero_byte_asset_rpc_returns_one_empty_eof_chunk_then_fails_closed() {
+        let directory = TestDirectory::new();
+        let password = b"empty asset handler password";
+        let logical_path = AssetPath::parse_canonical("empty.bin")
+            .unwrap_or_else(|error| panic!("asset path failed: {error}"));
+        create_asset_fixture(&directory, password, &logical_path, b"");
+        let mut service = RpcService::with_clock_and_policy(SystemClock::new(), test_policy());
+        hello(&mut service);
+        let mut unlocked = response(
+            &mut service,
+            2,
+            "vault.unlock",
+            json!({
+                "vaultPath": directory.path().to_string_lossy(),
+                "password": String::from_utf8_lossy(password),
+            }),
+        );
+        let mut session = Zeroizing::new(
+            unlocked["result"]["session"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+        );
+        scrub_object(&mut unlocked);
+        let mut opened = response(
+            &mut service,
+            3,
+            "asset.open",
+            json!({"session": session.as_str(), "logicalPath": logical_path.as_str()}),
+        );
+        assert_eq!(opened["result"]["size"], 0);
+        let mut handle = Zeroizing::new(
+            opened["result"]["handle"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+        );
+        scrub_object(&mut opened);
+        let mut chunk = response(
+            &mut service,
+            4,
+            "asset.readChunk",
+            json!({
+                "session": session.as_str(),
+                "handle": handle.as_str(),
+                "offset": 0,
+                "maxBytes": 1,
+            }),
+        );
+        assert_eq!(chunk["result"]["contentBase64"], "");
+        assert_eq!(chunk["result"]["eof"], true);
+        scrub_object(&mut chunk);
+        let mut repeated = response(
+            &mut service,
+            5,
+            "asset.readChunk",
+            json!({
+                "session": session.as_str(),
+                "handle": handle.as_str(),
+                "offset": 0,
+                "maxBytes": 1,
+            }),
+        );
+        assert_eq!(repeated["error"]["code"], ErrorCode::InvalidParams.number());
+        scrub_object(&mut repeated);
         session.zeroize();
         handle.zeroize();
     }

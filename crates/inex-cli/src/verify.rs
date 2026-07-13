@@ -8,13 +8,14 @@ use std::path::{Path, PathBuf};
 
 use inex_core::atomic::{VaultMutationGuard, open_file_matches_path_and_is_single_link};
 use inex_core::format::{self, ContentFlags, FormatError};
-use inex_core::path::{LogicalPath, PathError};
-use inex_core::tree::{self, TreeEntryKind, TreeError};
-use inex_core::vault::{MAX_EDRY_ENVELOPE_BYTES, VAULT_CONFIG_FILE};
+use inex_core::path::{AssetPath, LogicalPath, PathError};
+use inex_core::tree::{self, TreeEntryKind, TreeError, VaultTreeProfile};
+use inex_core::vault::{MAX_ASSET_EDRY_ENVELOPE_BYTES, MAX_EDRY_ENVELOPE_BYTES, VAULT_CONFIG_FILE};
 use inex_core::vault_config::{ConfigError, KdfPolicy, MAX_VAULT_JSON_BYTES, VaultConfig};
 
 pub(crate) struct VerificationReport {
     pub(crate) documents: usize,
+    pub(crate) assets: usize,
     pub(crate) directories: usize,
     pub(crate) weak_kdf_slots: usize,
     pub(crate) recovered_pending_transaction: bool,
@@ -103,9 +104,15 @@ pub(crate) fn verify_locked(root: &Path) -> Result<VerificationReport, VerifyErr
     let (config, warnings) = VaultConfig::parse_untrusted(&metadata_bytes, KdfPolicy::default())
         .map_err(VerifyError::Metadata)?;
 
-    let tree = tree::scan_vault_tree(&root).map_err(VerifyError::Tree)?;
+    let profile = if config.supports_opaque_assets() {
+        VaultTreeProfile::OpaqueAssetsV1
+    } else {
+        VaultTreeProfile::DocumentsOnly
+    };
+    let tree = tree::scan_vault_tree_with_profile(&root, profile).map_err(VerifyError::Tree)?;
     let mut file_ids = HashSet::new();
     let mut documents = 0_usize;
+    let mut assets = 0_usize;
     let mut directories = 0_usize;
 
     for entry in tree.entries() {
@@ -131,12 +138,33 @@ pub(crate) fn verify_locked(root: &Path) -> Result<VerificationReport, VerifyErr
                 }
                 documents += 1;
             }
+            TreeEntryKind::Asset => {
+                let logical =
+                    AssetPath::parse_canonical(entry.logical_path()).map_err(VerifyError::Path)?;
+                let physical = root.join(logical.to_ciphertext_relative_path());
+                let envelope = read_regular_bounded(&physical, MAX_ASSET_EDRY_ENVELOPE_BYTES)?;
+                let parts = format::split_envelope(&envelope).map_err(VerifyError::Format)?;
+                if parts.header.vault_id != config.vault_id
+                    || parts.header.key_epoch != config.key_epoch
+                    || parts.header.logical_path != logical.as_str()
+                {
+                    return Err(VerifyError::HeaderContextMismatch);
+                }
+                if parts.header.content_flags.contains(ContentFlags::DRAFT) {
+                    return Err(VerifyError::DraftInRepository);
+                }
+                if !file_ids.insert(parts.header.file_id) {
+                    return Err(VerifyError::DuplicateFileId);
+                }
+                assets += 1;
+            }
         }
     }
 
     drop(guard);
     Ok(VerificationReport {
         documents,
+        assets,
         directories,
         weak_kdf_slots: warnings.len(),
         recovered_pending_transaction,
@@ -280,7 +308,8 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use inex_core::path::{LogicalDir, LogicalPath};
+    use inex_core::crypto::VaultContentProfile;
+    use inex_core::path::{AssetPath, LogicalDir, LogicalPath};
     use inex_core::sodium::Argon2idParams;
     use inex_core::vault::Vault;
 
@@ -338,6 +367,21 @@ mod tests {
         .unwrap_or_else(|error| panic!("vault create failed: {error}"))
     }
 
+    fn create_asset_vault(directory: &TestDirectory) -> Vault {
+        Vault::create_with_profile_and_params(
+            directory.path(),
+            b"test password",
+            1_783_699_200_000,
+            VaultContentProfile::OpaqueAssetsV1,
+            Argon2idParams {
+                ops_limit: 1,
+                mem_limit_bytes: 8 * 1024,
+            },
+            policy(),
+        )
+        .unwrap_or_else(|error| panic!("asset vault create failed: {error}"))
+    }
+
     #[test]
     fn locked_verify_checks_structure_without_password() {
         let directory = TestDirectory::new();
@@ -357,9 +401,32 @@ mod tests {
         let report = verify_locked(directory.path())
             .unwrap_or_else(|error| panic!("verify failed: {error}"));
         assert_eq!(report.documents, 1);
+        assert_eq!(report.assets, 0);
         assert_eq!(report.directories, 1);
         assert_eq!(report.weak_kdf_slots, 1);
         assert!(!report.recovered_pending_transaction);
+    }
+
+    #[test]
+    fn locked_verify_counts_and_validates_opaque_assets() {
+        let directory = TestDirectory::new();
+        let mut vault = create_asset_vault(&directory);
+        let path = AssetPath::parse_canonical("image.bin")
+            .unwrap_or_else(|error| panic!("asset path failed: {error}"));
+        vault
+            .create_import_asset(
+                &path,
+                zeroize::Zeroizing::new(vec![0, 0xff, 1]),
+                1_783_699_201_000,
+            )
+            .unwrap_or_else(|error| panic!("asset create failed: {error}"));
+        drop(vault);
+
+        let report = verify_locked(directory.path())
+            .unwrap_or_else(|error| panic!("verify failed: {error}"));
+        assert_eq!(report.documents, 0);
+        assert_eq!(report.assets, 1);
+        assert_eq!(report.directories, 0);
     }
 
     #[test]

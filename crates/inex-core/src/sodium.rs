@@ -112,13 +112,15 @@ pub const COMPILED_RUST_TARGET: &str = if cfg!(all(
 /// Whether the executable was compiled with Rust debug assertions enabled.
 pub const COMPILED_WITH_DEBUG_ASSERTIONS: bool = cfg!(debug_assertions);
 
-/// Maximum v1 Markdown plaintext size.
-pub const MAX_AEAD_PLAINTEXT_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum one-shot plaintext accepted by the v1 AEAD boundary.
+///
+/// Product-level document and asset limits remain enforced by the EDRY format
+/// layer before these primitive wrappers are called.
+pub const MAX_AEAD_PLAINTEXT_BYTES: usize = 64 * 1024 * 1024;
 /// Generous bound for authenticated headers and key-wrap associated data.
 pub const MAX_AEAD_ASSOCIATED_DATA_BYTES: usize = 64 * 1024;
 /// Maximum input accepted by one-shot `BLAKE2b` helpers.
-pub const MAX_BLAKE2B_INPUT_BYTES: usize =
-    MAX_AEAD_PLAINTEXT_BYTES + MAX_AEAD_ASSOCIATED_DATA_BYTES;
+pub const MAX_BLAKE2B_INPUT_BYTES: usize = 16 * 1024 * 1024 + MAX_AEAD_ASSOCIATED_DATA_BYTES;
 
 /// Smallest password accepted by the vault v1 format.
 pub const MIN_PASSWORD_BYTES: usize = 1;
@@ -1621,6 +1623,7 @@ mod tests {
 
     #[test]
     fn xchacha20poly1305_round_trips_and_rejects_tampering() -> Result<(), SodiumError> {
+        assert_eq!(MAX_AEAD_PLAINTEXT_BYTES, 67_108_864);
         let key = [0x22_u8; KEY_BYTES];
         let nonce = [0x33_u8; XCHACHA20_NONCE_BYTES];
         let associated_data = b"INEX test AAD";

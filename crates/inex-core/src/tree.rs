@@ -3,10 +3,10 @@
 //! Discovery reads directory entries and link-aware metadata only. It never
 //! opens an EDRY file and therefore cannot place ciphertext or plaintext file
 //! contents in an error. Reserved implementation entries (`.git`,
-//! `.vault-local`, and root `vault.json`) are omitted. Portable unrelated
-//! regular files are ignored, while plaintext Markdown, ciphertext names that
-//! differ only from the canonical `.md.enc` spelling, non-portable names,
-//! links/reparse points, and special filesystem objects fail closed.
+//! `.vault-local`, and root `vault.json`) are omitted. Documents-only scans
+//! preserve the legacy behavior of ignoring portable unrelated regular files.
+//! Asset-enabled scans instead fail closed on unrelated regular files so a
+//! possible plaintext attachment cannot be silently omitted.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -17,7 +17,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::Serialize;
 use thiserror::Error;
 
-use crate::path::{LogicalDir, LogicalPath, PathError};
+use crate::path::{AssetPath, LogicalDir, LogicalPath, PathError, portable_case_fold};
 
 /// Default maximum number of filesystem entries inspected in one scan.
 pub const DEFAULT_MAX_TREE_ENTRIES: usize = 100_000;
@@ -30,6 +30,26 @@ pub const DEFAULT_MAX_TREE_PATH_BYTES: usize = 32 * 1024 * 1024;
 
 const MARKDOWN_SUFFIX: &str = ".md";
 const CIPHERTEXT_SUFFIX: &str = ".md.enc";
+const ASSET_CIPHERTEXT_SUFFIX: &str = ".asset.enc";
+
+/// The authenticated content profile used to interpret a vault tree.
+///
+/// Callers must select this from the already authenticated vault
+/// configuration. Tree discovery never infers a profile from filenames.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum VaultTreeProfile {
+    /// Preserve the feature-free Markdown-only vault interpretation.
+    #[default]
+    DocumentsOnly,
+    /// Interpret required feature `1` and expose canonical opaque assets.
+    OpaqueAssetsV1,
+}
+
+impl VaultTreeProfile {
+    const fn supports_opaque_assets(self) -> bool {
+        matches!(self, Self::OpaqueAssetsV1)
+    }
+}
 
 /// Resource limits for one vault-tree scan.
 ///
@@ -65,6 +85,8 @@ pub enum TreeEntryKind {
     Directory,
     /// A canonical encrypted Markdown document.
     File,
+    /// A canonical encrypted opaque asset.
+    Asset,
 }
 
 /// One validated logical entry returned to clients.
@@ -76,7 +98,7 @@ pub struct TreeEntry {
 }
 
 impl TreeEntry {
-    /// Return whether this entry is a directory or an encrypted Markdown file.
+    /// Return whether this entry is a directory, Markdown file, or opaque asset.
     #[must_use]
     pub const fn kind(&self) -> TreeEntryKind {
         self.kind
@@ -84,8 +106,9 @@ impl TreeEntry {
 
     /// Return the canonical logical path.
     ///
-    /// File paths include `.md` and never include physical `.enc`. Directory
-    /// paths have neither a trailing slash nor a special root entry.
+    /// Markdown paths include `.md`; asset paths preserve their source
+    /// extension. Neither includes a physical ciphertext suffix. Directory
+    /// paths have no trailing slash and the root is not represented.
     #[must_use]
     pub fn logical_path(&self) -> &str {
         &self.logical_path
@@ -207,6 +230,27 @@ pub enum TreeError {
         relative_path: String,
     },
 
+    /// An opaque-asset candidate used a non-canonical suffix spelling.
+    #[error("vault entry `{relative_path}` must use exact lowercase `.asset.enc`")]
+    NonCanonicalAssetCiphertextName {
+        /// Vault-relative metadata path; never asset contents.
+        relative_path: String,
+    },
+
+    /// A canonical asset entry appeared in a feature-free vault.
+    #[error("opaque asset entry `{relative_path}` requires vault feature 1")]
+    OpaqueAssetFeatureRequired {
+        /// Vault-relative metadata path; never asset contents.
+        relative_path: String,
+    },
+
+    /// An asset-enabled vault contained an unrecognized regular file.
+    #[error("vault entry `{relative_path}` is not an allowed encrypted or metadata file")]
+    UnexpectedRegularFile {
+        /// Vault-relative metadata path; never file contents.
+        relative_path: String,
+    },
+
     /// A likely plaintext Markdown file was found in the ciphertext vault.
     #[error("plaintext Markdown entry `{relative_path}` is not allowed in a vault")]
     PlaintextMarkdown {
@@ -221,12 +265,12 @@ pub enum TreeError {
         logical_path: String,
     },
 
-    /// Distinct logical names alias on a case-insensitive filesystem.
-    #[error("logical vault paths `{first}` and `{second}` collide under Unicode case folding")]
+    /// Distinct logical or mapped physical names alias on a portable filesystem.
+    #[error("vault paths `{first}` and `{second}` collide under portable Unicode case folding")]
     CaseFoldCollision {
-        /// First canonical logical path in deterministic ordering.
+        /// First canonical logical or physical path in deterministic ordering.
         first: String,
-        /// Second canonical logical path in deterministic ordering.
+        /// Second canonical logical or physical path in deterministic ordering.
         second: String,
     },
 
@@ -281,11 +325,30 @@ pub fn scan_vault_tree(root: impl AsRef<Path>) -> Result<VaultTree, TreeError> {
     scan_vault_tree_with_limits(root, TreeLimits::default())
 }
 
+/// Discover a vault tree using an explicit authenticated content profile.
+///
+/// Callers must derive `profile` from the authenticated `vault.json`; choosing
+/// [`VaultTreeProfile::OpaqueAssetsV1`] merely because an asset-looking name
+/// exists would bypass required-feature negotiation.
+///
+/// # Errors
+///
+/// Returns [`TreeError`] when the root cannot be inspected, an I/O operation
+/// fails, an entry violates `profile`, two logical names collide, or a default
+/// resource limit is exceeded.
+pub fn scan_vault_tree_with_profile(
+    root: impl AsRef<Path>,
+    profile: VaultTreeProfile,
+) -> Result<VaultTree, TreeError> {
+    scan_vault_tree_with_profile_and_limits(root, profile, TreeLimits::default())
+}
+
 /// Discover a vault tree with explicit resource limits.
 ///
 /// `max_entries` limits all entries inspected, not only entries returned in the
-/// tree. The scan excludes exact `.git` and `.vault-local` at every depth and
-/// exact root `vault.json`; any ASCII-case alias is rejected so it cannot be
+/// tree. The scan excludes exact root `.git`, `.vault-local`, and `vault.json`;
+/// any root ASCII-case alias is rejected, and nested reserved components are
+/// invalid, so they cannot be
 /// hidden on Linux and later collide on a case-insensitive checkout.
 ///
 /// # Errors
@@ -297,21 +360,51 @@ pub fn scan_vault_tree_with_limits(
     root: impl AsRef<Path>,
     limits: TreeLimits,
 ) -> Result<VaultTree, TreeError> {
+    scan_vault_tree_with_profile_and_limits(root, VaultTreeProfile::DocumentsOnly, limits)
+}
+
+/// Discover a vault tree with an explicit content profile and resource limits.
+///
+/// Documents-only scans retain the feature-free behavior of ignoring portable
+/// unrelated regular files, but reject asset-looking names. Asset-enabled scans
+/// expose canonical assets and reject unrelated regular files, except for exact
+/// root Git metadata maintained by Inex.
+///
+/// # Errors
+///
+/// Returns [`TreeError`] under the same conditions as
+/// [`scan_vault_tree_with_profile`] or when one of `limits` is exceeded.
+pub fn scan_vault_tree_with_profile_and_limits(
+    root: impl AsRef<Path>,
+    profile: VaultTreeProfile,
+    limits: TreeLimits,
+) -> Result<VaultTree, TreeError> {
     let root = root.as_ref();
     let root_metadata = validate_root(root)?;
     let mount_boundary =
         MountBoundary::new(root).map_err(|error| io_error(TreeIoOperation::InspectRoot, &error))?;
 
-    let mut scan = ScanState::new(limits, filesystem_device(&root_metadata), mount_boundary);
+    let mut scan = ScanState::new(
+        profile,
+        limits,
+        filesystem_device(&root_metadata),
+        mount_boundary,
+    );
     while let Some(relative_directory) = scan.pending_directories.pop() {
         scan_directory(root, &relative_directory, &mut scan)?;
     }
 
-    build_tree_from_path_lists(scan.directories, scan.ciphertext_files, limits)
+    build_tree_from_path_lists_with_assets(
+        scan.directories,
+        scan.ciphertext_files,
+        scan.asset_ciphertext_files,
+        limits,
+    )
 }
 
 #[derive(Debug)]
 struct ScanState {
+    profile: VaultTreeProfile,
     limits: TreeLimits,
     inspected_entries: usize,
     inspected_path_bytes: usize,
@@ -320,11 +413,18 @@ struct ScanState {
     pending_directories: Vec<PathBuf>,
     directories: Vec<PathBuf>,
     ciphertext_files: Vec<PathBuf>,
+    asset_ciphertext_files: Vec<PathBuf>,
 }
 
 impl ScanState {
-    fn new(limits: TreeLimits, root_device: Option<u64>, mount_boundary: MountBoundary) -> Self {
+    fn new(
+        profile: VaultTreeProfile,
+        limits: TreeLimits,
+        root_device: Option<u64>,
+        mount_boundary: MountBoundary,
+    ) -> Self {
         Self {
+            profile,
             limits,
             inspected_entries: 0,
             inspected_path_bytes: 0,
@@ -333,6 +433,7 @@ impl ScanState {
             pending_directories: vec![PathBuf::new()],
             directories: Vec::new(),
             ciphertext_files: Vec::new(),
+            asset_ciphertext_files: Vec::new(),
         }
     }
 
@@ -515,14 +616,14 @@ fn inspect_entry(
     scan: &mut ScanState,
 ) -> Result<(), TreeError> {
     let relative_path = parent.join(file_name);
-    match reserved_entry_kind(parent, file_name) {
-        ReservedEntryKind::Canonical => return Ok(()),
+    let reserved = reserved_entry_kind(parent, file_name);
+    match reserved {
         ReservedEntryKind::Alias => {
             return Err(TreeError::ReservedEntryAlias {
                 relative_path: relative_display(&relative_path),
             });
         }
-        ReservedEntryKind::NotReserved => {}
+        ReservedEntryKind::Canonical | ReservedEntryKind::NotReserved => {}
     }
     scan.count_path(&relative_path)?;
     enforce_depth(&relative_path, scan.limits.max_depth)?;
@@ -542,6 +643,15 @@ fn inspect_entry(
     }
 
     let file_type = metadata.file_type();
+    if reserved == ReservedEntryKind::Canonical {
+        return if file_type.is_dir() || file_type.is_file() {
+            Ok(())
+        } else {
+            Err(TreeError::UnsupportedFileType {
+                relative_path: relative_display(&relative_path),
+            })
+        };
+    }
     if file_type.is_dir() {
         logical_directory(&relative_path)?;
         scan.directories.push(relative_path.clone());
@@ -557,7 +667,6 @@ fn inspect_entry(
 }
 
 fn inspect_regular_file(relative_path: PathBuf, scan: &mut ScanState) -> Result<(), TreeError> {
-    logical_directory(&relative_path)?;
     let name = relative_path
         .file_name()
         .and_then(std::ffi::OsStr::to_str)
@@ -572,12 +681,40 @@ fn inspect_regular_file(relative_path: PathBuf, scan: &mut ScanState) -> Result<
 
     let lowercase_name = name.to_ascii_lowercase();
     if lowercase_name.ends_with(CIPHERTEXT_SUFFIX) {
+        logical_directory(&relative_path)?;
         return Err(TreeError::NonCanonicalCiphertextName {
             relative_path: relative_display(&relative_path),
         });
     }
+
+    if name.ends_with(ASSET_CIPHERTEXT_SUFFIX) {
+        AssetPath::from_ciphertext_relative_path(&relative_path)
+            .map_err(|reason| invalid_entry(&relative_path, reason))?;
+        if !scan.profile.supports_opaque_assets() {
+            return Err(TreeError::OpaqueAssetFeatureRequired {
+                relative_path: relative_display(&relative_path),
+            });
+        }
+        scan.asset_ciphertext_files.push(relative_path);
+        return Ok(());
+    }
+
+    if lowercase_name.ends_with(ASSET_CIPHERTEXT_SUFFIX) {
+        logical_directory(&relative_path)?;
+        return Err(TreeError::NonCanonicalAssetCiphertextName {
+            relative_path: relative_display(&relative_path),
+        });
+    }
+    logical_directory(&relative_path)?;
     if lowercase_name.ends_with(MARKDOWN_SUFFIX) {
         return Err(TreeError::PlaintextMarkdown {
+            relative_path: relative_display(&relative_path),
+        });
+    }
+
+    if scan.profile.supports_opaque_assets() && !is_allowed_root_repository_metadata(&relative_path)
+    {
+        return Err(TreeError::UnexpectedRegularFile {
             relative_path: relative_display(&relative_path),
         });
     }
@@ -585,12 +722,37 @@ fn inspect_regular_file(relative_path: PathBuf, scan: &mut ScanState) -> Result<
     Ok(())
 }
 
+fn is_allowed_root_repository_metadata(relative_path: &Path) -> bool {
+    relative_path
+        .parent()
+        .is_some_and(|parent| parent.as_os_str().is_empty())
+        && relative_path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|name| matches!(name, ".gitattributes" | ".gitignore"))
+}
+
+#[cfg(test)]
 fn build_tree_from_path_lists(
-    mut directories: Vec<PathBuf>,
-    mut ciphertext_files: Vec<PathBuf>,
+    directories: Vec<PathBuf>,
+    ciphertext_files: Vec<PathBuf>,
     limits: TreeLimits,
 ) -> Result<VaultTree, TreeError> {
-    if directories.len().saturating_add(ciphertext_files.len()) > limits.max_entries {
+    build_tree_from_path_lists_with_assets(directories, ciphertext_files, Vec::new(), limits)
+}
+
+fn build_tree_from_path_lists_with_assets(
+    mut directories: Vec<PathBuf>,
+    mut ciphertext_files: Vec<PathBuf>,
+    mut asset_ciphertext_files: Vec<PathBuf>,
+    limits: TreeLimits,
+) -> Result<VaultTree, TreeError> {
+    if directories
+        .len()
+        .saturating_add(ciphertext_files.len())
+        .saturating_add(asset_ciphertext_files.len())
+        > limits.max_entries
+    {
         return Err(TreeError::EntryLimitExceeded {
             maximum: limits.max_entries,
         });
@@ -598,6 +760,7 @@ fn build_tree_from_path_lists(
     let path_bytes = directories
         .iter()
         .chain(&ciphertext_files)
+        .chain(&asset_ciphertext_files)
         .fold(0_usize, |total, path| {
             total.saturating_add(path.as_os_str().as_encoded_bytes().len())
         });
@@ -609,13 +772,20 @@ fn build_tree_from_path_lists(
 
     directories.sort();
     ciphertext_files.sort();
-    let mut candidates = Vec::with_capacity(directories.len() + ciphertext_files.len());
+    asset_ciphertext_files.sort();
+    let mut candidates = Vec::with_capacity(
+        directories.len() + ciphertext_files.len() + asset_ciphertext_files.len(),
+    );
 
     for relative_path in directories {
         enforce_depth(&relative_path, limits.max_depth)?;
         let logical = logical_directory(&relative_path)?;
+        let physical_path = normal_relative_text(&relative_path)
+            .map_err(|reason| invalid_entry(&relative_path, reason))?;
         candidates.push(TreeCandidate {
             fold_key: logical.case_fold_key().as_str().to_owned(),
+            physical_fold_key: portable_case_fold(&physical_path),
+            physical_path,
             entry: TreeEntry {
                 kind: TreeEntryKind::Directory,
                 logical_path: logical.as_str().to_owned(),
@@ -626,10 +796,30 @@ fn build_tree_from_path_lists(
         enforce_depth(&relative_path, limits.max_depth)?;
         let logical = LogicalPath::from_ciphertext_relative_path(&relative_path)
             .map_err(|reason| invalid_entry(&relative_path, reason))?;
+        let physical_path = normal_relative_text(&relative_path)
+            .map_err(|reason| invalid_entry(&relative_path, reason))?;
         candidates.push(TreeCandidate {
             fold_key: logical.case_fold_key().as_str().to_owned(),
+            physical_fold_key: portable_case_fold(&physical_path),
+            physical_path,
             entry: TreeEntry {
                 kind: TreeEntryKind::File,
+                logical_path: logical.as_str().to_owned(),
+            },
+        });
+    }
+    for relative_path in asset_ciphertext_files {
+        enforce_depth(&relative_path, limits.max_depth)?;
+        let logical = AssetPath::from_ciphertext_relative_path(&relative_path)
+            .map_err(|reason| invalid_entry(&relative_path, reason))?;
+        let physical_path = normal_relative_text(&relative_path)
+            .map_err(|reason| invalid_entry(&relative_path, reason))?;
+        candidates.push(TreeCandidate {
+            fold_key: logical.case_fold_key().as_str().to_owned(),
+            physical_fold_key: portable_case_fold(&physical_path),
+            physical_path,
+            entry: TreeEntry {
+                kind: TreeEntryKind::Asset,
                 logical_path: logical.as_str().to_owned(),
             },
         });
@@ -654,12 +844,15 @@ fn build_tree_from_path_lists(
 #[derive(Debug)]
 struct TreeCandidate {
     fold_key: String,
+    physical_fold_key: String,
+    physical_path: String,
     entry: TreeEntry,
 }
 
 fn reject_aliases(candidates: &[TreeCandidate]) -> Result<(), TreeError> {
     let mut exact_paths = BTreeMap::<&str, TreeEntryKind>::new();
     let mut folded_paths = BTreeMap::<&str, &str>::new();
+    let mut physical_paths = BTreeMap::<&str, &str>::new();
 
     for candidate in candidates {
         let logical_path = candidate.entry.logical_path.as_str();
@@ -678,6 +871,16 @@ fn reject_aliases(candidates: &[TreeCandidate]) -> Result<(), TreeError> {
             return Err(TreeError::CaseFoldCollision {
                 first: first.to_owned(),
                 second: logical_path.to_owned(),
+            });
+        }
+
+        if let Some(first) = physical_paths.insert(
+            &candidate.physical_fold_key,
+            candidate.physical_path.as_str(),
+        ) {
+            return Err(TreeError::CaseFoldCollision {
+                first: first.to_owned(),
+                second: candidate.physical_path.clone(),
             });
         }
     }
@@ -768,11 +971,14 @@ fn reserved_entry_kind(parent: &Path, file_name: &std::ffi::OsStr) -> ReservedEn
     let Some(name) = file_name.to_str() else {
         return ReservedEntryKind::NotReserved;
     };
+    if !parent.as_os_str().is_empty() {
+        return ReservedEntryKind::NotReserved;
+    }
     let expected = if name.eq_ignore_ascii_case(".git") {
         Some(".git")
     } else if name.eq_ignore_ascii_case(".vault-local") {
         Some(".vault-local")
-    } else if parent.as_os_str().is_empty() && name.eq_ignore_ascii_case("vault.json") {
+    } else if name.eq_ignore_ascii_case("vault.json") {
         Some("vault.json")
     } else {
         None
@@ -837,6 +1043,19 @@ mod tests {
 
     fn pure_tree(directories: &[&str], files: &[&str]) -> Result<VaultTree, TreeError> {
         build_tree_from_path_lists(paths(directories), paths(files), TreeLimits::default())
+    }
+
+    fn pure_asset_tree(
+        directories: &[&str],
+        files: &[&str],
+        assets: &[&str],
+    ) -> Result<VaultTree, TreeError> {
+        build_tree_from_path_lists_with_assets(
+            paths(directories),
+            paths(files),
+            paths(assets),
+            TreeLimits::default(),
+        )
     }
 
     #[cfg(target_os = "linux")]
@@ -919,6 +1138,21 @@ mod tests {
                 second: "notes".to_owned(),
             })
         );
+
+        assert_eq!(
+            pure_asset_tree(&[], &["Photo.md.enc"], &["photo.MD.asset.enc"]),
+            Err(TreeError::CaseFoldCollision {
+                first: "Photo.md".to_owned(),
+                second: "photo.MD".to_owned(),
+            })
+        );
+
+        assert_eq!(
+            pure_asset_tree(&["images"], &[], &["images.asset.enc"]),
+            Err(TreeError::DuplicateLogicalPath {
+                logical_path: "images".to_owned(),
+            })
+        );
     }
 
     #[test]
@@ -985,7 +1219,11 @@ mod tests {
 
     #[test]
     fn serialized_tree_has_rpc_ready_stable_shape() {
-        let tree = match pure_tree(&["notes"], &["notes/today.md.enc"]) {
+        let tree = match pure_asset_tree(
+            &["notes"],
+            &["notes/today.md.enc"],
+            &["notes/chart.png.asset.enc"],
+        ) {
             Ok(tree) => tree,
             Err(error) => panic!("tree build failed: {error}"),
         };
@@ -998,6 +1236,7 @@ mod tests {
             serde_json::json!({
                 "entries": [
                     {"kind": "directory", "logicalPath": "notes"},
+                    {"kind": "asset", "logicalPath": "notes/chart.png"},
                     {"kind": "file", "logicalPath": "notes/today.md"}
                 ]
             })
@@ -1034,6 +1273,155 @@ mod tests {
     }
 
     #[test]
+    fn documents_only_scan_rejects_asset_names_without_inferring_feature() {
+        let canonical = TempDirectory::new();
+        write_file(&canonical.path().join("image.png.asset.enc"));
+        assert_eq!(
+            scan_vault_tree(canonical.path()),
+            Err(TreeError::OpaqueAssetFeatureRequired {
+                relative_path: "image.png.asset.enc".to_owned(),
+            })
+        );
+
+        for name in ["image.png.ASSET.ENC", "image.png.Asset.Enc"] {
+            let noncanonical = TempDirectory::new();
+            write_file(&noncanonical.path().join(name));
+            let expected = Err(TreeError::NonCanonicalAssetCiphertextName {
+                relative_path: name.to_owned(),
+            });
+            assert_eq!(scan_vault_tree(noncanonical.path()), expected);
+            assert_eq!(
+                scan_vault_tree_with_profile(noncanonical.path(), VaultTreeProfile::OpaqueAssetsV1,),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn asset_profile_lists_canonical_assets_and_rejects_invalid_asset_paths() {
+        let temporary = TempDirectory::new();
+        create_directory(&temporary.path().join("images"));
+        write_file(&temporary.path().join("images/photo.png.asset.enc"));
+        write_file(&temporary.path().join("notes.md.enc"));
+
+        let tree = match scan_vault_tree_with_profile(
+            temporary.path(),
+            VaultTreeProfile::OpaqueAssetsV1,
+        ) {
+            Ok(tree) => tree,
+            Err(error) => panic!("asset-aware filesystem scan failed: {error}"),
+        };
+        assert_eq!(
+            tree.entries(),
+            [
+                TreeEntry {
+                    kind: TreeEntryKind::Directory,
+                    logical_path: "images".to_owned(),
+                },
+                TreeEntry {
+                    kind: TreeEntryKind::Asset,
+                    logical_path: "images/photo.png".to_owned(),
+                },
+                TreeEntry {
+                    kind: TreeEntryKind::File,
+                    logical_path: "notes.md".to_owned(),
+                },
+            ]
+        );
+
+        let markdown_namespace = TempDirectory::new();
+        write_file(&markdown_namespace.path().join("notes.md.asset.enc"));
+        assert!(matches!(
+            scan_vault_tree_with_profile(
+                markdown_namespace.path(),
+                VaultTreeProfile::OpaqueAssetsV1,
+            ),
+            Err(TreeError::InvalidEntry {
+                reason: PathError::AssetUsesMarkdownSuffix,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn mapped_ciphertext_names_share_the_directory_physical_collision_domain() {
+        let asset_collision = TempDirectory::new();
+        create_directory(&asset_collision.path().join("FOO.ASSET.ENC"));
+        write_file(&asset_collision.path().join("foo.asset.enc"));
+        assert!(matches!(
+            scan_vault_tree_with_profile(asset_collision.path(), VaultTreeProfile::OpaqueAssetsV1,),
+            Err(TreeError::CaseFoldCollision { .. })
+        ));
+
+        let document_collision = TempDirectory::new();
+        create_directory(&document_collision.path().join("FOO.MD.ENC"));
+        write_file(&document_collision.path().join("foo.md.enc"));
+        assert!(matches!(
+            scan_vault_tree(document_collision.path()),
+            Err(TreeError::CaseFoldCollision { .. })
+        ));
+    }
+
+    #[test]
+    fn asset_profile_fails_closed_on_unrelated_regular_files() {
+        let temporary = TempDirectory::new();
+        write_file(&temporary.path().join("image.png"));
+        assert_eq!(
+            scan_vault_tree_with_profile(temporary.path(), VaultTreeProfile::OpaqueAssetsV1,),
+            Err(TreeError::UnexpectedRegularFile {
+                relative_path: "image.png".to_owned(),
+            })
+        );
+
+        let metadata = TempDirectory::new();
+        write_file(&metadata.path().join(".gitattributes"));
+        write_file(&metadata.path().join(".gitignore"));
+        assert!(
+            scan_vault_tree_with_profile(metadata.path(), VaultTreeProfile::OpaqueAssetsV1).is_ok()
+        );
+
+        create_directory(&metadata.path().join("nested"));
+        write_file(&metadata.path().join("nested/.gitignore"));
+        assert_eq!(
+            scan_vault_tree_with_profile(metadata.path(), VaultTreeProfile::OpaqueAssetsV1),
+            Err(TreeError::UnexpectedRegularFile {
+                relative_path: "nested/.gitignore".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn asset_entries_count_against_builder_resource_limits() {
+        assert_eq!(
+            build_tree_from_path_lists_with_assets(
+                Vec::new(),
+                paths(&["notes.md.enc"]),
+                paths(&["image.png.asset.enc"]),
+                TreeLimits {
+                    max_entries: 1,
+                    max_depth: 10,
+                    max_path_bytes: DEFAULT_MAX_TREE_PATH_BYTES,
+                },
+            ),
+            Err(TreeError::EntryLimitExceeded { maximum: 1 })
+        );
+
+        assert_eq!(
+            build_tree_from_path_lists_with_assets(
+                Vec::new(),
+                Vec::new(),
+                paths(&["image.png.asset.enc"]),
+                TreeLimits {
+                    max_entries: 10,
+                    max_depth: 10,
+                    max_path_bytes: 5,
+                },
+            ),
+            Err(TreeError::PathByteLimitExceeded { maximum: 5 })
+        );
+    }
+
+    #[test]
     fn filesystem_scan_rejects_wrong_case_reserved_aliases() {
         for (name, directory) in [
             (".GIT", true),
@@ -1050,6 +1438,40 @@ mod tests {
             assert!(matches!(
                 scan_vault_tree(temporary.path()),
                 Err(TreeError::ReservedEntryAlias { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn filesystem_scan_rejects_nested_reserved_components() {
+        for name in [".git", ".vault-local", ".GIT", ".Vault-Local"] {
+            let temporary = TempDirectory::new();
+            create_directory(&temporary.path().join("notes"));
+            create_directory(&temporary.path().join("notes").join(name));
+            assert!(matches!(
+                scan_vault_tree(temporary.path()),
+                Err(TreeError::InvalidEntry {
+                    reason: PathError::ReservedComponent { .. },
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_scan_inspects_root_reserved_entries_before_excluding_them() {
+        use std::os::unix::fs::symlink;
+
+        for name in [".git", ".vault-local"] {
+            let temporary = TempDirectory::new();
+            let outside = temporary.path().join("outside");
+            create_directory(&outside);
+            symlink(&outside, temporary.path().join(name))
+                .unwrap_or_else(|error| panic!("reserved symlink failed: {error}"));
+            assert!(matches!(
+                scan_vault_tree(temporary.path()),
+                Err(TreeError::LinkLikeEntry { .. })
             ));
         }
     }
