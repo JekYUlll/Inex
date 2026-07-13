@@ -73,15 +73,20 @@ Phase 6 extension — 现有 Markdown Git 仓库与加密附件迁移（Phase 7 
 - [ ] 扩展为长期维护的 Markdown Git 仓库 tracked-snapshot 初始化；源仓库与原 `.git` 全程只读，目标必须全新
   - [x] 冻结干净 HEAD、tracked regular-file allowlist、双轮内容证明、导入期间重验、dirty/symlink/submodule拒绝与source provenance最小泄漏契约
   - [x] 冻结单暂存根事务：完整vault、附件、`.git`、无parent根提交、独立解锁/全树/对象审计及递归durability全部在同一sibling staging完成，只以一次整根no-replace publication暴露目标
-  - [ ] 实现repository source manifest、secure no-follow遍历、完整`.git`控制树审计与最终source重验
+  - [x] 在Linux实现repository source manifest、`openat2` secure no-follow遍历、完整`.git`控制树审计与最终source重验；非Linux当前明确fail closed
   - [x] 设计并实现独立版本化附件密文格式、portable logical asset path、bounded whole-file/后续streaming边界及认证读写
-  - [ ] 让tree/RPC/VS Code区分Markdown与attachment，并在受控webview中解析同vault相对图片而不写明文临时文件
+  - [x] 让tree/RPC/VS Code区分Markdown与attachment，并在受控webview中解析同vault相对图片而不写明文临时文件
     - [x] core tree/Vault/locked verify与daemon status/tree/顺序asset RPC已贯通，严格feature negotiation、64 MiB上限、单session零化缓存及private staging recovery门禁通过
-    - [ ] VS Code协商feature-1能力、流式读取相对图片并在受控webview预览，关闭/锁定时释放句柄且不形成普通plaintext document/临时文件
-  - [ ] 让copy-import完整导入Markdown与受支持附件、验证计数/摘要/链接，忽略物理`.git`且拒绝无声明跳过
-  - [ ] 在单一staging root内初始化全新object database、形成单个initial snapshot、完成无明文对象审计与整根原子发布；原明文728提交只保留在只读源仓库，不复制refs/objects/alternates或伪造parent
-  - [ ] 将完整历史加密重写保留为独立experimental后续；未实现前不得宣称“保留历史”
-  - [ ] 在VS Code locked首屏提供Import/Unlock引导，锁定时隐藏或禁用CRUD，真实Extension Host覆盖首次使用路径
+    - [x] VS Code协商feature-1能力、顺序读取相对图片并在受控webview预览，关闭/锁定/编辑/隐藏时撤销URL并释放句柄，不形成普通plaintext document或临时文件
+  - [x] 由独立`import-repository`完整导入Markdown与全部受支持的tracked `100644`附件，验证计数/摘要/精确源字节，物理`.git`只读审计且任何unsupported状态均整体拒绝
+  - [x] 在单一staging root内初始化全新object database、形成单个initial snapshot、完成当前Linux对象/无明文审计与整根原子发布；真实728提交只保留在只读源仓库，不复制refs/objects/alternates或伪造parent
+  - [x] 将完整历史加密重写保留为独立experimental后续；当前产品与文档只承诺单个加密快照，不宣称“保留历史”
+  - [ ] 完成VS Code locked首次交互的最终发布门禁
+    - [x] 提供Import/Unlock welcome、锁定CRUD gate、绝对CLI任务、成功后Open New Vault，并由真实Extension Host覆盖底层import→密文workspace→asset/CRUD流程
+    - [ ] 在最终VSIX上人工驱动Linux真实folder picker、任务终端双口令与Open New Vault鼠标路径，并纳入persistent-profile残留证据
+  - [ ] 完成冻结GA对象证明：从approved path/OID trie独立序列化每棵raw tree，使用bounded streaming `cat-file --batch`逐对象比较，并补raw index-extension parser与资源边界
+  - [ ] 完成跨进程publication ambiguity恢复：设计通用持久publication claim/seal与existing-only reconcile guard，真实SIGKILL后同命令只对账并删除exact marker，绝不在final补建Git或触碰foreign destination
+  - [ ] 完成repository import构造/durability/publication每一边界的Linux force-kill、hostile same-UID source/target race、artifact-bound residue与原生Windows矩阵
 - **Status:** in_progress（用户实测驱动的迁移/附件扩展；原Markdown-only实现仍保持已验证基线）
 
 ### Phase 7: 跨平台验证、打包与发布准备
@@ -371,6 +376,9 @@ Phase 6 extension — 现有 Markdown Git 仓库与加密附件迁移（Phase 7 
 | Fixed hardening review found narrow setup-owner and guard-regression coverage gaps | 1 | Declare parent cleanup ownership before setup spawn and arm it without an unowned parse window; add durable park-ready plus Drop-path evidence and make the RAII regression exercise real unwinding |
 | Second hardening Clippy pass found one collapsible nested `if let` in best-effort owner evidence cleanup | 1 | Apply the equivalent let-chain, retain the same bounded cleanup behavior, and rerun the complete native and Windows GNU pedantic gates |
 | Post-matrix broad `/tmp` residue search descended into systemd-private directories and emitted expected permission errors | 1 | Restrict residue inspection to same-user top-level `inex-git-recovery-test-*` roots, then check their timestamps and `fixture-owner` descendants without traversing unrelated service sandboxes |
+| Repository-import独立终审发现fresh reopen仅比较长度/摘要、Git对象只列inventory且tracked worktree缺末尾统一seal重验 | 1 | fresh unlock后重新descriptor/Git-bound读取每个源文件并逐字节比较；逐个读取commit/blob/tree对象体、blob对worktree精确比较、tree typed rehash，并在每次完整target audit末尾再次复验allowlist、identity、size和SHA-256；定向测试、Clippy及Windows GNU check通过。独立raw-tree序列化与streaming仍保留为GA门禁 |
+| 发布后强杀重试审计确认随机16-byte marker与进程内`TargetRepository`无法跨进程重建exact ownership，重跑又先拒绝existing destination | 1 | 不做“看到marker就删”的危险补丁；把generic persistent publication claim/seal、existing-only reconcile guard、held-marker删除和真实SIGKILL矩阵列为独立未完成安全里程碑。当前Linux preview只承诺正常完成路径，terminal要求保留现场且禁止盲重跑 |
+| 发布工具与Sublime完整unittest首次分别漏设`PYTHONPATH=scripts`和`PYTHONPATH=editors/sublime`，产生模块导入错误 | 1 each | 将两次错误启动记录为无效证据；使用显式正确模块路径重跑，发布工具86/86和Sublime 84/84全部通过。后续固定命令保留显式`PYTHONPATH` |
 
 ## Notes
 
