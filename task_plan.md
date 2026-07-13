@@ -2,17 +2,17 @@
 
 ## Goal
 
-按照 `.agent/init_plan.md` 的架构与安全边界，交付可在 Windows/Linux 使用的 Rust 加密核心与本地 sidecar、VS Code/Sublime 客户端、Git/迁移工具及验证完备的可安装 MVP，使 Markdown 明文只在编辑器与受控进程内存中出现，磁盘仓库始终保存密文。
+按照 `.agent/init_plan.md` 的架构与安全边界，优先交付“现有 Markdown Git 仓库 → 全新 Inex 密文仓库”的可安装迁移闭环：从干净且固定的 source HEAD 只读导入当前 tracked snapshot，完整加密 Markdown 与图片/附件，在同一隐藏 sibling staging root 内建立并审计全新密文 Git 根提交，再以一次 verified no-replace 整根发布暴露目标；使相对图片可在 VS Code 受控内存界面中读取，且原明文 Git 历史保持在源仓库、绝不进入目标 object database。完成该闭环后继续原 Phase 7 的跨平台验证、打包与发布准备，使磁盘仓库始终只保存密文而不产生临时明文 Markdown/附件。
 
 ## Current Phase
 
-Phase 7 — 跨平台验证、打包与发布准备
+Phase 6 extension — 现有 Markdown Git 仓库与加密附件迁移（Phase 7 发布收尾暂停但不撤销）
 
 ## Scope and Acceptance Baseline
 
-- 真实 Git 仓库只保存 `vault.json`、目录元数据与 `*.md.enc` 密文，不创建临时明文 Markdown 文件。
+- 真实 Git 仓库只保存 `vault.json`、目录元数据、`*.md.enc` Markdown 密文及版本化附件密文，不创建临时明文 Markdown/附件文件。
 - 口令经 Argon2id 派生 KEK；随机 256-bit master key 被 KEK 包裹；文件使用派生子密钥与 XChaCha20-Poly1305 AEAD。
-- 支持创建/解锁/锁定 vault、文件读写、树浏览、内存搜索、换密码、导入与密文 Git 合并。
+- 支持创建/解锁/锁定 vault、文件读写、树浏览、内存搜索、换密码、从现有 Markdown Git 工作树安全迁移当前快照、加密附件与密文 Git 合并。
 - `inexd` 提供语言无关的本地 JSON-RPC 接口；VS Code 为主客户端，Sublime 为命令式轻量客户端。
 - VS Code 通过真实 `*.md.enc` 上的 CustomEditorProvider 提供目录树、编辑、受控链接/引用、扩展内安全搜索与加密 draft backup。
 - Sublime 以 experimental 模式支持 Quick Panel、scratch buffer、自管 dirty/加密 draft 与安全设置 hard gate，不承诺原生虚拟文件系统体验。
@@ -70,7 +70,19 @@ Phase 7 — 跨平台验证、打包与发布准备
 - [x] 实现加密冲突状态、普通编辑器保存清旗与 journal 恢复流程
 - [x] 实现 plaintext copy-import/dry-run、校验报告，并明确拒绝破坏性 in-place 转换
 - [x] 实现 vault verify/pending recovery 报告与恢复说明，确保失败不破坏源数据
-- **Status:** complete
+- [ ] 扩展为长期维护的 Markdown Git 仓库 tracked-snapshot 初始化；源仓库与原 `.git` 全程只读，目标必须全新
+  - [x] 冻结干净 HEAD、tracked regular-file allowlist、双轮内容证明、导入期间重验、dirty/symlink/submodule拒绝与source provenance最小泄漏契约
+  - [x] 冻结单暂存根事务：完整vault、附件、`.git`、无parent根提交、独立解锁/全树/对象审计及递归durability全部在同一sibling staging完成，只以一次整根no-replace publication暴露目标
+  - [ ] 实现repository source manifest、secure no-follow遍历、完整`.git`控制树审计与最终source重验
+  - [x] 设计并实现独立版本化附件密文格式、portable logical asset path、bounded whole-file/后续streaming边界及认证读写
+  - [ ] 让tree/RPC/VS Code区分Markdown与attachment，并在受控webview中解析同vault相对图片而不写明文临时文件
+    - [x] core tree/Vault/locked verify与daemon status/tree/顺序asset RPC已贯通，严格feature negotiation、64 MiB上限、单session零化缓存及private staging recovery门禁通过
+    - [ ] VS Code协商feature-1能力、流式读取相对图片并在受控webview预览，关闭/锁定时释放句柄且不形成普通plaintext document/临时文件
+  - [ ] 让copy-import完整导入Markdown与受支持附件、验证计数/摘要/链接，忽略物理`.git`且拒绝无声明跳过
+  - [ ] 在单一staging root内初始化全新object database、形成单个initial snapshot、完成无明文对象审计与整根原子发布；原明文728提交只保留在只读源仓库，不复制refs/objects/alternates或伪造parent
+  - [ ] 将完整历史加密重写保留为独立experimental后续；未实现前不得宣称“保留历史”
+  - [ ] 在VS Code locked首屏提供Import/Unlock引导，锁定时隐藏或禁用CRUD，真实Extension Host覆盖首次使用路径
+- **Status:** in_progress（用户实测驱动的迁移/附件扩展；原Markdown-only实现仍保持已验证基线）
 
 ### Phase 7: 跨平台验证、打包与发布准备
 
@@ -90,11 +102,11 @@ Phase 7 — 跨平台验证、打包与发布准备
   - [x] 用真实临时 Git 仓库覆盖 foreign lock、并行 porcelain、marker/candidate/published crash states 与 SHA-1/SHA-256
   - [x] 用真实 Linux 子 test + OS force-kill 覆盖 core atomic verified-stage/lock/replace/post-commit 四个边界，只接受完整 old/new ciphertext
   - [x] 修复并复审 Git v4 candidate 创建前的 durable pre-lock intent：orphan staging、foreign ownership、Windows exact-name 与 link/reparse 全部 fail closed
-  - [ ] 闭合 candidate/initial/final ownership receipt 之间的强杀自动恢复，或在 GA scope 中明确这些可见状态只能保留并人工处置
-    - [ ] 设计并实现 v5 immutable candidate bundle：只在未发布 scratch 完成 Git mutation、final digest 与完整 payload，再以 verified no-replace directory move 一次性发布；partial scratch 保留但不阻塞，active namespace 不再暴露多文件 receipt gap
+  - [x] 闭合 candidate/initial/final ownership receipt 之间的强杀自动恢复源码路径；不可归属的未发布 scratch 仍保留供人工审计
+    - [x] 设计并实现 v5 immutable candidate bundle：只在未发布 scratch 完成 Git mutation、final digest 与完整 payload，再以 verified no-replace directory move 一次性发布；partial scratch 保留但不阻塞，active namespace 不再暴露多文件 receipt gap
       - [x] 抽取跨平台 verified no-replace directory move，并冻结 audit-path/public API；Linux 与 Windows GNU/Wine 定向门禁通过
       - [x] 定义 strict canonical v5 manifest、exact two-file inventory、stable/scratch namespace 与 `RecoveryStatus`；明确 inventory 验证不替代真实 Git stage-map/expected-old/transaction 语义验证
-      - [ ] 将 immutable stable bundle 接入 v5 marker/journal/index recovery 与强杀矩阵
+      - [x] 将 immutable stable bundle 接入 v5 marker/journal/index recovery 源码路径
         - [x] 在 scratch 完成 alternate-index mutation、完整语义验证并一次性发布 immutable stable bundle
         - [x] 冻结 manifest transaction reference、canonical `INEXIDX5` marker、strict stable journal 与 fresh-process Git 语义 loader；v1-v4 读取/恢复兼容保持不变
         - [x] 从 immutable bundle 生成 token-derived publish staging，并支持 fresh-process 重新形成 held bundle/publish proofs；partial scratch 保留不阻塞，foreign/link/rebind/live drift fail closed
@@ -104,20 +116,29 @@ Phase 7 — 跨平台验证、打包与发布准备
         - [x] 完成 post-journal worktree/index 前滚、ExactFinal/LaterUnrelated 分类与 live-index identity 绑定；SHA-1/SHA-256 三 payload、故障注入、native/Windows GNU 门禁及双路独立复审通过
         - [x] 完成 bundle retire/cleanup receipt 七态状态机：held proof、relocated classifier、逐边durability/identity协调、SHA-1/SHA-256三payload与双路独立复审均通过
         - [x] 完成 production writer 接线：三payload真实入口统一走single-guard v5 disk-classified driver，旧v4手工tail结构性移除，private composite hooks与双路复审通过
-        - [ ] 完成端到端 OS force-kill recovery；Linux/Windows native分别绑定，强杀证据不冒充power-loss
-          - [x] Linux native：SHA-1/SHA-256 × InPlace/DetectedRename/SplitRename 六分片精确230-case真实强杀矩阵通过
-          - [ ] Windows native：
-            - [ ] 在 core Windows 平台层枚举并 fail-closed 拒绝 v5 bundle 目录、candidate 与 manifest 的 NTFS ADS，接入 initial/held/cleanup 重验证
-              - [x] 实现handle-bound `FileStreamInfo` core原语、严格bounded parser、Linux/unsupported语义、Windows native测试源码与Windows GNU/Wine结构门禁，并经独立复审确认无代码阻断项
-              - [x] 接入v5 full/manifest-only/empty bundle、journal/receipt与每个move/delete临界重验证
-                - [x] full/manifest-only/empty inventory、stable inventory连续持有及journal/receipt held proof已接线，Linux v5回归与Windows GNU静态门禁通过
-                - [x] 补齐publish staging、marker/candidate `index.lock`与completed live index的held ADS proof，避免named stream随move/replace传播或被静默删除
-                - [x] 补齐stable→cleanup、worktree split边界、真实journal→receipt、ReceiptOnly及transient/index owner的Windows-only对抗测试
-              - [ ] 在原生NTFS/ReFS执行file/directory与v5七态ADS对抗矩阵；Wine unsupported fail-closed不替代该门禁
-            - [ ] 绑定 Job Object suspended-before-assignment、active-process-zero 与句柄释放证据
-            - [ ] 在原生 NTFS/ReFS 宿主运行同一 230-case 矩阵
+  - [ ] 完成端到端 OS force-kill recovery 原生证据；Linux/Windows 分别绑定，强杀证据不冒充 power-loss
+    - [x] Linux native：SHA-1/SHA-256 × InPlace/DetectedRename/SplitRename 六分片精确230-case真实强杀矩阵通过
+    - [ ] Windows native：
+      - [x] 在 core Windows 平台层枚举并 fail-closed 拒绝全部 v5 transaction owner 的 NTFS ADS，接入 initial/held/critical move/delete 重验证
+        - [x] 实现handle-bound `FileStreamInfo` core原语、严格bounded parser、Linux/unsupported语义、Windows native测试源码与Windows GNU/Wine结构门禁，并经独立复审确认无代码阻断项
+        - [x] 接入v5 full/manifest-only/empty bundle、journal/receipt与每个move/delete临界重验证
+          - [x] full/manifest-only/empty inventory、stable inventory连续持有及journal/receipt held proof已接线，Linux v5回归与Windows GNU静态门禁通过
+          - [x] 补齐publish staging、marker/candidate `index.lock`与completed live index的held ADS proof，避免named stream随move/replace传播或被静默删除
+          - [x] 补齐stable→cleanup、worktree split边界、真实journal→receipt、ReceiptOnly及transient/index owner的Windows-only对抗测试
+      - [ ] 在原生NTFS/ReFS执行file/directory与v5七态ADS对抗矩阵；Wine unsupported fail-closed不替代该门禁
+      - [ ] 绑定 Job Object suspended-before-assignment、active-process-zero 与句柄释放证据
+        - [x] 实现 Rust force-kill `ChildGuard` Windows Job Object 源码路径并通过 Windows 静态/编译门禁及独立安全复审
+        - [ ] 在原生 Windows 运行 Job 进程树、归零与句柄释放对抗测试
+      - [ ] 在原生 NTFS/ReFS 宿主运行同一 230-case 矩阵
   - [ ] 原生 Windows NTFS/ReFS 复验 replace/write-through/power-loss，并由绑定证据决定是否取消 no-parallel-Git 边界
-- [x] 配置 Linux/Windows x64/arm64 CI、Rust 二进制、VSIX 与 Sublime 包产物；两次 hosted CI 已执行但失败，精确日志诊断、修复与绿色重跑待完成，package workflow 尚无运行记录
+- [x] 配置 Linux/Windows x64/arm64 CI、Rust 二进制、VSIX 与 Sublime 包产物
+- [ ] 获取两次 hosted CI 失败的权威 job/step 日志，修复真实根因并完成绿色重跑
+  - [x] 绑定最新run `29233324592`/source `b9ad906`的全部job、step与日志，归并为4个独立根因
+  - [x] 修复v5合法no-ancestor add/add身份验证回归，并让CLI测试区分预期unresolved与operational error
+  - [x] 将Sublime 61项Python 3.8产品测试与23项Python 3.13.14 Build4200 runner测试分层；Windows固定可用的3.8.10 x64
+  - [x] 将libsodium MSVC输入从mutable stable URL迁到版本化1.0.22 release资产，并补齐locked crate source pair，保留四文件SHA-256与双minisign验证
+  - [ ] 推送修复checkpoint并取得当前提交的全绿hosted CI结果
+- [ ] 在最终候选上执行 package workflow 四目标矩阵并保留绑定产物/证据
 - [x] 完成 threat model、用户指南、安全配置、迁移/升级与故障恢复文档
 - [ ] 审计磁盘明文残留、日志秘密、依赖许可与发布清单
   - [x] 将 target-bound Cargo graph、固定四 workspace member、精确许可策略/checksum、许可文本摘要与 libsodium 声明绑定到严格 `THIRD_PARTY_LICENSES.json`
@@ -170,11 +191,21 @@ Phase 7 — 跨平台验证、打包与发布准备
 | Binding release 只在独立、独占、静止 checkout 与可信不变工具链上形成 | 首尾 blob/config/identity 复核是有界采样而非 OS 锁；同主体并发写者可在样本间改写并恢复，manifest source identity 也不等于生成物 build attestation |
 | 新 Git merge 事务使用 v4 物理 index CAS，旧 v1/v2/v3 仅作恢复兼容 | Git porcelain 无 expected-old CAS；只有 alternate candidate + 真实 `index.lock` + old/candidate digest 才能把最后语义校验、worktree 前滚和 index 发布收缩为一个 fail-closed 事务 |
 | verified-file namespace move 保持协作式同用户边界 | Linux/Windows 的最终 rename/MoveFileEx 都是路径操作；句柄身份重验和真实 Git lock 可排斥正常 writer，但不能构成抵抗同一 OS 用户直接 rebind 路径的内核级 handle-bound CAS |
+| 现有仓库迁移使用 `import-repository` 当前 tracked snapshot，而非复制/连接原 `.git` | 目标必须是全新密文 object database 和单个无 parent 的 initial commit；源仓库的明文历史、refs、remotes、objects 与备份仍由用户独立保管，完整历史重写另列 experimental |
+| Opaque asset 注册 vault/EDRY required feature `1` 与 plaintext kind `2` | 附件必须与 Markdown 共享认证路径和碰撞域，却不能放宽 Markdown 的 16 MiB/UTF-8语义；未知旧客户端在 KDF 前拒绝 feature-1 vault，避免静默遗漏 |
+| 附件 v1 使用 whole-file AEAD，单文件 64 MiB、总导入 4 GiB | 可覆盖真实25 MiB图片并保持完整认证后才返回明文；streaming/random access需要新的required feature，不能在v1暗中改变格式 |
+| Repository import 只接受 Git 2.36+、SHA-1、clean HEAD、stage-zero `100644` tracked files | 以双轮HEAD/index/raw blob/worktree证明和完整no-follow `.git`控制树审计形成只读边界；symlink/submodule/split/sparse/LFS/filter/dirty/untracked均fail closed |
+| Repository import 使用“单一 sibling staging root → 一次整根发布”，明确 supersede 旧 `intent → candidate-ready → cleanup-ready → complete` 双发布恢复记录 | vault、附件、`.git`、根提交、独立解锁/全树/对象审计与durability均在最终路径不可见时完成；发布前final必然absent，发布后final必然已含完整Git，因此无需repository专用journal、owner、外部Git staging或finalize命令 |
 
 ## Errors Encountered
 
 | Error | Attempt | Resolution |
 |-------|---------|------------|
+| `create_goal` 拒绝新的迁移objective，因为线程已有paused但unfinished的长期Goal | 2 | 不伪造complete/blocked；把可执行细化Goal写入根`task_plan.md`并继续Git开发，待产品侧恢复/替换后端Goal |
+| Opaque asset 收口后的 workspace rustfmt check 发现 daemon 测试中一个多行 `assert_eq!` 仅有规范格式漂移 | 1 | 运行 canonical `cargo fmt --all`，随后 workspace pedantic Clippy 与 warnings-as-errors rustdoc 全部通过 |
+| Repository-import 规范的一次组合patch因上下文已变化而整体拒绝 | 1 | 确认无部分写入，按source config、journal、output和acceptance matrix拆成精确小patch并逐次`git diff --check` |
+| Repository-import 命令段与Git runner的组合patch因现有换行上下文不完全匹配而拒绝 | 1 | 确认无部分写入，读取精确行后以同一语义的窄上下文patch成功替换 |
+| 一次双引号`rg`模式中的反引号被shell当作命令替换并打印`HEAD`用法 | 1 | 只读且未改状态；后续含反引号模式固定使用单引号，并按精确文件范围复查结果 |
 | `cargo fmt --check` reported trailing blank lines in four new Rust source files | 1 | Run canonical `cargo fmt --all`, then rerun the full quality gate |
 | Combined PRD/architecture patch did not match the exact save-step text | 1 | Patch the two files separately after reading their current sections; no partial edit was applied |
 | EDRY fixed-header golden test timestamp bytes did not match the fixture header timestamp | 1 | Independently verified decimal/big-endian bytes, corrected the hand-authored vector, and passed all 44 core tests |
