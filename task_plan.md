@@ -321,6 +321,8 @@ Phase 7 — 跨平台验证、打包与发布准备
 | Force-kill process audit found setup-detach had no parent RAII owner and kill failure could enter an unbounded blocking wait | 1 | Install a non-panicking detached-fixture guard immediately after control load, use bounded `try_wait` polling for kill/drop paths, and prohibit recovery while a writer cannot be proven reaped |
 | Git-object residue regression only created a reachable commit object | 1 | Create a fragment-only unreachable blob with `git hash-object -w`, remove its input file and all refs, then require `--batch-all-objects` scanning to reject it |
 | Demo artifact recheck used the stale basename `inex-cli-0.1.0-linux-x64.zip`, so the chained inspection stopped after confirming the VSIX existed | 1 | Enumerate the release artifact directory first; use the actual paired bundle `inex-rust-0.1.0-linux-x64.zip`, then independently verify VSIX checksum and manifest |
+| Packaged VSIX inspection assumed `extension/README.md`, but the audited package intentionally contains no README member | 1 | Read bundled command metadata from `extension/package.json` and usage guidance from the source `docs/user-guide.md`/`editors/vscode/README.md`; do not treat an absent optional README as package corruption |
+| Isolated VSIX install emitted VS Code's Node DEP0169 warning for deprecated `url.parse()` | 1 | Record it as host CLI noise: installation and exact extension enumeration still exited 0; do not attribute the host-owned warning to Inex without a stack proving an extension callsite |
 
 ## Notes
 
