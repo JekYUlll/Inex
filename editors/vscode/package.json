@@ -30,6 +30,7 @@
     "onView:inex.vault",
     "onCommand:inex.showSecurityStatus",
     "onCommand:inex.unlockVault",
+    "onCommand:inex.importRepository",
     "onCommand:inex.newEncryptedMarkdown",
     "onCommand:inex.newFolder",
     "onCommand:inex.rename",
@@ -43,15 +44,24 @@
       },
       {
         "command": "inex.unlockVault",
-        "title": "Inex: Unlock Vault"
+        "title": "Inex: Unlock Vault",
+        "enablement": "!inex.vaultUnlocked"
+      },
+      {
+        "command": "inex.importRepository",
+        "title": "Inex: Import Existing Markdown Repository",
+        "icon": "$(repo-clone)",
+        "enablement": "!inex.vaultUnlocked"
       },
       {
         "command": "inex.lockVault",
-        "title": "Inex: Lock Vault"
+        "title": "Inex: Lock Vault",
+        "enablement": "inex.vaultUnlocked"
       },
       {
         "command": "inex.search",
-        "title": "Inex: Search Encrypted Vault"
+        "title": "Inex: Search Encrypted Vault",
+        "enablement": "inex.vaultUnlocked"
       },
       {
         "command": "inex.refreshTree",
@@ -60,22 +70,26 @@
       {
         "command": "inex.newEncryptedMarkdown",
         "title": "Inex: New Encrypted Markdown",
-        "icon": "$(new-file)"
+        "icon": "$(new-file)",
+        "enablement": "inex.vaultUnlocked"
       },
       {
         "command": "inex.newFolder",
         "title": "Inex: New Encrypted Folder",
-        "icon": "$(new-folder)"
+        "icon": "$(new-folder)",
+        "enablement": "inex.vaultUnlocked"
       },
       {
         "command": "inex.rename",
         "title": "Inex: Rename Encrypted Markdown",
-        "icon": "$(edit)"
+        "icon": "$(edit)",
+        "enablement": "inex.vaultUnlocked"
       },
       {
         "command": "inex.delete",
         "title": "Inex: Delete Encrypted Markdown",
-        "icon": "$(trash)"
+        "icon": "$(trash)",
+        "enablement": "inex.vaultUnlocked"
       }
     ],
     "viewsContainers": {
@@ -95,63 +109,80 @@
         }
       ]
     },
+    "viewsWelcome": [
+      {
+        "view": "inex.vault",
+        "contents": "No Inex vault is unlocked.\n[Unlock an Inex Vault](command:inex.unlockVault)\n[Import an Existing Markdown Repository](command:inex.importRepository)",
+        "when": "!inex.vaultUnlocked"
+      }
+    ],
     "menus": {
       "view/title": [
         {
+          "command": "inex.unlockVault",
+          "when": "view == inex.vault && !inex.vaultUnlocked",
+          "group": "navigation@1"
+        },
+        {
+          "command": "inex.importRepository",
+          "when": "view == inex.vault && !inex.vaultUnlocked",
+          "group": "navigation@2"
+        },
+        {
           "command": "inex.newEncryptedMarkdown",
-          "when": "view == inex.vault",
+          "when": "view == inex.vault && inex.vaultUnlocked",
           "group": "navigation@1"
         },
         {
           "command": "inex.newFolder",
-          "when": "view == inex.vault",
+          "when": "view == inex.vault && inex.vaultUnlocked",
           "group": "navigation@2"
         },
         {
           "command": "inex.refreshTree",
-          "when": "view == inex.vault",
+          "when": "view == inex.vault && inex.vaultUnlocked",
           "group": "navigation@3"
         }
       ],
       "view/item/context": [
         {
           "command": "inex.newEncryptedMarkdown",
-          "when": "view == inex.vault && viewItem == inex.directory",
+          "when": "view == inex.vault && inex.vaultUnlocked && viewItem == inex.directory",
           "group": "inline@1"
         },
         {
           "command": "inex.newFolder",
-          "when": "view == inex.vault && viewItem == inex.directory",
+          "when": "view == inex.vault && inex.vaultUnlocked && viewItem == inex.directory",
           "group": "inline@2"
         },
         {
           "command": "inex.rename",
-          "when": "view == inex.vault && viewItem == inex.file",
+          "when": "view == inex.vault && inex.vaultUnlocked && viewItem == inex.file",
           "group": "inline@1"
         },
         {
           "command": "inex.delete",
-          "when": "view == inex.vault && viewItem == inex.file",
+          "when": "view == inex.vault && inex.vaultUnlocked && viewItem == inex.file",
           "group": "inline@2"
         },
         {
           "command": "inex.newEncryptedMarkdown",
-          "when": "view == inex.vault && viewItem == inex.directory",
+          "when": "view == inex.vault && inex.vaultUnlocked && viewItem == inex.directory",
           "group": "inex@1"
         },
         {
           "command": "inex.newFolder",
-          "when": "view == inex.vault && viewItem == inex.directory",
+          "when": "view == inex.vault && inex.vaultUnlocked && viewItem == inex.directory",
           "group": "inex@2"
         },
         {
           "command": "inex.rename",
-          "when": "view == inex.vault && viewItem == inex.file",
+          "when": "view == inex.vault && inex.vaultUnlocked && viewItem == inex.file",
           "group": "inex@1"
         },
         {
           "command": "inex.delete",
-          "when": "view == inex.vault && viewItem == inex.file",
+          "when": "view == inex.vault && inex.vaultUnlocked && viewItem == inex.file",
           "group": "inex@2"
         }
       ]
@@ -176,6 +207,12 @@
           "default": "",
           "scope": "machine",
           "description": "Optional absolute path to an audited inexd binary. Empty uses the extension-bundled binary."
+        },
+        "inex.cliPath": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "description": "Optional absolute path to an audited inex CLI for repository import. Empty uses the extension-bundled binary."
         }
       }
     }

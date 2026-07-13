@@ -3,7 +3,9 @@ import * as vscode from "vscode";
 import { VaultController } from "./controller.ts";
 import { InexCrudActions } from "./crud.ts";
 import { InexCustomEditorProvider } from "./customEditor.ts";
+import { offerToOpenImportedVault } from "./importCompletion.ts";
 import { RpcRemoteError } from "./rpc.ts";
+import { importMarkdownRepository } from "./repositoryImport.ts";
 import { showSensitiveInputBox, showSensitiveQuickPick } from "./sensitiveUi.ts";
 import { InexTreeProvider } from "./tree.ts";
 
@@ -48,11 +50,16 @@ export function activate(
   const crud = new InexCrudActions(controller, tree, editor);
   activeController = controller;
   activeEditorProvider = editor;
+  const syncVaultContext = () => {
+    void vscode.commands.executeCommand("setContext", "inex.vaultUnlocked", controller.isUnlocked);
+  };
+  syncVaultContext();
 
   context.subscriptions.push(
     controller,
     tree,
     editor,
+    controller.onDidChangeState(syncVaultContext),
     vscode.window.registerTreeDataProvider("inex.vault", tree),
     vscode.window.registerCustomEditorProvider(VIEW_TYPE, editor, {
       supportsMultipleEditorsPerDocument: false,
@@ -91,20 +98,57 @@ export function activate(
         );
       });
     }),
+    vscode.commands.registerCommand("inex.importRepository", async () => {
+      await runUiAction(async () => {
+        if (controller.isUnlocked) {
+          await vscode.window.showInformationMessage(
+            "Lock the current Inex vault before importing another repository.",
+          );
+          return;
+        }
+        const target = await importMarkdownRepository(context);
+        if (target === undefined) {
+          return;
+        }
+        await offerToOpenImportedVault(target, {
+          prompt: async (message, action) =>
+            await vscode.window.showInformationMessage(message, action),
+          openFolder: async (folder) => {
+            await vscode.commands.executeCommand("vscode.openFolder", folder);
+          },
+        });
+      });
+    }),
     vscode.commands.registerCommand("inex.refreshTree", () => {
       tree.refresh();
     }),
     vscode.commands.registerCommand("inex.newEncryptedMarkdown", async (node?: unknown) => {
-      await runUiAction(() => crud.newEncryptedMarkdown(node));
+      await runUiAction(async () => {
+        if (await ensureVaultUnlocked(controller)) {
+          await crud.newEncryptedMarkdown(node);
+        }
+      });
     }),
     vscode.commands.registerCommand("inex.newFolder", async (node?: unknown) => {
-      await runUiAction(() => crud.newFolder(node));
+      await runUiAction(async () => {
+        if (await ensureVaultUnlocked(controller)) {
+          await crud.newFolder(node);
+        }
+      });
     }),
     vscode.commands.registerCommand("inex.rename", async (node?: unknown) => {
-      await runUiAction(() => crud.rename(node));
+      await runUiAction(async () => {
+        if (await ensureVaultUnlocked(controller)) {
+          await crud.rename(node);
+        }
+      });
     }),
     vscode.commands.registerCommand("inex.delete", async (node?: unknown) => {
-      await runUiAction(() => crud.delete(node));
+      await runUiAction(async () => {
+        if (await ensureVaultUnlocked(controller)) {
+          await crud.delete(node);
+        }
+      });
     }),
     vscode.commands.registerCommand("inex.internal.openTreeEntry", async (node: unknown) => {
       await runUiAction(async () => {
@@ -116,6 +160,9 @@ export function activate(
     }),
     vscode.commands.registerCommand("inex.search", async () => {
       await runUiAction(async () => {
+        if (!(await ensureVaultUnlocked(controller))) {
+          return;
+        }
         const session = controller.acquireSession();
         const query = await showSensitiveInputBox(
           {
@@ -237,9 +284,29 @@ function isTreeNode(value: unknown): value is import("./tree.ts").InexTreeNode {
   };
   return (
     candidate.session !== undefined &&
-    (candidate.entry?.kind === "file" || candidate.entry?.kind === "directory") &&
+    (candidate.entry?.kind === "file" ||
+      candidate.entry?.kind === "directory" ||
+      candidate.entry?.kind === "asset") &&
     typeof candidate.entry.logicalPath === "string"
   );
+}
+
+async function ensureVaultUnlocked(controller: VaultController): Promise<boolean> {
+  if (controller.isUnlocked) {
+    return true;
+  }
+  const choice = await vscode.window.showInformationMessage(
+    "Unlock an Inex vault, or import an existing Markdown Git repository into a new encrypted vault.",
+    "Unlock Vault",
+    "Import Existing Markdown Repository",
+  );
+  if (choice === "Unlock Vault") {
+    return (await controller.unlockInteractive()) !== undefined;
+  }
+  if (choice === "Import Existing Markdown Repository") {
+    await vscode.commands.executeCommand("inex.importRepository");
+  }
+  return false;
 }
 
 async function runUiAction(action: () => Promise<void>): Promise<void> {

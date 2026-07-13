@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  assetPathComponents,
   LogicalPathError,
   logicalDirectoryChild,
   logicalDirectoryComponents,
@@ -41,6 +42,17 @@ test("logical file validation reserves physical suffix space", () => {
     () => logicalFileComponents(`${"a".repeat(249)}.md`),
     LogicalPathError,
   );
+});
+
+test("opaque asset paths use their separate suffix and filename budget", () => {
+  assert.deepEqual(assetPathComponents("images/station photo.png"), [
+    "images",
+    "station photo.png",
+  ]);
+  assert.doesNotThrow(() => assetPathComponents(`${"a".repeat(245)}`));
+  for (const value of [`${"a".repeat(246)}`, "notes/readme.md", ".git/image.png"]) {
+    assert.throws(() => assetPathComponents(value), LogicalPathError, value);
+  }
 });
 
 test("logical child builders stay beneath the selected canonical directory", () => {

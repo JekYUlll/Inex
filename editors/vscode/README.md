@@ -8,6 +8,17 @@ webview, and the Rust `inexd` child process. It is never registered as a VS Code
 ## Current features
 
 - Explicit vault unlock/lock with a hidden password input.
+- A locked-state welcome page with explicit **Unlock** and **Import Existing
+  Markdown Repository** actions; encrypted CRUD commands remain disabled until
+  an authenticated vault session exists.
+- Linux engineering-preview snapshot import of an existing local Markdown Git
+  repository into a new, absent encrypted repository through a dedicated VS
+  Code process task. The extension
+  passes an argv array directly to `inex import-repository` (never a shell
+  command), so password prompts remain in the real task terminal. After a
+  successful copy it offers **Open New Vault**, reloads VS Code onto the real
+  ciphertext repository, and requires an explicit unlock there; it does not
+  unlock the target while Explorer and Git still point at the plaintext source.
 - A ciphertext-backed Tree View and editable Markdown custom editor.
 - Command Palette and Tree View actions for encrypted Markdown creation,
   single-directory creation, etag-conditional rename, and non-recursive delete.
@@ -21,13 +32,20 @@ webview, and the Rust `inexd` child process. It is never registered as a VS Code
   fail-closed wiping after timeout, daemon exit, protocol failure, or lock.
 - In-memory search UI, heading navigation, relative Markdown/wiki links, and
   bounded backlink discovery.
+- Opaque attachment discovery plus validated PNG/JPEG/WebP previews for
+  relative same-vault Markdown images. Preview bytes travel in sequential
+  1 MiB RPC chunks directly to a strict-CSP webview; no plaintext
+  `TextDocument`, temporary file, local-resource root, or network source is
+  used.
 - Strict Content-Length JSON-RPC parsing, bounded request queues, and no `PATH`
   fallback for the sidecar executable.
 
-The packaged extension expects `inexd` at
-`bin/<platform>-<architecture>/inexd[.exe]`. During development, set
-`inex.sidecarPath` to an absolute, regular, audited binary such as
-`/absolute/path/to/target/debug/inexd`.
+The packaged extension expects both `inexd` and `inex` at
+`bin/<platform>-<architecture>/inexd[.exe]` and
+`bin/<platform>-<architecture>/inex[.exe]`. During development, set
+`inex.sidecarPath` and `inex.cliPath` to absolute, regular, audited binaries
+such as `/absolute/path/to/target/debug/inexd` and
+`/absolute/path/to/target/debug/inex`.
 
 ## Development gates
 
@@ -38,6 +56,7 @@ pnpm test
 pnpm build
 pnpm test:extension:local
 pnpm test:extension:1.125
+pnpm test:extension:1.126
 ```
 
 `pnpm test` covers the pure protocol, path, bounded-file, Markdown-navigation,
@@ -45,13 +64,27 @@ and child-stream layers. Extension Host and isolated-profile residue tests are
 separate release gates; a green unit suite alone is not evidence that a given
 VS Code build leaves no plaintext recovery/history residue.
 
-The Extension Host gate creates a new encrypted vault through `inex import`,
-lets VS Code schedule a real EDRY custom-editor backup, and exercises the same
-`openCustomDocument(...backupId...)` recovery-and-save path after locking and
-re-unlocking. It runs with isolated HOME, XDG, Windows-profile, temporary,
-user-data, extension, and vault directories, then scans file contents, entry
-names, and complete stdout/stderr streams for the dynamic canary and its UTF-8,
-UTF-16, base64, base64url, hex, and high-entropy fragment forms.
+The Linux Extension Host gate creates a clean synthetic Git repository with two
+Markdown files and a valid relative PNG, imports it through the real
+`inex import-repository` CLI, deletes the plaintext source, and opens the real
+ciphertext vault as the only VS Code workspace. A safe observation proxy
+forwards bytes unchanged to the real `inexd` while recording only RPC method
+names and bounded asset-read metadata. The gate proves unlock, authenticated
+asset discovery, `asset.open`/1 MiB `asset.readChunk`/`asset.close`, editor
+hide-and-reveal restart, lock/shutdown ordering, encrypted CRUD, and a real EDRY
+backup/recovery-and-save path. It runs with isolated HOME, XDG,
+Windows-profile, temporary, user-data, extension, and vault directories, then
+scans file contents, entry names, and complete stdout/stderr streams for the
+dynamic canary and its UTF-8, UTF-16, base64, base64url, hex, and high-entropy
+fragment forms.
+
+The locked import Task terminal still requires a packaged Linux manual
+acceptance pass because its password is deliberately read from a hidden real
+TTY; the automated host must not add a password-injection backdoor. Browser
+rendering itself also remains in the manual visual pass. Automated tests bind
+command wiring, argv execution, the post-import workspace transition, real
+sidecar preview RPCs, image parsing, stale-transfer rejection, and handle
+cleanup, but they must not be described as mouse-driving the password prompt.
 
 VS Code forces application, profile, and workspace storage to be in-memory
 whenever `extensionTestsLocationURI` is present. Consequently,

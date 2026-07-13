@@ -33,7 +33,13 @@ export class InexTreeProvider
         : vscode.TreeItemCollapsibleState.None,
     );
     item.contextValue = `inex.${entry.kind}`;
-    item.iconPath = new vscode.ThemeIcon(entry.kind === "directory" ? "folder" : "lock");
+    item.iconPath = new vscode.ThemeIcon(
+      entry.kind === "directory"
+        ? "folder"
+        : entry.kind === "asset"
+          ? "file-media"
+          : "lock",
+    );
     item.tooltip = entry.logicalPath;
     if (entry.kind === "file") {
       item.command = {

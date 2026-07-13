@@ -3,6 +3,7 @@ import * as path from "node:path";
 
 import * as vscode from "vscode";
 
+import { AssetPreviewCoordinator } from "./assetPreviewCoordinator.ts";
 import { readBoundedRegularFile } from "./boundedFile.ts";
 import type { VaultController, VaultSession } from "./controller.ts";
 import {
@@ -322,6 +323,7 @@ export class InexCustomEditorProvider
     new vscode.EventEmitter<vscode.CustomDocumentContentChangeEvent<InexDocument>>();
   private readonly documents = new Set<InexDocument>();
   private readonly lockSubscription: vscode.Disposable;
+  private readonly previews: AssetPreviewCoordinator;
   private lastBackupUri: vscode.Uri | undefined;
   private failNextMutationCloseForTest = false;
 
@@ -331,7 +333,9 @@ export class InexCustomEditorProvider
     private readonly controller: VaultController,
     private readonly integrationTestMode = false,
   ) {
+    this.previews = new AssetPreviewCoordinator(controller);
     this.lockSubscription = controller.onDidLock(() => {
+      this.previews.cancelAll();
       this.wipeAllForLock();
     });
   }
@@ -444,29 +448,45 @@ export class InexCustomEditorProvider
     webviewPanel.webview.options = { enableScripts: true, localResourceRoots: [] };
     webviewPanel.webview.html = editorHtml();
     document.attach(webviewPanel);
+    this.previews.attach(document, webviewPanel);
     webviewPanel.webview.onDidReceiveMessage((message: unknown) => {
       if (!isRecord(message)) {
         return;
       }
-      if (message.type === "edit" && typeof message.content === "string") {
+      if (
+        message.type === "edit" &&
+        typeof message.content === "string" &&
+        isEditEpoch(message.editEpoch) &&
+        this.previews.acceptEditEpoch(document, webviewPanel, message.editEpoch)
+      ) {
         try {
           if (document.applyEdit(message.content)) {
             this.controller.noteUserActivity(document.session);
             this.changeEmitter.fire({ document });
           }
+          // The webview suspends previews on every local input, including an
+          // edit/undo sequence whose final bytes equal the host snapshot.
+          // Always issue a new host-owned generation after synchronization.
+          this.previews.refreshDocument(document);
         } catch (error: unknown) {
           void vscode.window.showErrorMessage(safeError(error));
           document.send(webviewPanel);
+          this.previews.refresh(document, webviewPanel, 0);
         }
         return;
       }
-      if (message.type === "ready") {
+      if (
+        message.type === "ready" &&
+        isEditEpoch(message.editEpoch) &&
+        this.previews.acceptEditEpoch(document, webviewPanel, message.editEpoch)
+      ) {
         if (!this.controller.isSessionCurrent(document.session)) {
           webviewPanel.webview.html = lockedHtml();
           return;
         }
         document.markReady(webviewPanel);
         document.send(webviewPanel);
+        this.previews.refresh(document, webviewPanel, 0);
         return;
       }
       if (message.type === "activity") {
@@ -477,13 +497,16 @@ export class InexCustomEditorProvider
         message.type === "snapshot" &&
         Number.isSafeInteger(message.requestId) &&
         typeof message.requestId === "number" &&
-        typeof message.content === "string"
+        typeof message.content === "string" &&
+        isEditEpoch(message.editEpoch) &&
+        this.previews.acceptEditEpoch(document, webviewPanel, message.editEpoch)
       ) {
         try {
           if (document.acceptSnapshot(message.requestId, message.content)) {
             this.controller.noteUserActivity(document.session);
             this.changeEmitter.fire({ document });
           }
+          this.previews.refreshDocument(document);
         } catch (error: unknown) {
           void vscode.window.showErrorMessage(safeError(error));
         }
@@ -493,13 +516,16 @@ export class InexCustomEditorProvider
         (message.type === "followLink" ||
           message.type === "showHeadings" ||
           message.type === "showBacklinks") &&
-        typeof message.content === "string"
+        typeof message.content === "string" &&
+        isEditEpoch(message.editEpoch) &&
+        this.previews.acceptEditEpoch(document, webviewPanel, message.editEpoch)
       ) {
         try {
           if (document.applyEdit(message.content)) {
             this.controller.noteUserActivity(document.session);
             this.changeEmitter.fire({ document });
           }
+          this.previews.refreshDocument(document);
           if (
             message.type === "followLink" &&
             Number.isSafeInteger(message.offset) &&
@@ -591,6 +617,7 @@ export class InexCustomEditorProvider
       }
       this.requireCurrentDocumentSession(document);
       document.replaceFromCiphertext(reloaded.content, reloaded.etag, reloaded.metadata);
+      this.previews.refreshDocument(document, 0);
       adopted = true;
     } finally {
       if (!adopted) {
@@ -648,11 +675,13 @@ export class InexCustomEditorProvider
 
   public dispose(): void {
     this.wipeAllForLock();
+    this.previews.dispose();
     this.lockSubscription.dispose();
     this.changeEmitter.dispose();
   }
 
   public wipeAllForLock(): void {
+    this.previews.cancelAll();
     for (const document of this.documents) {
       document.wipeForLock();
     }
@@ -841,6 +870,7 @@ export class InexCustomEditorProvider
         this.controller.noteUserActivity(document.session);
         this.changeEmitter.fire({ document });
         document.refreshPanels();
+        this.previews.refreshDocument(document);
       }
     } finally {
       snapshot.content.fill(0);
@@ -1230,28 +1260,59 @@ function editorHtml(): string {
   const nonce = randomBytes(18).toString("base64");
   return `<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}'; img-src blob:">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<style nonce="${nonce}">html,body{box-sizing:border-box;width:100%;height:100%;margin:0}body{display:grid;grid-template-rows:auto 1fr;background:var(--vscode-editor-background)}nav{display:flex;gap:.4rem;padding:.35rem .6rem;border-bottom:1px solid var(--vscode-panel-border)}button{color:var(--vscode-button-foreground);background:var(--vscode-button-background);border:0;padding:.25rem .6rem}textarea{box-sizing:border-box;width:100%;height:100%;resize:none;border:0;padding:1rem;color:var(--vscode-editor-foreground);background:var(--vscode-editor-background);font:var(--vscode-editor-font-size) var(--vscode-editor-font-family);outline:none}</style>
-</head><body><nav><button id="headings" type="button">Headings</button><button id="backlinks" type="button">Backlinks</button></nav><textarea id="editor" aria-label="Encrypted Markdown editor" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off"></textarea>
+<style nonce="${nonce}">html,body{box-sizing:border-box;width:100%;height:100%;margin:0}body{display:grid;grid-template-rows:auto minmax(10rem,1fr) auto;background:var(--vscode-editor-background)}nav{display:flex;gap:.4rem;padding:.35rem .6rem;border-bottom:1px solid var(--vscode-panel-border)}button{color:var(--vscode-button-foreground);background:var(--vscode-button-background);border:0;padding:.25rem .6rem}textarea{box-sizing:border-box;width:100%;height:100%;resize:none;border:0;padding:1rem;color:var(--vscode-editor-foreground);background:var(--vscode-editor-background);font:var(--vscode-editor-font-size) var(--vscode-editor-font-family);outline:none}#previews{display:flex;gap:.75rem;overflow:auto;max-height:40vh;padding:.6rem;border-top:1px solid var(--vscode-panel-border)}#previews[hidden]{display:none}figure{flex:0 0 auto;max-width:min(32rem,80vw);margin:0}figure img{display:block;max-width:100%;max-height:32vh}figcaption{overflow:hidden;margin-top:.25rem;color:var(--vscode-descriptionForeground);text-overflow:ellipsis;white-space:nowrap}.blocked{color:var(--vscode-descriptionForeground)}</style>
+</head><body><nav><button id="headings" type="button">Headings</button><button id="backlinks" type="button">Backlinks</button></nav><textarea id="editor" aria-label="Encrypted Markdown editor" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off"></textarea><section id="previews" aria-label="Validated encrypted image previews" hidden></section>
 <script nonce="${nonce}">
 const vscode=acquireVsCodeApi();
 const editor=document.getElementById('editor');
+const previews=document.getElementById('previews');
 const encoder=new TextEncoder();
 let applying=false;
 let editTimer;
 let lastActivity=0;
+let previewGeneration=0;
+let previewSuspended=true;
+let editEpoch=0;
+const transfers=new Map();
+const objectUrls=new Set();
 function byteIndex(text,target){let bytes=0,index=0;for(const scalar of text){if(bytes>=target)break;bytes+=encoder.encode(scalar).length;index+=scalar.length;}return index;}
 function cancelEditTimer(){if(editTimer!==undefined){clearTimeout(editTimer);editTimer=undefined;}}
-function sendEdit(){cancelEditTimer();if(!applying)vscode.postMessage({type:'edit',content:editor.value});}
-function sendNavigation(type,offset){cancelEditTimer();vscode.postMessage({type,offset,content:editor.value});}
-editor.addEventListener('input',()=>{if(!applying){const now=Date.now();if(now-lastActivity>=1000){lastActivity=now;vscode.postMessage({type:'activity'});}cancelEditTimer();editTimer=setTimeout(sendEdit,150);}});
+function sendEdit(){cancelEditTimer();if(!applying)vscode.postMessage({type:'edit',content:editor.value,editEpoch});}
+function sendNavigation(type,offset){cancelEditTimer();vscode.postMessage({type,offset,content:editor.value,editEpoch});}
+function wipe(bytes){if(bytes&&typeof bytes.fill==='function')bytes.fill(0);}
+function wipeTransfer(transfer){for(const chunk of transfer.chunks)wipe(chunk);transfer.chunks.length=0;transfer.total=0;}
+function clearPreviewStorage(){for(const transfer of transfers.values())wipeTransfer(transfer);transfers.clear();for(const url of objectUrls)URL.revokeObjectURL(url);objectUrls.clear();previews.replaceChildren();previews.hidden=true;}
+function suspendPreviews(){clearPreviewStorage();previewSuspended=true;}
+function acceptPreviewReset(message){if(!Number.isSafeInteger(message.generation)||message.generation<=previewGeneration||message.editEpoch!==editEpoch)return;clearPreviewStorage();previewGeneration=message.generation;previewSuspended=false;}
+function blocked(logicalPath){const item=document.createElement('span');item.className='blocked';item.textContent='Preview blocked: '+logicalPath;previews.append(item);previews.hidden=false;}
+function rejectTransfer(id,show){const transfer=transfers.get(id);if(transfer!==undefined){wipeTransfer(transfer);transfers.delete(id);if(show)blocked(transfer.logicalPath);}}
+function acceptAssetStart(message){if(previewSuspended||message.editEpoch!==editEpoch||message.generation!==previewGeneration||typeof message.transferId!=='string'||typeof message.logicalPath!=='string'||!Number.isSafeInteger(message.size)||message.size<0||message.size>33554432)return;rejectTransfer(message.transferId,false);transfers.set(message.transferId,{logicalPath:message.logicalPath,size:message.size,total:0,chunks:[]});}
+function acceptAssetChunk(message){const transfer=transfers.get(message.transferId);let bytes=message.bytes instanceof Uint8Array?message.bytes:message.bytes instanceof ArrayBuffer?new Uint8Array(message.bytes):undefined;if(previewSuspended||message.editEpoch!==editEpoch||message.generation!==previewGeneration||transfer===undefined||bytes===undefined||!Number.isSafeInteger(message.offset)||message.offset!==transfer.total||bytes.byteLength>1048576||transfer.total+bytes.byteLength>transfer.size){wipe(bytes);if(transfer!==undefined)rejectTransfer(message.transferId,true);return;}transfer.chunks.push(bytes);transfer.total+=bytes.byteLength;}
+function acceptAssetEnd(message){const transfer=transfers.get(message.transferId);if(previewSuspended||message.editEpoch!==editEpoch||message.generation!==previewGeneration||transfer===undefined||transfer.total!==transfer.size){if(transfer!==undefined)rejectTransfer(message.transferId,true);return;}transfers.delete(message.transferId);const bytes=new Uint8Array(transfer.size);let offset=0;for(const chunk of transfer.chunks){bytes.set(chunk,offset);offset+=chunk.byteLength;wipe(chunk);}transfer.chunks.length=0;const type=validatedRasterType(bytes);if(type===undefined){wipe(bytes);blocked(transfer.logicalPath);return;}const blob=new Blob([bytes],{type});wipe(bytes);const url=URL.createObjectURL(blob);objectUrls.add(url);const figure=document.createElement('figure');const image=document.createElement('img');image.alt='';image.src=url;image.addEventListener('error',()=>{URL.revokeObjectURL(url);objectUrls.delete(url);figure.remove();if(previews.childElementCount===0)previews.hidden=true;},{once:true});const caption=document.createElement('figcaption');caption.textContent=transfer.logicalPath;figure.append(image,caption);previews.append(figure);previews.hidden=false;}
+function validRasterDimensions(dimensions){return dimensions!==undefined&&dimensions[0]>=1&&dimensions[1]>=1&&dimensions[0]<=16384&&dimensions[1]<=16384&&dimensions[0]*dimensions[1]<=40000000;}
+function validatedRasterType(bytes){let dimensions;if(isPng(bytes))dimensions=pngDimensions(bytes);else if(isJpeg(bytes))dimensions=jpegDimensions(bytes);else if(isWebP(bytes))dimensions=webpDimensions(bytes);else return undefined;if(!validRasterDimensions(dimensions))return undefined;return isPng(bytes)?'image/png':isJpeg(bytes)?'image/jpeg':'image/webp';}
+function isPng(b){return b.length>=8&&b[0]===137&&b[1]===80&&b[2]===78&&b[3]===71&&b[4]===13&&b[5]===10&&b[6]===26&&b[7]===10;}
+function u16be(b,o){return b[o]*256+b[o+1];}
+function u24le(b,o){return b[o]+b[o+1]*256+b[o+2]*65536;}
+function u32be(b,o){return b[o]*16777216+b[o+1]*65536+b[o+2]*256+b[o+3];}
+function u32le(b,o){return (b[o]+b[o+1]*256+b[o+2]*65536+b[o+3]*16777216)>>>0;}
+function ascii(b,o,n){let value='';for(let i=0;i<n;i+=1)value+=String.fromCharCode(b[o+i]);return value;}
+function pngDimensions(b){let o=8,width=0,height=0,sawHeader=false,sawEnd=false;while(o+12<=b.length){const length=u32be(b,o);if(length>b.length-o-12)return undefined;const type=ascii(b,o+4,4);const data=o+8;if(!sawHeader){if(type!=='IHDR'||length!==13)return undefined;width=u32be(b,data);height=u32be(b,data+4);sawHeader=true;}if(type==='acTL'||type==='fcTL'||type==='fdAT')return undefined;if(type==='IEND'){if(length!==0||o+12!==b.length)return undefined;sawEnd=true;}o+=12+length;if(sawEnd)break;}return sawHeader&&sawEnd?[width,height]:undefined;}
+function isJpeg(b){return b.length>=4&&b[0]===255&&b[1]===216;}
+function isSof(marker){return [192,193,194,195,197,198,199,201,202,203,205,206,207].includes(marker);}
+function jpegDimensions(b){let i=2,width=0,height=0,inScan=false;while(i<b.length){let marker;if(inScan){let found=false;while(i<b.length){if(b[i++]!==255)continue;while(i<b.length&&b[i]===255)i+=1;if(i>=b.length)return undefined;marker=b[i++];if(marker===0||marker>=208&&marker<=215)continue;found=true;break;}if(!found)return undefined;}else{if(b[i++]!==255)return undefined;while(i<b.length&&b[i]===255)i+=1;if(i>=b.length)return undefined;marker=b[i++];}if(marker===217)return i===b.length&&width>0&&height>0?[width,height]:undefined;if(marker===216||marker===1||marker>=208&&marker<=215)return undefined;if(i+2>b.length)return undefined;const length=u16be(b,i);if(length<2||i+length>b.length)return undefined;if(isSof(marker)){if(length<7)return undefined;const nextHeight=u16be(b,i+3),nextWidth=u16be(b,i+5);if(width!==0&&(width!==nextWidth||height!==nextHeight))return undefined;width=nextWidth;height=nextHeight;}i+=length;if(marker===218)inScan=true;}return undefined;}
+function isWebP(b){return b.length>=12&&ascii(b,0,4)==='RIFF'&&ascii(b,8,4)==='WEBP'&&u32le(b,4)+8===b.length;}
+function webpDimensions(b){let i=12,index=0,flags=0,canvasWidth=0,canvasHeight=0,frameWidth=0,frameHeight=0,primaryType='',previous='',extended=false,iccp=false,alpha=false,exif=false,xmp=false;while(i+8<=b.length){const type=ascii(b,i,4),length=u32le(b,i+4),data=i+8,end=data+length,padded=end+(length&1);if(end>b.length||padded>b.length||(length&1)!==0&&b[end]!==0)return undefined;if(type==='ANIM'||type==='ANMF')return undefined;if(type==='VP8X'){if(index!==0||extended||length!==10||(b[data]&193)!==0||(b[data]&2)!==0||b[data+1]!==0||b[data+2]!==0||b[data+3]!==0)return undefined;extended=true;flags=b[data];canvasWidth=u24le(b,data+4)+1;canvasHeight=u24le(b,data+7)+1;if(!validRasterDimensions([canvasWidth,canvasHeight]))return undefined;}else if(type==='ICCP'){if(!extended||index!==1||iccp||primaryType!==''||(flags&32)===0)return undefined;iccp=true;}else if(type==='ALPH'){if(!extended||alpha||primaryType!==''||(flags&16)===0)return undefined;alpha=true;}else if(type==='VP8 '){if(primaryType!==''||!extended&&index!==0||alpha&&previous!=='ALPH'||extended&&(flags&16)!==0&&!alpha||length<10||b[data+3]!==157||b[data+4]!==1||b[data+5]!==42)return undefined;frameWidth=(b[data+6]+b[data+7]*256)&16383;frameHeight=(b[data+8]+b[data+9]*256)&16383;if(!validRasterDimensions([frameWidth,frameHeight]))return undefined;primaryType=type;}else if(type==='VP8L'){if(primaryType!==''||alpha||!extended&&index!==0||length<5||b[data]!==47)return undefined;frameWidth=1+b[data+1]+((b[data+2]&63)<<8);frameHeight=1+(b[data+2]>>6)+(b[data+3]<<2)+((b[data+4]&15)<<10);if(!validRasterDimensions([frameWidth,frameHeight]))return undefined;primaryType=type;}else if(type==='EXIF'){if(!extended||primaryType===''||exif||xmp||(flags&8)===0)return undefined;exif=true;}else if(type==='XMP '){if(!extended||primaryType===''||xmp||(flags&4)===0)return undefined;xmp=true;}else{return undefined;}previous=type;i=padded;index+=1;}if(i!==b.length||primaryType===''||extended&&(canvasWidth!==frameWidth||canvasHeight!==frameHeight||iccp!==((flags&32)!==0)||exif!==((flags&8)!==0)||xmp!==((flags&4)!==0)))return undefined;return [frameWidth,frameHeight];}
+editor.addEventListener('input',()=>{if(!applying){if(editEpoch>=Number.MAX_SAFE_INTEGER){suspendPreviews();return;}editEpoch+=1;suspendPreviews();const now=Date.now();if(now-lastActivity>=1000){lastActivity=now;vscode.postMessage({type:'activity'});}cancelEditTimer();editTimer=setTimeout(sendEdit,150);}});
 editor.addEventListener('click',(event)=>{if(event.ctrlKey||event.metaKey)sendNavigation('followLink',editor.selectionStart);});
 editor.addEventListener('keydown',(event)=>{if((event.ctrlKey||event.metaKey)&&event.key==='Enter'){event.preventDefault();sendNavigation('followLink',editor.selectionStart);}});
 document.getElementById('headings').addEventListener('click',()=>sendNavigation('showHeadings',editor.selectionStart));
 document.getElementById('backlinks').addEventListener('click',()=>sendNavigation('showBacklinks',editor.selectionStart));
-window.addEventListener('message',(event)=>{const message=event.data;if(message&&message.type==='content'&&typeof message.content==='string'){cancelEditTimer();applying=true;editor.value=message.content;applying=false;}else if(message&&message.type==='reveal'&&Number.isSafeInteger(message.startByte)&&Number.isSafeInteger(message.endByte)){const start=byteIndex(editor.value,message.startByte);const end=byteIndex(editor.value,message.endByte);editor.focus();editor.setSelectionRange(start,end);}else if(message&&message.type==='snapshotRequest'&&Number.isSafeInteger(message.requestId)){cancelEditTimer();vscode.postMessage({type:'snapshot',requestId:message.requestId,content:editor.value});}});
-vscode.postMessage({type:'ready'});
+window.addEventListener('message',(event)=>{const message=event.data;if(!message||typeof message!=='object')return;if(message.type==='content'&&typeof message.content==='string'){cancelEditTimer();applying=true;editor.value=message.content;applying=false;}else if(message.type==='reveal'&&Number.isSafeInteger(message.startByte)&&Number.isSafeInteger(message.endByte)){const start=byteIndex(editor.value,message.startByte);const end=byteIndex(editor.value,message.endByte);editor.focus();editor.setSelectionRange(start,end);}else if(message.type==='snapshotRequest'&&Number.isSafeInteger(message.requestId)){cancelEditTimer();vscode.postMessage({type:'snapshot',requestId:message.requestId,content:editor.value,editEpoch});}else if(message.type==='previewReset'){acceptPreviewReset(message);}else if(message.type==='assetStart'){acceptAssetStart(message);}else if(message.type==='assetChunk'){acceptAssetChunk(message);}else if(message.type==='assetEnd'){acceptAssetEnd(message);}else if(message.type==='assetRejected'&&!previewSuspended&&message.editEpoch===editEpoch&&message.generation===previewGeneration&&typeof message.logicalPath==='string'){if(typeof message.transferId==='string')rejectTransfer(message.transferId,false);blocked(message.logicalPath);}});
+window.addEventListener('beforeunload',suspendPreviews);
+vscode.postMessage({type:'ready',editEpoch});
 </script>
 </body></html>`;
 }
@@ -1266,6 +1327,10 @@ function mutationHtml(): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isEditEpoch(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
 function safeError(error: unknown): string {

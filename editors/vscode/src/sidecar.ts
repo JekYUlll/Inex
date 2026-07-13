@@ -15,6 +15,7 @@ import {
   responseResult,
 } from "./rpc.ts";
 import {
+  assetPathComponents,
   LogicalPathError,
   logicalDirectoryComponents,
   logicalFileComponents,
@@ -26,6 +27,8 @@ const MAX_PENDING_CALLS = 128;
 const MAX_OUTSTANDING_FRAME_BYTES = MAX_FRAME_BYTES + 64 * 1024;
 const MAX_CLIENT_IDLE_TIMEOUT_MS = 60 * 60 * 1_000;
 const MAX_DOCUMENT_BYTES = 16 * 1024 * 1024;
+const MAX_ASSET_BYTES = 64 * 1024 * 1024;
+export const MAX_ASSET_CHUNK_BYTES = 1024 * 1024;
 const MAX_DRAFT_ENVELOPE_BYTES = MAX_DOCUMENT_BYTES + 12 + 4096 + 16;
 const PROTOCOL_MAJOR = 1;
 
@@ -43,8 +46,12 @@ export interface UnlockResult {
 }
 
 export interface TreeEntry {
-  readonly kind: "directory" | "file";
+  readonly kind: "directory" | "file" | "asset";
   readonly logicalPath: string;
+}
+
+export interface VaultStatus {
+  readonly opaqueAssetsV1: boolean;
 }
 
 export interface DocumentMetadata {
@@ -63,6 +70,19 @@ export interface ReadResult {
 
 export interface OpenResult extends ReadResult {
   readonly handle: string;
+}
+
+export interface AssetOpenResult {
+  readonly handle: string;
+  readonly size: number;
+  readonly etag: string;
+  readonly metadata: DocumentMetadata;
+}
+
+export interface AssetChunkResult {
+  readonly offset: number;
+  readonly content: Buffer;
+  readonly eof: boolean;
 }
 
 export interface WriteResult {
@@ -125,6 +145,8 @@ export class InexSidecar {
   private readonly pending = new Map<RpcId, PendingCall>();
   private child: ChildProcessWithoutNullStreams | undefined;
   private session: string | undefined;
+  private negotiatedOpaqueAssetsV1 = false;
+  private authenticatedOpaqueAssetsV1 = false;
   private nextId = 1;
   private stderrBytes = 0;
   private terminalError: Error | undefined;
@@ -149,6 +171,14 @@ export class InexSidecar {
 
   public get hasSession(): boolean {
     return this.session !== undefined;
+  }
+
+  public get canReadOpaqueAssetsV1(): boolean {
+    return (
+      this.session !== undefined &&
+      this.negotiatedOpaqueAssetsV1 &&
+      this.authenticatedOpaqueAssetsV1
+    );
   }
 
   public async start(clientVersion: string): Promise<HelloResult> {
@@ -208,6 +238,7 @@ export class InexSidecar {
     ) {
       throw new RpcProtocolError("Inex sidecar capability negotiation failed");
     }
+    this.negotiatedOpaqueAssetsV1 = result.capabilities.includes("opaqueAssetsV1");
     return result;
   }
 
@@ -225,6 +256,15 @@ export class InexSidecar {
     const vaultId = expectUuid(result.vaultId, "vault id");
     const warnings = expectArray(result.warnings, "unlock warnings");
     this.session = session;
+    this.authenticatedOpaqueAssetsV1 = false;
+    if (this.negotiatedOpaqueAssetsV1) {
+      try {
+        this.authenticatedOpaqueAssetsV1 = (await this.status()).opaqueAssetsV1;
+      } catch (error: unknown) {
+        this.session = undefined;
+        throw error;
+      }
+    }
     return {
       vaultId,
       idleTimeoutMs,
@@ -238,7 +278,20 @@ export class InexSidecar {
       expectAcknowledgement(await this.callRaw("vault.lock", { session }));
     } finally {
       this.session = undefined;
+      this.authenticatedOpaqueAssetsV1 = false;
     }
+  }
+
+  public async status(): Promise<VaultStatus> {
+    const result = expectObject(
+      await this.callRaw("vault.status", { session: this.requireSession() }),
+    );
+    const features = expectObject(result.features);
+    expectExactKeys(features, ["opaqueAssetsV1"], "vault feature");
+    if (typeof features.opaqueAssetsV1 !== "boolean") {
+      throw new RpcProtocolError("RPC authenticated vault feature is invalid");
+    }
+    return { opaqueAssetsV1: features.opaqueAssetsV1 };
   }
 
   public async touch(): Promise<number> {
@@ -264,17 +317,104 @@ export class InexSidecar {
     return expectArray(result.entries, "tree entries").map((entry) => {
       const object = expectObject(entry);
       const kind = expectString(object.kind, "tree entry kind");
-      if (kind !== "directory" && kind !== "file") {
+      if (kind !== "directory" && kind !== "file" && kind !== "asset") {
         throw new RpcProtocolError("RPC tree entry kind is invalid");
+      }
+      if (kind === "asset" && !this.canReadOpaqueAssetsV1) {
+        throw new RpcProtocolError(
+          "RPC returned an asset without negotiated authenticated support",
+        );
       }
       return {
         kind,
         logicalPath:
           kind === "file"
             ? expectLogicalFile(object.logicalPath, "tree logical path")
-            : expectLogicalDirectory(object.logicalPath, "tree logical path"),
+            : kind === "asset"
+              ? expectAssetPath(object.logicalPath, "tree logical path")
+              : expectLogicalDirectory(object.logicalPath, "tree logical path"),
       };
     });
+  }
+
+  public async openAsset(logicalPath: string): Promise<AssetOpenResult> {
+    this.requireOpaqueAssetsV1();
+    assetPathComponents(logicalPath);
+    let value: JsonValue;
+    try {
+      value = await this.callRaw("asset.open", {
+        ...this.protectedParams(),
+        logicalPath,
+      });
+    } catch (error: unknown) {
+      const normalized = asError(error);
+      if (normalized instanceof RpcProtocolError) {
+        this.failTerminal(normalized);
+      }
+      throw normalized;
+    }
+    try {
+      return parseAssetOpenResult(value, logicalPath);
+    } catch (error: unknown) {
+      // The daemon may already own a fully authenticated plaintext handle,
+      // but an invalid result can make that capability unknowable. Terminate
+      // the process so its session store is destroyed rather than leaking an
+      // allocation that the client can no longer close.
+      const normalized = asError(error);
+      this.failTerminal(normalized);
+      throw normalized;
+    }
+  }
+
+  public async readAssetChunk(
+    handle: string,
+    offset: number,
+    maxBytes = MAX_ASSET_CHUNK_BYTES,
+  ): Promise<AssetChunkResult> {
+    this.requireOpaqueAssetsV1();
+    expectCapability(handle, "asset handle", 22);
+    if (
+      !Number.isSafeInteger(offset) ||
+      offset < 0 ||
+      offset > MAX_ASSET_BYTES ||
+      !Number.isSafeInteger(maxBytes) ||
+      maxBytes < 1 ||
+      maxBytes > MAX_ASSET_CHUNK_BYTES
+    ) {
+      throw new RpcProtocolError("Asset chunk request is outside the v1 range");
+    }
+    return parseAssetChunkResult(
+      await this.callRaw("asset.readChunk", {
+        ...this.protectedParams(),
+        handle,
+        offset,
+        maxBytes,
+      }),
+      offset,
+      maxBytes,
+    );
+  }
+
+  public async closeAsset(handle: string): Promise<void> {
+    this.requireOpaqueAssetsV1();
+    expectCapability(handle, "asset handle", 22);
+    try {
+      expectAcknowledgement(
+        await this.callRaw("asset.close", { ...this.protectedParams(), handle }),
+      );
+    } catch (error: unknown) {
+      const normalized = asError(error);
+      if (
+        !(normalized instanceof RpcRemoteError) ||
+        normalized.stableName !== "SESSION_INVALID"
+      ) {
+        // Any other failure leaves the disposition of a sensitive daemon-owned
+        // allocation unknown. A terminal transport teardown is the only safe
+        // recovery boundary.
+        this.failTerminal(normalized);
+      }
+      throw normalized;
+    }
   }
 
   public async read(logicalPath: string): Promise<ReadResult> {
@@ -523,17 +663,20 @@ export class InexSidecar {
   public async shutdown(): Promise<void> {
     if (this.child === undefined || this.terminalError !== undefined) {
       this.session = undefined;
+      this.authenticatedOpaqueAssetsV1 = false;
       return;
     }
     try {
       expectAcknowledgement(await this.callRaw("system.shutdown", {}));
     } finally {
       this.session = undefined;
+      this.authenticatedOpaqueAssetsV1 = false;
     }
   }
 
   public dispose(): void {
     this.session = undefined;
+    this.authenticatedOpaqueAssetsV1 = false;
     const child = this.child;
     this.child = undefined;
     this.decoder.clear();
@@ -553,6 +696,15 @@ export class InexSidecar {
       throw new SidecarLifecycleError("Inex vault is locked");
     }
     return this.session;
+  }
+
+  private requireOpaqueAssetsV1(): void {
+    this.requireSession();
+    if (!this.negotiatedOpaqueAssetsV1 || !this.authenticatedOpaqueAssetsV1) {
+      throw new SidecarLifecycleError(
+        "Opaque assets are unavailable for this sidecar or authenticated vault",
+      );
+    }
   }
 
   private callRaw(method: string, params: JsonObject): Promise<JsonValue> {
@@ -669,6 +821,7 @@ export class InexSidecar {
     this.terminalError = error;
     const hadSession = this.session !== undefined;
     this.session = undefined;
+    this.authenticatedOpaqueAssetsV1 = false;
     this.decoder.clear();
     this.outstandingFrameBytes = 0;
     this.rejectPending(error);
@@ -686,6 +839,7 @@ export class InexSidecar {
       return;
     }
     this.session = undefined;
+    this.authenticatedOpaqueAssetsV1 = false;
     this.onSessionLost?.(error);
   }
 
@@ -705,6 +859,7 @@ function methodRenewsSession(method: string): boolean {
     method === "vault.listTree" ||
     method.startsWith("file.") ||
     method.startsWith("document.") ||
+    method.startsWith("asset.") ||
     method.startsWith("draft.") ||
     method === "search.query" ||
     method === "cache.evict"
@@ -772,6 +927,62 @@ function parseRead(value: JsonValue, expectedLogicalPath: string): ReadResult {
     content.fill(0);
     throw error;
   }
+}
+
+/** @internal Exported for exact protocol-shape regression tests. */
+export function parseAssetOpenResult(
+  value: JsonValue,
+  expectedLogicalPath: string,
+): AssetOpenResult {
+  assetPathComponents(expectedLogicalPath);
+  const result = expectObject(value);
+  expectExactKeys(result, ["etag", "handle", "metadata", "size"], "asset open");
+  const size = expectSafeInteger(result.size, "asset size");
+  if (size < 0 || size > MAX_ASSET_BYTES) {
+    throw new RpcProtocolError("RPC asset size is outside the v1 range");
+  }
+  return {
+    handle: expectCapability(result.handle, "asset handle", 22),
+    size,
+    etag: expectEtag(result.etag, "asset etag"),
+    metadata: parseAssetMetadata(result.metadata, expectedLogicalPath),
+  };
+}
+
+/** @internal Exported for exact protocol-shape regression tests. */
+export function parseAssetChunkResult(
+  value: JsonValue,
+  expectedOffset: number,
+  maximumBytes: number,
+): AssetChunkResult {
+  if (
+    !Number.isSafeInteger(expectedOffset) ||
+    expectedOffset < 0 ||
+    expectedOffset > MAX_ASSET_BYTES ||
+    !Number.isSafeInteger(maximumBytes) ||
+    maximumBytes < 1 ||
+    maximumBytes > MAX_ASSET_CHUNK_BYTES
+  ) {
+    throw new RpcProtocolError("Asset chunk expectation is outside the v1 range");
+  }
+  const result = expectObject(value);
+  expectExactKeys(result, ["contentBase64", "eof", "offset"], "asset chunk");
+  const offset = expectSafeInteger(result.offset, "asset chunk offset");
+  if (offset !== expectedOffset || typeof result.eof !== "boolean") {
+    throw new RpcProtocolError("RPC asset chunk sequencing is invalid");
+  }
+  const content = decodeCanonicalBase64url(
+    expectString(result.contentBase64, "asset chunk"),
+    maximumBytes,
+  );
+  if (
+    offset + content.byteLength > MAX_ASSET_BYTES ||
+    (content.byteLength === 0 && result.eof !== true)
+  ) {
+    content.fill(0);
+    throw new RpcProtocolError("RPC asset chunk range is invalid");
+  }
+  return { offset, content, eof: result.eof };
 }
 
 /** @internal Exported so protocol-shape tests can exercise the frozen v1 contract. */
@@ -851,13 +1062,28 @@ function parseMetadata(
   value: JsonValue | undefined,
   expectedLogicalPath: string,
 ): DocumentMetadata {
+  return parseMetadataWithPath(value, expectedLogicalPath, expectLogicalFile);
+}
+
+function parseAssetMetadata(
+  value: JsonValue | undefined,
+  expectedLogicalPath: string,
+): DocumentMetadata {
+  return parseMetadataWithPath(value, expectedLogicalPath, expectAssetPath);
+}
+
+function parseMetadataWithPath(
+  value: JsonValue | undefined,
+  expectedLogicalPath: string,
+  pathParser: (value: JsonValue | undefined, field: string) => string,
+): DocumentMetadata {
   const metadata = expectObject(value);
   expectExactKeys(
     metadata,
     ["createdAt", "fileId", "flags", "logicalPath", "modifiedAt"],
     "document metadata",
   );
-  const logicalPath = expectLogicalFile(metadata.logicalPath, "metadata logical path");
+  const logicalPath = pathParser(metadata.logicalPath, "metadata logical path");
   if (logicalPath !== expectedLogicalPath) {
     throw new RpcProtocolError("RPC metadata logical path does not match the request");
   }
@@ -899,6 +1125,19 @@ function expectLogicalDirectory(value: JsonValue | undefined, _field: string): s
   } catch (error: unknown) {
     if (error instanceof LogicalPathError) {
       throw new RpcProtocolError("RPC logical directory path is invalid");
+    }
+    throw error;
+  }
+  return text;
+}
+
+function expectAssetPath(value: JsonValue | undefined, _field: string): string {
+  const text = expectString(value, _field);
+  try {
+    assetPathComponents(text);
+  } catch (error: unknown) {
+    if (error instanceof LogicalPathError) {
+      throw new RpcProtocolError("RPC logical asset path is invalid");
     }
     throw error;
   }

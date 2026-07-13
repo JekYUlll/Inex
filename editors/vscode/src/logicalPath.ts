@@ -1,6 +1,7 @@
 const MAX_LOGICAL_PATH_BYTES = 1024;
 const MAX_COMPONENT_BYTES = 255;
 const MAX_FILE_COMPONENT_BYTES = 251;
+const MAX_ASSET_COMPONENT_BYTES = 245;
 
 export class LogicalPathError extends Error {
   public override readonly name = "LogicalPathError";
@@ -20,6 +21,23 @@ export function logicalFileComponents(value: string): readonly string[] {
 
 export function logicalDirectoryComponents(value: string): readonly string[] {
   return logicalComponents(value, true);
+}
+
+/** Validate one canonical opaque-asset path from the authenticated vault tree. */
+export function assetPathComponents(value: string): readonly string[] {
+  const components = logicalComponents(value, false);
+  const fileName = components.at(-1);
+  if (fileName === undefined || fileName.endsWith(".md")) {
+    throw new LogicalPathError(
+      "Logical asset path must not end in lowercase .md",
+    );
+  }
+  if (Buffer.byteLength(fileName, "utf8") > MAX_ASSET_COMPONENT_BYTES) {
+    throw new LogicalPathError(
+      "Logical asset filename exceeds the portable byte limit",
+    );
+  }
+  return components;
 }
 
 /** Build one file child without allowing an input value to smuggle separators. */

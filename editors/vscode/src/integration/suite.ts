@@ -8,6 +8,10 @@ import * as vscode from "vscode";
 const EXTENSION_ID = "horeb.inex-vscode";
 const VIEW_TYPE = "inex.markdownEditor";
 const LOGICAL_PATH = "canary.md";
+const SECONDARY_LOGICAL_PATH = "plain.md";
+const ASSET_LOGICAL_PATH = "images/pixel.png";
+const EXPECTED_ASSET_CHUNK_BYTES = 1024 * 1024;
+const MAX_TRACE_BYTES = 1024 * 1024;
 const WAIT_TIMEOUT_MS = 20_000;
 
 interface InexIntegrationTestApi {
@@ -30,7 +34,7 @@ interface InexIntegrationTestApi {
   readonly renameDocument: (source: string, destination: string) => Promise<void>;
   readonly deleteDocument: (logicalPath: string) => Promise<void>;
   readonly listTree: () => Promise<readonly {
-    readonly kind: "directory" | "file";
+    readonly kind: "directory" | "file" | "asset";
     readonly logicalPath: string;
   }[]>;
   readonly failNextMutationClose: () => void;
@@ -43,14 +47,40 @@ interface FixtureEnvironment {
   readonly sourcePath: string;
   readonly password: string;
   readonly sidecarPath: string;
+  readonly sidecarTracePath: string;
   readonly userDataPath: string;
   readonly expectedSha256: string;
+}
+
+interface SidecarTraceEntry {
+  readonly pid: number;
+  readonly sequence: number;
+  readonly method: string;
+  readonly logicalPath?: string;
+  readonly offset?: number;
+  readonly maxBytes?: number;
+}
+
+interface AssetTraceCycle {
+  readonly pid: number;
+  readonly openSequence: number;
+  readonly closeSequence: number;
 }
 
 type CustomEditorTab = vscode.Tab & { readonly input: vscode.TabInputCustom };
 
 export async function run(): Promise<void> {
   const fixture = fixtureEnvironment();
+  assert.equal(
+    vscode.workspace.workspaceFolders?.length,
+    1,
+    "Feature-1 acceptance host did not open one ciphertext vault workspace",
+  );
+  assert.equal(
+    samePath(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? "", fixture.vaultPath),
+    true,
+    "Feature-1 acceptance host remained on the plaintext source workspace",
+  );
   const extension = vscode.extensions.getExtension<InexIntegrationTestApi>(EXTENSION_ID);
   assert.ok(extension, `Extension ${EXTENSION_ID} is unavailable`);
   const api = await extension.activate();
@@ -61,6 +91,7 @@ export async function run(): Promise<void> {
     "inex.newFolder",
     "inex.rename",
     "inex.delete",
+    "inex.importRepository",
   ]) {
     assert.equal(registeredCommands.has(command), true, `Extension did not register ${command}`);
   }
@@ -72,6 +103,8 @@ async function runBackupRecoveryCycle(
   api: InexIntegrationTestApi,
   fixture: FixtureEnvironment,
 ): Promise<void> {
+  await api.unlock(fixture.vaultPath, fixture.password, fixture.sidecarPath);
+  await runFeatureOneAssetLifecycle(api, fixture);
   await api.unlock(fixture.vaultPath, fixture.password, fixture.sidecarPath);
   await runCrudCycle(api, fixture);
   await api.openDocument(LOGICAL_PATH);
@@ -116,10 +149,120 @@ async function runBackupRecoveryCycle(
     );
     await api.lock();
     assertNoPlaintextTextDocument(tab.input.uri, fixture.sourcePath);
-    console.log("Inex Extension Host CRUD and backup/recovery cycles passed");
+    console.log(
+      "Inex Extension Host feature-1 asset, CRUD, and backup/recovery cycles passed",
+    );
   } finally {
     await fs.rm(recoveryBackupPath, { force: true });
   }
+}
+
+async function runFeatureOneAssetLifecycle(
+  api: InexIntegrationTestApi,
+  fixture: FixtureEnvironment,
+): Promise<void> {
+  const importedEntries = await api.listTree();
+  for (const expected of [
+    { kind: "file", logicalPath: LOGICAL_PATH },
+    { kind: "file", logicalPath: SECONDARY_LOGICAL_PATH },
+    { kind: "asset", logicalPath: ASSET_LOGICAL_PATH },
+  ] as const) {
+    assert.deepEqual(
+      importedEntries.find((entry) => entry.logicalPath === expected.logicalPath),
+      expected,
+      `Imported feature-1 tree omitted ${expected.logicalPath}`,
+    );
+  }
+
+  await api.openDocument(LOGICAL_PATH);
+  const assetTab = await waitForCustomTab(fixture.vaultPath, LOGICAL_PATH);
+  await waitFor(
+    () => assetTab.isActive,
+    "The imported Markdown image fixture did not become the active custom editor",
+  );
+  assertNoPlaintextTextDocument(assetTab.input.uri, fixture.sourcePath);
+  await waitForAssetCycles(fixture, 1);
+
+  await api.openDocument(SECONDARY_LOGICAL_PATH);
+  const secondaryTab = await waitForCustomTab(
+    fixture.vaultPath,
+    SECONDARY_LOGICAL_PATH,
+  );
+  await waitFor(
+    () => secondaryTab.isActive && !assetTab.isActive,
+    "Opening a second encrypted note did not hide the image-bearing editor",
+  );
+  assertNoPlaintextTextDocument(secondaryTab.input.uri, fixture.sourcePath);
+  await new Promise((resolve) => setTimeout(resolve, 350));
+  const hiddenEntries = await readSidecarTrace(fixture);
+  const hiddenCycles = completedAssetCycles(hiddenEntries);
+  assert.equal(
+    hiddenCycles.length > 0,
+    true,
+    "The first relative-image preview did not complete before the editor was hidden",
+  );
+  assert.equal(
+    countAssetOperations(hiddenEntries, "asset.open"),
+    countAssetOperations(hiddenEntries, "asset.close"),
+    "Hiding the image-bearing editor left an observed asset handle open",
+  );
+
+  await api.openDocument(LOGICAL_PATH);
+  await waitFor(
+    () => assetTab.isActive && !secondaryTab.isActive,
+    "Reopening the imported Markdown note did not reveal its custom editor",
+  );
+  const resumedCycles = await waitForAssetCycles(fixture, hiddenCycles.length + 1);
+  const resumedCycle = resumedCycles.at(-1);
+  assert.ok(resumedCycle, "The revealed editor did not restart its relative-image preview");
+  assert.equal(
+    await vscode.window.tabGroups.close([assetTab, secondaryTab], true),
+    true,
+    "VS Code did not close the feature-1 preview fixtures",
+  );
+  await waitForNoCustomTab(fixture.vaultPath, LOGICAL_PATH);
+  await waitForNoCustomTab(fixture.vaultPath, SECONDARY_LOGICAL_PATH);
+
+  await api.lock();
+  const lockedEntries = await waitForSidecarTrace(
+    fixture,
+    (entries) => {
+      const lock = entries.find(
+        (entry) =>
+          entry.pid === resumedCycle.pid &&
+          entry.method === "vault.lock" &&
+          entry.sequence > resumedCycle.closeSequence,
+      );
+      return (
+        lock !== undefined &&
+        entries.some(
+          (entry) =>
+            entry.pid === resumedCycle.pid &&
+            entry.method === "system.shutdown" &&
+            entry.sequence > lock.sequence,
+        )
+      );
+    },
+    "Locking the feature-1 vault did not lock and shut down the real sidecar",
+  );
+  const lock = lockedEntries.find(
+    (entry) =>
+      entry.pid === resumedCycle.pid &&
+      entry.method === "vault.lock" &&
+      entry.sequence > resumedCycle.closeSequence,
+  );
+  assert.ok(lock);
+  assert.equal(
+    lockedEntries.some(
+      (entry) =>
+        entry.pid === resumedCycle.pid &&
+        entry.method.startsWith("asset.") &&
+        entry.sequence > lock.sequence,
+    ),
+    false,
+    "The preview lifecycle issued an asset RPC after vault.lock",
+  );
+  assertNoPlaintextTextDocument(assetTab.input.uri, fixture.sourcePath);
 }
 
 async function runCrudCycle(
@@ -335,6 +478,7 @@ function fixtureEnvironment(): FixtureEnvironment {
     sourcePath: requiredEnvironment("INEX_TEST_SOURCE_PATH"),
     password: requiredEnvironment("INEX_TEST_PASSWORD"),
     sidecarPath: requiredEnvironment("INEX_TEST_INEXD_PATH"),
+    sidecarTracePath: requiredEnvironment("INEX_TEST_SIDECAR_TRACE_PATH"),
     userDataPath: requiredEnvironment("INEX_TEST_USER_DATA_PATH"),
     expectedSha256,
   };
@@ -378,6 +522,157 @@ async function waitFor(predicate: () => boolean, message: string): Promise<void>
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   throw new Error(message);
+}
+
+async function waitForAssetCycles(
+  fixture: FixtureEnvironment,
+  minimumCycles: number,
+): Promise<readonly AssetTraceCycle[]> {
+  const entries = await waitForSidecarTrace(
+    fixture,
+    (candidate) => completedAssetCycles(candidate).length >= minimumCycles,
+    `Relative-image preview did not complete ${minimumCycles} real sidecar lifecycle(s)`,
+  );
+  return completedAssetCycles(entries);
+}
+
+async function waitForSidecarTrace(
+  fixture: FixtureEnvironment,
+  predicate: (entries: readonly SidecarTraceEntry[]) => boolean,
+  message: string,
+): Promise<readonly SidecarTraceEntry[]> {
+  const deadline = Date.now() + WAIT_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const entries = await readSidecarTrace(fixture);
+    if (predicate(entries)) {
+      return entries;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(message);
+}
+
+async function readSidecarTrace(
+  fixture: FixtureEnvironment,
+): Promise<readonly SidecarTraceEntry[]> {
+  let metadata;
+  try {
+    metadata = await fs.lstat(fixture.sidecarTracePath);
+  } catch (error: unknown) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      return [];
+    }
+    throw error;
+  }
+  assert.equal(metadata.isFile(), true, "Sidecar observation trace is not a regular file");
+  assert.equal(metadata.isSymbolicLink(), false, "Sidecar observation trace is a symlink");
+  assert.equal(metadata.size <= MAX_TRACE_BYTES, true, "Sidecar observation trace is oversized");
+  const raw = await fs.readFile(fixture.sidecarTracePath, "utf8");
+  assert.equal(
+    raw.includes(fixture.password),
+    false,
+    "Sidecar observation trace exposed the integration password",
+  );
+  const finalNewline = raw.lastIndexOf("\n");
+  if (finalNewline < 0) {
+    return [];
+  }
+  const entries = raw
+    .slice(0, finalNewline)
+    .split("\n")
+    .filter((line) => line.length > 0)
+    .map((line) => parseSidecarTraceEntry(line));
+  const lastSequenceByPid = new Map<number, number>();
+  for (const entry of entries) {
+    const previous = lastSequenceByPid.get(entry.pid) ?? 0;
+    assert.equal(
+      entry.sequence > previous,
+      true,
+      "Sidecar observation sequence is not strictly increasing",
+    );
+    lastSequenceByPid.set(entry.pid, entry.sequence);
+  }
+  return entries;
+}
+
+function parseSidecarTraceEntry(line: string): SidecarTraceEntry {
+  const value: unknown = JSON.parse(line);
+  assert.ok(value !== null && typeof value === "object", "Invalid sidecar trace record");
+  const record = value as Record<string, unknown>;
+  assert.equal(Number.isSafeInteger(record.pid), true, "Invalid sidecar trace PID");
+  assert.equal(typeof record.pid === "number" && record.pid > 0, true);
+  assert.equal(Number.isSafeInteger(record.sequence), true, "Invalid sidecar trace sequence");
+  assert.equal(typeof record.sequence === "number" && record.sequence > 0, true);
+  assert.equal(typeof record.method, "string", "Invalid sidecar trace method");
+  assert.match(record.method as string, /^[A-Za-z][A-Za-z0-9.]{0,63}$/u);
+  const allowed = new Set(["pid", "sequence", "method"]);
+  if (record.method === "asset.open") {
+    allowed.add("logicalPath");
+    assert.equal(typeof record.logicalPath, "string", "Asset-open trace omitted its path");
+  } else if (record.method === "asset.readChunk") {
+    allowed.add("offset");
+    allowed.add("maxBytes");
+    assert.equal(Number.isSafeInteger(record.offset), true, "Invalid asset trace offset");
+    assert.equal(Number.isSafeInteger(record.maxBytes), true, "Invalid asset trace chunk bound");
+  }
+  assert.deepEqual(
+    Object.keys(record).sort(),
+    [...allowed].sort(),
+    "Sidecar trace recorded fields outside the safe observation schema",
+  );
+  return record as unknown as SidecarTraceEntry;
+}
+
+function completedAssetCycles(
+  entries: readonly SidecarTraceEntry[],
+): readonly AssetTraceCycle[] {
+  const cycles: AssetTraceCycle[] = [];
+  for (let index = 0; index < entries.length; index += 1) {
+    const opened = entries[index];
+    if (opened?.method !== "asset.open" || opened.logicalPath !== ASSET_LOGICAL_PATH) {
+      continue;
+    }
+    const reads: SidecarTraceEntry[] = [];
+    for (let cursor = index + 1; cursor < entries.length; cursor += 1) {
+      const entry = entries[cursor];
+      if (entry === undefined || entry.pid !== opened.pid) {
+        continue;
+      }
+      if (entry.method === "asset.open") {
+        break;
+      }
+      if (entry.method === "asset.readChunk") {
+        reads.push(entry);
+      }
+      if (entry.method === "asset.close") {
+        assert.equal(reads.length, 1, "Small PNG preview did not use one bounded asset read");
+        assert.equal(reads[0]?.offset, 0, "Small PNG preview did not start at offset zero");
+        assert.equal(
+          reads[0]?.maxBytes,
+          EXPECTED_ASSET_CHUNK_BYTES,
+          "Small PNG preview did not use the sidecar chunk ceiling",
+        );
+        cycles.push({
+          pid: opened.pid,
+          openSequence: opened.sequence,
+          closeSequence: entry.sequence,
+        });
+        break;
+      }
+    }
+  }
+  return cycles;
+}
+
+function countAssetOperations(
+  entries: readonly SidecarTraceEntry[],
+  method: "asset.open" | "asset.close",
+): number {
+  return entries.filter((entry) => entry.method === method).length;
+}
+
+function isNodeError(error: unknown): error is NodeJS.ErrnoException {
+  return error instanceof Error && "code" in error;
 }
 
 function samePath(left: string, right: string): boolean {
