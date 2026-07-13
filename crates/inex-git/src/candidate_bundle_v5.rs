@@ -464,6 +464,10 @@ impl HeldCleanupFullV5 {
     pub(super) fn transaction(&self) -> &MergeJournalPayload {
         &self.inventory.manifest.transaction
     }
+
+    pub(super) fn inventory(&self) -> &InventoryVerifiedCandidateBundleV5 {
+        &self.inventory
+    }
 }
 
 #[derive(Debug)]
@@ -1182,6 +1186,19 @@ pub(super) fn revalidate_held_stable_inventory_v5(
     held_inventory_matches_path_v5(&stable_path, &reference.bundle_basename, inventory)
 }
 
+pub(super) fn revalidate_held_relocated_inventory_v5(
+    root: &Path,
+    reference: &CandidateBundleTransactionReferenceV5,
+    inventory: &InventoryVerifiedCandidateBundleV5,
+) -> Result<(), GitError> {
+    validate_reference_inventory_binding_v5(reference, inventory)
+        .map_err(cleanup_semantic_or_operational)?;
+    let cleanup_basename = candidate_bundle_cleanup_basename_v5(&reference.token)?;
+    let cleanup_path = candidate_bundle_cleanup_path_v5(root, &cleanup_basename)?;
+    held_inventory_matches_path_v5(&cleanup_path, &reference.bundle_basename, inventory)
+        .map_err(cleanup_semantic_or_operational)
+}
+
 fn cleanup_member_names_v5(path: &Path) -> Result<BTreeSet<String>, GitError> {
     let entries =
         fs::read_dir(path).map_err(|error| io_error(GitIoOperation::InspectMetadata, &error))?;
@@ -1427,34 +1444,38 @@ pub(super) fn remove_cleanup_candidate_v5(
     root: &Path,
     reference: &CandidateBundleTransactionReferenceV5,
     held: HeldCleanupFullV5,
-) -> Result<ParentSyncStatus, GitError> {
+) -> Result<(ParentSyncStatus, HeldCleanupManifestV5), GitError> {
     let cleanup_basename = candidate_bundle_cleanup_basename_v5(&reference.token)?;
     let cleanup_path = candidate_bundle_cleanup_path_v5(root, &cleanup_basename)?;
     let inventory = held.inventory;
     held_inventory_matches_path_v5(&cleanup_path, &reference.bundle_basename, &inventory)?;
     validate_reference_inventory_binding_v5(reference, &inventory)?;
     let CandidateBundleInventorySealV5 {
+        directory_identity,
         candidate_file,
         manifest_file,
-        ..
     } = inventory.seal;
-    drop(manifest_file);
     let outcome = atomic_remove_verified_file(
         &cleanup_path.join(CANDIDATE_BUNDLE_INDEX_V5),
         candidate_file,
     )
     .map_err(map_verified_remove_error_v5)?;
-    Ok(outcome.parent_sync)
+    let manifest = HeldCleanupManifestV5 {
+        directory_identity,
+        manifest_file,
+    };
+    revalidate_held_cleanup_manifest_v5(root, reference, &manifest)?;
+    Ok((outcome.parent_sync, manifest))
 }
 
 pub(super) fn remove_cleanup_manifest_v5(
     root: &Path,
     reference: &CandidateBundleTransactionReferenceV5,
     held: HeldCleanupManifestV5,
-) -> Result<ParentSyncStatus, GitError> {
+) -> Result<(ParentSyncStatus, HeldCleanupEmptyV5), GitError> {
     let cleanup_basename = candidate_bundle_cleanup_basename_v5(&reference.token)?;
     let cleanup_path = candidate_bundle_cleanup_path_v5(root, &cleanup_basename)?;
-    if filesystem_directory_identity(&cleanup_path).map_err(|_| GitError::RecoveryConflict)?
+    if filesystem_directory_identity(&cleanup_path).map_err(cleanup_identity_error)?
         != held.directory_identity
     {
         return Err(GitError::RecoveryConflict);
@@ -1464,7 +1485,11 @@ pub(super) fn remove_cleanup_manifest_v5(
         held.manifest_file,
     )
     .map_err(map_verified_remove_error_v5)?;
-    Ok(outcome.parent_sync)
+    let empty = HeldCleanupEmptyV5 {
+        directory_identity: held.directory_identity,
+    };
+    revalidate_held_cleanup_empty_v5(root, reference, &empty)?;
+    Ok((outcome.parent_sync, empty))
 }
 
 pub(super) fn remove_empty_cleanup_directory_v5(
@@ -2471,18 +2496,27 @@ fn required_path_matches_file_identity_v5(
     }
 }
 
+fn candidate_stage_map_at_bundle_path_v5(
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+    inventory: &InventoryVerifiedCandidateBundleV5,
+    bundle_path: &Path,
+) -> Result<BTreeMap<(String, u8), super::StageEntry>, GitError> {
+    held_inventory_matches_path_v5(bundle_path, &reference.bundle_basename, inventory)?;
+    let candidate_git = git.with_index_file(bundle_path.join(CANDIDATE_BUNDLE_INDEX_V5))?;
+    candidate_git.ensure_full_index()?;
+    let map = index_entry_map(&candidate_git)?;
+    held_inventory_matches_path_v5(bundle_path, &reference.bundle_basename, inventory)?;
+    Ok(map)
+}
+
 fn stable_candidate_stage_map_v5(
     git: &Git,
     reference: &CandidateBundleTransactionReferenceV5,
     inventory: &InventoryVerifiedCandidateBundleV5,
 ) -> Result<BTreeMap<(String, u8), super::StageEntry>, GitError> {
     let stable_path = candidate_bundle_stable_path_v5(&git.root, &reference.bundle_basename)?;
-    held_inventory_matches_path_v5(&stable_path, &reference.bundle_basename, inventory)?;
-    let candidate_git = git.with_index_file(stable_path.join(CANDIDATE_BUNDLE_INDEX_V5))?;
-    candidate_git.ensure_full_index()?;
-    let map = index_entry_map(&candidate_git)?;
-    held_inventory_matches_path_v5(&stable_path, &reference.bundle_basename, inventory)?;
-    Ok(map)
+    candidate_stage_map_at_bundle_path_v5(git, reference, inventory, &stable_path)
 }
 
 fn expected_transaction_projection_v5(
@@ -2632,6 +2666,101 @@ pub(super) fn classify_completed_live_index_with_journal_v5(
         CompletedLiveIndexStateV5::LaterUnrelated
     };
     Ok((inventory, state, live_identity))
+}
+
+/// Classifies the completed live index against a held, relocated cleanup
+/// inventory while the original v5 journal is still active.
+pub(super) fn classify_completed_live_index_with_cleanup_v5(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+    cleanup: &HeldCleanupFullV5,
+) -> Result<(CompletedLiveIndexStateV5, FilesystemFileIdentity), GitError> {
+    validate_reference_inventory_binding_v5(reference, &cleanup.inventory)?;
+    let cleanup_basename = candidate_bundle_cleanup_basename_v5(&reference.token)?;
+    let cleanup_path = candidate_bundle_cleanup_path_v5(&git.root, &cleanup_basename)?;
+    revalidate_held_cleanup_full_v5(&git.root, reference, cleanup)?;
+    if classify_index_lock_v5(&git.root, reference, &cleanup.inventory)? != IndexLockStateV5::Absent
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    let live_path = index_path(&git.root);
+    let live_file = match File::open(&live_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(GitError::RecoveryConflict);
+        }
+        Err(error) => return Err(io_error(GitIoOperation::ReadMetadata, &error)),
+    };
+    if !required_open_file_matches_path_v5(&live_path, &live_file)? {
+        return Err(GitError::RecoveryConflict);
+    }
+    let live_identity = filesystem_file_identity(&live_file)
+        .map_err(|error| io_error(GitIoOperation::InspectMetadata, &error))?;
+    let first = read_index_snapshot(&live_path)?;
+    let current = index_entry_map(git)?;
+    let second = read_index_snapshot(&live_path)?;
+    if first.size != second.size
+        || first.sha256 != second.sha256
+        || !required_open_file_matches_path_v5(&live_path, &live_file)?
+        || classify_index_lock_v5(&git.root, reference, &cleanup.inventory)?
+            != IndexLockStateV5::Absent
+    {
+        return Err(GitError::IndexChanged);
+    }
+    let candidate =
+        candidate_stage_map_at_bundle_path_v5(git, reference, &cleanup.inventory, &cleanup_path)?;
+    let protected =
+        verify_final_candidate_projection_v5(&cleanup.inventory.manifest.transaction, &candidate)?;
+    if protected_stage_projection_v5(&current, &protected)
+        != protected_stage_projection_v5(&candidate, &protected)
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    revalidate_held_cleanup_full_v5(&git.root, reference, cleanup)?;
+    if !guard.is_for_root(&git.root)
+        || !required_open_file_matches_path_v5(&live_path, &live_file)?
+        || classify_index_lock_v5(&git.root, reference, &cleanup.inventory)?
+            != IndexLockStateV5::Absent
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    let state = if first.size == cleanup.inventory.manifest.final_index.size
+        && first.sha256 == cleanup.inventory.manifest.final_index.sha256
+        && current == candidate
+    {
+        CompletedLiveIndexStateV5::ExactFinal
+    } else {
+        CompletedLiveIndexStateV5::LaterUnrelated
+    };
+    Ok((state, live_identity))
+}
+
+/// Revalidates the exact live-index capability returned by a completed-state
+/// classifier after intervening payload/worktree audits and immediately before
+/// a cleanup namespace edge.
+pub(super) fn revalidate_completed_live_index_capability_v5(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+    inventory: &InventoryVerifiedCandidateBundleV5,
+    classified_identity: &FilesystemFileIdentity,
+) -> Result<(), GitError> {
+    validate_reference_inventory_binding_v5(reference, inventory)?;
+    let live_path = index_path(&git.root);
+    if !guard.is_for_root(&git.root)
+        || classify_index_lock_v5(&git.root, reference, inventory)? != IndexLockStateV5::Absent
+        || !required_path_matches_file_identity_v5(&live_path, classified_identity)?
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    if !required_path_matches_file_identity_v5(&live_path, classified_identity)?
+        || classify_index_lock_v5(&git.root, reference, inventory)? != IndexLockStateV5::Absent
+        || !guard.is_for_root(&git.root)
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    Ok(())
 }
 
 fn verify_held_candidate_index_lock_v5(
@@ -3298,8 +3427,10 @@ fn map_directory_publish_error_v5(error: &AtomicDirectoryPublishError) -> GitErr
         | AtomicDirectoryPublishError::Indeterminate => GitError::RecoveryConflict,
         AtomicDirectoryPublishError::InvalidPaths
         | AtomicDirectoryPublishError::NotMoved
-        | AtomicDirectoryPublishError::PublishedCleanupFailed
-        | AtomicDirectoryPublishError::Io { .. } => GitError::DurabilityNotConfirmed,
+        | AtomicDirectoryPublishError::PublishedCleanupFailed => GitError::DurabilityNotConfirmed,
+        AtomicDirectoryPublishError::Io { source } => {
+            io_error(GitIoOperation::WriteJournal, source)
+        }
     }
 }
 
@@ -4078,6 +4209,15 @@ mod tests {
         assert!(matches!(
             cleanup_semantic_or_operational(GitError::InvalidJournal),
             GitError::RecoveryConflict
+        ));
+        assert!(matches!(
+            map_directory_publish_error_v5(&AtomicDirectoryPublishError::Io {
+                source: io::Error::from(io::ErrorKind::PermissionDenied),
+            }),
+            GitError::Io {
+                operation: GitIoOperation::WriteJournal,
+                kind: io::ErrorKind::PermissionDenied,
+            }
         ));
     }
 
