@@ -114,7 +114,7 @@ fn create_repository(initial: &[u8]) -> (TestDirectory, LogicalPath) {
     assert_eq!(
         fs::read_to_string(directory.path().join(".gitattributes"))
             .unwrap_or_else(|error| panic!("attributes read failed: {error}")),
-        "# retained attributes\n*.md.enc -text -diff merge=inex\n"
+        "# retained attributes\n*.md.enc -text -diff merge=inex\n*.asset.enc binary\n"
     );
     assert_eq!(
         fs::read_to_string(directory.path().join(".gitignore"))

@@ -37,8 +37,8 @@ use inex_core::atomic::{
 };
 use inex_core::crypto::{DecryptedDocument, EncryptedDocument};
 use inex_core::format;
-use inex_core::path::{LogicalPath, MAX_LOGICAL_PATH_BYTES};
-use inex_core::tree::{self, TreeEntryKind, TreeError};
+use inex_core::path::{AssetPath, LogicalPath, MAX_LOGICAL_PATH_BYTES};
+use inex_core::tree::{self, TreeEntryKind, TreeError, VaultTreeProfile};
 use inex_core::vault::{MAX_EDRY_ENVELOPE_BYTES, Vault, VaultError};
 use inex_core::vault_config::{KdfPolicy, MAX_VAULT_JSON_BYTES, VaultConfig};
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
@@ -49,9 +49,19 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 mod candidate_bundle_v5;
+mod repository_import;
+
+pub use repository_import::{
+    RepositoryImportError, SourceSnapshot, SourceSnapshotEntry, TargetRepository,
+    audit_repository_import_target, audit_repository_import_target_for_publication,
+    durably_audit_repository_import_target, initialize_and_audit_target, plan_source_repository,
+};
 
 /// Exact repository attribute installed for encrypted Markdown objects.
 pub const ATTRIBUTES_RULE: &str = "*.md.enc -text -diff merge=inex";
+
+/// Exact repository attribute installed for encrypted opaque assets.
+pub const ASSET_ATTRIBUTES_RULE: &str = "*.asset.enc binary";
 
 /// Exact repository-local ignore rule for private runtime state.
 pub const IGNORE_RULE: &str = "/.vault-local/";
@@ -460,14 +470,18 @@ impl fmt::Display for GitIoOperation {
 /// a failed local Git command, or post-write verification mismatch.
 pub fn install_driver(vault_root: &Path) -> Result<InstallReport, GitError> {
     let git = Git::open(vault_root)?;
-    validate_locked_vault_metadata(&git.root)?;
+    let vault_config = validate_locked_vault_metadata(&git.root)?;
     let driver_command = installed_driver_command()?;
-    let vault_tree =
-        tree::scan_vault_tree(&git.root).map_err(|_| GitError::UnsafeRepositoryMetadata)?;
+    let profile = if vault_config.supports_opaque_assets() {
+        VaultTreeProfile::OpaqueAssetsV1
+    } else {
+        VaultTreeProfile::DocumentsOnly
+    };
+    let vault_tree = tree::scan_vault_tree_with_profile(&git.root, profile)
+        .map_err(|_| GitError::UnsafeRepositoryMetadata)?;
     git.sync_configuration()?;
     let ignore_changed = ensure_repository_line(&git.root, GIT_IGNORE_FILE, IGNORE_RULE)?;
-    let attributes_changed =
-        ensure_repository_line(&git.root, GIT_ATTRIBUTES_FILE, ATTRIBUTES_RULE)?;
+    let attributes_changed = ensure_repository_attribute_rules(&git.root)?;
     sync_directory(&git.root).map_err(|_| GitError::DurabilityNotConfirmed)?;
 
     git.configure("merge.inex.name", DRIVER_NAME)?;
@@ -480,17 +494,30 @@ pub fn install_driver(vault_root: &Path) -> Result<InstallReport, GitError> {
     git.verify_configuration("merge.inex.driver", &driver_command)?;
     git.verify_attributes_for_path("__inex_probe__.md.enc")?;
     git.verify_attributes_for_path("__inex_probe__/entry.md.enc")?;
-    let physical_paths = vault_tree
+    git.verify_asset_attributes_for_path("__inex_probe__.asset.enc")?;
+    git.verify_asset_attributes_for_path("__inex_probe__/entry.asset.enc")?;
+    let document_physical_paths = vault_tree
         .entries()
         .iter()
         .filter(|entry| entry.kind() == TreeEntryKind::File)
         .map(|entry| format!("{}.enc", entry.logical_path()))
         .collect::<Vec<_>>();
-    let paths = physical_paths
+    let document_paths = document_physical_paths
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>();
-    git.verify_attributes_for_paths(&paths)?;
+    git.verify_attributes_for_paths(&document_paths)?;
+    let asset_physical_paths = vault_tree
+        .entries()
+        .iter()
+        .filter(|entry| entry.kind() == TreeEntryKind::Asset)
+        .map(|entry| format!("{}.asset.enc", entry.logical_path()))
+        .collect::<Vec<_>>();
+    let asset_paths = asset_physical_paths
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    git.verify_asset_attributes_for_paths(&asset_paths)?;
     #[cfg(windows)]
     git.verify_configuration("core.longPaths", "true")?;
 
@@ -500,13 +527,13 @@ pub fn install_driver(vault_root: &Path) -> Result<InstallReport, GitError> {
     })
 }
 
-fn validate_locked_vault_metadata(root: &Path) -> Result<(), GitError> {
+fn validate_locked_vault_metadata(root: &Path) -> Result<VaultConfig, GitError> {
     let path = root.join(inex_core::vault::VAULT_CONFIG_FILE);
     let bytes = read_regular_bounded(&path, MAX_VAULT_JSON_BYTES)
         .map_err(|_| GitError::UnsafeRepositoryMetadata)?;
-    VaultConfig::parse_untrusted(&bytes, KdfPolicy::default())
+    let (config, _) = VaultConfig::parse_untrusted(&bytes, KdfPolicy::default())
         .map_err(|_| GitError::UnsafeRepositoryMetadata)?;
-    Ok(())
+    Ok(config)
 }
 
 /// Recover any one pending ciphertext-only worktree/index transaction.
@@ -2737,22 +2764,42 @@ impl Git {
     }
 
     fn verify_attributes_for_paths(&self, physical_paths: &[&str]) -> Result<(), GitError> {
+        self.verify_typed_attributes_for_paths(physical_paths, false)
+    }
+
+    fn verify_asset_attributes_for_path(&self, physical_path: &str) -> Result<(), GitError> {
+        self.verify_asset_attributes_for_paths(&[physical_path])
+    }
+
+    fn verify_asset_attributes_for_paths(&self, physical_paths: &[&str]) -> Result<(), GitError> {
+        self.verify_typed_attributes_for_paths(physical_paths, true)
+    }
+
+    fn verify_typed_attributes_for_paths(
+        &self,
+        physical_paths: &[&str],
+        asset: bool,
+    ) -> Result<(), GitError> {
         if physical_paths.is_empty() {
             return Ok(());
         }
         for path in physical_paths {
-            validate_physical_path(path)?;
+            if asset {
+                validate_asset_physical_path(path)?;
+            } else {
+                validate_physical_path(path)?;
+            }
         }
         let mut start = 0;
         while start < physical_paths.len() {
             let end = next_attribute_batch_end(&self.executable, physical_paths, start)?;
-            self.verify_attribute_batch(&physical_paths[start..end])?;
+            self.verify_attribute_batch(&physical_paths[start..end], asset)?;
             start = end;
         }
         Ok(())
     }
 
-    fn verify_attribute_batch(&self, physical_paths: &[&str]) -> Result<(), GitError> {
+    fn verify_attribute_batch(&self, physical_paths: &[&str], asset: bool) -> Result<(), GitError> {
         debug_assert!(!physical_paths.is_empty());
         let mut arguments = CHECK_ATTR_ARGUMENTS
             .iter()
@@ -2770,10 +2817,11 @@ impl Git {
             maximum_output,
         )?;
         let records = nul_records(&output)?;
+        let expected_merge = if asset { "unset" } else { "inex" };
         let expected = [
             ("text".as_bytes(), "unset".as_bytes()),
             ("diff".as_bytes(), "unset".as_bytes()),
-            ("merge".as_bytes(), "inex".as_bytes()),
+            ("merge".as_bytes(), expected_merge.as_bytes()),
         ];
         if records.len() != expected.len() * 3 * physical_paths.len() {
             return Err(GitError::IneffectiveAttributes);
@@ -3568,6 +3616,28 @@ fn ensure_repository_line(root: &Path, name: &str, required: &str) -> Result<boo
     Ok(true)
 }
 
+fn ensure_repository_attribute_rules(root: &Path) -> Result<bool, GitError> {
+    let target = root.join(GIT_ATTRIBUTES_FILE);
+    let current = read_repository_metadata(&target)?;
+    let Some(mut replacement) = append_attribute_rules_if_missing(&current)? else {
+        return Ok(false);
+    };
+    let condition = if current.is_empty() && !target.exists() {
+        WriteCondition::IfNoneMatch
+    } else {
+        WriteCondition::IfMatch(digest(&current))
+    };
+    let guard = VaultMutationGuard::acquire(root).map_err(map_atomic_error)?;
+    let outcome = guard
+        .write(&target, &replacement, condition)
+        .map_err(map_atomic_error)?;
+    if outcome.parent_sync != ParentSyncStatus::Synced {
+        return Err(GitError::DurabilityNotConfirmed);
+    }
+    replacement.fill(0);
+    Ok(true)
+}
+
 fn read_repository_metadata(path: &Path) -> Result<Vec<u8>, GitError> {
     read_regular_bounded(path, MAX_REPOSITORY_METADATA_BYTES)
 }
@@ -3663,6 +3733,30 @@ fn append_line_if_missing(current: &[u8], required: &str) -> Result<Option<Vec<u
         replacement.push(b'\n');
     }
     replacement.extend_from_slice(required.as_bytes());
+    replacement.push(b'\n');
+    Ok(Some(replacement))
+}
+
+fn append_attribute_rules_if_missing(current: &[u8]) -> Result<Option<Vec<u8>>, GitError> {
+    let text = std::str::from_utf8(current).map_err(|_| GitError::UnsafeRepositoryMetadata)?;
+    let mut lines = text.lines().rev();
+    if lines.next() == Some(ASSET_ATTRIBUTES_RULE) && lines.next() == Some(ATTRIBUTES_RULE) {
+        return Ok(None);
+    }
+    let extra = ATTRIBUTES_RULE
+        .len()
+        .saturating_add(ASSET_ATTRIBUTES_RULE.len())
+        .saturating_add(2);
+    if current.len().saturating_add(extra).saturating_add(1) > MAX_REPOSITORY_METADATA_BYTES {
+        return Err(GitError::UnsafeRepositoryMetadata);
+    }
+    let mut replacement = current.to_vec();
+    if !replacement.is_empty() && !replacement.ends_with(b"\n") {
+        replacement.push(b'\n');
+    }
+    replacement.extend_from_slice(ATTRIBUTES_RULE.as_bytes());
+    replacement.push(b'\n');
+    replacement.extend_from_slice(ASSET_ATTRIBUTES_RULE.as_bytes());
     replacement.push(b'\n');
     Ok(Some(replacement))
 }
@@ -3806,6 +3900,14 @@ fn validate_physical_path(path: &str) -> Result<LogicalPath, GitError> {
         return Err(GitError::UnsupportedConflictEntry);
     }
     LogicalPath::from_ciphertext_relative_path(Path::new(path))
+        .map_err(|_| GitError::UnsupportedConflictEntry)
+}
+
+fn validate_asset_physical_path(path: &str) -> Result<AssetPath, GitError> {
+    if path.is_empty() || path.len() > MAX_GIT_PATH_BYTES || path.as_bytes().contains(&0) {
+        return Err(GitError::UnsupportedConflictEntry);
+    }
+    AssetPath::from_ciphertext_relative_path(Path::new(path))
         .map_err(|_| GitError::UnsupportedConflictEntry)
 }
 

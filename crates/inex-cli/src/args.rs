@@ -12,6 +12,7 @@ pub(crate) const USAGE: &str = "\
 Usage:
   inex init <vault>
   inex import <plaintext-source> <new-vault> [--dry-run]
+  inex import-repository <source-repository> <new-vault> [--dry-run]
   inex verify <vault>
   inex password add <vault> [--slot <current-slot-uuid>]
   inex password remove <vault> <slot-to-remove> --slot <retained-slot-uuid>
@@ -56,6 +57,14 @@ Links, reparse points, special entries, collisions, and unsafe paths fail.
 Limits are 100000 source entries/files, depth 128, 32 MiB of source/target path
 storage, 16 MiB per Markdown file, and 256 MiB total Markdown plaintext.
 
+`import-repository` initializes a completely new Inex vault and Git history
+from one clean, tracked source `HEAD` snapshot. It imports exact lowercase
+`.md` files as encrypted Markdown and every other tracked regular file as an
+encrypted opaque asset. The source repository and its plaintext history are
+read-only and are never copied into the target object database. `--dry-run`
+performs no password prompt, KDF work, directory creation, Git initialization,
+or product-state write.
+
 `verify` performs locked structural validation only. It does not authenticate
 vault metadata or document ciphertext. It acquires the vault mutation lock and
 may recover a pending ciphertext transaction; it is not a pure read-only scan.
@@ -98,6 +107,11 @@ pub(crate) enum Command {
         vault: PathBuf,
         dry_run: bool,
     },
+    ImportRepository {
+        source: PathBuf,
+        vault: PathBuf,
+        dry_run: bool,
+    },
     Password(PasswordCommand),
     Search {
         vault: PathBuf,
@@ -122,6 +136,7 @@ impl Command {
             Self::Init { .. } => "init",
             Self::Verify { .. } => "verify",
             Self::Import { .. } => "import",
+            Self::ImportRepository { .. } => "import-repository",
             Self::Password(PasswordCommand::Add { .. }) => "password add",
             Self::Password(PasswordCommand::Remove { .. }) => "password remove",
             Self::Password(PasswordCommand::Change { .. }) => "password change",
@@ -232,6 +247,7 @@ impl Cli {
                 vault: arguments.pop_path()?.ok_or(ArgumentError::MissingVault)?,
             },
             "import" => parse_import(&mut arguments)?,
+            "import-repository" => parse_import_repository(&mut arguments)?,
             "password" => Command::Password(parse_password(&mut arguments)?),
             "search" => parse_search(&mut arguments)?,
             "merge-driver" => parse_merge_driver(&mut arguments)?,
@@ -343,6 +359,17 @@ fn parse_import(arguments: &mut Arguments) -> Result<Command, ArgumentError> {
     let vault = arguments.pop_path()?.ok_or(ArgumentError::MissingVault)?;
     let options = parse_options(arguments, false, false, true)?;
     Ok(Command::Import {
+        source,
+        vault,
+        dry_run: options.dry_run,
+    })
+}
+
+fn parse_import_repository(arguments: &mut Arguments) -> Result<Command, ArgumentError> {
+    let source = arguments.pop_path()?.ok_or(ArgumentError::MissingSource)?;
+    let vault = arguments.pop_path()?.ok_or(ArgumentError::MissingVault)?;
+    let options = parse_options(arguments, false, false, true)?;
+    Ok(Command::ImportRepository {
         source,
         vault,
         dry_run: options.dry_run,
@@ -505,6 +532,17 @@ mod tests {
             })
         ));
         assert!(matches!(
+            Cli::parse([
+                "import-repository",
+                "/source-repository",
+                "/new-vault",
+                "--dry-run"
+            ]),
+            Ok(Cli {
+                command: Command::ImportRepository { dry_run: true, .. }
+            })
+        ));
+        assert!(matches!(
             Cli::parse(["serve"]),
             Ok(Cli {
                 command: Command::Serve
@@ -614,6 +652,16 @@ mod tests {
     fn rejects_password_and_extra_arguments() {
         assert!(matches!(
             Cli::parse(["init", "/vault", "--password", "secret"]),
+            Err(ArgumentError::ForbiddenPasswordArgument)
+        ));
+        assert!(matches!(
+            Cli::parse([
+                "import-repository",
+                "/source",
+                "/vault",
+                "--password",
+                "secret"
+            ]),
             Err(ArgumentError::ForbiddenPasswordArgument)
         ));
         assert!(matches!(

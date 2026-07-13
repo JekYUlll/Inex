@@ -2606,6 +2606,16 @@ impl SecureSourceDirectory {
 
 #[cfg(target_os = "linux")]
 impl SecureSourceFile {
+    /// Return the stable opaque identity of this held single-link file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the descriptor no longer names a regular
+    /// single-link file or its identity cannot be queried.
+    pub fn identity(&self) -> io::Result<FilesystemFileIdentity> {
+        filesystem_file_identity(&self.file)
+    }
+
     /// Return the length observed on the held file handle.
     ///
     /// # Errors

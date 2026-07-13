@@ -12,6 +12,7 @@ mod args;
 mod import;
 mod password;
 mod query;
+mod repository_import;
 mod verify;
 
 use std::fmt;
@@ -82,6 +83,11 @@ fn execute(command: Command) -> Result<ExitCode, AppError> {
             vault,
             dry_run,
         } => command_import(&source, &vault, dry_run),
+        Command::ImportRepository {
+            source,
+            vault,
+            dry_run,
+        } => command_import_repository(&source, &vault, dry_run),
         Command::Password(command) => command_password(command, PasswordInput::from_environment()?),
         Command::Search {
             vault,
@@ -344,6 +350,152 @@ fn command_import(source: &Path, vault_path: &Path, dry_run: bool) -> Result<Exi
     println!("destination: published-new-vault");
     println!("result: staged copy import complete");
     Ok(ExitCode::SUCCESS)
+}
+
+fn command_import_repository(
+    source: &Path,
+    vault_path: &Path,
+    dry_run: bool,
+) -> Result<ExitCode, AppError> {
+    let plan = repository_import::plan(source, vault_path)?;
+    print_repository_import_plan(&plan, dry_run);
+
+    if dry_run {
+        plan.revalidate_source()?;
+        print_repository_import_dry_run_success();
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    command_repository_import_create(&plan)
+}
+
+fn print_repository_import_plan(plan: &repository_import::RepositoryImportPlan, dry_run: bool) {
+    println!(
+        "import-mode: {}",
+        if dry_run {
+            "repository-dry-run"
+        } else {
+            "repository-copy"
+        }
+    );
+    println!("source-policy: clean-head-read-only");
+    println!("source-object-format: sha1");
+    println!("source-tree-entries: {}", plan.source_tree_entries());
+    println!("source-index-entries: {}", plan.source_index_entries());
+    println!("source-worktree-files: {}", plan.source_worktree_files());
+    println!("source-directories: {}", plan.source_directories());
+    println!("markdown-files: {}", plan.markdown_files());
+    println!("asset-files: {}", plan.asset_files());
+    println!("markdown-bytes: {}", plan.markdown_bytes());
+    println!("asset-bytes: {}", plan.asset_bytes());
+    println!("largest-asset-bytes: {}", plan.largest_asset_bytes());
+    println!("normalized-path-entries: {}", plan.normalized_entries());
+    println!("lfs-files: 0");
+    println!("filtered-files: 0");
+    println!("untracked-entries: 0");
+    println!("destination-policy: new-vault-new-git-root-single-atomic-publication");
+}
+
+fn print_repository_import_dry_run_success() {
+    println!("source-revalidated: yes");
+    println!("source-preserved: yes");
+    println!("import-writes: none");
+    println!("password-prompted: no");
+    println!("destination-created: no");
+    println!("candidate-root: not-created");
+    println!("vault-publication: not-started");
+    println!("git-repository: not-created");
+    println!("recovery-required: none");
+    println!("result: repository import plan valid");
+}
+
+fn command_repository_import_create(
+    plan: &repository_import::RepositoryImportPlan,
+) -> Result<ExitCode, AppError> {
+    if let Err(error) = io::stdout().flush() {
+        print_repository_import_terminal(repository_import::RepositoryImportTerminal::NotCreated);
+        return Err(AppError::io(IoOperation::WriteOutput, &error));
+    }
+    let creation_params = match calibrated_creation_params(KdfPolicy::default()) {
+        Ok(params) => params,
+        Err(error) => {
+            print_repository_import_terminal(
+                repository_import::RepositoryImportTerminal::NotCreated,
+            );
+            return Err(VaultError::from(error).into());
+        }
+    };
+    let password_input = match PasswordInput::from_environment() {
+        Ok(input) => input,
+        Err(error) => {
+            print_repository_import_terminal(
+                repository_import::RepositoryImportTerminal::NotCreated,
+            );
+            return Err(error.into());
+        }
+    };
+    let password = match read_confirmed_password(password_input, "New vault password: ") {
+        Ok(password) => password,
+        Err(error) => {
+            print_repository_import_terminal(
+                repository_import::RepositoryImportTerminal::NotCreated,
+            );
+            return Err(error.into());
+        }
+    };
+    let created_at_ms = match unix_time_ms() {
+        Ok(value) => value,
+        Err(error) => {
+            drop(password);
+            print_repository_import_terminal(
+                repository_import::RepositoryImportTerminal::NotCreated,
+            );
+            return Err(error);
+        }
+    };
+    let report =
+        repository_import::execute(plan, password.as_slice(), created_at_ms, creation_params);
+    drop(password);
+    let report = match report {
+        Ok(report) => report,
+        Err(failure) => {
+            let (error, terminal) = failure.into_parts();
+            print_repository_import_terminal(terminal);
+            return Err(error.into());
+        }
+    };
+    print_repository_import_success(&report);
+    Ok(ExitCode::SUCCESS)
+}
+
+fn print_repository_import_success(report: &repository_import::RepositoryImportReport) {
+    print_warnings(&report.warnings);
+    println!(
+        "committed-encrypted-markdown: {}",
+        report.committed_markdown
+    );
+    println!("committed-encrypted-assets: {}", report.committed_assets);
+    println!("candidate-vault-audit: passed");
+    println!("candidate-git-object-audit: passed");
+    println!("candidate-plaintext-file-objects: 0");
+    println!("source-revalidated: yes");
+    println!("source-preserved: yes");
+    println!("candidate-root: published");
+    println!("vault-publication: published");
+    println!("git-repository: initialized");
+    println!("git-root-commit: {}", report.git_root_commit);
+    println!("git-root-parent-count: 0");
+    println!("git-tracked-source-plaintext-files: 0");
+    println!("recovery-required: none");
+    println!("result: repository import complete");
+}
+
+fn print_repository_import_terminal(terminal: repository_import::RepositoryImportTerminal) {
+    let [candidate, publication, git, recovery] = terminal.fields();
+    println!("candidate-root: {candidate}");
+    println!("vault-publication: {publication}");
+    println!("git-repository: {git}");
+    println!("recovery-required: {recovery}");
 }
 
 fn command_init(vault_path: &Path, input: PasswordInput) -> Result<ExitCode, AppError> {
@@ -687,6 +839,7 @@ impl fmt::Display for IoOperation {
 enum AppError {
     Arguments(args::ArgumentError),
     Import(import::ImportError),
+    RepositoryImport(repository_import::RepositoryImportError),
     Password(password::PasswordError),
     Query(query::QueryError),
     Verification(verify::VerifyError),
@@ -718,6 +871,7 @@ impl AppError {
         match self {
             Self::Arguments(_) => ExitCode::from(2),
             Self::Import(_)
+            | Self::RepositoryImport(_)
             | Self::Password(_)
             | Self::Query(_)
             | Self::Verification(_)
@@ -739,6 +893,7 @@ impl fmt::Display for AppError {
         match self {
             Self::Arguments(error) => write!(formatter, "{error}\n\n{}", args::USAGE),
             Self::Import(error) => error.fmt(formatter),
+            Self::RepositoryImport(error) => error.fmt(formatter),
             Self::Password(error) => error.fmt(formatter),
             Self::Query(error) => error.fmt(formatter),
             Self::Verification(error) => error.fmt(formatter),
@@ -771,6 +926,12 @@ impl From<args::ArgumentError> for AppError {
 impl From<import::ImportError> for AppError {
     fn from(error: import::ImportError) -> Self {
         Self::Import(error)
+    }
+}
+
+impl From<repository_import::RepositoryImportError> for AppError {
+    fn from(error: repository_import::RepositoryImportError) -> Self {
+        Self::RepositoryImport(error)
     }
 }
 
