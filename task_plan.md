@@ -84,7 +84,10 @@ Phase 6 extension — 现有 Markdown Git 仓库与加密附件迁移（Phase 7 
   - [ ] 完成VS Code locked首次交互的最终发布门禁
     - [x] 提供Import/Unlock welcome、锁定CRUD gate、绝对CLI任务、成功后Open New Vault，并由真实Extension Host覆盖底层import→密文workspace→asset/CRUD流程
     - [ ] 在最终VSIX上人工驱动Linux真实folder picker、任务终端双口令与Open New Vault鼠标路径，并纳入persistent-profile残留证据
-  - [ ] 完成冻结GA对象证明：从approved path/OID trie独立序列化每棵raw tree，使用bounded streaming `cat-file --batch`逐对象比较，并补raw index-extension parser与资源边界
+  - [ ] 完成冻结GA对象证明与生产接线
+    - [x] 实现strict SHA-1 raw index v2/v3/v4 parser，校验entry/extension/trailer、排序、canonical v4 varint与资源边界（`62fa0aa`）
+    - [x] 从approved path/OID trie独立typed-SHA-1序列化每棵raw tree，并用单个bounded streaming `cat-file --batch`逐对象比较blob/tree/commit body与exact inventory（`d8805bd`）
+    - [ ] 将同一次secure-handle raw index读取接入repository import，证明raw index、`ls-files -s`与HEAD tree三方完全一致；随后闭合恶意Git后代持pipe、hostile same-UID TOCTOU及全资源边界
   - [ ] 完成跨进程publication ambiguity恢复：设计通用持久publication claim/seal与existing-only reconcile guard，真实SIGKILL后同命令只对账并删除exact marker，绝不在final补建Git或触碰foreign destination
   - [ ] 完成repository import构造/durability/publication每一边界的Linux force-kill、hostile same-UID source/target race、artifact-bound residue与原生Windows矩阵
 - **Status:** in_progress（用户实测驱动的迁移/附件扩展；原Markdown-only实现仍保持已验证基线）
@@ -207,7 +210,10 @@ Phase 6 extension — 现有 Markdown Git 仓库与加密附件迁移（Phase 7 
 
 | Error | Attempt | Resolution |
 |-------|---------|------------|
-| `create_goal` 拒绝新的迁移objective，因为线程已有paused但unfinished的长期Goal | 2 | 不伪造complete/blocked；把可执行细化Goal写入根`task_plan.md`并继续Git开发，待产品侧恢复/替换后端Goal |
+| `create_goal` 拒绝新的迁移objective，因为线程已有paused但unfinished的长期Goal | 3 | 不伪造complete/blocked；把可执行细化Goal写入根`task_plan.md`并继续Git开发，待产品侧恢复/替换后端Goal |
+| raw index parser首版拒绝“有IEOT但无EOIE”的真实Git 2.43 index | 1 | 以真实Git生成的v4 index和Git格式契约确认IEOT可独立存在；放宽该组合但保持唯一extension、分区与block独立解码校验，定向测试和Windows GNU检查通过 |
+| `cat-file --batch`初版在错误清理路径调用无界`Child::wait` | 1 | 改为固定2秒`try_wait`轮询并绑定reaped/finished状态；直接子进程路径闭合，恶意后代继承pipe仍保留为GA进程组/Windows Job门禁 |
+| 独立对象审计后的完整`inex-git`套件一次触发既有v5 recovery时序性`RecoveryConflict` | 1 | 精确隔离复跑该test 1/1通过；不把该次完整套件写成全绿，也未把它归因于repository import，后续整套继续观察 |
 | Opaque asset 收口后的 workspace rustfmt check 发现 daemon 测试中一个多行 `assert_eq!` 仅有规范格式漂移 | 1 | 运行 canonical `cargo fmt --all`，随后 workspace pedantic Clippy 与 warnings-as-errors rustdoc 全部通过 |
 | Repository-import 规范的一次组合patch因上下文已变化而整体拒绝 | 1 | 确认无部分写入，按source config、journal、output和acceptance matrix拆成精确小patch并逐次`git diff --check` |
 | Repository-import 命令段与Git runner的组合patch因现有换行上下文不完全匹配而拒绝 | 1 | 确认无部分写入，读取精确行后以同一语义的窄上下文patch成功替换 |
