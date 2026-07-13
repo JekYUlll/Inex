@@ -103,7 +103,8 @@ Phase 7 — 跨平台验证、打包与发布准备
         - [x] 发布 v5 durable journal：fresh held marker、三 payload 双授权、随机 retained scratch、no-replace/reconciliation、双目录 durability 与四态 fresh recovery
         - [x] 完成 post-journal worktree/index 前滚、ExactFinal/LaterUnrelated 分类与 live-index identity 绑定；SHA-1/SHA-256 三 payload、故障注入、native/Windows GNU 门禁及双路独立复审通过
         - [x] 完成 bundle retire/cleanup receipt 七态状态机：held proof、relocated classifier、逐边durability/identity协调、SHA-1/SHA-256三payload与双路独立复审均通过
-        - [ ] 完成 production writer 接线与端到端 OS force-kill recovery
+        - [x] 完成 production writer 接线：三payload真实入口统一走single-guard v5 disk-classified driver，旧v4手工tail结构性移除，private composite hooks与双路复审通过
+        - [ ] 完成端到端 OS force-kill recovery；Linux/Windows native分别绑定，强杀证据不冒充power-loss
   - [ ] 原生 Windows NTFS/ReFS 复验 replace/write-through/power-loss，并由绑定证据决定是否取消 no-parallel-Git 边界
 - [x] 配置 Linux/Windows x64/arm64 CI、Rust 二进制、VSIX 与 Sublime 包产物；远端 hosted jobs 尚待执行
 - [x] 完成 threat model、用户指南、安全配置、迁移/升级与故障恢复文档
