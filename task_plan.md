@@ -163,6 +163,7 @@ Phase 6 extension — 现有 Markdown Git 仓库与加密附件迁移（Phase 7 
 - [x] 从 clean `eeca0bc` 以 Node 22.23.1/Rust 1.97.0/system GCC 完成两次逐字节一致的 Linux x64 package/audit/native-dependency/exact VS Code 1.125.0 smoke，并采集三次原生 KDF external evidence
 - [x] 从第三个 standalone clean `eeca0bc` harness clone 对同一最终 artifact 重跑完整 lifecycle；旧 `5aa0b8c` lifecycle 不继承到新 CLI/package checkpoint
 - [x] 从 standalone clean `bd2b58e` 以 Node 22.23.1/Rust 1.97.0/system GCC 构建当前 Linux x64 pre-alpha engineering demo；23/23 VS Code 测试、strict package/audit/native-dependency、SHA256SUMS、冻结 VS Code 1.125.0 smoke 与本机 1.128.0 隔离安装均通过。该单次构建不替代 A/B reproducibility、完整 lifecycle、签名或发布批准
+- [x] 从 standalone clean `7fb83ec` 以Node 26.3.1、Rust 1.97.0、`/usr/bin/gcc` 13.3.0重建含repository-import与双binary VSIX的Linux x64 engineering demo；strict三包audit、shared CLI/sidecar、native dependency、SHA256SUMS与VS Code 1.128.0隔离安装/打包CLI+daemon smoke通过。该单次构建不替代Node 22 A/B reproducibility、真实打包VSIX UI/persistent-profile lifecycle、签名或发布批准
 - **Status:** in_progress
 
 ## Key Questions
@@ -379,6 +380,8 @@ Phase 6 extension — 现有 Markdown Git 仓库与加密附件迁移（Phase 7 
 | Repository-import独立终审发现fresh reopen仅比较长度/摘要、Git对象只列inventory且tracked worktree缺末尾统一seal重验 | 1 | fresh unlock后重新descriptor/Git-bound读取每个源文件并逐字节比较；逐个读取commit/blob/tree对象体、blob对worktree精确比较、tree typed rehash，并在每次完整target audit末尾再次复验allowlist、identity、size和SHA-256；定向测试、Clippy及Windows GNU check通过。独立raw-tree序列化与streaming仍保留为GA门禁 |
 | 发布后强杀重试审计确认随机16-byte marker与进程内`TargetRepository`无法跨进程重建exact ownership，重跑又先拒绝existing destination | 1 | 不做“看到marker就删”的危险补丁；把generic persistent publication claim/seal、existing-only reconcile guard、held-marker删除和真实SIGKILL矩阵列为独立未完成安全里程碑。当前Linux preview只承诺正常完成路径，terminal要求保留现场且禁止盲重跑 |
 | 发布工具与Sublime完整unittest首次分别漏设`PYTHONPATH=scripts`和`PYTHONPATH=editors/sublime`，产生模块导入错误 | 1 each | 将两次错误启动记录为无效证据；使用显式正确模块路径重跑，发布工具86/86和Sublime 84/84全部通过。后续固定命令保留显式`PYTHONPATH` |
+| 首次release构建仅设置`CC=/usr/bin/gcc`，Rust最终linker仍从PATH选择xlings并产生非portable interpreter | 1 | Strict packager在artifact形成前拒绝；使用全新target并显式设置`CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/usr/bin/gcc`，重建后interpreter固定为`/lib64/ld-linux-x86-64.so.2` |
+| Main checkout虽然clean但登记多个既有worktree，strict provenance拒绝；standalone根又无package.json且local clone origin不是canonical URL | 1 each | 不删除历史worktree；以`--no-local --single-branch`创建独立clone，分别在VS Code/vsce目录离线frozen install，仅把一次性clone origin改为canonical GitHub URL且不fetch/push。最终clean source、package/audit/smoke通过 |
 
 ## Notes
 
