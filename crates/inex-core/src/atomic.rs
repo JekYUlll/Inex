@@ -922,7 +922,7 @@ impl VerifiedDirectoryMovePaths {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            self.parent_identity.volume == self.source_identity.volume
+            self.parent_identity.comparison_volume() == self.source_identity.comparison_volume()
         }
     }
 
@@ -1499,16 +1499,250 @@ pub fn open_file_matches_path_and_is_single_link(path: &Path, file: &File) -> io
     platform::open_file_matches_path_and_is_single_link(path, file)
 }
 
+/// Stable scheme used to project an opaque filesystem identity onto a wire.
+///
+/// The discriminants are part of the publication-marker wire format and must
+/// not be renumbered.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[repr(u16)]
+pub enum PublicationIdentityScheme {
+    /// Linux `st_dev` plus the normalized `st_ino` identifier.
+    LinuxDevInodeV1 = 1,
+    /// Windows 64-bit volume serial plus a nonzero `FILE_ID_128`.
+    WindowsModernFileId128V1 = 2,
+    /// Windows legacy volume serial plus normalized 64-bit file index.
+    WindowsLegacyFileIndexV1 = 3,
+}
+
+impl PublicationIdentityScheme {
+    /// Returns the exact unsigned value encoded in publication marker wires.
+    #[must_use]
+    pub const fn wire_value(self) -> u16 {
+        self as u16
+    }
+}
+
+/// Immutable canonical 24-byte projection of one filesystem identity.
+///
+/// The first eight bytes are the volume in big-endian order and the remaining
+/// sixteen bytes are the scheme-specific normalized identifier. The fields
+/// are private so callers cannot relabel bytes with a different scheme.
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+pub struct PublicationIdentityWire {
+    scheme: PublicationIdentityScheme,
+    bytes: [u8; 24],
+}
+
+impl PublicationIdentityWire {
+    fn new(scheme: PublicationIdentityScheme, volume: u64, identifier: [u8; 16]) -> Self {
+        let mut bytes = [0_u8; 24];
+        bytes[..8].copy_from_slice(&volume.to_be_bytes());
+        bytes[8..].copy_from_slice(&identifier);
+        Self { scheme, bytes }
+    }
+
+    /// Returns the explicit provenance of these wire bytes.
+    #[must_use]
+    pub const fn scheme(&self) -> PublicationIdentityScheme {
+        self.scheme
+    }
+
+    /// Returns the exact canonical 24-byte wire projection.
+    #[must_use]
+    pub const fn wire_bytes(&self) -> &[u8; 24] {
+        &self.bytes
+    }
+
+    fn volume(&self) -> u64 {
+        u64::from_be_bytes([
+            self.bytes[0],
+            self.bytes[1],
+            self.bytes[2],
+            self.bytes[3],
+            self.bytes[4],
+            self.bytes[5],
+            self.bytes[6],
+            self.bytes[7],
+        ])
+    }
+}
+
+impl fmt::Debug for PublicationIdentityWire {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "PublicationIdentityWire {{ scheme: {:?}, bytes: [REDACTED] }}",
+            self.scheme
+        )
+    }
+}
+
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
+struct FilesystemIdentityProjections {
+    primary: PublicationIdentityWire,
+}
+
+impl FilesystemIdentityProjections {
+    fn single(primary: PublicationIdentityWire) -> Self {
+        Self { primary }
+    }
+
+    fn get(&self, scheme: PublicationIdentityScheme) -> Option<PublicationIdentityWire> {
+        (self.primary.scheme() == scheme).then_some(self.primary)
+    }
+
+    fn comparison_volume(&self) -> u64 {
+        self.primary.volume()
+    }
+}
+
+fn normalized_index_identifier(index: u64, discriminator: u8) -> [u8; 16] {
+    let mut identifier = [0_u8; 16];
+    identifier[..8].copy_from_slice(&index.to_le_bytes());
+    identifier[15] = discriminator;
+    identifier
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_identity_projections(
+    volume: u64,
+    inode: u64,
+    discriminator: u8,
+) -> FilesystemIdentityProjections {
+    FilesystemIdentityProjections::single(PublicationIdentityWire::new(
+        PublicationIdentityScheme::LinuxDevInodeV1,
+        volume,
+        normalized_index_identifier(inode, discriminator),
+    ))
+}
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WindowsModernIdentityQueryOutcome {
+    // This means the modern API succeeded with an all-zero identifier. API
+    // errors are never represented by this variant.
+    LegacyOnly,
+    Available { volume: u64, identifier: [u8; 16] },
+}
+
+#[cfg(any(windows, test))]
+fn classify_windows_modern_identity_query(
+    query: io::Result<(u64, [u8; 16])>,
+) -> io::Result<WindowsModernIdentityQueryOutcome> {
+    // No Windows error code is treated as an implicit legacy-only result:
+    // without a documented, narrow unsupported outcome, every error remains
+    // observable and fails the identity proof closed.
+    let (volume, identifier) = query?;
+    if identifier.iter().all(|byte| *byte == 0) {
+        Ok(WindowsModernIdentityQueryOutcome::LegacyOnly)
+    } else {
+        Ok(WindowsModernIdentityQueryOutcome::Available { volume, identifier })
+    }
+}
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WindowsModernIdentityComparison {
+    UseLegacy,
+    Resolved(bool),
+}
+
+#[cfg(any(windows, test))]
+fn compare_windows_modern_identities(
+    first: WindowsModernIdentityQueryOutcome,
+    second: WindowsModernIdentityQueryOutcome,
+    include_volume: bool,
+) -> WindowsModernIdentityComparison {
+    match (first, second) {
+        (
+            WindowsModernIdentityQueryOutcome::LegacyOnly,
+            WindowsModernIdentityQueryOutcome::LegacyOnly,
+        ) => WindowsModernIdentityComparison::UseLegacy,
+        (
+            WindowsModernIdentityQueryOutcome::Available {
+                volume: first_volume,
+                identifier: first_identifier,
+            },
+            WindowsModernIdentityQueryOutcome::Available {
+                volume: second_volume,
+                identifier: second_identifier,
+            },
+        ) => WindowsModernIdentityComparison::Resolved(
+            first_identifier == second_identifier
+                && (!include_volume || first_volume == second_volume),
+        ),
+        (
+            WindowsModernIdentityQueryOutcome::LegacyOnly,
+            WindowsModernIdentityQueryOutcome::Available { .. },
+        )
+        | (
+            WindowsModernIdentityQueryOutcome::Available { .. },
+            WindowsModernIdentityQueryOutcome::LegacyOnly,
+        ) => WindowsModernIdentityComparison::Resolved(false),
+    }
+}
+
+#[cfg(any(windows, test))]
+fn windows_identity_projections(
+    legacy_volume: u32,
+    legacy_index: u64,
+    modern: WindowsModernIdentityQueryOutcome,
+    discriminator: u8,
+) -> io::Result<FilesystemIdentityProjections> {
+    let primary = match modern {
+        WindowsModernIdentityQueryOutcome::Available { volume, identifier } => {
+            PublicationIdentityWire::new(
+                PublicationIdentityScheme::WindowsModernFileId128V1,
+                volume,
+                identifier,
+            )
+        }
+        WindowsModernIdentityQueryOutcome::LegacyOnly => {
+            if legacy_index == 0 {
+                return Err(io::Error::other(
+                    "legacy Windows filesystem identity is unavailable",
+                ));
+            }
+            PublicationIdentityWire::new(
+                PublicationIdentityScheme::WindowsLegacyFileIndexV1,
+                u64::from(legacy_volume),
+                normalized_index_identifier(legacy_index, discriminator),
+            )
+        }
+    };
+    Ok(FilesystemIdentityProjections::single(primary))
+}
+
 /// Stable identity of one single-link regular file.
 ///
 /// The fields are deliberately opaque. The value can be retained after a
 /// Windows namespace operation forces every open file handle to be closed,
 /// then compared with a freshly opened path using
 /// [`path_matches_file_identity_and_is_single_link`].
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
 pub struct FilesystemFileIdentity {
-    volume: u64,
-    identifier: [u8; 16],
+    projections: FilesystemIdentityProjections,
+}
+
+impl FilesystemFileIdentity {
+    /// Returns this identity's single canonical projection when its captured
+    /// primary scheme is exactly `scheme`.
+    #[must_use]
+    pub fn publication_identity(
+        &self,
+        scheme: PublicationIdentityScheme,
+    ) -> Option<PublicationIdentityWire> {
+        self.projections.get(scheme)
+    }
+}
+
+impl fmt::Debug for FilesystemFileIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FilesystemFileIdentity")
+            .field("identity", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// Captures the physical identity of one held single-link regular file.
@@ -2038,7 +2272,8 @@ impl VerifiedFileMovePaths {
             filesystem_directory_identity(&resolved_destination_parent)?;
         if source_parent_input_identity != source_parent_identity
             || destination_parent_input_identity != destination_parent_identity
-            || source_parent_identity.volume != destination_parent_identity.volume
+            || source_parent_identity.comparison_volume()
+                != destination_parent_identity.comparison_volume()
             || !paths_share_mount(&resolved_source_parent, &resolved_destination_parent)?
         {
             return Err(invalid_atomic_file_move(
@@ -2157,10 +2392,290 @@ fn invalid_atomic_file_move(message: &'static str) -> io::Error {
 /// This opaque value is suitable for equality checks that detect bind-mount,
 /// junction, and alternate-spelling aliases without exposing platform handle
 /// structures to callers.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
 pub struct FilesystemDirectoryIdentity {
-    volume: u64,
-    identifier: [u8; 16],
+    projections: FilesystemIdentityProjections,
+}
+
+impl FilesystemDirectoryIdentity {
+    /// Returns this identity's single canonical projection when its captured
+    /// primary scheme is exactly `scheme`.
+    #[must_use]
+    pub fn publication_identity(
+        &self,
+        scheme: PublicationIdentityScheme,
+    ) -> Option<PublicationIdentityWire> {
+        self.projections.get(scheme)
+    }
+
+    fn comparison_volume(&self) -> u64 {
+        self.projections.comparison_volume()
+    }
+}
+
+impl fmt::Debug for FilesystemDirectoryIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FilesystemDirectoryIdentity")
+            .field("identity", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod publication_identity_tests {
+    use std::cmp::Ordering;
+    use std::io;
+
+    use super::{
+        FilesystemDirectoryIdentity, FilesystemFileIdentity, PublicationIdentityScheme,
+        WindowsModernIdentityComparison, WindowsModernIdentityQueryOutcome,
+        classify_windows_modern_identity_query, compare_windows_modern_identities,
+        linux_identity_projections, windows_identity_projections,
+    };
+
+    const VOLUME: u64 = 0x0102_0304_0506_0708;
+    const INDEX: u64 = 0x1112_1314_1516_1718;
+
+    #[test]
+    fn publication_scheme_wire_values_are_frozen() {
+        assert_eq!(PublicationIdentityScheme::LinuxDevInodeV1.wire_value(), 1);
+        assert_eq!(
+            PublicationIdentityScheme::WindowsModernFileId128V1.wire_value(),
+            2
+        );
+        assert_eq!(
+            PublicationIdentityScheme::WindowsLegacyFileIndexV1.wire_value(),
+            3
+        );
+    }
+
+    #[test]
+    fn linux_directory_and_file_projections_match_the_exact_wire() {
+        let directory = FilesystemDirectoryIdentity {
+            projections: linux_identity_projections(VOLUME, INDEX, 1),
+        };
+        let file = FilesystemFileIdentity {
+            projections: linux_identity_projections(VOLUME, INDEX, 2),
+        };
+        let expected_directory = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13,
+            0x12, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        ];
+        let mut expected_file = expected_directory;
+        expected_file[23] = 2;
+
+        let Some(directory_wire) =
+            directory.publication_identity(PublicationIdentityScheme::LinuxDevInodeV1)
+        else {
+            panic!("Linux directory projection is missing");
+        };
+        let Some(file_wire) = file.publication_identity(PublicationIdentityScheme::LinuxDevInodeV1)
+        else {
+            panic!("Linux file projection is missing");
+        };
+        assert_eq!(directory_wire.wire_bytes(), &expected_directory);
+        assert_eq!(file_wire.wire_bytes(), &expected_file);
+        assert_eq!(
+            directory.publication_identity(PublicationIdentityScheme::WindowsLegacyFileIndexV1),
+            None
+        );
+    }
+
+    #[test]
+    fn windows_legacy_projection_matches_the_exact_wire() {
+        let file = FilesystemFileIdentity {
+            projections: windows_identity_projections(
+                0x0102_0304,
+                INDEX,
+                WindowsModernIdentityQueryOutcome::LegacyOnly,
+                2,
+            )
+            .expect("nonzero legacy identity must project"),
+        };
+        let expected = [
+            0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13,
+            0x12, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
+        ];
+        let Some(wire) =
+            file.publication_identity(PublicationIdentityScheme::WindowsLegacyFileIndexV1)
+        else {
+            panic!("Windows legacy projection is missing");
+        };
+        assert_eq!(wire.wire_bytes(), &expected);
+        assert_eq!(
+            file.publication_identity(PublicationIdentityScheme::WindowsModernFileId128V1),
+            None
+        );
+    }
+
+    #[test]
+    fn windows_modern_capture_is_exact_and_cannot_be_relabelled_legacy() {
+        let modern_identifier = [
+            0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad,
+            0xae, 0xaf,
+        ];
+        let directory = FilesystemDirectoryIdentity {
+            projections: windows_identity_projections(
+                0x0102_0304,
+                INDEX,
+                WindowsModernIdentityQueryOutcome::Available {
+                    volume: VOLUME,
+                    identifier: modern_identifier,
+                },
+                1,
+            )
+            .expect("nonzero modern identity must project"),
+        };
+        let expected_modern = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5,
+            0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf,
+        ];
+        let Some(modern) =
+            directory.publication_identity(PublicationIdentityScheme::WindowsModernFileId128V1)
+        else {
+            panic!("Windows modern projection is missing");
+        };
+        assert_eq!(modern.wire_bytes(), &expected_modern);
+        assert_eq!(
+            directory.publication_identity(PublicationIdentityScheme::WindowsLegacyFileIndexV1),
+            None
+        );
+    }
+
+    #[test]
+    fn zero_modern_identity_is_legacy_only_and_availability_drift_is_unequal() {
+        let legacy_only = FilesystemFileIdentity {
+            projections: windows_identity_projections(
+                7,
+                10,
+                WindowsModernIdentityQueryOutcome::LegacyOnly,
+                2,
+            )
+            .expect("nonzero legacy identity must project"),
+        };
+        let zero_modern = FilesystemFileIdentity {
+            projections: windows_identity_projections(
+                7,
+                10,
+                classify_windows_modern_identity_query(Ok((91, [0; 16])))
+                    .expect("an all-zero successful modern query must classify"),
+                2,
+            )
+            .expect("nonzero legacy identity must project"),
+        };
+        let modern_available = FilesystemFileIdentity {
+            projections: windows_identity_projections(
+                7,
+                10,
+                WindowsModernIdentityQueryOutcome::Available {
+                    volume: 91,
+                    identifier: [0xa5; 16],
+                },
+                2,
+            )
+            .expect("nonzero modern identity must project"),
+        };
+
+        assert_eq!(legacy_only, zero_modern);
+        assert_ne!(legacy_only, modern_available);
+        assert_eq!(
+            zero_modern.publication_identity(PublicationIdentityScheme::WindowsModernFileId128V1),
+            None
+        );
+    }
+
+    #[test]
+    fn modern_query_propagates_errors_and_legacy_path_requires_two_zero_outcomes() {
+        let arbitrary_error = classify_windows_modern_identity_query(Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "synthetic query failure",
+        )))
+        .expect_err("an arbitrary modern-query error must not become legacy-only");
+        assert_eq!(arbitrary_error.kind(), io::ErrorKind::PermissionDenied);
+
+        let legacy_only = WindowsModernIdentityQueryOutcome::LegacyOnly;
+        let modern = WindowsModernIdentityQueryOutcome::Available {
+            volume: 7,
+            identifier: [0x5a; 16],
+        };
+        assert_eq!(
+            compare_windows_modern_identities(legacy_only, legacy_only, true),
+            WindowsModernIdentityComparison::UseLegacy
+        );
+        assert_eq!(
+            compare_windows_modern_identities(legacy_only, modern, true),
+            WindowsModernIdentityComparison::Resolved(false)
+        );
+        let same_identifier_other_volume = WindowsModernIdentityQueryOutcome::Available {
+            volume: 8,
+            identifier: [0x5a; 16],
+        };
+        assert_eq!(
+            compare_windows_modern_identities(modern, same_identifier_other_volume, true),
+            WindowsModernIdentityComparison::Resolved(false)
+        );
+        assert_eq!(
+            compare_windows_modern_identities(modern, same_identifier_other_volume, false),
+            WindowsModernIdentityComparison::Resolved(true)
+        );
+    }
+
+    #[test]
+    fn modern_projection_ignores_zero_legacy_index_and_has_one_scheme() {
+        let modern = WindowsModernIdentityQueryOutcome::Available {
+            volume: 91,
+            identifier: [0xa5; 16],
+        };
+        let first = FilesystemFileIdentity {
+            projections: windows_identity_projections(7, 0, modern, 2)
+                .expect("modern identity must not require a legacy index"),
+        };
+        let second = FilesystemFileIdentity {
+            projections: windows_identity_projections(8, 11, modern, 2)
+                .expect("modern identity must ignore legacy identity fields"),
+        };
+
+        assert_eq!(first, second);
+        assert_eq!(first.cmp(&second), Ordering::Equal);
+        assert_eq!(
+            first.publication_identity(PublicationIdentityScheme::WindowsLegacyFileIndexV1),
+            None
+        );
+        assert_eq!(
+            second.publication_identity(PublicationIdentityScheme::WindowsLegacyFileIndexV1),
+            None
+        );
+    }
+
+    #[test]
+    fn legacy_only_projection_rejects_zero_legacy_index() {
+        assert!(
+            windows_identity_projections(7, 0, WindowsModernIdentityQueryOutcome::LegacyOnly, 2,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn filesystem_and_wire_debug_output_redacts_identity_bytes() {
+        let identity = FilesystemFileIdentity {
+            projections: linux_identity_projections(VOLUME, INDEX, 2),
+        };
+        let Some(wire) = identity.publication_identity(PublicationIdentityScheme::LinuxDevInodeV1)
+        else {
+            panic!("Linux file projection is missing");
+        };
+
+        assert_eq!(
+            format!("{wire:?}"),
+            "PublicationIdentityWire { scheme: LinuxDevInodeV1, bytes: [REDACTED] }"
+        );
+        assert_eq!(
+            format!("{identity:?}"),
+            "FilesystemFileIdentity { identity: \"[REDACTED]\" }"
+        );
+        assert!(!format!("{wire:?}").contains("0102030405060708"));
+    }
 }
 
 /// Obtain the filesystem identity of a non-link directory.
@@ -2667,12 +3182,8 @@ fn linux_directory_identity_from_file(file: &File) -> io::Result<FilesystemDirec
             "source handle is not a directory",
         ));
     }
-    let mut identifier = [0_u8; 16];
-    identifier[..8].copy_from_slice(&metadata.ino().to_le_bytes());
-    identifier[15] = 1;
     Ok(FilesystemDirectoryIdentity {
-        volume: metadata.dev(),
-        identifier,
+        projections: linux_identity_projections(metadata.dev(), metadata.ino(), 1),
     })
 }
 
@@ -3933,12 +4444,8 @@ mod platform {
         _path: &Path,
         metadata: &Metadata,
     ) -> io::Result<super::FilesystemDirectoryIdentity> {
-        let mut identifier = [0_u8; 16];
-        identifier[..8].copy_from_slice(&metadata.ino().to_le_bytes());
-        identifier[15] = 1;
         Ok(super::FilesystemDirectoryIdentity {
-            volume: metadata.dev(),
-            identifier,
+            projections: super::linux_identity_projections(metadata.dev(), metadata.ino(), 1),
         })
     }
 
@@ -3953,12 +4460,8 @@ mod platform {
                 "file identity requires a single-link regular file",
             ));
         }
-        let mut identifier = [0_u8; 16];
-        identifier[..8].copy_from_slice(&metadata.ino().to_le_bytes());
-        identifier[15] = 2;
         Ok(super::FilesystemFileIdentity {
-            volume: metadata.dev(),
-            identifier,
+            projections: super::linux_identity_projections(metadata.dev(), metadata.ino(), 2),
         })
     }
 
@@ -4380,23 +4883,15 @@ mod platform {
                 "directory identity rejected a reparse point",
             ));
         }
-        let modern = file_id_information(file)?;
-        if modern.file_id.identifier.iter().any(|byte| *byte != 0) {
-            return Ok(super::FilesystemDirectoryIdentity {
-                volume: modern.volume_serial_number,
-                identifier: modern.file_id.identifier,
-            });
-        }
+        let modern = modern_identity_query(file)?;
         let file_index = u64::from(legacy.file_index_high) << 32 | u64::from(legacy.file_index_low);
-        if file_index == 0 {
-            return Err(io::Error::other("directory identity is unavailable"));
-        }
-        let mut identifier = [0_u8; 16];
-        identifier[..8].copy_from_slice(&file_index.to_le_bytes());
-        identifier[15] = 1;
         Ok(super::FilesystemDirectoryIdentity {
-            volume: u64::from(legacy.volume_serial_number),
-            identifier,
+            projections: super::windows_identity_projections(
+                legacy.volume_serial_number,
+                file_index,
+                modern,
+                1,
+            )?,
         })
     }
 
@@ -4414,23 +4909,15 @@ mod platform {
                 "file identity requires a non-reparse single-link regular file",
             ));
         }
-        let modern = file_id_information(file)?;
-        if modern.file_id.identifier.iter().any(|byte| *byte != 0) {
-            return Ok(super::FilesystemFileIdentity {
-                volume: modern.volume_serial_number,
-                identifier: modern.file_id.identifier,
-            });
-        }
+        let modern = modern_identity_query(file)?;
         let file_index = u64::from(legacy.file_index_high) << 32 | u64::from(legacy.file_index_low);
-        if file_index == 0 {
-            return Err(io::Error::other("file identity is unavailable"));
-        }
-        let mut identifier = [0_u8; 16];
-        identifier[..8].copy_from_slice(&file_index.to_le_bytes());
-        identifier[15] = 2;
         Ok(super::FilesystemFileIdentity {
-            volume: u64::from(legacy.volume_serial_number),
-            identifier,
+            projections: super::windows_identity_projections(
+                legacy.volume_serial_number,
+                file_index,
+                modern,
+                2,
+            )?,
         })
     }
 
@@ -4486,8 +4973,8 @@ mod platform {
         let current = options.open(path)?;
         let handle_info = handle_information(file)?;
         let current_info = handle_information(&current)?;
-        let handle_id = file_id_information(file)?;
-        let current_id = file_id_information(&current)?;
+        let handle_id = modern_identity_query(file)?;
+        let current_id = modern_identity_query(&current)?;
         Ok(
             handle_info.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
                 && current_info.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
@@ -4513,8 +5000,8 @@ mod platform {
         let current = options.open(path)?;
         let held_legacy = handle_information(file)?;
         let current_legacy = handle_information(&current)?;
-        let held_modern = file_id_information(file)?;
-        let current_modern = file_id_information(&current)?;
+        let held_modern = modern_identity_query(file)?;
+        let current_modern = modern_identity_query(&current)?;
         if held_legacy.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
             || current_legacy.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
             || held_legacy.number_of_links != 1
@@ -4522,44 +5009,27 @@ mod platform {
         {
             return Ok(false);
         }
-        let held_has_modern = held_modern.file_id.identifier.iter().any(|byte| *byte != 0);
-        let current_has_modern = current_modern
-            .file_id
-            .identifier
-            .iter()
-            .any(|byte| *byte != 0);
-        if held_has_modern && current_has_modern {
-            return Ok(held_modern.file_id == current_modern.file_id);
+        match super::compare_windows_modern_identities(held_modern, current_modern, false) {
+            super::WindowsModernIdentityComparison::Resolved(matches) => Ok(matches),
+            super::WindowsModernIdentityComparison::UseLegacy => {
+                let held_index = u64::from(held_legacy.file_index_high) << 32
+                    | u64::from(held_legacy.file_index_low);
+                let current_index = u64::from(current_legacy.file_index_high) << 32
+                    | u64::from(current_legacy.file_index_low);
+                Ok(held_index != 0 && held_index == current_index)
+            }
         }
-        if held_has_modern || current_has_modern {
-            return Ok(false);
-        }
-        let held_index =
-            u64::from(held_legacy.file_index_high) << 32 | u64::from(held_legacy.file_index_low);
-        let current_index = u64::from(current_legacy.file_index_high) << 32
-            | u64::from(current_legacy.file_index_low);
-        Ok(held_index != 0 && held_index == current_index)
     }
 
     fn same_file_identity(
         first_legacy: &ByHandleFileInformation,
         second_legacy: &ByHandleFileInformation,
-        first_modern: &FileIdInfo,
-        second_modern: &FileIdInfo,
+        first_modern: &super::WindowsModernIdentityQueryOutcome,
+        second_modern: &super::WindowsModernIdentityQueryOutcome,
     ) -> bool {
-        let first_has_128_bit_id = first_modern
-            .file_id
-            .identifier
-            .iter()
-            .any(|byte| *byte != 0);
-        let second_has_128_bit_id = second_modern
-            .file_id
-            .identifier
-            .iter()
-            .any(|byte| *byte != 0);
-        match (first_has_128_bit_id, second_has_128_bit_id) {
-            (true, true) => first_modern == second_modern,
-            (false, false) => {
+        match super::compare_windows_modern_identities(*first_modern, *second_modern, true) {
+            super::WindowsModernIdentityComparison::Resolved(matches) => matches,
+            super::WindowsModernIdentityComparison::UseLegacy => {
                 let first_index = u64::from(first_legacy.file_index_high) << 32
                     | u64::from(first_legacy.file_index_low);
                 let second_index = u64::from(second_legacy.file_index_high) << 32
@@ -4568,7 +5038,6 @@ mod platform {
                     && first_legacy.volume_serial_number == second_legacy.volume_serial_number
                     && first_index == second_index
             }
-            (true, false) | (false, true) => false,
         }
     }
 
@@ -4738,6 +5207,13 @@ mod platform {
         }
     }
 
+    fn modern_identity_query(file: &File) -> io::Result<super::WindowsModernIdentityQueryOutcome> {
+        super::classify_windows_modern_identity_query(
+            file_id_information(file)
+                .map(|identity| (identity.volume_serial_number, identity.file_id.identifier)),
+        )
+    }
+
     fn verify_handle_has_no_alternate_data_streams(
         file: &File,
         object_kind: super::WindowsStreamObjectKind,
@@ -4790,9 +5266,9 @@ mod platform {
     mod tests {
         use std::path::Path;
 
-        use super::{
-            ByHandleFileInformation, FileId128, FileIdInfo, FileTime, extended_path,
-            same_file_identity,
+        use super::{ByHandleFileInformation, FileTime, extended_path, same_file_identity};
+        use crate::atomic::{
+            WindowsModernIdentityQueryOutcome, classify_windows_modern_identity_query,
         };
 
         #[test]
@@ -4855,11 +5331,12 @@ mod platform {
             ));
         }
 
-        fn modern(volume_serial_number: u64, identifier: [u8; 16]) -> FileIdInfo {
-            FileIdInfo {
-                volume_serial_number,
-                file_id: FileId128 { identifier },
-            }
+        fn modern(
+            volume_serial_number: u64,
+            identifier: [u8; 16],
+        ) -> WindowsModernIdentityQueryOutcome {
+            classify_windows_modern_identity_query(Ok((volume_serial_number, identifier)))
+                .expect("synthetic successful query must classify")
         }
 
         fn legacy(volume_serial_number: u32, file_index: u64) -> ByHandleFileInformation {
