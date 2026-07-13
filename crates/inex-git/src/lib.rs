@@ -14,7 +14,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::fs::{self, File, Metadata, OpenOptions};
+#[cfg(any(test, windows))]
+use std::fs::OpenOptions;
+use std::fs::{self, File, Metadata};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -141,6 +143,51 @@ enum V5CleanupState {
     CleanupEmptyR,
     ReceiptOnly,
     Clean,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum V5WriterCheckpoint {
+    CandidatePrepared,
+    PublishPrepared,
+    MarkerAcquired,
+    JournalPublished,
+    WorktreeMutation { completed: u8, total: u8 },
+    CandidatePublishedToLock,
+    LiveIndexPublished,
+    CleanupAdvanced(V5CleanupState),
+}
+
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "context is consumed by private test-only writer hooks"
+    )
+)]
+struct V5WriterContext<'a> {
+    vault: &'a Vault,
+    git: &'a Git,
+    guard: &'a VaultMutationGuard,
+}
+
+trait V5WriterHooks {
+    fn checkpoint(
+        &mut self,
+        checkpoint: V5WriterCheckpoint,
+        context: &V5WriterContext<'_>,
+    ) -> Result<(), GitError>;
+}
+
+struct ProductionV5WriterHooks;
+
+impl V5WriterHooks for ProductionV5WriterHooks {
+    fn checkpoint(
+        &mut self,
+        _checkpoint: V5WriterCheckpoint,
+        _context: &V5WriterContext<'_>,
+    ) -> Result<(), GitError> {
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -1598,12 +1645,24 @@ fn advance_v5_cleanup_to_clean(
     git: &Git,
     guard: &VaultMutationGuard,
 ) -> Result<(), GitError> {
+    let mut hooks = ProductionV5WriterHooks;
+    advance_v5_cleanup_to_clean_with_hooks(vault, git, guard, &mut hooks)
+}
+
+fn advance_v5_cleanup_to_clean_with_hooks<H: V5WriterHooks>(
+    vault: &Vault,
+    git: &Git,
+    guard: &VaultMutationGuard,
+    hooks: &mut H,
+) -> Result<(), GitError> {
     let mut state = inspect_held_v5_cleanup_state(vault.root())?;
+    let context = V5WriterContext { vault, git, guard };
     for _ in 0..6 {
         if state.kind() == V5CleanupState::Clean {
             return Ok(());
         }
         state = advance_v5_cleanup_one(vault, git, guard, state)?;
+        hooks.checkpoint(V5WriterCheckpoint::CleanupAdvanced(state.kind()), &context)?;
     }
     if state.kind() == V5CleanupState::Clean {
         Ok(())
@@ -1729,11 +1788,22 @@ fn advance_v5_to_durable_journal(
     git: &Git,
     guard: &VaultMutationGuard,
 ) -> Result<V5PreJournalState, GitError> {
+    let mut hooks = ProductionV5WriterHooks;
+    advance_v5_to_durable_journal_with_hooks(vault, git, guard, &mut hooks)
+}
+
+fn advance_v5_to_durable_journal_with_hooks<H: V5WriterHooks>(
+    vault: &Vault,
+    git: &Git,
+    guard: &VaultMutationGuard,
+    hooks: &mut H,
+) -> Result<V5PreJournalState, GitError> {
     if vault.root() != git.root || !guard.is_for_root(vault.root()) {
         return Err(GitError::RecoveryConflict);
     }
     let mut state = read_v5_prejournal_state_from_disk(guard, vault.root())?
         .ok_or(GitError::RecoveryConflict)?;
+    let context = V5WriterContext { vault, git, guard };
     for _ in 0..3 {
         let expected = match state {
             V5PreJournalState::StableOnly => {
@@ -1743,6 +1813,7 @@ fn advance_v5_to_durable_journal(
                 candidate_bundle_v5::prepare_candidate_publish_staging_v5(
                     guard, git, &reference, &inventory,
                 )?;
+                hooks.checkpoint(V5WriterCheckpoint::PublishPrepared, &context)?;
                 V5PreJournalState::PublishReady
             }
             V5PreJournalState::PublishReady => {
@@ -1762,6 +1833,7 @@ fn advance_v5_to_durable_journal(
                     &loaded.inventory,
                     &loaded.staging,
                 )?;
+                hooks.checkpoint(V5WriterCheckpoint::MarkerAcquired, &context)?;
                 V5PreJournalState::MarkerNoJournal
             }
             V5PreJournalState::MarkerNoJournal => {
@@ -1775,7 +1847,7 @@ fn advance_v5_to_durable_journal(
                     &loaded.inventory,
                     &loaded.staging,
                 )?;
-                let mut hooks = ProductionDurableJournalHooksV5;
+                let mut journal_hooks = ProductionDurableJournalHooksV5;
                 publish_durable_journal_v5_with_hooks(
                     vault,
                     git,
@@ -1784,8 +1856,9 @@ fn advance_v5_to_durable_journal(
                     &loaded.inventory,
                     &loaded.staging,
                     &marker,
-                    &mut hooks,
+                    &mut journal_hooks,
                 )?;
+                hooks.checkpoint(V5WriterCheckpoint::JournalPublished, &context)?;
                 V5PreJournalState::JournalReady
             }
             V5PreJournalState::JournalReady => return Ok(state),
@@ -1813,6 +1886,56 @@ fn advance_v5_to_durable_journal(
     } else {
         Err(GitError::RecoveryConflict)
     }
+}
+
+fn commit_payload_v5(
+    vault: &Vault,
+    git: &Git,
+    guard: &VaultMutationGuard,
+    payload: MergeJournalPayload,
+) -> Result<(), GitError> {
+    let mut hooks = ProductionV5WriterHooks;
+    commit_payload_v5_with_hooks(vault, git, guard, payload, &mut hooks)
+}
+
+fn commit_payload_v5_with_hooks<H: V5WriterHooks>(
+    vault: &Vault,
+    git: &Git,
+    guard: &VaultMutationGuard,
+    payload: MergeJournalPayload,
+    hooks: &mut H,
+) -> Result<(), GitError> {
+    if vault.root() != git.root || !guard.is_for_root(vault.root()) {
+        return Err(GitError::RecoveryConflict);
+    }
+    drop(candidate_bundle_v5::prepare_candidate_bundle_v5(
+        guard, git, &payload,
+    )?);
+    if read_v5_prejournal_state_from_disk(guard, vault.root())?
+        != Some(V5PreJournalState::StableOnly)
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    let context = V5WriterContext { vault, git, guard };
+    hooks.checkpoint(V5WriterCheckpoint::CandidatePrepared, &context)?;
+    if advance_v5_to_durable_journal_with_hooks(vault, git, guard, hooks)?
+        != V5PreJournalState::JournalReady
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    let completed = recover_bundle_v5_pending_with_hooks(vault, git, guard, hooks)?;
+    if !matches!(
+        completed,
+        V5PostJournalState::ExactFinal | V5PostJournalState::LaterUnrelated
+    ) {
+        return Err(GitError::RecoveryConflict);
+    }
+    advance_v5_cleanup_to_clean_with_hooks(vault, git, guard, hooks)?;
+    if inspect_held_v5_cleanup_state(vault.root())?.kind() != V5CleanupState::Clean {
+        return Err(GitError::RecoveryConflict);
+    }
+    drop(payload);
+    Ok(())
 }
 
 /// Inspect whether a structurally valid encrypted merge transaction is pending.
@@ -2255,6 +2378,7 @@ enum PendingMergeJournal {
     BundleV5(BundleMergeJournalV5),
 }
 
+#[cfg(test)]
 struct PreparedIndexCas {
     root: PathBuf,
     prelock: PreLockReservation,
@@ -2269,6 +2393,7 @@ struct PreparedIndexCas {
     armed: bool,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum PreLockOwnershipPhase {
     Reservation,
@@ -2278,6 +2403,7 @@ enum PreLockOwnershipPhase {
     MarkerStaging,
 }
 
+#[cfg(test)]
 struct PreLockReservationGuard {
     root: PathBuf,
     reservation: PreLockReservation,
@@ -2285,6 +2411,7 @@ struct PreLockReservationGuard {
     armed: bool,
 }
 
+#[cfg(test)]
 impl PreLockReservationGuard {
     fn new(root: PathBuf, reservation: PreLockReservation) -> Self {
         Self {
@@ -2316,6 +2443,7 @@ impl PreLockReservationGuard {
     }
 }
 
+#[cfg(test)]
 impl Drop for PreLockReservationGuard {
     fn drop(&mut self) {
         if !self.armed {
@@ -2325,6 +2453,7 @@ impl Drop for PreLockReservationGuard {
     }
 }
 
+#[cfg(test)]
 impl PreparedIndexCas {
     fn journal(&self, transaction: MergeJournalPayload) -> CasMergeJournal {
         CasMergeJournal {
@@ -2346,6 +2475,7 @@ impl PreparedIndexCas {
     }
 }
 
+#[cfg(test)]
 impl Drop for PreparedIndexCas {
     fn drop(&mut self) {
         if !self.armed {
@@ -5048,6 +5178,7 @@ fn verify_candidate_index(
     Ok(())
 }
 
+#[cfg(test)]
 fn create_private_file(path: &Path, bytes: &[u8]) -> Result<File, GitError> {
     let mut file = OpenOptions::new()
         .read(true)
@@ -5197,6 +5328,7 @@ fn read_candidate_receipt(
     Ok(Some(receipt))
 }
 
+#[cfg(test)]
 fn install_candidate_receipt(
     root: &Path,
     receipt: &CandidateOwnershipReceipt,
@@ -5235,6 +5367,7 @@ fn remove_candidate_receipt_exact(
     Ok(())
 }
 
+#[cfg(test)]
 fn install_prelock_reservation(
     root: &Path,
     reservation: &PreLockReservation,
@@ -5646,6 +5779,7 @@ fn clean_verified_prelock_owned_files(
     Ok(())
 }
 
+#[cfg(test)]
 fn index_lock_may_belong_to_prelock(
     root: &Path,
     reservation: &PreLockReservation,
@@ -5674,6 +5808,7 @@ fn index_lock_may_belong_to_prelock(
     Ok(parsed.lock_token == reservation.lock_token)
 }
 
+#[cfg(test)]
 fn abort_owned_prelock_reservation(
     root: &Path,
     reservation: &PreLockReservation,
@@ -5786,6 +5921,7 @@ fn recover_prelock_without_index_lock(
     remove_prelock_reservation_exact(root, reservation)
 }
 
+#[cfg(test)]
 fn prepare_index_cas(
     git: &Git,
     transaction: &MergeJournalPayload,
@@ -5793,6 +5929,7 @@ fn prepare_index_cas(
     prepare_index_cas_with_hook(git, transaction, || Ok(()))
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_lines)] // Keep candidate preparation and real-lock acquisition adjacent.
 fn prepare_index_cas_with_hook<F>(
     git: &Git,
@@ -5927,6 +6064,7 @@ where
     Ok(prepared)
 }
 
+#[cfg(test)]
 fn write_cas_journal(
     root: &Path,
     prepared: &mut PreparedIndexCas,
@@ -6521,10 +6659,10 @@ fn commit_result(
         .join(conflict.logical_path.to_ciphertext_relative_path());
     let expected = expected_worktree_digest(prepared).ok_or(GitError::UnsupportedConflictEntry)?;
     let current_target = guard.inspect(&target).map_err(map_atomic_error)?;
-    let condition = match current_target {
-        CurrentTarget::File(actual) if actual == expected => WriteCondition::IfMatch(expected),
+    match current_target {
+        CurrentTarget::File(actual) if actual == expected => {}
         _ => return Err(GitError::WorktreeChanged),
-    };
+    }
     let result_digest = digest(&prepared.encrypted.bytes);
     let journal = MergeJournal {
         version: 1,
@@ -6535,58 +6673,8 @@ fn commit_result(
         result_oid: prepared.result_oid.clone(),
         result_sha256: hex_digest(result_digest),
     };
-    let transaction = MergeJournalPayload::InPlace(journal.clone());
-    let mut prepared_index = prepare_index_cas(git, &transaction)?;
-    if git.unmerged_entries()?.get(&conflict.physical_path) != Some(conflict)
-        || git.stage_zero(&conflict.physical_path)?.is_some()
-    {
-        return Err(GitError::IndexChanged);
-    }
-    verify_merge_identity_owners(
-        vault,
-        git,
-        &guard,
-        &prepared.file_id,
-        None,
-        &[&conflict.physical_path],
-    )?;
-    git.verify_attributes_for_path(&conflict.physical_path)?;
-    let pending = write_cas_journal(vault.root(), &mut prepared_index, transaction)?;
-
-    let outcome = guard
-        .write(&target, &prepared.encrypted.bytes, condition)
-        .map_err(map_atomic_error)?;
-    if outcome.parent_sync != ParentSyncStatus::Synced {
-        return Err(GitError::DurabilityNotConfirmed);
-    }
-    if git.unmerged_entries()?.get(&conflict.physical_path) != Some(conflict)
-        || git.stage_zero(&conflict.physical_path)?.is_some()
-    {
-        return Err(GitError::IndexChanged);
-    }
-    verify_merge_identity_owners(
-        vault,
-        git,
-        &guard,
-        &prepared.file_id,
-        None,
-        &[&conflict.physical_path],
-    )?;
-    git.update_index(
-        &conflict.physical_path,
-        &journal.result_mode,
-        &prepared.result_oid,
-    )?;
-    verify_merge_identity_owners(
-        vault,
-        git,
-        &guard,
-        &prepared.file_id,
-        Some(&conflict.physical_path),
-        &[&conflict.physical_path],
-    )?;
-    verify_committed_state(git, &guard, &target, &journal, result_digest)?;
-    remove_journal(vault.root(), &pending)
+    let payload = MergeJournalPayload::InPlace(journal);
+    commit_payload_v5(vault, git, &guard, payload)
 }
 
 #[allow(clippy::too_many_lines)] // Keep the ordered crash transaction visible in one state machine.
@@ -6687,69 +6775,8 @@ fn commit_detected_rename_result(
         result_oid: prepared.result_oid.clone(),
         result_sha256: hex_digest(result_digest),
     };
-    let transaction = MergeJournalPayload::DetectedRename(journal.clone());
-    let mut prepared_index = prepare_index_cas(git, &transaction)?;
-    if !detected_index_is_original(git, conflict, &source_physical_path)? {
-        return Err(GitError::IndexChanged);
-    }
-    verify_merge_identity_owners(
-        vault,
-        git,
-        &guard,
-        &prepared.file_id,
-        None,
-        &[&source_physical_path, &conflict.physical_path],
-    )?;
-    verify_active_rename_provenance(git, provenance)?;
-    git.verify_attributes_for_paths(&[&source_physical_path, &conflict.physical_path])?;
-    let pending = write_cas_journal(vault.root(), &mut prepared_index, transaction)?;
-
-    let outcome = guard
-        .write(
-            &destination_target,
-            &prepared.encrypted.bytes,
-            WriteCondition::IfMatch(expected_destination_digest),
-        )
-        .map_err(map_atomic_error)?;
-    if outcome.parent_sync != ParentSyncStatus::Synced {
-        return Err(GitError::DurabilityNotConfirmed);
-    }
-    if guard.inspect(&source_target).map_err(map_atomic_error)? != CurrentTarget::Absent {
-        return Err(GitError::WorktreeChanged);
-    }
-    sync_directory(
-        source_target
-            .parent()
-            .ok_or(GitError::DurabilityNotConfirmed)?,
-    )
-    .map_err(|_| GitError::DurabilityNotConfirmed)?;
-    if !detected_index_is_original(git, conflict, &source_physical_path)? {
-        return Err(GitError::IndexChanged);
-    }
-    verify_merge_identity_owners(
-        vault,
-        git,
-        &guard,
-        &prepared.file_id,
-        None,
-        &[&source_physical_path, &conflict.physical_path],
-    )?;
-    verify_active_rename_provenance(git, provenance)?;
-    git.update_index(
-        &conflict.physical_path,
-        &journal.result_mode,
-        &journal.result_oid,
-    )?;
-    verify_detected_rename_committed_state(
-        vault,
-        git,
-        &guard,
-        &source_target,
-        &destination_target,
-        &journal,
-        result_digest,
-    )?;
-    remove_journal(vault.root(), &pending)
+    let payload = MergeJournalPayload::DetectedRename(journal);
+    commit_payload_v5(vault, git, &guard, payload)
 }
 
 fn detected_index_is_original(
@@ -6869,77 +6896,8 @@ fn commit_split_rename_result(
         result_oid: prepared.result_oid.clone(),
         result_sha256: hex_digest(result_digest),
     };
-    let transaction = MergeJournalPayload::Rename(journal.clone());
-    let mut prepared_index = prepare_index_cas(git, &transaction)?;
-    if !split_index_is_original(git, source, destination)? {
-        return Err(GitError::IndexChanged);
-    }
-    verify_merge_identity_owners(
-        vault,
-        git,
-        &guard,
-        &prepared.file_id,
-        Some(&destination.physical_path),
-        &[&source.physical_path, &destination.physical_path],
-    )?;
-    verify_active_rename_provenance(git, provenance)?;
-    git.verify_attributes_for_paths(&[&source.physical_path, &destination.physical_path])?;
-    let pending = write_cas_journal(vault.root(), &mut prepared_index, transaction)?;
-
-    let destination_outcome = guard
-        .write(
-            &destination_target,
-            &prepared.encrypted.bytes,
-            WriteCondition::IfMatch(expected_destination_digest),
-        )
-        .map_err(map_atomic_error)?;
-    if destination_outcome.parent_sync != ParentSyncStatus::Synced {
-        return Err(GitError::DurabilityNotConfirmed);
-    }
-    match source_state {
-        CurrentTarget::File(expected) => {
-            let outcome = guard
-                .delete(&source_target, WriteCondition::IfMatch(expected))
-                .map_err(map_atomic_error)?;
-            if outcome.parent_sync != ParentSyncStatus::Synced {
-                return Err(GitError::DurabilityNotConfirmed);
-            }
-        }
-        CurrentTarget::Absent => {
-            let parent = source_target.parent().ok_or(GitError::RecoveryConflict)?;
-            sync_directory(parent).map_err(|_| GitError::DurabilityNotConfirmed)?;
-        }
-        CurrentTarget::Other => return Err(GitError::WorktreeChanged),
-    }
-
-    if !split_index_is_original(git, source, destination)? {
-        return Err(GitError::IndexChanged);
-    }
-    verify_merge_identity_owners(
-        vault,
-        git,
-        &guard,
-        &prepared.file_id,
-        Some(&destination.physical_path),
-        &[&source.physical_path, &destination.physical_path],
-    )?;
-    verify_active_rename_provenance(git, provenance)?;
-    git.update_index_rename(
-        &source.physical_path,
-        &destination.physical_path,
-        &journal.result_mode,
-        &journal.result_oid,
-    )?;
-    verify_split_rename_committed_state(
-        vault,
-        git,
-        &guard,
-        &source_target,
-        &destination_target,
-        &journal,
-        result_digest,
-    )?;
-    remove_journal(vault.root(), &pending)
+    let payload = MergeJournalPayload::Rename(journal);
+    commit_payload_v5(vault, git, &guard, payload)
 }
 
 fn split_index_is_original(
@@ -7086,11 +7044,22 @@ fn recover_bundle_v5_pending(
     git: &Git,
     guard: &VaultMutationGuard,
 ) -> Result<V5PostJournalState, GitError> {
+    let mut hooks = ProductionV5WriterHooks;
+    recover_bundle_v5_pending_with_hooks(vault, git, guard, &mut hooks)
+}
+
+fn recover_bundle_v5_pending_with_hooks<H: V5WriterHooks>(
+    vault: &Vault,
+    git: &Git,
+    guard: &VaultMutationGuard,
+    hooks: &mut H,
+) -> Result<V5PostJournalState, GitError> {
     if vault.root() != git.root || !guard.is_for_root(vault.root()) {
         return Err(GitError::RecoveryConflict);
     }
     let reference = load_v5_reference_from_disk(vault.root())?;
     let held_journal = load_held_bundle_journal_v5(vault.root(), &reference)?;
+    let context = V5WriterContext { vault, git, guard };
     let mut state =
         inspect_v5_postjournal_state(guard, vault.root())?.ok_or(GitError::RecoveryConflict)?;
     for _ in 0..3 {
@@ -7098,7 +7067,9 @@ fn recover_bundle_v5_pending(
             V5PostJournalState::JournalReady => {
                 let payload = v5_payload_from_reference(vault.root(), &reference)?;
                 revalidate_held_bundle_journal_v5(vault.root(), &held_journal)?;
-                prepare_payload_worktree_for_v5_index(vault, git, guard, &payload)?;
+                prepare_payload_worktree_for_v5_index_with_hooks(
+                    vault, git, guard, &payload, hooks,
+                )?;
                 revalidate_held_bundle_journal_v5(vault.root(), &held_journal)?;
                 let loaded = candidate_bundle_v5::load_candidate_publish_staging_with_journal_v5(
                     guard, git, &reference,
@@ -7125,6 +7096,7 @@ fn recover_bundle_v5_pending(
                         revalidate_held_bundle_journal_v5(vault.root(), &held_journal)
                     },
                 )?;
+                hooks.checkpoint(V5WriterCheckpoint::CandidatePublishedToLock, &context)?;
                 revalidate_held_bundle_journal_v5(vault.root(), &held_journal)?;
                 V5PostJournalState::CandidateInLock
             }
@@ -7147,6 +7119,7 @@ fn recover_bundle_v5_pending(
                         revalidate_held_bundle_journal_v5(vault.root(), &held_journal)
                     },
                 )?;
+                hooks.checkpoint(V5WriterCheckpoint::LiveIndexPublished, &context)?;
                 revalidate_held_bundle_journal_v5(vault.root(), &held_journal)?;
                 V5PostJournalState::ExactFinal
             }
@@ -8361,6 +8334,7 @@ fn advance_detected_rename_worktree_v5(
     Ok(())
 }
 
+#[cfg(test)]
 fn advance_split_rename_worktree_v5(
     root: &Path,
     guard: &VaultMutationGuard,
@@ -8390,6 +8364,41 @@ fn advance_split_rename_worktree_v5(
     )
 }
 
+fn advance_split_rename_worktree_v5_with_hook<F>(
+    root: &Path,
+    guard: &VaultMutationGuard,
+    authenticated: &AuthenticatedRenameRecovery,
+    after_destination: F,
+) -> Result<(), GitError>
+where
+    F: FnOnce() -> Result<(), GitError>,
+{
+    let source = root.join(
+        authenticated
+            .source
+            .logical_path
+            .to_ciphertext_relative_path(),
+    );
+    let destination = root.join(
+        authenticated
+            .destination
+            .logical_path
+            .to_ciphertext_relative_path(),
+    );
+    let source_state = guard.inspect(&source).map_err(map_atomic_error)?;
+    let destination_state = guard.inspect(&destination).map_err(map_atomic_error)?;
+    advance_split_rename_worktree_with_hook(
+        guard,
+        &source,
+        &destination,
+        source_state,
+        destination_state,
+        authenticated,
+        after_destination,
+    )
+}
+
+#[cfg(test)]
 fn advance_authenticated_worktree_v5(
     vault: &Vault,
     guard: &VaultMutationGuard,
@@ -8409,6 +8418,58 @@ fn advance_authenticated_worktree_v5(
     verify_authenticated_worktree_final_v5(vault, guard, payload)
 }
 
+fn advance_authenticated_worktree_v5_with_hooks<H: V5WriterHooks>(
+    vault: &Vault,
+    git: &Git,
+    guard: &VaultMutationGuard,
+    payload: &AuthenticatedMergePayloadV5<'_>,
+    hooks: &mut H,
+) -> Result<(), GitError> {
+    let context = V5WriterContext { vault, git, guard };
+    match payload {
+        AuthenticatedMergePayloadV5::InPlace { authenticated, .. } => {
+            advance_in_place_worktree_v5(vault.root(), guard, authenticated)?;
+            hooks.checkpoint(
+                V5WriterCheckpoint::WorktreeMutation {
+                    completed: 1,
+                    total: 1,
+                },
+                &context,
+            )?;
+        }
+        AuthenticatedMergePayloadV5::DetectedRename { authenticated, .. } => {
+            advance_detected_rename_worktree_v5(vault.root(), guard, authenticated)?;
+            hooks.checkpoint(
+                V5WriterCheckpoint::WorktreeMutation {
+                    completed: 1,
+                    total: 1,
+                },
+                &context,
+            )?;
+        }
+        AuthenticatedMergePayloadV5::SplitRename { authenticated, .. } => {
+            advance_split_rename_worktree_v5_with_hook(vault.root(), guard, authenticated, || {
+                hooks.checkpoint(
+                    V5WriterCheckpoint::WorktreeMutation {
+                        completed: 1,
+                        total: 2,
+                    },
+                    &context,
+                )
+            })?;
+            hooks.checkpoint(
+                V5WriterCheckpoint::WorktreeMutation {
+                    completed: 2,
+                    total: 2,
+                },
+                &context,
+            )?;
+        }
+    }
+    verify_authenticated_worktree_final_v5(vault, guard, payload)
+}
+
+#[cfg(test)]
 fn prepare_payload_worktree_for_v5_index(
     vault: &Vault,
     git: &Git,
@@ -8418,6 +8479,20 @@ fn prepare_payload_worktree_for_v5_index(
     let authenticated = authenticate_merge_payload_v5(vault, git, payload)?;
     verify_authenticated_payload_old_index_v5(vault, git, guard, &authenticated)?;
     advance_authenticated_worktree_v5(vault, guard, &authenticated)?;
+    verify_authenticated_payload_old_index_v5(vault, git, guard, &authenticated)?;
+    verify_authenticated_worktree_final_v5(vault, guard, &authenticated)
+}
+
+fn prepare_payload_worktree_for_v5_index_with_hooks<H: V5WriterHooks>(
+    vault: &Vault,
+    git: &Git,
+    guard: &VaultMutationGuard,
+    payload: &MergeJournalPayload,
+    hooks: &mut H,
+) -> Result<(), GitError> {
+    let authenticated = authenticate_merge_payload_v5(vault, git, payload)?;
+    verify_authenticated_payload_old_index_v5(vault, git, guard, &authenticated)?;
+    advance_authenticated_worktree_v5_with_hooks(vault, git, guard, &authenticated, hooks)?;
     verify_authenticated_payload_old_index_v5(vault, git, guard, &authenticated)?;
     verify_authenticated_worktree_final_v5(vault, guard, &authenticated)
 }
@@ -8807,6 +8882,30 @@ fn advance_split_rename_worktree(
     destination_state: CurrentTarget,
     authenticated: &AuthenticatedRenameRecovery,
 ) -> Result<(), GitError> {
+    advance_split_rename_worktree_with_hook(
+        guard,
+        source_target,
+        destination_target,
+        source_state,
+        destination_state,
+        authenticated,
+        || Ok(()),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn advance_split_rename_worktree_with_hook<F>(
+    guard: &VaultMutationGuard,
+    source_target: &Path,
+    destination_target: &Path,
+    source_state: CurrentTarget,
+    destination_state: CurrentTarget,
+    authenticated: &AuthenticatedRenameRecovery,
+    after_destination: F,
+) -> Result<(), GitError>
+where
+    F: FnOnce() -> Result<(), GitError>,
+{
     match destination_state {
         CurrentTarget::File(actual) if actual == authenticated.expected_destination_digest => {
             if source_state != authenticated.expected_source_state {
@@ -8833,6 +8932,7 @@ fn advance_split_rename_worktree(
             return Err(GitError::RecoveryConflict);
         }
     }
+    after_destination()?;
     match guard.inspect(source_target).map_err(map_atomic_error)? {
         CurrentTarget::File(actual)
             if authenticated.expected_source_state == CurrentTarget::File(actual) =>
@@ -9093,6 +9193,7 @@ fn journal_path(root: &Path) -> PathBuf {
     root.join(VAULT_LOCAL_DIRECTORY).join(JOURNAL_FILE)
 }
 
+#[cfg(test)]
 fn journal_staging_path(root: &Path, journal: &PendingMergeJournal) -> PathBuf {
     let suffix = match journal {
         PendingMergeJournal::Cas(journal) => journal.lock_token.clone(),
@@ -9113,6 +9214,7 @@ fn ensure_no_journal(root: &Path) -> Result<(), GitError> {
     }
 }
 
+#[cfg(test)]
 fn write_journal(root: &Path, journal: &PendingMergeJournal) -> Result<(), GitError> {
     ensure_no_journal(root)?;
     let local = root.join(VAULT_LOCAL_DIRECTORY);
@@ -11729,6 +11831,7 @@ mod tests {
         git: Git,
         destination_path: LogicalPath,
         conflict: ConflictEntry,
+        stage_paths: [Option<LogicalPath>; 3],
         prepared: PreparedResult,
         source_target: PathBuf,
         destination_target: PathBuf,
@@ -11878,6 +11981,7 @@ mod tests {
             git,
             destination_path,
             conflict,
+            stage_paths,
             prepared,
             source_target,
             destination_target,
@@ -11885,6 +11989,181 @@ mod tests {
             expected_destination,
             result_digest,
             journal,
+        }
+    }
+
+    struct InPlaceProductionEntryFixtureV5 {
+        _directory: TestDirectory,
+        vault: Vault,
+        git: Git,
+        conflict: ConflictEntry,
+        prepared: PreparedResult,
+        journal: MergeJournal,
+    }
+
+    fn create_in_place_production_entry_fixture_v5(
+        object_format: GitObjectFormat,
+    ) -> InPlaceProductionEntryFixtureV5 {
+        let (directory, vault) = create_conflicted_repository_with_format(object_format);
+        let git = Git::open(directory.path()).expect("production in-place Git repository opens");
+        let conflict = git
+            .unmerged_entries()
+            .expect("production in-place conflict enumerates")
+            .into_values()
+            .next()
+            .expect("production in-place conflict exists");
+        let identities =
+            tracked_identity_index(&vault, &git).expect("production identities inspect");
+        let prepared = prepare_result(&vault, &git, &conflict, &identities, 1_783_699_204_000)
+            .expect("production in-place result prepares");
+        let expected =
+            expected_worktree_digest(&prepared).expect("production worktree stage exists");
+        let result_digest = digest(&prepared.encrypted.bytes);
+        let journal = MergeJournal {
+            version: 1,
+            physical_path: conflict.physical_path.clone(),
+            result_mode: result_mode(&conflict)
+                .expect("production result mode exists")
+                .to_owned(),
+            stages: conflict.stages.clone(),
+            expected_worktree_sha256: hex_digest(expected),
+            result_oid: prepared.result_oid.clone(),
+            result_sha256: hex_digest(result_digest),
+        };
+        InPlaceProductionEntryFixtureV5 {
+            _directory: directory,
+            vault,
+            git,
+            conflict,
+            prepared,
+            journal,
+        }
+    }
+
+    enum ProductionEntryFixtureV5 {
+        InPlace(InPlaceProductionEntryFixtureV5),
+        DetectedRename(DetectedRenameRecoveryFixture),
+        SplitRename(RenameRecoveryFixture),
+    }
+
+    struct TestV5WriterHooks<F> {
+        checkpoint: F,
+    }
+
+    impl<F> V5WriterHooks for TestV5WriterHooks<F>
+    where
+        F: FnMut(V5WriterCheckpoint, &V5WriterContext<'_>) -> Result<(), GitError>,
+    {
+        fn checkpoint(
+            &mut self,
+            checkpoint: V5WriterCheckpoint,
+            context: &V5WriterContext<'_>,
+        ) -> Result<(), GitError> {
+            (self.checkpoint)(checkpoint, context)
+        }
+    }
+
+    impl ProductionEntryFixtureV5 {
+        fn create(object_format: GitObjectFormat, kind: CandidatePayloadKindV5) -> Self {
+            match kind {
+                CandidatePayloadKindV5::InPlace => {
+                    Self::InPlace(create_in_place_production_entry_fixture_v5(object_format))
+                }
+                CandidatePayloadKindV5::DetectedRename => Self::DetectedRename(
+                    create_detected_rename_recovery_fixture_with_format(object_format),
+                ),
+                CandidatePayloadKindV5::SplitRename => {
+                    Self::SplitRename(create_rename_recovery_fixture_with_format(object_format))
+                }
+            }
+        }
+
+        fn vault(&self) -> &Vault {
+            match self {
+                Self::InPlace(fixture) => &fixture.vault,
+                Self::DetectedRename(fixture) => &fixture.vault,
+                Self::SplitRename(fixture) => &fixture.vault,
+            }
+        }
+
+        fn git(&self) -> &Git {
+            match self {
+                Self::InPlace(fixture) => &fixture.git,
+                Self::DetectedRename(fixture) => &fixture.git,
+                Self::SplitRename(fixture) => &fixture.git,
+            }
+        }
+
+        fn payload(&self) -> MergeJournalPayload {
+            match self {
+                Self::InPlace(fixture) => MergeJournalPayload::InPlace(fixture.journal.clone()),
+                Self::DetectedRename(fixture) => {
+                    MergeJournalPayload::DetectedRename(fixture.journal.clone())
+                }
+                Self::SplitRename(fixture) => MergeJournalPayload::Rename(fixture.journal.clone()),
+            }
+        }
+
+        fn commit(&self) -> Result<(), GitError> {
+            match self {
+                Self::InPlace(fixture) => commit_result(
+                    &fixture.vault,
+                    &fixture.git,
+                    &fixture.conflict,
+                    &fixture.prepared,
+                ),
+                Self::DetectedRename(fixture) => commit_detected_rename_result(
+                    &fixture.vault,
+                    &fixture.git,
+                    &fixture.conflict,
+                    &fixture.stage_paths,
+                    fixture.journal.renamed_side,
+                    &fixture.journal.provenance,
+                    &fixture.prepared,
+                ),
+                Self::SplitRename(fixture) => commit_split_rename_result(
+                    &fixture.vault,
+                    &fixture.git,
+                    &fixture.source,
+                    &fixture.destination,
+                    fixture.journal.renamed_side,
+                    &fixture.journal.provenance,
+                    &fixture.prepared,
+                ),
+            }
+        }
+
+        fn commit_payload_with_hooks<H: V5WriterHooks>(
+            &self,
+            hooks: &mut H,
+        ) -> Result<(), GitError> {
+            let guard =
+                VaultMutationGuard::acquire(self.vault().root()).map_err(map_atomic_error)?;
+            commit_payload_v5_with_hooks(self.vault(), self.git(), &guard, self.payload(), hooks)
+        }
+
+        fn assert_clean_completed(&self) {
+            let root = self.vault().root();
+            assert_eq!(
+                inspect_held_v5_cleanup_state(root)
+                    .expect("production cleanup state inspects")
+                    .kind(),
+                V5CleanupState::Clean
+            );
+            assert!(
+                read_journal(root)
+                    .expect("production journal absence reads")
+                    .is_none()
+            );
+            assert!(
+                exact_reserved_private_names(root)
+                    .expect("production private namespace inspects")
+                    .is_empty()
+            );
+            let guard = VaultMutationGuard::acquire(root)
+                .expect("production final verification guard acquires");
+            verify_payload_completed_v5(self.vault(), self.git(), &guard, &self.payload())
+                .expect("production payload is complete");
         }
     }
 
@@ -17438,6 +17717,231 @@ mod tests {
             .expect("foreign receipt clone remains preserved"),
             journal.bytes
         );
+    }
+
+    fn assert_production_writer_has_only_v5_durable_state(vault: &Vault, git: &Git) {
+        let root = vault.root();
+        let Some(PendingMergeJournal::BundleV5(journal)) =
+            read_journal(root).expect("production durable journal reads")
+        else {
+            panic!("production writer must publish only a v5 journal");
+        };
+        assert_eq!(journal.reference.object_format, git.object_format);
+        let namespace = candidate_bundle_v5::inspect_candidate_bundle_namespace_v5(root)
+            .expect("production v5 namespace inspects");
+        assert_eq!(
+            namespace.stable_bundle_basename.as_deref(),
+            Some(journal.reference.bundle_basename.as_str())
+        );
+        assert_eq!(
+            namespace.publish_staging_basename.as_deref(),
+            Some(journal.reference.publish_staging_basename.as_str())
+        );
+        assert!(namespace.cleanup_bundle_basename.is_none());
+        assert!(namespace.cleanup_receipt_basename.is_none());
+        assert!(
+            read_prelock_reservation(root)
+                .expect("legacy prelock absence inspects")
+                .is_none()
+        );
+        assert_eq!(
+            exact_reserved_private_names(root).expect("reserved private names inspect"),
+            BTreeSet::from([
+                JOURNAL_FILE.to_owned(),
+                journal.reference.bundle_basename,
+                journal.reference.publish_staging_basename,
+            ])
+        );
+    }
+
+    #[test]
+    fn production_v5_entries_finish_clean_for_all_payloads_and_object_formats() {
+        for object_format in [GitObjectFormat::Sha1, GitObjectFormat::Sha256] {
+            for kind in [
+                CandidatePayloadKindV5::InPlace,
+                CandidatePayloadKindV5::DetectedRename,
+                CandidatePayloadKindV5::SplitRename,
+            ] {
+                let fixture = ProductionEntryFixtureV5::create(object_format, kind);
+                fixture
+                    .commit()
+                    .expect("real production entry completes through v5");
+                fixture.assert_clean_completed();
+            }
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "keep the complete private writer checkpoint contract in one matrix"
+    )]
+    fn v5_writer_hooks_observe_only_v5_and_preserve_later_unrelated() {
+        for object_format in [GitObjectFormat::Sha1, GitObjectFormat::Sha256] {
+            for kind in [
+                CandidatePayloadKindV5::InPlace,
+                CandidatePayloadKindV5::DetectedRename,
+                CandidatePayloadKindV5::SplitRename,
+            ] {
+                let fixture = ProductionEntryFixtureV5::create(object_format, kind);
+                let checkpoints = Rc::new(RefCell::new(Vec::new()));
+                let recorded = Rc::clone(&checkpoints);
+                let mut hooks = TestV5WriterHooks {
+                    checkpoint: move |checkpoint, context: &V5WriterContext<'_>| {
+                        recorded.borrow_mut().push(checkpoint);
+                        match checkpoint {
+                            V5WriterCheckpoint::CandidatePrepared => {
+                                assert_eq!(
+                                    read_v5_prejournal_state_from_disk(
+                                        context.guard,
+                                        context.vault.root(),
+                                    )
+                                    .expect("production stable state inspects"),
+                                    Some(V5PreJournalState::StableOnly)
+                                );
+                                assert!(
+                                    read_journal(context.vault.root())
+                                        .expect("pre-journal absence reads")
+                                        .is_none()
+                                );
+                            }
+                            V5WriterCheckpoint::JournalPublished => {
+                                assert_production_writer_has_only_v5_durable_state(
+                                    context.vault,
+                                    context.git,
+                                );
+                            }
+                            V5WriterCheckpoint::LiveIndexPublished => {
+                                fs::write(
+                                    context.vault.root().join("later-production-unrelated.bin"),
+                                    b"external staged owner after v5 index publication",
+                                )
+                                .expect("later unrelated worktree file writes");
+                                assert!(test_git(
+                                    context.vault.root(),
+                                    ["add", "later-production-unrelated.bin"]
+                                ));
+                                assert_eq!(
+                                    inspect_v5_postjournal_state(
+                                        context.guard,
+                                        context.vault.root(),
+                                    )
+                                    .expect("later unrelated production state inspects"),
+                                    Some(V5PostJournalState::LaterUnrelated)
+                                );
+                            }
+                            V5WriterCheckpoint::PublishPrepared
+                            | V5WriterCheckpoint::MarkerAcquired
+                            | V5WriterCheckpoint::WorktreeMutation { .. }
+                            | V5WriterCheckpoint::CandidatePublishedToLock
+                            | V5WriterCheckpoint::CleanupAdvanced(_) => {}
+                        }
+                        Ok(())
+                    },
+                };
+
+                fixture
+                    .commit_payload_with_hooks(&mut hooks)
+                    .expect("composite writer hook path completes through v5");
+                drop(hooks);
+                let checkpoints = checkpoints.borrow();
+                assert!(checkpoints.contains(&V5WriterCheckpoint::CandidatePrepared));
+                assert!(checkpoints.contains(&V5WriterCheckpoint::PublishPrepared));
+                assert!(checkpoints.contains(&V5WriterCheckpoint::MarkerAcquired));
+                assert!(checkpoints.contains(&V5WriterCheckpoint::JournalPublished));
+                assert!(checkpoints.contains(&V5WriterCheckpoint::CandidatePublishedToLock));
+                assert!(checkpoints.contains(&V5WriterCheckpoint::LiveIndexPublished));
+                assert_eq!(
+                    checkpoints
+                        .iter()
+                        .filter(|checkpoint| matches!(
+                            checkpoint,
+                            V5WriterCheckpoint::CleanupAdvanced(_)
+                        ))
+                        .count(),
+                    6
+                );
+                match kind {
+                    CandidatePayloadKindV5::InPlace | CandidatePayloadKindV5::DetectedRename => {
+                        assert!(checkpoints.contains(&V5WriterCheckpoint::WorktreeMutation {
+                            completed: 1,
+                            total: 1,
+                        }));
+                    }
+                    CandidatePayloadKindV5::SplitRename => {
+                        assert!(checkpoints.contains(&V5WriterCheckpoint::WorktreeMutation {
+                            completed: 1,
+                            total: 2,
+                        }));
+                        assert!(checkpoints.contains(&V5WriterCheckpoint::WorktreeMutation {
+                            completed: 2,
+                            total: 2,
+                        }));
+                    }
+                }
+                drop(checkpoints);
+                fixture.assert_clean_completed();
+                assert!(
+                    index_entry_map(fixture.git())
+                        .expect("later unrelated index map inspects")
+                        .contains_key(&("later-production-unrelated.bin".to_owned(), 0))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn v5_writer_checkpoint_failures_resume_with_fresh_recovery() {
+        for object_format in [GitObjectFormat::Sha1, GitObjectFormat::Sha256] {
+            for kind in [
+                CandidatePayloadKindV5::InPlace,
+                CandidatePayloadKindV5::DetectedRename,
+                CandidatePayloadKindV5::SplitRename,
+            ] {
+                let fixture = ProductionEntryFixtureV5::create(object_format, kind);
+                let checkpoints = Rc::new(RefCell::new(Vec::new()));
+                let recorded = Rc::clone(&checkpoints);
+                let mut hooks = TestV5WriterHooks {
+                    checkpoint: move |checkpoint, context: &V5WriterContext<'_>| {
+                        recorded.borrow_mut().push(checkpoint);
+                        if checkpoint == V5WriterCheckpoint::JournalPublished {
+                            assert_production_writer_has_only_v5_durable_state(
+                                context.vault,
+                                context.git,
+                            );
+                            return Err(GitError::DurabilityNotConfirmed);
+                        }
+                        Ok(())
+                    },
+                };
+
+                assert!(matches!(
+                    fixture.commit_payload_with_hooks(&mut hooks),
+                    Err(GitError::DurabilityNotConfirmed)
+                ));
+                drop(hooks);
+                assert_eq!(
+                    *checkpoints.borrow(),
+                    [
+                        V5WriterCheckpoint::CandidatePrepared,
+                        V5WriterCheckpoint::PublishPrepared,
+                        V5WriterCheckpoint::MarkerAcquired,
+                        V5WriterCheckpoint::JournalPublished,
+                    ],
+                    "{object_format:?} {kind:?}"
+                );
+                assert_eq!(
+                    inspect_test_v5_prejournal_state(fixture.vault().root())
+                        .expect("failed production state reclassifies"),
+                    Some(V5PreJournalState::JournalReady)
+                );
+                assert!(matches!(
+                    recover_pending(fixture.vault(), fixture.git()),
+                    Ok(true)
+                ));
+                fixture.assert_clean_completed();
+            }
+        }
     }
 
     #[test]
