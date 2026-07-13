@@ -3281,14 +3281,16 @@ def validate_artifact_report(report: Dict[str, object]) -> None:
         if any(seal[field] != member[field] for field in ("mode", "size", "sha256")):
             raise QaFailure("artifact report executable differs from its package member")
     if (
-        executable_map["inexd"]["seal"].get("sha256")
+        executable_map["inex"]["seal"].get("sha256")
+        != release_audit.get("sharedCliSha256")
+        or executable_map["inexd"]["seal"].get("sha256")
         != release_audit.get("sharedSidecarSha256")
         or any(
             executable_map["inexd"]["seal"][field] != tree_map["bin/inexd"][field]
             for field in ("mode", "size", "sha256")
         )
     ):
-        raise QaFailure("artifact report sidecar binding is invalid")
+        raise QaFailure("artifact report shared executable binding is invalid")
 
     tools = report.get("tools")
     expected_tool_names = sorted(

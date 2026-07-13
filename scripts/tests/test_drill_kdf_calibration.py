@@ -108,6 +108,7 @@ class KdfCalibrationEvidenceTests(unittest.TestCase):
         cls,
         platform_name: str = "linux-x64",
         *,
+        cli_sha256: str = "f" * 64,
         daemon_sha256: str = "d" * 64,
     ) -> dict[str, object]:
         extension_by_kind = {"rust": "zip", "sublime": "zip", "vscode": "vsix"}
@@ -133,6 +134,7 @@ class KdfCalibrationEvidenceTests(unittest.TestCase):
             "cargoComponentCount": 77,
             "licenseTextCount": 147,
             "sharedLicenseInventorySha256": "c" * 64,
+            "sharedCliSha256": cli_sha256,
             "sharedSidecarSha256": daemon_sha256,
             "notCovered": list(artifact_audit.RELEASE_SET_NOT_COVERED),
             "trustAssumptions": list(artifact_audit.RELEASE_SET_TRUST_ASSUMPTIONS),
@@ -322,6 +324,9 @@ class KdfCalibrationEvidenceTests(unittest.TestCase):
         wrong_binary = json.loads(json.dumps(report))
         wrong_binary["packagedExecutables"][1]["sha256"] = "9" * 64
         mutations.append(wrong_binary)
+        wrong_shared_cli = json.loads(json.dumps(report))
+        wrong_shared_cli["releaseSetAudit"]["sharedCliSha256"] = "9" * 64
+        mutations.append(wrong_shared_cli)
         wrong_runtime = json.loads(json.dumps(report))
         wrong_runtime["runtimeProbes"][0]["runtimeInfo"]["libsodiumMinimal"] = True
         mutations.append(wrong_runtime)
@@ -412,8 +417,12 @@ class KdfCalibrationEvidenceTests(unittest.TestCase):
             artifact_directory.mkdir()
             cli_bytes = b"packaged-cli"
             daemon_bytes = b"packaged-daemon"
+            cli_sha256 = sha256_bytes(cli_bytes)
             daemon_sha256 = sha256_bytes(daemon_bytes)
-            audit = self.release_set_audit(daemon_sha256=daemon_sha256)
+            audit = self.release_set_audit(
+                cli_sha256=cli_sha256,
+                daemon_sha256=daemon_sha256,
+            )
             artifact_hashes = {
                 record["name"]: record["sha256"] for record in audit["artifacts"]
             }
@@ -542,6 +551,10 @@ class KdfCalibrationEvidenceTests(unittest.TestCase):
         self.assertTrue(all(not call["cwd"].exists() for call in calls))
         self.assertEqual([attempt["ordinal"] for attempt in report["attempts"]], [1, 2, 3])
         self.assertEqual([probe["product"] for probe in report["runtimeProbes"]], ["inex", "inexd"])
+        self.assertEqual(
+            report["packagedExecutables"][0]["sha256"],
+            report["releaseSetAudit"]["sharedCliSha256"],
+        )
         self.assertEqual(
             report["packagedExecutables"][1]["sha256"],
             report["releaseSetAudit"]["sharedSidecarSha256"],

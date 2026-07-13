@@ -281,6 +281,7 @@ def _valid_report(scenario: str = "normal") -> dict:
         "cargoComponentCount": 1,
         "licenseTextCount": 1,
         "sharedLicenseInventorySha256": _digest("e"),
+        "sharedCliSha256": _digest("c"),
         "sharedSidecarSha256": _digest("d"),
         "notCovered": [
             "artifact-signing-and-publication",
@@ -1491,6 +1492,9 @@ time.sleep(60)
         def wrong_sidecar_digest(report: dict) -> None:
             report["releaseSetAudit"]["sharedSidecarSha256"] = _digest("0")
 
+        def wrong_cli_digest(report: dict) -> None:
+            report["releaseSetAudit"]["sharedCliSha256"] = _digest("0")
+
         def missing_tool(report: dict) -> None:
             report["tools"].pop()
 
@@ -1548,6 +1552,7 @@ time.sleep(60)
             duplicate_member,
             reverse_members,
             wrong_tree_digest,
+            wrong_cli_digest,
             wrong_sidecar_digest,
             missing_tool,
             wrong_helper_digest,

@@ -886,27 +886,31 @@ def validate_vscode(
         expected_platform=expected_platform,
         expected_version=expected_version,
     )
-    sidecars = [
-        name
-        for name in entries
-        if name.startswith("extension/bin/") and name.rsplit("/", 1)[-1] in {"inexd", "inexd.exe"}
-    ]
-    if len(sidecars) != 1:
-        raise ReleaseError(f"VSIX must contain exactly one target sidecar, found {len(sidecars)}")
-    if sidecars[0].endswith("/inexd") and entries[sidecars[0]][1] & 0o111 == 0:
-        raise ReleaseError("Linux VSIX sidecar is not executable in the archive")
-    runtime = sidecars[0].split("/")[-2]
-    platform = {
+    runtime = {
         "linux-x64": "linux-x64",
         "linux-arm64": "linux-arm64",
-        "win32-x64": "windows-x64",
-        "win32-arm64": "windows-arm64",
-    }.get(runtime)
-    if platform is None:
-        raise ReleaseError("VSIX sidecar has an unsupported runtime directory")
-    if platform != expected_platform:
-        raise ReleaseError("VSIX runtime directory does not match the artifact platform")
-    validate_native_binary(entries[sidecars[0]][0], expected_platform, "VSIX inexd")
+        "windows-x64": "win32-x64",
+        "windows-arm64": "win32-arm64",
+    }.get(expected_platform)
+    if runtime is None:
+        raise ReleaseError("VSIX artifact has an unsupported platform")
+    suffix = ".exe" if expected_platform.startswith("windows-") else ""
+    expected_products = {
+        f"extension/bin/{runtime}/inex{suffix}": "VSIX inex",
+        f"extension/bin/{runtime}/inexd{suffix}": "VSIX inexd",
+    }
+    product_entries = {
+        name
+        for name in entries
+        if name.startswith("extension/bin/")
+        and name.rsplit("/", 1)[-1] in {"inex", "inex.exe", "inexd", "inexd.exe"}
+    }
+    if product_entries != set(expected_products):
+        raise ReleaseError("VSIX must contain exactly one target inex and inexd pair")
+    for executable, label in expected_products.items():
+        if not suffix and entries[executable][1] & 0o111 == 0:
+            raise ReleaseError(f"Linux {label} is not executable in the archive")
+        validate_native_binary(entries[executable][0], expected_platform, label)
     validate_license_inventory(
         entries["extension/THIRD_PARTY_LICENSES.json"][0],
         entries,
@@ -1003,6 +1007,7 @@ def validate_release_set_report(report: dict[str, object]) -> None:
         "cargoComponentCount",
         "licenseTextCount",
         "sharedLicenseInventorySha256",
+        "sharedCliSha256",
         "sharedSidecarSha256",
         "notCovered",
         "trustAssumptions",
@@ -1075,7 +1080,11 @@ def validate_release_set_report(report: dict[str, object]) -> None:
         value = report.get(field)
         if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
             raise ReleaseError("release-set audit report has an invalid dependency count")
-    for field in ("sharedLicenseInventorySha256", "sharedSidecarSha256"):
+    for field in (
+        "sharedLicenseInventorySha256",
+        "sharedCliSha256",
+        "sharedSidecarSha256",
+    ):
         value = report.get(field)
         if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
             raise ReleaseError("release-set audit report has an invalid shared digest")
@@ -1116,6 +1125,8 @@ def audit_directory(
     release_identity: tuple[str, str] | None = None
     release_source: dict[str, object] | None = None
     shared_inventory: bytes | None = None
+    shared_cli_digest: str | None = None
+    cli_artifact_count = 0
     shared_sidecar_digest: str | None = None
     cargo_component_count: int | None = None
     license_text_count: int | None = None
@@ -1201,6 +1212,29 @@ def audit_directory(
             shared_sidecar_digest = sidecar_digest
         elif sidecar_digest != shared_sidecar_digest:
             raise ReleaseError("release artifacts do not contain one identical sidecar")
+        if kind in {"rust", "vscode"}:
+            cli_names = (
+                [
+                    name
+                    for name in entries
+                    if name.endswith(("/bin/inex", "/bin/inex.exe"))
+                ]
+                if kind == "rust"
+                else [
+                    name
+                    for name in entries
+                    if name.startswith("extension/bin/")
+                    and name.rsplit("/", 1)[-1] in {"inex", "inex.exe"}
+                ]
+            )
+            if len(cli_names) != 1:
+                raise ReleaseError("release artifact does not contain exactly one CLI")
+            cli_digest = sha256_bytes(entries[cli_names[0]][0])
+            cli_artifact_count += 1
+            if shared_cli_digest is None:
+                shared_cli_digest = cli_digest
+            elif cli_digest != shared_cli_digest:
+                raise ReleaseError("Rust and VSIX artifacts do not contain one identical CLI")
         artifact_records.append(
             {
                 "name": path.name,
@@ -1214,6 +1248,8 @@ def audit_directory(
         release_identity is None
         or release_source is None
         or shared_inventory is None
+        or shared_cli_digest is None
+        or cli_artifact_count != 2
         or shared_sidecar_digest is None
         or cargo_component_count is None
         or license_text_count is None
@@ -1232,6 +1268,7 @@ def audit_directory(
         "cargoComponentCount": cargo_component_count,
         "licenseTextCount": license_text_count,
         "sharedLicenseInventorySha256": sha256_bytes(shared_inventory),
+        "sharedCliSha256": shared_cli_digest,
         "sharedSidecarSha256": shared_sidecar_digest,
         "notCovered": list(RELEASE_SET_NOT_COVERED),
         "trustAssumptions": list(RELEASE_SET_TRUST_ASSUMPTIONS),

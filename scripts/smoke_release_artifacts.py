@@ -48,7 +48,7 @@ def extract_archive(archive_path: Path, destination: Path) -> None:
                 output.chmod(mode)
 
 
-def run_binary(executable: Path, arguments: list[str], expected_stdout: str | None) -> None:
+def run_binary(executable: Path, arguments: list[str], expected_stdout: str | None) -> str:
     result = subprocess.run(
         [str(executable), *arguments],
         check=False,
@@ -64,10 +64,23 @@ def run_binary(executable: Path, arguments: list[str], expected_stdout: str | No
     )
     if result.returncode != 0:
         raise ReleaseError(f"packaged executable failed: {executable.name}")
-    if expected_stdout is not None and result.stdout.decode("utf-8", "strict").strip() != expected_stdout:
+    stdout = result.stdout.decode("utf-8", "strict").strip()
+    if expected_stdout is not None and stdout != expected_stdout:
         raise ReleaseError(f"packaged executable returned an unexpected version: {executable.name}")
     if result.stderr:
         raise ReleaseError(f"packaged executable wrote unexpected stderr: {executable.name}")
+    return stdout
+
+
+def require_repository_import_command(executable: Path) -> None:
+    usage = run_binary(executable, ["--help"], None)
+    expected = (
+        "  inex import-repository <source-repository> <new-vault> [--dry-run]"
+    )
+    if usage.splitlines().count(expected) != 1:
+        raise ReleaseError(
+            "packaged CLI does not expose the repository-import command exactly once"
+        )
 
 
 def expected_runtime_info(product: str, version: str, platform: str) -> str:
@@ -103,6 +116,7 @@ def smoke_portable_archives(directory: Path, temporary: Path) -> None:
 
     _kind, version, platform = artifact_identity(rust_archive.name)
     run_binary(inex_matches[0], ["--version"], f"inex {version}")
+    require_repository_import_command(inex_matches[0])
     run_binary(
         inex_matches[0],
         ["runtime-info"],
@@ -189,11 +203,24 @@ def smoke_vsix(directory: Path, vscode_cli: Path, temporary: Path) -> None:
     sidecars = list((matches[0] / "bin").glob("*/inexd")) + list(
         (matches[0] / "bin").glob("*/inexd.exe")
     )
+    clis = list((matches[0] / "bin").glob("*/inex")) + list(
+        (matches[0] / "bin").glob("*/inex.exe")
+    )
     if len(sidecars) != 1:
         raise ReleaseError("installed VSIX does not contain exactly one sidecar")
-    if os.name != "nt" and sidecars[0].stat().st_mode & 0o111 == 0:
-        raise ReleaseError("installed VSIX sidecar lost its executable mode")
+    if len(clis) != 1:
+        raise ReleaseError("installed VSIX does not contain exactly one CLI")
+    if os.name != "nt":
+        for executable, label in ((clis[0], "CLI"), (sidecars[0], "sidecar")):
+            if executable.stat().st_mode & 0o111 == 0:
+                raise ReleaseError(f"installed VSIX {label} lost its executable mode")
     _kind, version, platform = artifact_identity(vsix.name)
+    require_repository_import_command(clis[0])
+    run_binary(
+        clis[0],
+        ["--runtime-info"],
+        expected_runtime_info("inex", version, platform),
+    )
     run_binary(
         sidecars[0],
         ["--runtime-info"],

@@ -1264,10 +1264,14 @@ def validate_evidence_report(report: dict[str, object]) -> None:
             or re.fullmatch(r"[0-9a-f]{64}", executable["sha256"]) is None
         ):
             raise ReleaseError("KDF evidence executable differs from the audited Rust archive")
-        if product == "inexd" and executable["sha256"] != release_set_audit.get(
-            "sharedSidecarSha256"
-        ):
-            raise ReleaseError("KDF evidence daemon differs from the shared-sidecar identity")
+        shared_digest_field = {
+            "inex": "sharedCliSha256",
+            "inexd": "sharedSidecarSha256",
+        }[product]
+        if executable["sha256"] != release_set_audit.get(shared_digest_field):
+            raise ReleaseError(
+                f"KDF evidence {product} differs from its shared release identity"
+            )
         if (
             not isinstance(probe, dict)
             or set(probe)
@@ -1481,10 +1485,14 @@ def run_kdf_calibration_drill(
         ]
         if len(rust_artifacts) != 1:
             raise ReleaseError("the audited artifact set does not contain one Rust archive")
-        if executable_hashes["inexd"] != release_set_audit.get("sharedSidecarSha256"):
-            raise ReleaseError(
-                "the packaged daemon differs from the strict shared-sidecar identity"
-            )
+        for product, shared_digest_field in (
+            ("inex", "sharedCliSha256"),
+            ("inexd", "sharedSidecarSha256"),
+        ):
+            if executable_hashes[product] != release_set_audit.get(shared_digest_field):
+                raise ReleaseError(
+                    f"the packaged {product} differs from its strict shared release identity"
+                )
         _verify_execution_inputs(
             executable_paths,
             executable_seals,

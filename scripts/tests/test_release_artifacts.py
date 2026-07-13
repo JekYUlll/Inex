@@ -691,7 +691,7 @@ class ReleaseArchiveTests(unittest.TestCase):
                 "linux-x64",
             )
 
-    def test_release_set_requires_shared_inventory_and_sidecar(self) -> None:
+    def test_release_set_requires_shared_inventory_cli_and_sidecar(self) -> None:
         version = "0.1.0"
         platform = "linux-x64"
         source = {
@@ -701,6 +701,7 @@ class ReleaseArchiveTests(unittest.TestCase):
         }
         manifest = self.canonical_json({"source": source})
         inventory = self.canonical_json({"components": [{"name": "component"}]})
+        cli = b"one-identical-cli"
         sidecar = b"one-identical-sidecar"
         artifact_names = {
             "rust": f"inex-rust-{version}-{platform}.zip",
@@ -721,12 +722,14 @@ class ReleaseArchiveTests(unittest.TestCase):
                 artifact_names["rust"]: {
                     rust_prefix + "PACKAGE-MANIFEST.json": (manifest, 0o644),
                     rust_prefix + "THIRD_PARTY_LICENSES.json": (inventory, 0o644),
+                    rust_prefix + "bin/inex": (cli, 0o755),
                     rust_prefix + "bin/inexd": (sidecar, 0o755),
                     rust_prefix + "THIRD_PARTY_LICENSE_TEXTS/license": (b"license", 0o644),
                 },
                 artifact_names["vscode"]: {
                     "extension/PACKAGE-MANIFEST.json": (manifest, 0o644),
                     "extension/THIRD_PARTY_LICENSES.json": (inventory, 0o644),
+                    "extension/bin/linux-x64/inex": (cli, 0o755),
                     "extension/bin/linux-x64/inexd": (sidecar, 0o755),
                     "extension/THIRD_PARTY_LICENSE_TEXTS/license": (b"license", 0o644),
                 },
@@ -757,6 +760,7 @@ class ReleaseArchiveTests(unittest.TestCase):
             self.assertEqual(report["artifactCount"], 3)
             self.assertEqual(report["cargoComponentCount"], 1)
             self.assertEqual(report["licenseTextCount"], 1)
+            self.assertEqual(report["sharedCliSha256"], sha256_bytes(cli))
 
             vscode_inventory_name = "extension/THIRD_PARTY_LICENSES.json"
             original_inventory = entries_by_name[artifact_names["vscode"]][
@@ -781,6 +785,16 @@ class ReleaseArchiveTests(unittest.TestCase):
             with self.assertRaisesRegex(ReleaseError, "identical sidecar"):
                 run_audit()
             entries_by_name[artifact_names["vscode"]][sidecar_name] = original_sidecar
+
+            cli_name = "extension/bin/linux-x64/inex"
+            original_cli = entries_by_name[artifact_names["vscode"]][cli_name]
+            entries_by_name[artifact_names["vscode"]][cli_name] = (
+                b"different-cli",
+                0o755,
+            )
+            with self.assertRaisesRegex(ReleaseError, "identical CLI"):
+                run_audit()
+            entries_by_name[artifact_names["vscode"]][cli_name] = original_cli
 
             invalid_report = dict(report)
             invalid_report["schemaVersion"] = True
@@ -936,6 +950,72 @@ class ReleaseArchiveTests(unittest.TestCase):
                 expected_platform="linux-x64",
                 expected_version="0.1.0",
             )
+
+    def test_vsix_requires_one_platform_native_executable_pair(self) -> None:
+        cli_name = "extension/bin/linux-x64/inex"
+        daemon_name = "extension/bin/linux-x64/inexd"
+        native = self.minimal_elf(0x3E, "/lib64/ld-linux-x86-64.so.2")
+        entries = self.minimal_vsix_metadata()
+        entries.update(
+            {
+                "extension/PACKAGE-MANIFEST.json": (b"manifest", 0o644),
+                "extension/THIRD_PARTY_LICENSES.json": (b"licenses", 0o644),
+                "extension/dist/extension.js": (b"extension", 0o644),
+                "extension/resources/inex.svg": (b"svg", 0o644),
+                cli_name: (native, 0o755),
+                daemon_name: (native, 0o755),
+            }
+        )
+
+        def validate(candidate: dict[str, tuple[bytes, int]]) -> None:
+            with (
+                mock.patch("audit_release_artifacts.validate_license_inventory"),
+                mock.patch("audit_release_artifacts.validate_documentation"),
+                mock.patch("audit_release_artifacts.validate_package_manifest"),
+            ):
+                validate_vscode(
+                    candidate,
+                    require_clean_source=True,
+                    expected_platform="linux-x64",
+                    expected_version="0.1.0",
+                )
+
+        validate(entries)
+        for label, replacement in (
+            ("missing CLI", {cli_name: None}),
+            (
+                "wrong runtime",
+                {
+                    cli_name: None,
+                    "extension/bin/linux-arm64/inex": (native, 0o755),
+                },
+            ),
+            (
+                "extra CLI",
+                {"extension/bin/linux-arm64/inex": (native, 0o755)},
+            ),
+            ("CLI mode", {cli_name: (native, 0o644)}),
+            ("daemon mode", {daemon_name: (native, 0o644)}),
+        ):
+            candidate = dict(entries)
+            for name, value in replacement.items():
+                if value is None:
+                    candidate.pop(name)
+                else:
+                    candidate[name] = value
+            with self.subTest(label=label), self.assertRaises(ReleaseError):
+                validate(candidate)
+
+        wrong_architecture = self.minimal_elf(
+            0xB7, "/lib/ld-linux-aarch64.so.1"
+        )
+        for name in (cli_name, daemon_name):
+            candidate = dict(entries)
+            candidate[name] = (wrong_architecture, 0o755)
+            with self.subTest(native=name), self.assertRaisesRegex(
+                ReleaseError, "does not match"
+            ):
+                validate(candidate)
 
     def test_vsix_identity_and_content_types_are_strictly_validated(self) -> None:
         entries = self.minimal_vsix_metadata()

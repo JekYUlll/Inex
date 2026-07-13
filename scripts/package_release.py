@@ -57,8 +57,10 @@ DOCUMENTATION_FILES = (
     "user-guide.md",
     "spec/edry-v1.md",
     "spec/git-merge-v1.md",
+    "spec/import-repository-v1.md",
     "spec/import-v1.md",
     "spec/json-rpc-v1.md",
+    "spec/opaque-assets-v1.md",
     "spec/vault-v1.md",
 )
 PACKAGE_REPORT_NOT_COVERED = (
@@ -319,7 +321,7 @@ def package_rust(
     version: str,
     licenses: bytes,
     license_texts: dict[str, tuple[bytes, int]],
-) -> tuple[Path, Path]:
+) -> tuple[Path, Path, Path]:
     entries, inex, inexd = read_product_entries(
         repository_root, target_dir, platform, licenses, license_texts
     )
@@ -338,12 +340,13 @@ def package_rust(
     )
     output = output_directory / f"inex-rust-{version}-{platform}.zip"
     write_reproducible_zip(output, entries)
-    return output, inexd
+    return output, inex, inexd
 
 
 def stage_vscode(
     repository_root: Path,
     stage: Path,
+    inex: Path,
     inexd: Path,
     platform: str,
     version: str,
@@ -360,6 +363,7 @@ def stage_vscode(
         "SECURITY.md": (repository_root / "SECURITY.md", 0o644),
         "dist/extension.js": (editor / "dist" / "extension.js", 0o644),
         "resources/inex.svg": (editor / "resources" / "inex.svg", 0o644),
+        f"bin/{runtime}/inex{suffix}": (inex, 0o755),
         f"bin/{runtime}/inexd{suffix}": (inexd, 0o755),
     }
     entries = files_as_entries(files)
@@ -416,6 +420,7 @@ def stage_vscode(
 def package_vscode(
     repository_root: Path,
     output_directory: Path,
+    inex: Path,
     inexd: Path,
     platform: str,
     version: str,
@@ -434,7 +439,14 @@ def package_vscode(
     with tempfile.TemporaryDirectory(prefix="inex-vscode-stage-") as temporary:
         stage = Path(temporary) / "extension"
         stage_vscode(
-            repository_root, stage, inexd, platform, version, licenses, license_texts
+            repository_root,
+            stage,
+            inex,
+            inexd,
+            platform,
+            version,
+            licenses,
+            license_texts,
         )
         environment = os.environ.copy()
         for sensitive_name in (
@@ -542,7 +554,7 @@ def main() -> int:
 
     version = project_version(repository_root)
     licenses, license_texts = generate_license_materials(repository_root, version, platform)
-    rust_archive, inexd = package_rust(
+    rust_archive, inex, inexd = package_rust(
         repository_root,
         output_directory,
         target_dir,
@@ -554,6 +566,7 @@ def main() -> int:
     vscode_archive = package_vscode(
         repository_root,
         output_directory,
+        inex,
         inexd,
         platform,
         version,

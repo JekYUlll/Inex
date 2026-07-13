@@ -89,6 +89,7 @@ class ReleaseLifecycleTests(unittest.TestCase):
             "cargoComponentCount": 77,
             "licenseTextCount": 147,
             "sharedLicenseInventorySha256": "c" * 64,
+            "sharedCliSha256": "e" * 64,
             "sharedSidecarSha256": "d" * 64,
             "notCovered": list(artifact_audit.RELEASE_SET_NOT_COVERED),
             "trustAssumptions": list(artifact_audit.RELEASE_SET_TRUST_ASSUMPTIONS),
