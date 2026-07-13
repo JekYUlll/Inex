@@ -379,3 +379,5 @@
 - Full-body canary只能证明完整正文未残留，不能证明crash-time partial write没有留下前缀、单行或中段。Linux绑定证据应同时扫描足够长且互异、并由真实解密stage/result证明包含关系的fragment；mutation必须只泄漏fragment，避免测试仍由完整正文命中而掩盖缺口。
 - `git cat-file --batch-all-objects --batch`的安全价值在于覆盖reachable与unreachable对象；回归若只提交reachable commit没有绑定这一点。应使用`git hash-object -w`写入fragment-only blob、删除输入且不创建ref，再要求统一scanner仍捕获。
 - Setup child用`mem::forget`转移临时目录owner后，父进程必须立即接管RAII cleanup；否则timeout/panic会留下vault甚至残余明文。进程guard也不能在kill失败后调用无界`wait()`：只有有界`try_wait`证明writer已reap才允许启动fresh recovery，析构路径同样不得永久挂起。
+- Mutation regression不能用`catch_unwind(|| whole_scanner())`证明detector命中：Git命令失败、目录枚举或文件读取panic也会让测试假PASS。应先在catch外完成I/O/status并断言注入fragment确实存在，再只捕获纯字节detector的预期panic。
+- Setup owner的严格转移不能依赖“成功child退出后再parse control”：parent应在spawn前声明cleanup guard，并在一旦可认证取得root时arm；drop order必须保证setup/writer/recovery child先有界reap、fixture后删除。Guard回归也应有durable ready证明目标已park，并分别覆盖显式kill与Drop路径。
