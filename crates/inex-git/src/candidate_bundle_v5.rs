@@ -228,6 +228,8 @@ pub(super) enum PostJournalIndexCheckpointV5 {
     AfterPublishOverMarker,
     BeforePublishOverIndex,
     AfterPublishOverIndex,
+    AfterInitialLiveIndexClassification,
+    AfterFinalLiveIndexClassification,
 }
 
 pub(super) struct PostJournalIndexAuthorizationV5<'a, F> {
@@ -242,6 +244,12 @@ impl<'a, F> PostJournalIndexAuthorizationV5<'a, F> {
             critical_audit,
         }
     }
+}
+
+struct PostJournalLiveIndexProofV5<'a> {
+    candidate_identity: &'a FilesystemFileIdentity,
+    old_live_identity: &'a FilesystemFileIdentity,
+    journal_file: &'a File,
 }
 
 #[derive(Debug)]
@@ -264,6 +272,10 @@ pub(super) trait PostJournalIndexHooksV5 {
         _context: &PostJournalIndexContextV5<'_>,
     ) -> Result<(), GitError> {
         Ok(())
+    }
+
+    fn post_replace_audit_error(&mut self) -> Option<GitError> {
+        None
     }
 
     fn replace(
@@ -2255,15 +2267,17 @@ fn reconcile_postjournal_replace_error_v5<F>(
 where
     F: FnOnce() -> Result<(), GitError>,
 {
-    if !is_postjournal_semantic_conflict_v5(&post_error) {
-        return Err(post_error);
-    }
     match pre_audit() {
         Ok(()) => Err(io_error(GitIoOperation::SyncGitState, move_error)),
-        Err(error) if is_postjournal_semantic_conflict_v5(&error) => {
+        Err(pre_error) => {
+            if !is_postjournal_semantic_conflict_v5(&post_error) {
+                return Err(post_error);
+            }
+            if !is_postjournal_semantic_conflict_v5(&pre_error) {
+                return Err(pre_error);
+            }
             Err(GitError::RecoveryConflict)
         }
-        Err(error) => Err(error),
     }
 }
 
@@ -2395,15 +2409,18 @@ fn publish_staging_over_marker_with_journal_v5_impl<
         scratch_basename: _,
     } = marker;
     let move_result = hooks.replace(&publish_path, source, &lock_path, destination);
-    let post = audit_candidate_over_marker_post_v5(
-        guard,
-        git,
-        reference,
-        &inventory,
-        &publish_identity,
-        &marker_identity,
-        journal_file,
-    );
+    let post = match hooks.post_replace_audit_error() {
+        Some(error) => Err(error),
+        None => audit_candidate_over_marker_post_v5(
+            guard,
+            git,
+            reference,
+            &inventory,
+            &publish_identity,
+            &marker_identity,
+            journal_file,
+        ),
+    };
     match (move_result, post) {
         (Ok(outcome), Ok(())) => verify_synced_postjournal_replace_v5(outcome)?,
         (Err(_), Ok(())) => {}
@@ -2472,58 +2489,90 @@ fn audit_candidate_lock_before_index_v5(
     Ok(())
 }
 
-fn audit_candidate_over_live_index_post_v5(
-    guard: &VaultMutationGuard,
+fn revalidate_completed_live_index_identity_v5(
     git: &Git,
     reference: &CandidateBundleTransactionReferenceV5,
-    candidate_identity: &FilesystemFileIdentity,
-    old_live_identity: &FilesystemFileIdentity,
-    journal_file: &File,
+    inventory: &InventoryVerifiedCandidateBundleV5,
+    proof: &PostJournalLiveIndexProofV5<'_>,
+    completed: CompletedLiveIndexStateV5,
 ) -> Result<(), GitError> {
-    verify_candidate_publish_namespace_v5(&git.root, reference, false, true)?;
-    verify_held_active_journal_identity_v5(git, journal_file)?;
-    let lock_path = index_lock_path(&git.root);
     let live_path = index_path(&git.root);
-    if !path_entry_is_absent(&lock_path)?
-        || !required_path_matches_file_identity_v5(&live_path, candidate_identity)?
-        || required_path_matches_file_identity_v5(&live_path, old_live_identity)?
+    if classify_index_lock_v5(&git.root, reference, inventory)? != IndexLockStateV5::Absent
+        || required_path_matches_file_identity_v5(&live_path, proof.old_live_identity)?
     {
         return Err(GitError::RecoveryConflict);
     }
-    let (_, completed) = classify_completed_live_index_with_journal_v5(guard, git, reference)?;
-    verify_held_active_journal_identity_v5(git, journal_file)?;
-    if completed != CompletedLiveIndexStateV5::ExactFinal {
-        return Err(GitError::RecoveryConflict);
-    }
-    sync_directory(&git.root.join(".git")).map_err(|_| GitError::DurabilityNotConfirmed)?;
-    Ok(())
-}
-
-fn audit_candidate_over_live_index_final_v5(
-    guard: &VaultMutationGuard,
-    git: &Git,
-    reference: &CandidateBundleTransactionReferenceV5,
-    candidate_identity: &FilesystemFileIdentity,
-    old_live_identity: &FilesystemFileIdentity,
-    journal_file: &File,
-) -> Result<CompletedLiveIndexStateV5, GitError> {
-    verify_candidate_publish_namespace_v5(&git.root, reference, false, true)?;
-    verify_held_active_journal_identity_v5(git, journal_file)?;
-    let live_path = index_path(&git.root);
-    if required_path_matches_file_identity_v5(&live_path, old_live_identity)? {
-        return Err(GitError::RecoveryConflict);
-    }
-    let candidate_matches = required_path_matches_file_identity_v5(&live_path, candidate_identity)?;
-    let (_, completed) = classify_completed_live_index_with_journal_v5(guard, git, reference)?;
-    verify_held_active_journal_identity_v5(git, journal_file)?;
+    let candidate_matches =
+        required_path_matches_file_identity_v5(&live_path, proof.candidate_identity)?;
     if !matches!(
         (completed, candidate_matches),
         (CompletedLiveIndexStateV5::ExactFinal, true)
             | (CompletedLiveIndexStateV5::LaterUnrelated, false)
-    ) {
+    ) || classify_index_lock_v5(&git.root, reference, inventory)? != IndexLockStateV5::Absent
+    {
         return Err(GitError::RecoveryConflict);
     }
+    Ok(())
+}
+
+fn audit_candidate_over_live_index_post_v5<H: PostJournalIndexHooksV5>(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+    proof: &PostJournalLiveIndexProofV5<'_>,
+    hooks: &mut H,
+    context: &PostJournalIndexContextV5<'_>,
+) -> Result<(), GitError> {
+    verify_candidate_publish_namespace_v5(&git.root, reference, false, true)?;
+    verify_held_active_journal_identity_v5(git, proof.journal_file)?;
+    let lock_path = index_lock_path(&git.root);
+    let live_path = index_path(&git.root);
+    if !path_entry_is_absent(&lock_path)?
+        || !required_path_matches_file_identity_v5(&live_path, proof.candidate_identity)?
+        || required_path_matches_file_identity_v5(&live_path, proof.old_live_identity)?
+    {
+        return Err(GitError::RecoveryConflict);
+    }
+    let (inventory, completed) =
+        classify_completed_live_index_with_journal_v5(guard, git, reference)?;
+    if completed != CompletedLiveIndexStateV5::ExactFinal {
+        return Err(GitError::RecoveryConflict);
+    }
+    hooks.checkpoint(
+        PostJournalIndexCheckpointV5::AfterInitialLiveIndexClassification,
+        context,
+    )?;
     sync_directory(&git.root.join(".git")).map_err(|_| GitError::DurabilityNotConfirmed)?;
+    verify_held_active_journal_identity_v5(git, proof.journal_file)?;
+    revalidate_completed_live_index_identity_v5(git, reference, &inventory, proof, completed)?;
+    verify_held_active_journal_identity_v5(git, proof.journal_file)?;
+    Ok(())
+}
+
+fn audit_candidate_over_live_index_final_v5<H: PostJournalIndexHooksV5>(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+    proof: &PostJournalLiveIndexProofV5<'_>,
+    hooks: &mut H,
+    context: &PostJournalIndexContextV5<'_>,
+) -> Result<CompletedLiveIndexStateV5, GitError> {
+    verify_candidate_publish_namespace_v5(&git.root, reference, false, true)?;
+    verify_held_active_journal_identity_v5(git, proof.journal_file)?;
+    let live_path = index_path(&git.root);
+    if required_path_matches_file_identity_v5(&live_path, proof.old_live_identity)? {
+        return Err(GitError::RecoveryConflict);
+    }
+    let (inventory, completed) =
+        classify_completed_live_index_with_journal_v5(guard, git, reference)?;
+    hooks.checkpoint(
+        PostJournalIndexCheckpointV5::AfterFinalLiveIndexClassification,
+        context,
+    )?;
+    sync_directory(&git.root.join(".git")).map_err(|_| GitError::DurabilityNotConfirmed)?;
+    verify_held_active_journal_identity_v5(git, proof.journal_file)?;
+    revalidate_completed_live_index_identity_v5(git, reference, &inventory, proof, completed)?;
+    verify_held_active_journal_identity_v5(git, proof.journal_file)?;
     Ok(completed)
 }
 
@@ -2634,20 +2683,23 @@ fn publish_candidate_lock_over_live_index_with_journal_v5_impl<
         .map_err(|error| io_error(GitIoOperation::SyncGitState, &error))?;
     let old_live_identity = filesystem_file_identity(&live_file)
         .map_err(|error| io_error(GitIoOperation::SyncGitState, &error))?;
+    let proof = PostJournalLiveIndexProofV5 {
+        candidate_identity: &candidate_identity,
+        old_live_identity: &old_live_identity,
+        journal_file,
+    };
     let LoadedCandidateIndexLockV5 {
         inventory: _,
         file: source,
     } = loaded;
     let destination = live_file;
     let move_result = hooks.replace(&lock_path, source, &live_path, destination);
-    let post = audit_candidate_over_live_index_post_v5(
-        guard,
-        git,
-        reference,
-        &candidate_identity,
-        &old_live_identity,
-        journal_file,
-    );
+    let post = match hooks.post_replace_audit_error() {
+        Some(error) => Err(error),
+        None => {
+            audit_candidate_over_live_index_post_v5(guard, git, reference, &proof, hooks, &context)
+        }
+    };
     match (move_result, post) {
         (Ok(outcome), Ok(())) => verify_synced_postjournal_replace_v5(outcome)?,
         (Err(_), Ok(())) => {}
@@ -2657,9 +2709,9 @@ fn publish_candidate_lock_over_live_index_with_journal_v5_impl<
                     guard,
                     git,
                     reference,
-                    &candidate_identity,
-                    &old_live_identity,
-                    journal_file,
+                    proof.candidate_identity,
+                    proof.old_live_identity,
+                    proof.journal_file,
                 )
             });
         }
@@ -2669,15 +2721,8 @@ fn publish_candidate_lock_over_live_index_with_journal_v5_impl<
         PostJournalIndexCheckpointV5::AfterPublishOverIndex,
         &context,
     )?;
-    audit_candidate_over_live_index_final_v5(
-        guard,
-        git,
-        reference,
-        &candidate_identity,
-        &old_live_identity,
-        journal_file,
-    )
-    .map(|_| ())
+    audit_candidate_over_live_index_final_v5(guard, git, reference, &proof, hooks, &context)
+        .map(|_| ())
 }
 
 const MAX_SCRATCH_TOKEN_ATTEMPTS_V5: usize = 64;

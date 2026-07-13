@@ -646,6 +646,23 @@ fn load_held_bundle_journal_v5(
     root: &Path,
     expected_reference: &candidate_bundle_v5::CandidateBundleTransactionReferenceV5,
 ) -> Result<HeldBundleJournalV5, GitError> {
+    load_held_bundle_journal_v5_impl(root, expected_reference, || {})
+}
+
+#[cfg(test)]
+fn load_held_bundle_journal_v5_with_hook<F: FnOnce()>(
+    root: &Path,
+    expected_reference: &candidate_bundle_v5::CandidateBundleTransactionReferenceV5,
+    after_read: F,
+) -> Result<HeldBundleJournalV5, GitError> {
+    load_held_bundle_journal_v5_impl(root, expected_reference, after_read)
+}
+
+fn load_held_bundle_journal_v5_impl<F: FnOnce()>(
+    root: &Path,
+    expected_reference: &candidate_bundle_v5::CandidateBundleTransactionReferenceV5,
+    after_read: F,
+) -> Result<HeldBundleJournalV5, GitError> {
     let pending = read_journal(root)?.ok_or(GitError::RecoveryConflict)?;
     let PendingMergeJournal::BundleV5(journal) = pending else {
         return Err(GitError::RecoveryConflict);
@@ -655,7 +672,10 @@ fn load_held_bundle_journal_v5(
     }
     let bytes = serialize_bundle_journal_v5(&journal)?;
     let path = journal_path(root);
-    let file = File::open(&path).map_err(|error| io_error(GitIoOperation::ReadJournal, &error))?;
+    after_read();
+    let file = File::open(&path)
+        .map_err(|error| io_error(GitIoOperation::ReadJournal, &error))
+        .map_err(map_expected_journal_state_error)?;
     verify_held_durable_journal_v5(&path, &file, &bytes, &journal)?;
     Ok(HeldBundleJournalV5 {
         journal,
@@ -3442,6 +3462,24 @@ fn map_recorded_provenance_journal_error(error: GitError) -> GitError {
 fn map_recorded_provenance_state_error(error: GitError) -> GitError {
     match error {
         GitError::UnsupportedConflictEntry => GitError::RecoveryConflict,
+        error => error,
+    }
+}
+
+fn map_recovery_owner_state_error(error: GitError) -> GitError {
+    match error {
+        GitError::IndexChanged
+        | GitError::WorktreeChanged
+        | GitError::UnsupportedConflictEntry
+        | GitError::StageAuthenticationFailed
+        | GitError::RecoveryConflict => GitError::RecoveryConflict,
+        error => error,
+    }
+}
+
+fn map_in_place_stage_authentication_error(error: GitError) -> GitError {
+    match error {
+        GitError::StageAuthenticationFailed => GitError::RecoveryConflict,
         error => error,
     }
 }
@@ -6346,7 +6384,7 @@ fn authenticate_all_in_place_stages_v5(
 ) -> Result<(), GitError> {
     for stage in authenticated.conflict.stages.iter().flatten() {
         let identity = authenticate_stage_identity(vault, git, stage)
-            .map_err(|_| GitError::RecoveryConflict)?;
+            .map_err(map_in_place_stage_authentication_error)?;
         if identity.logical_path != authenticated.conflict.logical_path
             || identity.file_id != authenticated.file_id
         {
@@ -6393,7 +6431,7 @@ fn recover_in_place_pending(
         index_done.then_some(journal.physical_path.as_str()),
         &[&journal.physical_path],
     )
-    .map_err(|_| GitError::RecoveryConflict)?;
+    .map_err(map_recovery_owner_state_error)?;
 
     let current_target = guard.inspect(&target).map_err(map_atomic_error)?;
     let worktree_done =
@@ -6439,7 +6477,7 @@ fn recover_in_place_pending(
         Some(&journal.physical_path),
         &[&journal.physical_path],
     )
-    .map_err(|_| GitError::RecoveryConflict)?;
+    .map_err(map_recovery_owner_state_error)?;
     verify_committed_state(git, guard, &target, journal, result_digest)?;
     Ok(())
 }
@@ -7547,20 +7585,52 @@ fn verify_held_durable_journal_v5(
     bytes: &[u8],
     journal: &BundleMergeJournalV5,
 ) -> Result<(), GitError> {
+    verify_held_durable_journal_v5_impl(path, file, bytes, journal, || {})
+}
+
+#[cfg(test)]
+fn verify_held_durable_journal_v5_with_hook<F: FnOnce()>(
+    path: &Path,
+    file: &File,
+    bytes: &[u8],
+    journal: &BundleMergeJournalV5,
+    after_initial_match: F,
+) -> Result<(), GitError> {
+    verify_held_durable_journal_v5_impl(path, file, bytes, journal, after_initial_match)
+}
+
+fn map_expected_journal_state_error(error: GitError) -> GitError {
+    match error {
+        GitError::IndexChanged
+        | GitError::Io {
+            kind: io::ErrorKind::NotFound,
+            ..
+        } => GitError::RecoveryConflict,
+        error => error,
+    }
+}
+
+fn verify_held_durable_journal_v5_impl<F: FnOnce()>(
+    path: &Path,
+    file: &File,
+    bytes: &[u8],
+    journal: &BundleMergeJournalV5,
+    after_initial_match: F,
+) -> Result<(), GitError> {
     let held_matches =
         |path: &Path, file: &File| match open_file_matches_path_and_is_single_link(path, file) {
             Ok(matches) => Ok(matches),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(io_error(GitIoOperation::ReadJournal, &error)),
         };
-    let actual = match read_regular_exact(path, bytes.len()) {
-        Ok(actual) => actual,
-        Err(GitError::IndexChanged) => return Err(GitError::RecoveryConflict),
-        Err(error) => return Err(error),
-    };
-    if !held_matches(path, file)?
-        || actual != bytes
-        || read_journal_file(path)? != PendingMergeJournal::BundleV5(journal.clone())
+    if !held_matches(path, file)? {
+        return Err(GitError::RecoveryConflict);
+    }
+    after_initial_match();
+    let actual = read_regular_exact(path, bytes.len()).map_err(map_expected_journal_state_error)?;
+    let rebound = read_journal_file(path).map_err(map_expected_journal_state_error)?;
+    if actual != bytes
+        || rebound != PendingMergeJournal::BundleV5(journal.clone())
         || !held_matches(path, file)?
     {
         return Err(GitError::RecoveryConflict);
@@ -7911,7 +7981,7 @@ fn verify_detected_rename_committed_state(
             &journal.destination_physical_path,
         ],
     )
-    .map_err(|_| GitError::RecoveryConflict)?;
+    .map_err(map_recovery_owner_state_error)?;
     git.sync_object(&journal.result_oid)?;
     git.sync_index()?;
     Ok(())
@@ -7967,7 +8037,7 @@ fn verify_split_rename_committed_state(
             &journal.destination_physical_path,
         ],
     )
-    .map_err(|_| GitError::RecoveryConflict)?;
+    .map_err(map_recovery_owner_state_error)?;
     git.sync_object(&journal.result_oid)?;
     git.sync_index()?;
     Ok(())
@@ -8565,6 +8635,41 @@ mod tests {
         assert!(matches!(
             map_worktree_vault_error(&VaultError::DocumentNotFound),
             GitError::WorktreeChanged
+        ));
+    }
+
+    #[test]
+    fn recovery_authentication_mappers_preserve_git_and_io_failures() {
+        for mapper in [
+            map_recovery_owner_state_error as fn(GitError) -> GitError,
+            map_in_place_stage_authentication_error,
+        ] {
+            assert!(matches!(
+                mapper(GitError::GitCommandFailed {
+                    operation: GitOperation::ReadObject
+                }),
+                GitError::GitCommandFailed {
+                    operation: GitOperation::ReadObject
+                }
+            ));
+            assert!(matches!(
+                mapper(GitError::Io {
+                    operation: GitIoOperation::InspectMetadata,
+                    kind: io::ErrorKind::PermissionDenied
+                }),
+                GitError::Io {
+                    operation: GitIoOperation::InspectMetadata,
+                    kind: io::ErrorKind::PermissionDenied
+                }
+            ));
+        }
+        assert!(matches!(
+            map_recovery_owner_state_error(GitError::WorktreeChanged),
+            GitError::RecoveryConflict
+        ));
+        assert!(matches!(
+            map_in_place_stage_authentication_error(GitError::StageAuthenticationFailed),
+            GitError::RecoveryConflict
         ));
     }
 
@@ -10030,6 +10135,7 @@ mod tests {
         MoveThenError,
         MoveWithUnsyncedParent,
         MoveErrorBeforeMove,
+        MoveErrorWithOperationalPost,
         ForeignDuringMove,
         SourceCloneDuringMove,
         DestinationCloneDuringMove,
@@ -10039,6 +10145,8 @@ mod tests {
         OwnerDriftBeforeMove,
         LiveIndexDriftBeforeMove,
         LaterUnrelatedAfterMove,
+        OldLiveRebindAfterClassification,
+        IndexLockReappearsAfterClassification,
     }
 
     #[derive(Debug)]
@@ -10059,6 +10167,96 @@ mod tests {
                 root: None,
                 retained_path: None,
             }
+        }
+
+        fn root(&self) -> io::Result<&Path> {
+            self.root
+                .as_deref()
+                .ok_or_else(|| io::Error::other("post-journal hook root was not captured"))
+        }
+
+        fn replace_with_source_clone(
+            &mut self,
+            source: &Path,
+            source_file: File,
+            destination_file: File,
+        ) -> io::Result<AtomicFileMoveOutcome> {
+            drop(source_file);
+            drop(destination_file);
+            let retained = self.root()?.join(format!(
+                "held-post-journal-source-{}",
+                Uuid::new_v4().simple()
+            ));
+            fs::rename(source, &retained)?;
+            fs::copy(&retained, source)?;
+            self.retained_path = Some(retained);
+            Err(io::Error::other("injected byte-identical source clone"))
+        }
+
+        fn replace_with_destination_clone(
+            &mut self,
+            source_file: File,
+            destination: &Path,
+            destination_file: File,
+        ) -> io::Result<AtomicFileMoveOutcome> {
+            drop(source_file);
+            drop(destination_file);
+            let retained = self.root()?.join(format!(
+                "held-post-journal-destination-{}",
+                Uuid::new_v4().simple()
+            ));
+            fs::rename(destination, &retained)?;
+            fs::copy(&retained, destination)?;
+            self.retained_path = Some(retained);
+            Err(io::Error::other(
+                "injected byte-identical destination clone",
+            ))
+        }
+
+        fn replace_with_journal_clone(
+            &mut self,
+            source: &Path,
+            source_file: File,
+            destination: &Path,
+            destination_file: File,
+        ) -> io::Result<AtomicFileMoveOutcome> {
+            let journal = journal_path(self.root()?);
+            let retained = self.root()?.join(format!(
+                "held-post-journal-journal-{}",
+                Uuid::new_v4().simple()
+            ));
+            let bytes = fs::read(&journal)?;
+            fs::rename(&journal, &retained)?;
+            fs::write(&journal, bytes)?;
+            self.retained_path = Some(retained);
+            atomic_replace_verified_file(source, source_file, destination, destination_file)
+        }
+
+        fn replace_retaining_old_live(
+            &mut self,
+            source: &Path,
+            source_file: File,
+            destination: &Path,
+            destination_file: File,
+        ) -> io::Result<AtomicFileMoveOutcome> {
+            let retained = self.root()?.join(format!(
+                "held-post-journal-old-live-{}",
+                Uuid::new_v4().simple()
+            ));
+            drop(source_file);
+            drop(destination_file);
+            fs::rename(destination, &retained)?;
+            fs::rename(source, destination)?;
+            sync_directory(
+                destination
+                    .parent()
+                    .ok_or_else(|| io::Error::other("post-journal destination parent is absent"))?,
+            )?;
+            self.retained_path = Some(retained);
+            Ok(AtomicFileMoveOutcome {
+                source_parent_sync: ParentSyncStatus::Synced,
+                destination_parent_sync: ParentSyncStatus::Synced,
+            })
         }
     }
 
@@ -10118,6 +10316,27 @@ mod tests {
                         return Err(GitError::DurabilityNotConfirmed);
                     }
                 }
+                PostJournalIndexTestActionV5::OldLiveRebindAfterClassification
+                    if checkpoint
+                        == candidate_bundle_v5::PostJournalIndexCheckpointV5::AfterFinalLiveIndexClassification =>
+                {
+                    self.action_fired = true;
+                    let retained = self.retained_path.take().ok_or(GitError::RecoveryConflict)?;
+                    fs::remove_file(context.index_path)
+                        .and_then(|()| fs::rename(retained, context.index_path))
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                }
+                PostJournalIndexTestActionV5::IndexLockReappearsAfterClassification
+                    if checkpoint
+                        == candidate_bundle_v5::PostJournalIndexCheckpointV5::AfterFinalLiveIndexClassification =>
+                {
+                    self.action_fired = true;
+                    fs::write(
+                        context.lock_path,
+                        b"foreign lock after completed-index classification",
+                    )
+                    .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                }
                 PostJournalIndexTestActionV5::FailAfterMove if after => {
                     self.action_fired = true;
                     return Err(GitError::DurabilityNotConfirmed);
@@ -10125,6 +10344,11 @@ mod tests {
                 _ => {}
             }
             Ok(())
+        }
+
+        fn post_replace_audit_error(&mut self) -> Option<GitError> {
+            (self.action == PostJournalIndexTestActionV5::MoveErrorWithOperationalPost)
+                .then_some(GitError::DurabilityNotConfirmed)
         }
 
         fn replace(
@@ -10165,6 +10389,14 @@ mod tests {
                     drop(destination_file);
                     Err(io::Error::other("injected error before post-journal move"))
                 }
+                PostJournalIndexTestActionV5::MoveErrorWithOperationalPost => {
+                    self.action_fired = true;
+                    drop(source_file);
+                    drop(destination_file);
+                    Err(io::Error::other(
+                        "injected move error with operational post-audit failure",
+                    ))
+                }
                 PostJournalIndexTestActionV5::ForeignDuringMove => {
                     self.action_fired = true;
                     drop(source_file);
@@ -10177,59 +10409,29 @@ mod tests {
                 }
                 PostJournalIndexTestActionV5::SourceCloneDuringMove => {
                     self.action_fired = true;
-                    drop(source_file);
-                    drop(destination_file);
-                    let root = self.root.as_ref().ok_or_else(|| {
-                        io::Error::other("post-journal hook root was not captured")
-                    })?;
-                    let retained = root.join(format!(
-                        "held-post-journal-source-{}",
-                        Uuid::new_v4().simple()
-                    ));
-                    fs::rename(source, &retained)?;
-                    fs::copy(&retained, source)?;
-                    self.retained_path = Some(retained);
-                    Err(io::Error::other("injected byte-identical source clone"))
+                    self.replace_with_source_clone(source, source_file, destination_file)
                 }
                 PostJournalIndexTestActionV5::DestinationCloneDuringMove => {
                     self.action_fired = true;
-                    drop(source_file);
-                    drop(destination_file);
-                    let root = self.root.as_ref().ok_or_else(|| {
-                        io::Error::other("post-journal hook root was not captured")
-                    })?;
-                    let retained = root.join(format!(
-                        "held-post-journal-destination-{}",
-                        Uuid::new_v4().simple()
-                    ));
-                    fs::rename(destination, &retained)?;
-                    fs::copy(&retained, destination)?;
-                    self.retained_path = Some(retained);
-                    Err(io::Error::other(
-                        "injected byte-identical destination clone",
-                    ))
+                    self.replace_with_destination_clone(source_file, destination, destination_file)
                 }
                 PostJournalIndexTestActionV5::JournalCloneDuringMove => {
                     self.action_fired = true;
-                    let root = self.root.as_ref().ok_or_else(|| {
-                        io::Error::other("post-journal hook root was not captured")
-                    })?;
-                    let journal = journal_path(root);
-                    let retained = root.join(format!(
-                        "held-post-journal-journal-{}",
-                        Uuid::new_v4().simple()
-                    ));
-                    let bytes = fs::read(&journal)?;
-                    fs::rename(&journal, &retained)?;
-                    fs::write(&journal, bytes)?;
-                    self.retained_path = Some(retained);
-                    atomic_replace_verified_file(source, source_file, destination, destination_file)
+                    self.replace_with_journal_clone(
+                        source,
+                        source_file,
+                        destination,
+                        destination_file,
+                    )
                 }
+                PostJournalIndexTestActionV5::OldLiveRebindAfterClassification => self
+                    .replace_retaining_old_live(source, source_file, destination, destination_file),
                 PostJournalIndexTestActionV5::FailAfterMove
                 | PostJournalIndexTestActionV5::WorktreeDriftBeforeMove
                 | PostJournalIndexTestActionV5::OwnerDriftBeforeMove
                 | PostJournalIndexTestActionV5::LiveIndexDriftBeforeMove
-                | PostJournalIndexTestActionV5::LaterUnrelatedAfterMove => {
+                | PostJournalIndexTestActionV5::LaterUnrelatedAfterMove
+                | PostJournalIndexTestActionV5::IndexLockReappearsAfterClassification => {
                     atomic_replace_verified_file(source, source_file, destination, destination_file)
                 }
             }
@@ -15120,6 +15322,40 @@ mod tests {
     }
 
     #[test]
+    fn v5_expected_journal_disappearance_is_a_recovery_conflict() {
+        let fixture = create_candidate_payload_fixture_v5(
+            GitObjectFormat::Sha1,
+            CandidatePayloadKindV5::InPlace,
+        );
+        let root = fixture.vault.root();
+        let prepared = prepare_test_postjournal_state(&fixture);
+        let load_result =
+            load_held_bundle_journal_v5_with_hook(root, &prepared.transaction_reference, || {
+                fs::remove_file(journal_path(root)).expect("journal disappears before held open");
+            });
+        assert!(matches!(load_result, Err(GitError::RecoveryConflict)));
+
+        let fixture = create_candidate_payload_fixture_v5(
+            GitObjectFormat::Sha1,
+            CandidatePayloadKindV5::InPlace,
+        );
+        let root = fixture.vault.root();
+        let prepared = prepare_test_postjournal_state(&fixture);
+        let held = load_held_bundle_journal_v5(root, &prepared.transaction_reference)
+            .expect("journal holds before disappearance");
+        let verify_result = verify_held_durable_journal_v5_with_hook(
+            &journal_path(root),
+            &held.file,
+            &held.bytes,
+            &held.journal,
+            || {
+                fs::remove_file(journal_path(root)).expect("journal disappears before reread");
+            },
+        );
+        assert!(matches!(verify_result, Err(GitError::RecoveryConflict)));
+    }
+
+    #[test]
     fn v5_later_unrelated_accepts_only_transaction_external_stage_changes() {
         for object_format in [GitObjectFormat::Sha1, GitObjectFormat::Sha256] {
             let fixture =
@@ -15270,6 +15506,15 @@ mod tests {
             PostJournalIndexTestActionV5::MoveWithUnsyncedParent => {
                 assert!(matches!(result, Err(GitError::DurabilityNotConfirmed)));
             }
+            PostJournalIndexTestActionV5::MoveErrorWithOperationalPost => {
+                assert!(matches!(
+                    result,
+                    Err(GitError::Io {
+                        operation: GitIoOperation::SyncGitState,
+                        kind: io::ErrorKind::Other
+                    })
+                ));
+            }
             _ => assert!(result.is_err(), "{action:?} must surface its boundary"),
         }
         if action == PostJournalIndexTestActionV5::LiveIndexDriftBeforeMove {
@@ -15297,6 +15542,7 @@ mod tests {
             | PostJournalIndexTestActionV5::FailAfterMove => V5PostJournalState::CandidateInLock,
             PostJournalIndexTestActionV5::ForeignDuringMove => V5PostJournalState::Conflict,
             PostJournalIndexTestActionV5::MoveErrorBeforeMove
+            | PostJournalIndexTestActionV5::MoveErrorWithOperationalPost
             | PostJournalIndexTestActionV5::SourceCloneDuringMove
             | PostJournalIndexTestActionV5::DestinationCloneDuringMove
             | PostJournalIndexTestActionV5::WorktreeDriftBeforeMove
@@ -15304,7 +15550,11 @@ mod tests {
                 V5PostJournalState::JournalReady
             }
             PostJournalIndexTestActionV5::LiveIndexDriftBeforeMove
-            | PostJournalIndexTestActionV5::LaterUnrelatedAfterMove => unreachable!(),
+            | PostJournalIndexTestActionV5::LaterUnrelatedAfterMove
+            | PostJournalIndexTestActionV5::OldLiveRebindAfterClassification
+            | PostJournalIndexTestActionV5::IndexLockReappearsAfterClassification => {
+                unreachable!()
+            }
         };
         assert_eq!(
             inspect_test_v5_postjournal_state(root).expect("marker fault physical state inspects"),
@@ -15330,6 +15580,7 @@ mod tests {
             PostJournalIndexTestActionV5::MoveThenError,
             PostJournalIndexTestActionV5::MoveWithUnsyncedParent,
             PostJournalIndexTestActionV5::MoveErrorBeforeMove,
+            PostJournalIndexTestActionV5::MoveErrorWithOperationalPost,
             PostJournalIndexTestActionV5::ForeignDuringMove,
             PostJournalIndexTestActionV5::SourceCloneDuringMove,
             PostJournalIndexTestActionV5::DestinationCloneDuringMove,
@@ -15466,8 +15717,13 @@ mod tests {
             PostJournalIndexTestActionV5::LaterUnrelatedAfterMove => {
                 V5PostJournalState::LaterUnrelated
             }
-            PostJournalIndexTestActionV5::ForeignDuringMove => V5PostJournalState::Conflict,
+            PostJournalIndexTestActionV5::ForeignDuringMove
+            | PostJournalIndexTestActionV5::OldLiveRebindAfterClassification
+            | PostJournalIndexTestActionV5::IndexLockReappearsAfterClassification => {
+                V5PostJournalState::Conflict
+            }
             PostJournalIndexTestActionV5::MoveErrorBeforeMove
+            | PostJournalIndexTestActionV5::MoveErrorWithOperationalPost
             | PostJournalIndexTestActionV5::SourceCloneDuringMove
             | PostJournalIndexTestActionV5::DestinationCloneDuringMove
             | PostJournalIndexTestActionV5::WorktreeDriftBeforeMove
@@ -15523,6 +15779,8 @@ mod tests {
             PostJournalIndexTestActionV5::OwnerDriftBeforeMove,
             PostJournalIndexTestActionV5::LiveIndexDriftBeforeMove,
             PostJournalIndexTestActionV5::LaterUnrelatedAfterMove,
+            PostJournalIndexTestActionV5::OldLiveRebindAfterClassification,
+            PostJournalIndexTestActionV5::IndexLockReappearsAfterClassification,
         ] {
             let (fixture, hooks, result) = run_v5_live_index_fault_action(action);
             assert_v5_live_index_fault_action(action, &fixture, &hooks, &result);
