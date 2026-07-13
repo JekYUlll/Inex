@@ -105,6 +105,8 @@ Phase 7 — 跨平台验证、打包与发布准备
         - [x] 完成 bundle retire/cleanup receipt 七态状态机：held proof、relocated classifier、逐边durability/identity协调、SHA-1/SHA-256三payload与双路独立复审均通过
         - [x] 完成 production writer 接线：三payload真实入口统一走single-guard v5 disk-classified driver，旧v4手工tail结构性移除，private composite hooks与双路复审通过
         - [ ] 完成端到端 OS force-kill recovery；Linux/Windows native分别绑定，强杀证据不冒充power-loss
+          - [x] Linux native：SHA-1/SHA-256 × InPlace/DetectedRename/SplitRename 六分片精确230-case真实强杀矩阵通过
+          - [ ] Windows native：绑定Job Object active-process-zero、句柄释放与同一230-case矩阵
   - [ ] 原生 Windows NTFS/ReFS 复验 replace/write-through/power-loss，并由绑定证据决定是否取消 no-parallel-Git 边界
 - [x] 配置 Linux/Windows x64/arm64 CI、Rust 二进制、VSIX 与 Sublime 包产物；远端 hosted jobs 尚待执行
 - [x] 完成 threat model、用户指南、安全配置、迁移/升级与故障恢复文档
@@ -327,6 +329,7 @@ Phase 7 — 跨平台验证、打包与发布准备
 | First fixed hardening snapshot received one GO, but process-security review found mutation regressions could pass on any scanner operational panic | 1 | Move Git enumeration, status validation and file reads outside `catch_unwind`, prove injected fragment is present, and catch only the detector assertion before repeating dual review |
 | Fixed hardening review found narrow setup-owner and guard-regression coverage gaps | 1 | Declare parent cleanup ownership before setup spawn and arm it without an unowned parse window; add durable park-ready plus Drop-path evidence and make the RAII regression exercise real unwinding |
 | Second hardening Clippy pass found one collapsible nested `if let` in best-effort owner evidence cleanup | 1 | Apply the equivalent let-chain, retain the same bounded cleanup behavior, and rerun the complete native and Windows GNU pedantic gates |
+| Post-matrix broad `/tmp` residue search descended into systemd-private directories and emitted expected permission errors | 1 | Restrict residue inspection to same-user top-level `inex-git-recovery-test-*` roots, then check their timestamps and `fixture-owner` descendants without traversing unrelated service sandboxes |
 
 ## Notes
 

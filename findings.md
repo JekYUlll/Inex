@@ -381,3 +381,5 @@
 - Setup child用`mem::forget`转移临时目录owner后，父进程必须立即接管RAII cleanup；否则timeout/panic会留下vault甚至残余明文。进程guard也不能在kill失败后调用无界`wait()`：只有有界`try_wait`证明writer已reap才允许启动fresh recovery，析构路径同样不得永久挂起。
 - Mutation regression不能用`catch_unwind(|| whole_scanner())`证明detector命中：Git命令失败、目录枚举或文件读取panic也会让测试假PASS。应先在catch外完成I/O/status并断言注入fragment确实存在，再只捕获纯字节detector的预期panic。
 - Setup owner的严格转移不能依赖“成功child退出后再parse control”：parent应在spawn前声明cleanup guard，并在一旦可认证取得root时arm；drop order必须保证setup/writer/recovery child先有界reap、fixture后删除。Guard回归也应有durable ready证明目标已park，并分别覆盖显式kill与Drop路径。
+- Linux v5 force-kill绑定最终是六个原生shard、精确230个case，而不是6个代表点：两object formats分别覆盖InPlace 37、DetectedRename 37、SplitRename 38，所有case均执行setup退出、writer OS kill/reap、两次fresh recovery、final verifier与plaintext/object residue检查。634秒全绿只关闭Linux进程强杀；Windows进程树、NTFS ADS与设备掉电仍是独立门禁。
+- 默认`cargo test -p inex-git`不会执行full shard是刻意设计：本轮164个非ignored测试全绿，11个ignored由5个child entry和6个full shard组成；发布证据必须同时保留默认套件结果与显式六分片230/230结果，不能仅引用其中一个。
