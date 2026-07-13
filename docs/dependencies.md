@@ -71,14 +71,19 @@ enumeration are implemented and verified; both Windows rows remain required.
 - Release builds use the pinned crate's bundled/static path, not a drifting
   system pkg-config dependency. Distribution builds do not enable moving
   `fetch-latest`, host-specific `optimized`, or API-reducing `minimal` features.
-- The configured CI is intended to record `sodium_version_string()` and run an
-  offline clean rebuild from a populated dependency cache. Its four platform
-  workflows have not yet been pushed/run, so this is not current evidence.
+- The configured CI records `sodium_version_string()` and runs an offline clean
+  rebuild from a populated dependency cache. Two hosted CI runs exist and both
+  failed; the latest binds `b9ad906`. Their four diagnosed causes are being
+  repaired, but no green rerun or package-workflow result is current evidence.
 - Linux builders require a C compiler, make, and shell. Windows uses MSVC
-  artifacts/source paths supplied and verified by the pinned sys crate.
+  artifacts/source paths supplied and verified by the pinned sys crate. The
+  preparation script copies the signed `LATEST` pair from the Cargo-checksum-
+  locked `libsodium-sys-stable 1.24.0` package and downloads the MSVC pair from
+  the versioned upstream `1.0.22-RELEASE`; all four files have independent
+  size/SHA-256 pins before the crate verifies both official minisign signatures.
 - Linux/Windows x64 are the first blocking matrix; Linux/Windows arm64 join
   before GA. Format fixtures must be byte-identical on every target.
-- The current strict release-tool source suite passes 76/76; `actionlint`,
+- The current strict release-tool source suite passes 85/85; `actionlint`,
   pedantic/all-features Clippy, warnings-as-errors rustdoc, and the Windows GNU
   cross-check pass. A binding Linux x64 candidate requires two standalone clean
   system-GCC builds to be byte-identical and pass strict

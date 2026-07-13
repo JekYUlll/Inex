@@ -231,10 +231,11 @@ a private scratch directory, verify its exact two-member inventory
 directory to a stable token-bound name with a verified no-replace move. The
 manifest is the sole complete copy of the semantic payload and binds the object
 format and exact old/final index/member sizes and SHA-256 digests. On Windows,
-this current inventory binds entry names and each member's unnamed stream but
-does not enumerate alternate data
-streams on the bundle directory or members; ADS enumeration and mutation tests
-remain an explicit native release gate. A clean result clears the merge flag.
+handle-bound `FileStreamInfo` checks reject unexpected alternate data streams
+on the bundle and every transient or active v5 transaction owner before and
+after critical namespace transitions. Those checks and their adversarial test
+source compile for Windows GNU, but the mutation matrix still requires native
+NTFS/ReFS execution. A clean result clears the merge flag.
 A conflict result contains encrypted diff3
 markers and sets authenticated `ContentFlags::UNRESOLVED_MERGE`; a later
 ordinary editor save clears the flag only after all canonical marker lines have

@@ -100,7 +100,7 @@ The implemented release tooling creates `inex-rust-<version>-<platform>.zip`
 with `bin/inex[.exe]`, `bin/inexd[.exe]`, bundled documentation, manifests,
 checksums, a target-bound resolved license inventory, the canonical engineering
 license policy, and complete collected license/NOTICE texts. Current strict
-release-tool source tests pass 76/76. Two clean-source system-GCC Linux x64
+release-tool source tests pass 85/85. Two clean-source system-GCC Linux x64
 builds are required to be byte-for-byte identical across both binaries and all
 four output files. Both must pass strict release-set/native audit, isolated VS
 Code install, and executable/bundled-sidecar smoke; their manifests must record
@@ -439,9 +439,12 @@ all-features and whitespace gates; each package target reruns native x64 tests
 or compiles ARM test targets, enforces canonical repository/origin provenance,
 and installs/smokes its platform VSIX with VS Code 1.125.0. The workflow files
 pass local `actionlint`. Two hosted CI runs have executed and both failed, most
-recently for source `b9ad906`; exact log diagnosis, fixes, and a green rerun are
-pending. The package workflow has no recorded run. Runner-label availability,
-native builds, tests, and uploaded artifacts therefore remain non-binding.
+recently for source `b9ad906`. Their job/step logs are now bound to four root
+causes: v5 add/add recovery, the Sublime Python split, a nonexistent Windows
+3.8.18 asset, and the mutable libsodium input. The source/workflow fixes pass
+their local gates, but a pushed green rerun is still pending. The package
+workflow has no recorded run. Runner-label availability, native builds, tests,
+and uploaded artifacts therefore remain non-binding.
 
 ## Installation sanity checks
 

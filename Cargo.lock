@@ -312,6 +312,7 @@ dependencies = [
  "sha2",
  "thiserror",
  "uuid",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 

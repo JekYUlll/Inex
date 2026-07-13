@@ -32,7 +32,7 @@ In particular:
   persistent-profile evidence. Keyboard/menu Save, other kill variants,
   Hot Exit/history/sync behavior, other platforms, and the complete canary
   matrix remain unproven, so the client remains experimental; and
-- release-tool tests pass 76/76, `actionlint` and pedantic/all-features Clippy
+- release-tool tests pass 85/85, `actionlint` and pedantic/all-features Clippy
   pass, and independent release-tool code review is GO. The binding artifact
   workflow requires two standalone clean system-GCC builds to be byte-identical
   and pass strict archive/native-dependency plus isolated VS Code
@@ -136,11 +136,15 @@ then retires the bundle through a durable journal-to-receipt state machine
 instead of guessing ownership from partial files. A normal Git index writer
 either wins before the real lock or fails while it is held.
 
-The current bundle inventory binds directory entry names and each file's
-unnamed data stream. It does not enumerate NTFS alternate data streams on the
-bundle directory, candidate, or manifest. Native Windows ADS enumeration and
-mutation tests are therefore an open production-validation gate, not a property
-inferred from the exact two-member check or Windows GNU compilation.
+The Windows platform layer now binds each v5 transaction owner to a no-follow
+file or directory handle and rejects every unexpected NTFS alternate data
+stream. The full bundle, manifest-only and empty cleanup forms, transient
+publish/marker/journal files, candidate or live index, journal, receipt, and
+worktree split boundaries are rechecked around their critical moves and
+deletes. Windows GNU compilation and the Windows-only adversarial test source
+close the implementation slice only. The same matrix still has to run on
+native NTFS/ReFS; Wine returning `ERROR_INVALID_FUNCTION` is a fail-closed
+unsupported result, not native ADS evidence.
 
 On Linux, six SHA-1/SHA-256 shards have killed the writer in 230
 InPlace/DetectedRename/SplitRename cases spanning the durable checkpoints. Each

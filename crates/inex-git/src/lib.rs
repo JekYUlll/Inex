@@ -8,7 +8,11 @@
 //! database, and then committed to the worktree/index under a recoverable
 //! ciphertext-only journal.
 
-#![forbid(unsafe_code)]
+// Production code has no FFI escape hatch. Tests remain deny-by-default so the
+// Windows force-kill harness can isolate its audited Win32 calls in one narrow
+// `#[allow(unsafe_code)]` adapter instead of weakening the crate generally.
+#![cfg_attr(not(test), forbid(unsafe_code))]
+#![cfg_attr(test, deny(unsafe_code))]
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -7410,11 +7414,22 @@ fn authenticate_all_in_place_stages_v5(
     git: &Git,
     authenticated: &AuthenticatedInPlaceRecovery,
 ) -> Result<(), GitError> {
-    for stage in authenticated.conflict.stages.iter().flatten() {
+    let stages = &authenticated.conflict.stages;
+    // A no-ancestor conflict with both sides present is add/add: the result
+    // deliberately inherits our identity, while their independently created
+    // document may have a different file id. Every conflict with an ancestor
+    // retains the stricter single-identity requirement.
+    let independent_incoming_add =
+        stages[0].is_none() && stages[1].is_some() && stages[2].is_some();
+    for (stage_index, stage) in stages.iter().enumerate() {
+        let Some(stage) = stage else {
+            continue;
+        };
         let identity = authenticate_stage_identity(vault, git, stage)
             .map_err(map_in_place_stage_authentication_error)?;
         if identity.logical_path != authenticated.conflict.logical_path
-            || identity.file_id != authenticated.file_id
+            || (identity.file_id != authenticated.file_id
+                && !(independent_incoming_add && stage_index == 2))
         {
             return Err(GitError::RecoveryConflict);
         }

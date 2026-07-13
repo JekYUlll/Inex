@@ -645,9 +645,10 @@ fn unlocked_add_add_uses_empty_ancestor_without_plaintext_artifacts() {
     git(directory.path(), ["checkout", "-q", "-b", "ours"]);
     let mut vault = Vault::unlock(directory.path(), PASSWORD, None, KdfPolicy::default())
         .unwrap_or_else(|error| panic!("ours unlock failed: {error}"));
-    vault
+    let ours_metadata = vault
         .create_document(&added, OURS, 1_783_699_202_000)
         .unwrap_or_else(|error| panic!("ours create failed: {error}"));
+    let ours_file_id = ours_metadata.header.file_id.to_string();
     drop(vault);
     git(directory.path(), ["add", "added.md.enc"]);
     git(directory.path(), ["commit", "-q", "-m", "ours add"]);
@@ -655,9 +656,10 @@ fn unlocked_add_add_uses_empty_ancestor_without_plaintext_artifacts() {
     git(directory.path(), ["checkout", "-q", "-b", "theirs"]);
     let mut vault = Vault::unlock(directory.path(), PASSWORD, None, KdfPolicy::default())
         .unwrap_or_else(|error| panic!("theirs unlock failed: {error}"));
-    vault
+    let theirs_metadata = vault
         .create_document(&added, THEIRS, 1_783_699_203_000)
         .unwrap_or_else(|error| panic!("theirs create failed: {error}"));
+    assert_ne!(ours_file_id, theirs_metadata.header.file_id.to_string());
     drop(vault);
     git(directory.path(), ["add", "added.md.enc"]);
     git(directory.path(), ["commit", "-q", "-m", "theirs add"]);
@@ -670,6 +672,14 @@ fn unlocked_add_add_uses_empty_ancestor_without_plaintext_artifacts() {
     );
     let merged = run_unlocked_merge(directory.path());
     assert_eq!(merged.status.code(), Some(1));
+    let merge_stderr = String::from_utf8_lossy(&merged.stderr);
+    assert!(
+        !merge_stderr.contains("inex: "),
+        "unresolved merge reported an operational error: {merge_stderr}"
+    );
+    let merge_stdout = String::from_utf8_lossy(&merged.stdout);
+    assert!(merge_stdout.contains("unresolved-encrypted-results: 1"));
+    assert!(merge_stdout.contains("plaintext-files-written: 0"));
     assert!(
         git_output(directory.path(), ["ls-files", "-u"])
             .stdout

@@ -67,6 +67,20 @@ const CHILD_GUARD_TEST_ENV: &str = "INEX_V5_FORCE_KILL_GUARD_CHILD";
 const CHILD_GUARD_TEST_VALUE: &str = "park-until-bounded-kill";
 const CHILD_GUARD_READY_ENV: &str = "INEX_V5_FORCE_KILL_GUARD_READY";
 const CHILD_GUARD_READY_BYTES: &[u8] = b"force-kill-guard-child-parked\n";
+const CHILD_CLEANUP_ABORT_TEST_ENV: &str = "INEX_V5_FORCE_KILL_ABORT_CHILD";
+const CHILD_CLEANUP_ABORT_TEST_VALUE: &str = "abort-on-unproven-cleanup";
+const CHILD_CLEANUP_ABORT_SENTINEL_ENV: &str = "INEX_V5_FORCE_KILL_ABORT_SENTINEL";
+const CHILD_CLEANUP_ABORT_SENTINEL_BYTES: &[u8] = b"cleanup-proof-abort-still-armed\n";
+#[cfg(windows)]
+const CHILD_WINDOWS_JOB_TREE_TEST_ENV: &str = "INEX_V5_FORCE_KILL_WINDOWS_JOB_TREE_CHILD";
+#[cfg(windows)]
+const CHILD_WINDOWS_JOB_TREE_TEST_VALUE: &str = "spawn-inherited-grandchild-and-park";
+#[cfg(windows)]
+const CHILD_WINDOWS_JOB_TREE_ROOT_READY_ENV: &str =
+    "INEX_V5_FORCE_KILL_WINDOWS_JOB_TREE_ROOT_READY";
+#[cfg(windows)]
+const CHILD_WINDOWS_JOB_TREE_GRANDCHILD_READY_ENV: &str =
+    "INEX_V5_FORCE_KILL_WINDOWS_JOB_TREE_GRANDCHILD_READY";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -1947,8 +1961,493 @@ fn child_command(control_directory: &Path, test_name: &str) -> Command {
 
 type ChildDropEvidence = Arc<Mutex<Option<(u32, Result<ExitStatus, String>)>>>;
 
+#[cfg(windows)]
+// This is the sole unsafe boundary in the force-kill harness. Each Win32 call
+// below documents its handle/buffer invariant; the parent test module remains
+// `deny(unsafe_code)`, and production builds remain `forbid(unsafe_code)`.
+#[allow(unsafe_code)]
+mod windows_job_api {
+    use super::*;
+    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::process::CommandExt as _;
+
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    };
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation,
+        JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
+        TerminateJobObject,
+    };
+    use windows_sys::Win32::System::Threading::{
+        CREATE_SUSPENDED, GetProcessIdOfThread, OpenThread, ResumeThread,
+        THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
+    };
+
+    const WINDOWS_JOB_TERMINATION_EXIT_CODE: u32 = 0xe000_0001;
+
+    pub(super) fn spawn_suspended_child(mut command: Command) -> io::Result<Child> {
+        command.creation_flags(CREATE_SUSPENDED);
+        command.spawn()
+    }
+
+    fn windows_api_error(operation: &str) -> io::Error {
+        let source = io::Error::last_os_error();
+        io::Error::new(source.kind(), format!("{operation}: {source}"))
+    }
+
+    fn windows_structure_size<T>() -> io::Result<u32> {
+        u32::try_from(std::mem::size_of::<T>())
+            .map_err(|_| io::Error::other("Windows structure size does not fit in DWORD"))
+    }
+
+    struct WindowsOwnedHandle {
+        raw: HANDLE,
+    }
+
+    impl WindowsOwnedHandle {
+        fn from_nullable(raw: HANDLE, operation: &str) -> io::Result<Self> {
+            if raw.is_null() {
+                Err(windows_api_error(operation))
+            } else {
+                Ok(Self { raw })
+            }
+        }
+
+        fn from_snapshot(raw: HANDLE) -> io::Result<Self> {
+            if raw == INVALID_HANDLE_VALUE {
+                Err(windows_api_error("CreateToolhelp32Snapshot failed"))
+            } else {
+                Ok(Self { raw })
+            }
+        }
+
+        fn raw(&self) -> HANDLE {
+            self.raw
+        }
+
+        fn close(mut self) -> io::Result<()> {
+            // `CloseHandle` consumes our ownership even when it reports failure:
+            // Windows does not promise that retrying the same numeric value is
+            // safe, and it may already have been recycled. Null the field before
+            // the call so Drop never guesses and attempts a second close.
+            let raw = std::mem::replace(&mut self.raw, std::ptr::null_mut());
+            // SAFETY: `raw` was an owned, live Win32 handle and this is its sole
+            // close attempt. Failure is surfaced as unverifiable release evidence.
+            if unsafe { CloseHandle(raw) } == 0 {
+                return Err(windows_api_error("CloseHandle failed"));
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for WindowsOwnedHandle {
+        fn drop(&mut self) {
+            if !self.raw.is_null() {
+                let raw = std::mem::replace(&mut self.raw, std::ptr::null_mut());
+                // SAFETY: this is the sole best-effort close for a still-owned
+                // handle on an unwind path; explicit paths report close failure.
+                let _ = unsafe { CloseHandle(raw) };
+            }
+        }
+    }
+
+    fn close_owned_handle_after_error(
+        handle: WindowsOwnedHandle,
+        primary: io::Error,
+    ) -> io::Error {
+        match handle.close() {
+            Ok(()) => primary,
+            Err(close) => io::Error::new(
+                primary.kind(),
+                format!("{primary}; owned Job handle release was not provable: {close}"),
+            ),
+        }
+    }
+
+    pub(super) struct WindowsJob {
+        handle: WindowsOwnedHandle,
+    }
+
+    impl WindowsJob {
+        pub(super) fn create() -> io::Result<Self> {
+            let extended_info_size =
+                windows_structure_size::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>()?;
+            // SAFETY: null security attributes select current-process defaults;
+            // a null name creates a private, unnamed, non-inheritable Job.
+            let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            let handle = WindowsOwnedHandle::from_nullable(raw, "CreateJobObjectW failed")?;
+            let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            // SAFETY: `limits` exactly matches the information class and size.
+            if unsafe {
+                SetInformationJobObject(
+                    handle.raw(),
+                    JobObjectExtendedLimitInformation,
+                    std::ptr::from_ref(&limits).cast(),
+                    extended_info_size,
+                )
+            } == 0
+            {
+                let error = windows_api_error("SetInformationJobObject(KILL_ON_JOB_CLOSE) failed");
+                return Err(close_owned_handle_after_error(handle, error));
+            }
+
+            let mut applied = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            // SAFETY: `applied` is an exact writable buffer. This readback occurs
+            // before spawn, so no child exists unless the kernel-confirmed limit
+            // is exactly KILL_ON_JOB_CLOSE (with no breakaway permission).
+            if unsafe {
+                QueryInformationJobObject(
+                    handle.raw(),
+                    JobObjectExtendedLimitInformation,
+                    std::ptr::from_mut(&mut applied).cast(),
+                    extended_info_size,
+                    std::ptr::null_mut(),
+                )
+            } == 0
+            {
+                let error =
+                    windows_api_error("QueryInformationJobObject(ExtendedLimit readback) failed");
+                return Err(close_owned_handle_after_error(handle, error));
+            }
+            let applied_flags = applied.BasicLimitInformation.LimitFlags;
+            if applied_flags != JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE {
+                let error = io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Windows Job limit readback must be exactly KILL_ON_JOB_CLOSE; found \
+                         0x{applied_flags:08x}"
+                    ),
+                );
+                return Err(close_owned_handle_after_error(handle, error));
+            }
+            Ok(Self { handle })
+        }
+
+        pub(super) fn assign_process(&self, child: &Child) -> io::Result<()> {
+            // SAFETY: both handles are live. The child is CREATE_SUSPENDED, so
+            // user code cannot create an escaping descendant before assignment.
+            if unsafe { AssignProcessToJobObject(self.handle.raw(), child.as_raw_handle()) } == 0 {
+                return Err(windows_api_error("AssignProcessToJobObject failed"));
+            }
+            Ok(())
+        }
+
+        fn process_is_assigned(&self, child: &Child) -> io::Result<bool> {
+            let mut assigned = 0;
+            // SAFETY: both handles are live and `assigned` is writable storage.
+            if unsafe {
+                IsProcessInJob(child.as_raw_handle(), self.handle.raw(), &raw mut assigned)
+            } == 0
+            {
+                return Err(windows_api_error("IsProcessInJob failed"));
+            }
+            Ok(assigned != 0)
+        }
+
+        fn active_processes(&self) -> io::Result<u32> {
+            let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+            // SAFETY: `accounting` exactly matches the information class and size.
+            if unsafe {
+                QueryInformationJobObject(
+                    self.handle.raw(),
+                    JobObjectBasicAccountingInformation,
+                    std::ptr::from_mut(&mut accounting).cast(),
+                    windows_structure_size::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>()?,
+                    std::ptr::null_mut(),
+                )
+            } == 0
+            {
+                return Err(windows_api_error(
+                    "QueryInformationJobObject(BasicAccounting) failed",
+                ));
+            }
+            Ok(accounting.ActiveProcesses)
+        }
+
+        pub(super) fn verify_root_and_active_process_count(
+            &self,
+            child: &Child,
+            expected_active: u32,
+        ) -> io::Result<()> {
+            if !self.process_is_assigned(child)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "suspended child is not assigned to its Job Object",
+                ));
+            }
+            let active = self.active_processes()?;
+            if active != expected_active {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "force-kill Job must contain {expected_active} active process(es), found \
+                         {active}"
+                    ),
+                ));
+            }
+            Ok(())
+        }
+
+        pub(super) fn wait_until_empty(&self, deadline: Instant) -> io::Result<()> {
+            loop {
+                let active = self.active_processes()?;
+                if active == 0 {
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("force-kill Job retained {active} active process(es)"),
+                    ));
+                }
+                thread::sleep(CHILD_POLL_INTERVAL);
+            }
+        }
+
+        pub(super) fn request_termination(&self) -> io::Result<()> {
+            // SAFETY: the Job handle is live; the nonzero code is test-only.
+            if unsafe { TerminateJobObject(self.handle.raw(), WINDOWS_JOB_TERMINATION_EXIT_CODE) }
+                == 0
+            {
+                return Err(windows_api_error("TerminateJobObject failed"));
+            }
+            Ok(())
+        }
+
+        pub(super) fn terminate_and_wait_until_empty(&self, deadline: Instant) -> io::Result<()> {
+            let mut last_termination_error = None;
+            loop {
+                let active = self.active_processes()?;
+                if active == 0 {
+                    return Ok(());
+                }
+                if let Err(error) = self.request_termination() {
+                    last_termination_error = Some(error);
+                }
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "force-kill Job retained {active} active process(es) after bounded \
+                             termination; last termination error: {last_termination_error:?}"
+                        ),
+                    ));
+                }
+                thread::sleep(CHILD_POLL_INTERVAL);
+            }
+        }
+
+        pub(super) fn close(self) -> io::Result<()> {
+            self.handle.close()
+        }
+    }
+
+    fn sole_process_thread_id(process_id: u32) -> io::Result<u32> {
+        let thread_entry_size = windows_structure_size::<THREADENTRY32>()?;
+        // SAFETY: returns an owned snapshot or INVALID_HANDLE_VALUE, checked here.
+        let snapshot = WindowsOwnedHandle::from_snapshot(unsafe {
+            CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)
+        })?;
+        let mut entry = THREADENTRY32 {
+            dwSize: thread_entry_size,
+            ..THREADENTRY32::default()
+        };
+        // SAFETY: snapshot is live; `entry` has the documented size.
+        if unsafe { Thread32First(snapshot.raw(), &raw mut entry) } == 0 {
+            let error = windows_api_error("Thread32First failed");
+            return Err(combine_windows_cleanup_error(error, snapshot.close()));
+        }
+        let mut primary_thread_id = None;
+        loop {
+            if entry.th32OwnerProcessID == process_id
+                && primary_thread_id.replace(entry.th32ThreadID).is_some()
+            {
+                let error = io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "suspended child exposed more than one thread before resume",
+                );
+                return Err(combine_windows_cleanup_error(error, snapshot.close()));
+            }
+            // SAFETY: snapshot and output entry remain live and valid.
+            if unsafe { Thread32Next(snapshot.raw(), &raw mut entry) } == 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(ERROR_NO_MORE_FILES.cast_signed()) {
+                    break;
+                }
+                let error = io::Error::new(
+                    error.kind(),
+                    format!("Thread32Next failed: {error}"),
+                );
+                return Err(combine_windows_cleanup_error(error, snapshot.close()));
+            }
+        }
+        let snapshot_close = snapshot.close();
+        let Some(thread_id) = primary_thread_id else {
+            let error = io::Error::new(
+                io::ErrorKind::InvalidData,
+                "suspended child primary thread was absent from the Toolhelp census",
+            );
+            return Err(combine_windows_cleanup_error(error, snapshot_close));
+        };
+        snapshot_close?;
+        Ok(thread_id)
+    }
+
+    pub(super) fn resume_single_suspended_process_thread(child: &mut Child) -> io::Result<()> {
+        let process_id = child.id();
+        let thread_id = sole_process_thread_id(process_id)?;
+
+        // The Toolhelp snapshot names a TID, not a stable handle. Request query
+        // access too so the live handle can revalidate its owner before resume.
+        // SAFETY: access flags are documented and `thread_id` came from Toolhelp.
+        let thread = WindowsOwnedHandle::from_nullable(
+            unsafe {
+                OpenThread(
+                    THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION,
+                    0,
+                    thread_id,
+                )
+            },
+            "OpenThread(resume/query) failed",
+        )?;
+        // SAFETY: `thread` is live with THREAD_QUERY_LIMITED_INFORMATION access.
+        let live_owner = unsafe { GetProcessIdOfThread(thread.raw()) };
+        if live_owner == 0 || live_owner != process_id {
+            let error = if live_owner == 0 {
+                windows_api_error("GetProcessIdOfThread failed")
+            } else {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "suspended-child thread owner changed before resume: expected \
+                         {process_id}, found {live_owner}"
+                    ),
+                )
+            };
+            return Err(combine_windows_cleanup_error(error, thread.close()));
+        }
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                let error = io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "suspended child exited before its primary thread could be resumed",
+                );
+                return Err(combine_windows_cleanup_error(error, thread.close()));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Err(combine_windows_cleanup_error(error, thread.close()));
+            }
+        }
+        // SAFETY: thread is live with THREAD_SUSPEND_RESUME access.
+        let previous_suspend_count = unsafe { ResumeThread(thread.raw()) };
+        let resume_error =
+            (previous_suspend_count == u32::MAX).then(|| windows_api_error("ResumeThread failed"));
+        let close = thread.close();
+        if let Some(error) = resume_error {
+            return Err(combine_windows_cleanup_error(error, close));
+        }
+        close?;
+        if previous_suspend_count != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "primary thread suspend count must be exactly one before resume, found \
+                     {previous_suspend_count}"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn combine_windows_cleanup_error(
+        primary: io::Error,
+        cleanup: io::Result<()>,
+    ) -> io::Error {
+        match cleanup {
+            Ok(()) => primary,
+            Err(cleanup) => io::Error::new(
+                primary.kind(),
+                format!("{primary}; suspended-child cleanup also failed: {cleanup}"),
+            ),
+        }
+    }
+
+    pub(super) fn retain_windows_cleanup_error(first: &mut Option<io::Error>, next: io::Error) {
+        let combined = match first.take() {
+            Some(primary) => io::Error::new(
+                primary.kind(),
+                format!("{primary}; additional Windows cleanup failure: {next}"),
+            ),
+            None => next,
+        };
+        *first = Some(combined);
+    }
+
+    pub(super) fn combine_windows_cleanup_results<const N: usize>(
+        results: [io::Result<()>; N],
+    ) -> io::Result<()> {
+        let mut first_error = None;
+        for result in results {
+            if let Err(error) = result {
+                retain_windows_cleanup_error(&mut first_error, error);
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
+#[cfg(windows)]
+use windows_job_api::{
+    WindowsJob, combine_windows_cleanup_error, combine_windows_cleanup_results,
+    resume_single_suspended_process_thread, spawn_suspended_child,
+};
+
+fn abort_after_child_cleanup_proof_failure(context: &str, error: &io::Error) -> ! {
+    let _ = writeln!(
+        io::stderr().lock(),
+        "fatal: {context}; child cleanup proof failed: {error}"
+    );
+    std::process::abort()
+}
+
+#[cfg(windows)]
+fn cleanup_unassigned_suspended_child(mut child: Child, job: WindowsJob) {
+    if let Err(error) = terminate_child_bounded(&mut child) {
+        abort_after_child_cleanup_proof_failure(
+            "unassigned CREATE_SUSPENDED child did not become waitable",
+            &error,
+        );
+    }
+    drop(child);
+    if let Err(error) = job.wait_until_empty(Instant::now() + CHILD_TERMINATION_TIMEOUT) {
+        abort_after_child_cleanup_proof_failure(
+            "empty Job proof failed after releasing an unassigned suspended child",
+            &error,
+        );
+    }
+    if let Err(error) = job.close() {
+        abort_after_child_cleanup_proof_failure(
+            "empty Job handle release failed after an unassigned suspended child",
+            &error,
+        );
+    }
+}
+
 struct ChildGuard {
     child: Option<Child>,
+    #[cfg(windows)]
+    job: Option<WindowsJob>,
     drop_evidence: Option<ChildDropEvidence>,
 }
 
@@ -1980,21 +2479,65 @@ fn terminate_child_bounded(child: &mut Child) -> io::Result<ExitStatus> {
 }
 
 impl ChildGuard {
-    fn spawn(mut command: Command) -> io::Result<Self> {
-        command.spawn().map(|child| Self {
-            child: Some(child),
-            drop_evidence: None,
-        })
+    fn spawn(command: Command) -> io::Result<Self> {
+        Self::spawn_inner(command, None)
     }
 
     fn spawn_with_drop_evidence(
-        mut command: Command,
+        command: Command,
         drop_evidence: ChildDropEvidence,
+    ) -> io::Result<Self> {
+        Self::spawn_inner(command, Some(drop_evidence))
+    }
+
+    #[cfg(not(windows))]
+    fn spawn_inner(
+        mut command: Command,
+        drop_evidence: Option<ChildDropEvidence>,
     ) -> io::Result<Self> {
         command.spawn().map(|child| Self {
             child: Some(child),
-            drop_evidence: Some(drop_evidence),
+            drop_evidence,
         })
+    }
+
+    #[cfg(windows)]
+    fn spawn_inner(command: Command, drop_evidence: Option<ChildDropEvidence>) -> io::Result<Self> {
+        let job = WindowsJob::create()?;
+        let child = match spawn_suspended_child(command) {
+            Ok(child) => child,
+            Err(error) => {
+                let empty = job.wait_until_empty(Instant::now() + CHILD_TERMINATION_TIMEOUT);
+                let close = job.close();
+                let cleanup = combine_windows_cleanup_results([empty, close]);
+                return Err(combine_windows_cleanup_error(error, cleanup));
+            }
+        };
+        if let Err(error) = job.assign_process(&child) {
+            cleanup_unassigned_suspended_child(child, job);
+            return Err(error);
+        }
+        let mut guard = Self {
+            child: Some(child),
+            job: Some(job),
+            drop_evidence,
+        };
+        if let Err(error) = guard.verify_windows_job_contains_only_root() {
+            let cleanup = guard.terminate_windows_and_disarm().map(|_| ());
+            return Err(combine_windows_cleanup_error(error, cleanup));
+        }
+        let resume = {
+            let child = guard
+                .child
+                .as_mut()
+                .expect("new Windows child guard remains armed before resume");
+            resume_single_suspended_process_thread(child)
+        };
+        if let Err(error) = resume {
+            let cleanup = guard.terminate_windows_and_disarm().map(|_| ());
+            return Err(combine_windows_cleanup_error(error, cleanup));
+        }
+        Ok(guard)
     }
 
     fn child_mut(&mut self) -> &mut Child {
@@ -2002,26 +2545,168 @@ impl ChildGuard {
     }
 
     fn id(&self) -> u32 {
-        self.child
-            .as_ref()
-            .expect("child guard remains armed")
-            .id()
+        self.child.as_ref().expect("child guard remains armed").id()
     }
 
-    fn kill_and_wait(&mut self) -> io::Result<ExitStatus> {
-        let status = terminate_child_bounded(self.child_mut())?;
-        drop(self.child.take().expect("terminated child guard disarms"));
+    #[cfg(windows)]
+    fn verify_windows_job_contains_only_root(&mut self) -> io::Result<()> {
+        self.verify_windows_job_root_and_active_process_count(1)
+    }
+
+    #[cfg(windows)]
+    fn verify_windows_job_root_and_active_process_count(
+        &mut self,
+        expected_active: u32,
+    ) -> io::Result<()> {
+        let child = self
+            .child
+            .as_mut()
+            .ok_or_else(|| io::Error::other("Windows child guard is disarmed"))?;
+        if child.try_wait()?.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Windows child exited before its Job root proof",
+            ));
+        }
+        self.job
+            .as_ref()
+            .ok_or_else(|| io::Error::other("Windows child guard lost its Job Object"))?
+            .verify_root_and_active_process_count(child, expected_active)
+    }
+
+    #[cfg(windows)]
+    fn terminate_windows_and_disarm(&mut self) -> io::Result<ExitStatus> {
+        self.job
+            .as_ref()
+            .ok_or_else(|| io::Error::other("Windows child guard lost its Job Object"))?
+            .request_termination()?;
+
+        let deadline = Instant::now() + CHILD_TERMINATION_TIMEOUT;
+        let child = self
+            .child
+            .as_mut()
+            .ok_or_else(|| io::Error::other("Windows child guard has no root process handle"))?;
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "terminated Windows Job root did not become waitable",
+                ));
+            }
+            thread::sleep(CHILD_POLL_INTERVAL);
+        };
+
+        // ActiveProcesses does not reach zero while this process handle remains
+        // referenced. Release Child first, but retain the Job so a failed zero
+        // proof stays armed for Drop to retry (and ultimately abort if needed).
+        drop(
+            self.child
+                .take()
+                .expect("waitable Windows child guard releases its root handle"),
+        );
+        self.terminate_windows_job_only_and_disarm()?;
         Ok(status)
     }
 
-    fn disarm_reaped(&mut self, status: ExitStatus) -> ExitStatus {
-        drop(self.child.take().expect("reaped child guard disarms"));
-        status
+    #[cfg(windows)]
+    fn terminate_windows_job_only_and_disarm(&mut self) -> io::Result<()> {
+        let job = self
+            .job
+            .as_ref()
+            .ok_or_else(|| io::Error::other("Windows child guard lost its Job Object"))?;
+        job.terminate_and_wait_until_empty(Instant::now() + CHILD_TERMINATION_TIMEOUT)?;
+        let job = self
+            .job
+            .take()
+            .expect("active-zero proof keeps the Windows Job armed until close");
+        if let Err(error) = job.close() {
+            abort_after_child_cleanup_proof_failure(
+                "active-zero Windows Job handle release was not provable",
+                &error,
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn disarm_reaped_windows(&mut self, status: ExitStatus) -> io::Result<ExitStatus> {
+        if self.job.is_none() {
+            return Err(io::Error::other(
+                "Windows child guard lost its Job Object after root exit",
+            ));
+        }
+        drop(
+            self.child
+                .take()
+                .ok_or_else(|| io::Error::other("Windows child guard is disarmed"))?,
+        );
+        self.terminate_windows_job_only_and_disarm()?;
+        Ok(status)
+    }
+
+    fn kill_and_wait(&mut self) -> io::Result<ExitStatus> {
+        #[cfg(windows)]
+        {
+            self.terminate_windows_and_disarm()
+        }
+        #[cfg(not(windows))]
+        {
+            let status = terminate_child_bounded(self.child_mut())?;
+            drop(self.child.take().expect("terminated child guard disarms"));
+            Ok(status)
+        }
+    }
+
+    fn disarm_reaped(&mut self, status: ExitStatus) -> io::Result<ExitStatus> {
+        #[cfg(windows)]
+        {
+            self.disarm_reaped_windows(status)
+        }
+        #[cfg(not(windows))]
+        {
+            let child = self
+                .child
+                .take()
+                .ok_or_else(|| io::Error::other("reaped child guard is already disarmed"))?;
+            drop(child);
+            Ok(status)
+        }
     }
 }
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
+        #[cfg(windows)]
+        {
+            if self.child.is_none() && self.job.is_none() {
+                return;
+            }
+            let pid = self.child.as_ref().map(Child::id);
+            let cleanup = if self.child.is_some() {
+                self.terminate_windows_and_disarm().map(Some)
+            } else {
+                self.terminate_windows_job_only_and_disarm().map(|()| None)
+            };
+            match cleanup {
+                Ok(Some(status)) => {
+                    if let (Some(pid), Some(evidence)) = (pid, self.drop_evidence.as_ref())
+                        && let Ok(mut slot) = evidence.lock()
+                    {
+                        *slot = Some((pid, Ok(status)));
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => abort_after_child_cleanup_proof_failure(
+                    "Windows ChildGuard Drop could not prove process-tree cleanup",
+                    &error,
+                ),
+            }
+        }
+
+        #[cfg(not(windows))]
         if let Some(child) = self.child.as_mut() {
             let pid = child.id();
             let result = terminate_child_bounded(child).map_err(|error| error.to_string());
@@ -2031,6 +2716,7 @@ impl Drop for ChildGuard {
                 *slot = Some((pid, result));
             }
         }
+        #[cfg(not(windows))]
         drop(self.child.take());
     }
 }
@@ -2073,7 +2759,9 @@ fn wait_for_setup_child(
             .try_wait()
             .expect("setup child status polls")
         {
-            break child.disarm_reaped(status);
+            break child
+                .disarm_reaped(status)
+                .expect("setup child Job/process handles close after active-zero proof");
         }
         assert!(
             Instant::now() < deadline,
@@ -2145,7 +2833,9 @@ fn wait_for_completed_child(
             .try_wait()
             .expect("recovery child status polls")
         {
-            let status = child.disarm_reaped(status);
+            let status = child
+                .disarm_reaped(status)
+                .expect("completed child Job/process handles close after active-zero proof");
             assert!(
                 ready,
                 "force-kill child exited without durable completion signal"
@@ -2178,10 +2868,9 @@ fn assert_no_child_processes(pid: u32) {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 fn assert_no_child_processes(_pid: u32) {
-    // Intentionally not evidence for Windows-native process-tree termination. That
-    // remains gated on a Job Object active-process-zero barrier in the Windows shard.
+    // Native force-kill evidence is currently implemented only for Linux and Windows.
 }
 
 fn write_control(directory: &Path, control: &ForceKillControl) {
@@ -2306,11 +2995,19 @@ fn run_force_kill_case(
         &control_root.join(WRITER_ARMED_FILE),
         &writer_armed,
     );
+    #[cfg(windows)]
+    writer
+        .verify_windows_job_contains_only_root()
+        .expect("armed Windows writer Job contains only the live root process");
+    #[cfg(not(windows))]
     assert_no_child_processes(writer.id());
     let killed = writer
         .kill_and_wait()
         .expect("force-kill writer terminates and reaps");
-    assert!(!killed.success(), "force-killed writer must not exit cleanly");
+    assert!(
+        !killed.success(),
+        "force-killed writer must not exit cleanly"
+    );
 
     assert_no_secret_canaries(&control.vault_root, &control_root);
 
@@ -2714,6 +3411,165 @@ fn force_kill_child_guard_park_child() {
     park_forever();
 }
 
+#[test]
+#[ignore = "spawned only by the cleanup-proof abort regression"]
+fn force_kill_cleanup_proof_abort_child() {
+    if std::env::var_os(CHILD_CLEANUP_ABORT_TEST_ENV).as_deref()
+        != Some(OsStr::new(CHILD_CLEANUP_ABORT_TEST_VALUE))
+    {
+        return;
+    }
+    let sentinel_path = PathBuf::from(
+        std::env::var_os(CHILD_CLEANUP_ABORT_SENTINEL_ENV)
+            .expect("cleanup-proof abort child receives a sentinel path"),
+    );
+    let mut sentinel = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&sentinel_path)
+        .expect("cleanup-proof abort sentinel creates");
+    sentinel
+        .write_all(CHILD_CLEANUP_ABORT_SENTINEL_BYTES)
+        .expect("cleanup-proof abort sentinel writes");
+    sentinel
+        .sync_all()
+        .expect("cleanup-proof abort sentinel syncs");
+    drop(sentinel);
+    sync_directory(
+        sentinel_path
+            .parent()
+            .expect("cleanup-proof abort sentinel has a parent"),
+    )
+    .expect("cleanup-proof abort sentinel parent syncs");
+    let _unwind_sentinel = AbortUnwindSentinel {
+        path: sentinel_path,
+    };
+    abort_after_child_cleanup_proof_failure(
+        "synthetic cleanup-proof regression",
+        &io::Error::other("synthetic unproven cleanup"),
+    );
+}
+
+struct AbortUnwindSentinel {
+    path: PathBuf,
+}
+
+impl Drop for AbortUnwindSentinel {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+#[test]
+fn v5_force_kill_unproven_cleanup_aborts_instead_of_unwinding() {
+    let directory = TestDirectory::new();
+    let sentinel_path = directory.path().join("cleanup-proof-abort.armed");
+    let executable = std::env::current_exe().expect("current test executable resolves");
+    let status = Command::new(executable)
+        .args([
+            "--ignored",
+            "--exact",
+            "tests::v5_force_kill_tests::force_kill_cleanup_proof_abort_child",
+            "--test-threads=1",
+        ])
+        .env(
+            CHILD_CLEANUP_ABORT_TEST_ENV,
+            CHILD_CLEANUP_ABORT_TEST_VALUE,
+        )
+        .env(CHILD_CLEANUP_ABORT_SENTINEL_ENV, &sentinel_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("cleanup-proof policy child launches");
+    assert!(
+        !status.success(),
+        "unproven child cleanup must abort the owner instead of unwinding"
+    );
+    assert_eq!(
+        fs::read(&sentinel_path).expect("abort leaves the armed sentinel in place"),
+        CHILD_CLEANUP_ABORT_SENTINEL_BYTES,
+        "abort must bypass Drop instead of unwinding the sentinel guard"
+    );
+    fs::remove_file(sentinel_path).expect("abort regression sentinel removes after proof");
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "spawned only by the Windows Job process-tree regression"]
+fn force_kill_windows_job_tree_child() {
+    if std::env::var_os(CHILD_WINDOWS_JOB_TREE_TEST_ENV).as_deref()
+        != Some(OsStr::new(CHILD_WINDOWS_JOB_TREE_TEST_VALUE))
+    {
+        return;
+    }
+    let root_ready_path = PathBuf::from(
+        std::env::var_os(CHILD_WINDOWS_JOB_TREE_ROOT_READY_ENV)
+            .expect("Windows Job tree child receives a root-ready path"),
+    );
+    let grandchild_ready_path = PathBuf::from(
+        std::env::var_os(CHILD_WINDOWS_JOB_TREE_GRANDCHILD_READY_ENV)
+            .expect("Windows Job tree child receives a grandchild-ready path"),
+    );
+    let mut grandchild = guarded_park_child_command(&grandchild_ready_path)
+        .spawn()
+        .expect("Windows Job root spawns its inherited grandchild");
+    let deadline = Instant::now() + CHILD_TIMEOUT;
+    loop {
+        if grandchild_ready_path
+            .try_exists()
+            .expect("Windows Job grandchild readiness metadata inspects")
+        {
+            assert_eq!(
+                fs::read(&grandchild_ready_path)
+                    .expect("Windows Job grandchild readiness reads"),
+                CHILD_GUARD_READY_BYTES,
+                "inherited grandchild durably acknowledges its parked boundary"
+            );
+            assert!(
+                grandchild
+                    .try_wait()
+                    .expect("Windows Job grandchild liveness rechecks")
+                    .is_none(),
+                "inherited grandchild remains live after publishing readiness"
+            );
+            break;
+        }
+        if let Some(status) = grandchild
+            .try_wait()
+            .expect("Windows Job grandchild status polls")
+        {
+            panic!("Windows Job grandchild exited before its parked boundary: {status:?}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Windows Job grandchild did not acknowledge its parked boundary"
+        );
+        thread::sleep(CHILD_POLL_INTERVAL);
+    }
+
+    let root_ready_bytes = format!("{}\n", grandchild.id());
+    let mut root_ready = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&root_ready_path)
+        .expect("Windows Job root readiness creates");
+    root_ready
+        .write_all(root_ready_bytes.as_bytes())
+        .expect("Windows Job root readiness writes the inherited grandchild PID");
+    root_ready
+        .sync_all()
+        .expect("Windows Job root readiness syncs");
+    drop(root_ready);
+    sync_directory(
+        root_ready_path
+            .parent()
+            .expect("Windows Job root-ready path has a parent"),
+    )
+    .expect("Windows Job root readiness parent syncs");
+    park_forever();
+}
+
 fn guarded_park_child_command(ready_path: &Path) -> Command {
     let executable = std::env::current_exe().expect("current test executable resolves");
     let mut command = Command::new(executable);
@@ -2727,6 +3583,33 @@ fn guarded_park_child_command(ready_path: &Path) -> Command {
         ])
         .env(CHILD_GUARD_TEST_ENV, CHILD_GUARD_TEST_VALUE)
         .env(CHILD_GUARD_READY_ENV, ready_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
+}
+
+#[cfg(windows)]
+fn windows_job_tree_child_command(root_ready_path: &Path, grandchild_ready_path: &Path) -> Command {
+    let executable = std::env::current_exe().expect("current test executable resolves");
+    let mut command = Command::new(executable);
+    command
+        .args([
+            "--ignored",
+            "--exact",
+            "tests::v5_force_kill_tests::force_kill_windows_job_tree_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(
+            CHILD_WINDOWS_JOB_TREE_TEST_ENV,
+            CHILD_WINDOWS_JOB_TREE_TEST_VALUE,
+        )
+        .env(CHILD_WINDOWS_JOB_TREE_ROOT_READY_ENV, root_ready_path)
+        .env(
+            CHILD_WINDOWS_JOB_TREE_GRANDCHILD_READY_ENV,
+            grandchild_ready_path,
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -2753,6 +3636,10 @@ fn wait_for_guard_child_ready(child: &mut ChildGuard, ready_path: &Path) {
                     .is_none(),
                 "guard child remains live after publishing readiness"
             );
+            #[cfg(windows)]
+            child
+                .verify_windows_job_contains_only_root()
+                .expect("parked Windows guard Job contains only its live root process");
             return;
         }
         if let Some(status) = child
@@ -2786,6 +3673,93 @@ fn v5_force_kill_child_guard_terminates_ready_child_without_blocking_wait() {
         started.elapsed() <= CHILD_TERMINATION_TIMEOUT + Duration::from_secs(1),
         "bounded child termination completes within the declared deadline"
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn v5_force_kill_windows_job_binds_one_root_and_proves_empty_before_close() {
+    let directory = TestDirectory::new();
+    let ready_path = directory.path().join("windows-job-root.ready");
+    let command = guarded_park_child_command(&ready_path);
+    let mut child = ChildGuard::spawn(command)
+        .expect("Windows guard creates a suspended child, assigns its Job, and resumes it");
+    wait_for_guard_child_ready(&mut child, &ready_path);
+    child
+        .verify_windows_job_contains_only_root()
+        .expect("Windows Job contains exactly its live root before termination");
+    let status = child
+        .kill_and_wait()
+        .expect("Windows Job termination reaches active-process-zero before handles close");
+    assert!(!status.success(), "Windows Job root is force-killed");
+    fs::remove_file(&ready_path).expect("released Windows child retains no readiness handle");
+}
+
+#[cfg(windows)]
+#[test]
+fn v5_force_kill_windows_job_terminates_inherited_grandchild_tree() {
+    let directory = TestDirectory::new();
+    let root_ready_path = directory.path().join("windows-job-tree-root.ready");
+    let grandchild_ready_path = directory.path().join("windows-job-tree-grandchild.ready");
+    let command = windows_job_tree_child_command(&root_ready_path, &grandchild_ready_path);
+    let mut child = ChildGuard::spawn(command)
+        .expect("Windows guard assigns and resumes the process-tree root");
+    let deadline = Instant::now() + CHILD_TIMEOUT;
+    let grandchild_pid = loop {
+        if root_ready_path
+            .try_exists()
+            .expect("Windows Job root readiness metadata inspects")
+        {
+            let bytes = fs::read(&root_ready_path).expect("Windows Job root readiness reads");
+            let text = std::str::from_utf8(&bytes)
+                .expect("Windows Job root readiness is UTF-8")
+                .trim();
+            let pid = text
+                .parse::<u32>()
+                .expect("Windows Job root readiness contains the grandchild PID");
+            assert_ne!(pid, 0, "Windows Job grandchild PID is nonzero");
+            assert_eq!(
+                fs::read(&grandchild_ready_path)
+                    .expect("Windows Job grandchild readiness reads from the parent"),
+                CHILD_GUARD_READY_BYTES,
+                "Windows Job grandchild reached its parked boundary before root readiness"
+            );
+            assert!(
+                child
+                    .child_mut()
+                    .try_wait()
+                    .expect("Windows Job root liveness rechecks")
+                    .is_none(),
+                "Windows Job root remains live with its parked grandchild"
+            );
+            break pid;
+        }
+        if let Some(status) = child
+            .child_mut()
+            .try_wait()
+            .expect("Windows Job root status polls")
+        {
+            panic!("Windows Job root exited before publishing its process tree: {status:?}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Windows Job root did not publish its inherited grandchild"
+        );
+        thread::sleep(CHILD_POLL_INTERVAL);
+    };
+    child
+        .verify_windows_job_root_and_active_process_count(2)
+        .expect("Windows Job contains its live root and automatically inherited grandchild");
+    let status = child
+        .kill_and_wait()
+        .expect("Windows Job tree termination reaches ActiveProcesses zero before handle close");
+    assert!(
+        !status.success(),
+        "Windows Job root is force-killed with grandchild {grandchild_pid}"
+    );
+    fs::remove_file(&root_ready_path)
+        .expect("terminated Windows Job root retains no readiness handle");
+    fs::remove_file(&grandchild_ready_path)
+        .expect("terminated Windows Job grandchild retains no readiness handle");
 }
 
 #[test]
