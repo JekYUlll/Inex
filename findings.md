@@ -372,3 +372,10 @@
 - 证据harness的最终清理检查不能用`Path::exists()`：该API把metadata错误折叠为false，可能把无法验证的目录状态写成clean。应使用`try_exists()`并传播错误；Windows native还需要真实process-tree/handle-leak runtime证据，非Linux no-op只能维持静态可编译而不能关闭该门禁。
 - “fresh recovery child”不足以单独证明进程隔离：如果父进程仍持有已解锁`Vault`、`Git`或fixture内部File/密钥状态，kill后的观测仍不是纯fresh-disk边界。严格harness应由setup child创建fixture并退出关闭所有句柄，父只持序列化control与paths；恢复/最终验证都另起child，pre-stable续跑也在fresh verifier中完成。
 - 短side plaintext若同时出现在合法Git branch/commit metadata，不能直接加入全对象blind byte scan，也不能因此省略。可证伪方案是：通用canary继续扫描全部raw和所有解压对象；`ours\n`/`theirs\n`采用精确raw metadata排除并对所有Git blob（含unreachable）按object type解压扫描，确保合法commit对象不误报、plaintext blob/scratch仍必报。
+- Fixture setup child若要把`TestDirectory`留给后续进程，必须先原子发布control/ready，再显式detach仅目录owner并正常退出；父只有在setup成功reap且control/ready精确绑定后才能启动writer。进程退出本身关闭fixture内Vault/Git/File/密钥内存，后继final verifier重新unlock/open，避免`mem::forget`把句柄保留在仍存活的父进程。
+- 对合法Git metadata冲突的处理若只是“exact path整文件不扫描”，路径集合虽窄但内容边界仍宽：同一文件被追加一份side plaintext也会被豁免。更强证据是让fixture正文使用不进入branch/commit/path的unique canary，从而零排除地全raw/全object扫描；次选是认证合法metadata bytes或精确剥离已证明的occurrence后继续扫描余下内容。
+- Canary长度本身也是证据稳定性边界：`ours\n`/`base\n`等5-byte token在随机ciphertext中有可观的长期碰撞面，完整230×多阶段raw扫描会放大flaky假阳性。专用canary应足够长、静态可审、逐payload确实进入base/ours/theirs/merged plaintext，同时与Git metadata/control/path/argv零碰撞，才能使用统一零豁免扫描。
+- 不必为三种payload都重写fixture：InPlace是短正文与Git metadata碰撞的来源，可单独自建neutral fixture；Detected/Split既有长正文可在setup child中实际解密stage/result并与冻结canary逐项比较。关键是每个被扫描token都由真实plaintext来源证明，而不是仅把一个未使用常量加入scanner。
+- Full-body canary只能证明完整正文未残留，不能证明crash-time partial write没有留下前缀、单行或中段。Linux绑定证据应同时扫描足够长且互异、并由真实解密stage/result证明包含关系的fragment；mutation必须只泄漏fragment，避免测试仍由完整正文命中而掩盖缺口。
+- `git cat-file --batch-all-objects --batch`的安全价值在于覆盖reachable与unreachable对象；回归若只提交reachable commit没有绑定这一点。应使用`git hash-object -w`写入fragment-only blob、删除输入且不创建ref，再要求统一scanner仍捕获。
+- Setup child用`mem::forget`转移临时目录owner后，父进程必须立即接管RAII cleanup；否则timeout/panic会留下vault甚至残余明文。进程guard也不能在kill失败后调用无界`wait()`：只有有界`try_wait`证明writer已reap才允许启动fresh recovery，析构路径同样不得永久挂起。
