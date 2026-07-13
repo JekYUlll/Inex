@@ -2111,6 +2111,7 @@ pub(super) fn classify_completed_live_index_with_journal_v5(
     (
         InventoryVerifiedCandidateBundleV5,
         CompletedLiveIndexStateV5,
+        FilesystemFileIdentity,
     ),
     GitError,
 > {
@@ -2118,11 +2119,25 @@ pub(super) fn classify_completed_live_index_with_journal_v5(
     if classify_index_lock_v5(&git.root, reference, &inventory)? != IndexLockStateV5::Absent {
         return Err(GitError::RecoveryConflict);
     }
-    let first = read_index_snapshot(&index_path(&git.root))?;
+    let live_path = index_path(&git.root);
+    let live_file = match File::open(&live_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(GitError::RecoveryConflict);
+        }
+        Err(error) => return Err(io_error(GitIoOperation::ReadMetadata, &error)),
+    };
+    if !required_open_file_matches_path_v5(&live_path, &live_file)? {
+        return Err(GitError::RecoveryConflict);
+    }
+    let live_identity = filesystem_file_identity(&live_file)
+        .map_err(|error| io_error(GitIoOperation::InspectMetadata, &error))?;
+    let first = read_index_snapshot(&live_path)?;
     let current = index_entry_map(git)?;
-    let second = read_index_snapshot(&index_path(&git.root))?;
+    let second = read_index_snapshot(&live_path)?;
     if first.size != second.size
         || first.sha256 != second.sha256
+        || !required_open_file_matches_path_v5(&live_path, &live_file)?
         || classify_index_lock_v5(&git.root, reference, &inventory)? != IndexLockStateV5::Absent
     {
         return Err(GitError::IndexChanged);
@@ -2140,7 +2155,10 @@ pub(super) fn classify_completed_live_index_with_journal_v5(
         &reference.bundle_basename,
         &inventory,
     )?;
-    if !guard.is_for_root(&git.root) {
+    if !guard.is_for_root(&git.root)
+        || !required_open_file_matches_path_v5(&live_path, &live_file)?
+        || classify_index_lock_v5(&git.root, reference, &inventory)? != IndexLockStateV5::Absent
+    {
         return Err(GitError::RecoveryConflict);
     }
     let state = if first.size == inventory.manifest.final_index.size
@@ -2151,7 +2169,7 @@ pub(super) fn classify_completed_live_index_with_journal_v5(
     } else {
         CompletedLiveIndexStateV5::LaterUnrelated
     };
-    Ok((inventory, state))
+    Ok((inventory, state, live_identity))
 }
 
 fn verify_held_candidate_index_lock_v5(
@@ -2494,10 +2512,12 @@ fn revalidate_completed_live_index_identity_v5(
     reference: &CandidateBundleTransactionReferenceV5,
     inventory: &InventoryVerifiedCandidateBundleV5,
     proof: &PostJournalLiveIndexProofV5<'_>,
+    classified_identity: &FilesystemFileIdentity,
     completed: CompletedLiveIndexStateV5,
 ) -> Result<(), GitError> {
     let live_path = index_path(&git.root);
     if classify_index_lock_v5(&git.root, reference, inventory)? != IndexLockStateV5::Absent
+        || !required_path_matches_file_identity_v5(&live_path, classified_identity)?
         || required_path_matches_file_identity_v5(&live_path, proof.old_live_identity)?
     {
         return Err(GitError::RecoveryConflict);
@@ -2508,7 +2528,8 @@ fn revalidate_completed_live_index_identity_v5(
         (completed, candidate_matches),
         (CompletedLiveIndexStateV5::ExactFinal, true)
             | (CompletedLiveIndexStateV5::LaterUnrelated, false)
-    ) || classify_index_lock_v5(&git.root, reference, inventory)? != IndexLockStateV5::Absent
+    ) || !required_path_matches_file_identity_v5(&live_path, classified_identity)?
+        || classify_index_lock_v5(&git.root, reference, inventory)? != IndexLockStateV5::Absent
     {
         return Err(GitError::RecoveryConflict);
     }
@@ -2533,7 +2554,7 @@ fn audit_candidate_over_live_index_post_v5<H: PostJournalIndexHooksV5>(
     {
         return Err(GitError::RecoveryConflict);
     }
-    let (inventory, completed) =
+    let (inventory, completed, classified_identity) =
         classify_completed_live_index_with_journal_v5(guard, git, reference)?;
     if completed != CompletedLiveIndexStateV5::ExactFinal {
         return Err(GitError::RecoveryConflict);
@@ -2544,7 +2565,14 @@ fn audit_candidate_over_live_index_post_v5<H: PostJournalIndexHooksV5>(
     )?;
     sync_directory(&git.root.join(".git")).map_err(|_| GitError::DurabilityNotConfirmed)?;
     verify_held_active_journal_identity_v5(git, proof.journal_file)?;
-    revalidate_completed_live_index_identity_v5(git, reference, &inventory, proof, completed)?;
+    revalidate_completed_live_index_identity_v5(
+        git,
+        reference,
+        &inventory,
+        proof,
+        &classified_identity,
+        completed,
+    )?;
     verify_held_active_journal_identity_v5(git, proof.journal_file)?;
     Ok(())
 }
@@ -2563,7 +2591,7 @@ fn audit_candidate_over_live_index_final_v5<H: PostJournalIndexHooksV5>(
     if required_path_matches_file_identity_v5(&live_path, proof.old_live_identity)? {
         return Err(GitError::RecoveryConflict);
     }
-    let (inventory, completed) =
+    let (inventory, completed, classified_identity) =
         classify_completed_live_index_with_journal_v5(guard, git, reference)?;
     hooks.checkpoint(
         PostJournalIndexCheckpointV5::AfterFinalLiveIndexClassification,
@@ -2571,7 +2599,14 @@ fn audit_candidate_over_live_index_final_v5<H: PostJournalIndexHooksV5>(
     )?;
     sync_directory(&git.root.join(".git")).map_err(|_| GitError::DurabilityNotConfirmed)?;
     verify_held_active_journal_identity_v5(git, proof.journal_file)?;
-    revalidate_completed_live_index_identity_v5(git, reference, &inventory, proof, completed)?;
+    revalidate_completed_live_index_identity_v5(
+        git,
+        reference,
+        &inventory,
+        proof,
+        &classified_identity,
+        completed,
+    )?;
     verify_held_active_journal_identity_v5(git, proof.journal_file)?;
     Ok(completed)
 }

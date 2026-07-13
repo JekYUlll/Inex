@@ -776,10 +776,10 @@ fn inspect_v5_postjournal_state(
                     &git,
                     &journal.reference,
                 ) {
-                    Ok((_, candidate_bundle_v5::CompletedLiveIndexStateV5::ExactFinal)) => {
+                    Ok((_, candidate_bundle_v5::CompletedLiveIndexStateV5::ExactFinal, _)) => {
                         V5PostJournalState::ExactFinal
                     }
-                    Ok((_, candidate_bundle_v5::CompletedLiveIndexStateV5::LaterUnrelated)) => {
+                    Ok((_, candidate_bundle_v5::CompletedLiveIndexStateV5::LaterUnrelated, _)) => {
                         V5PostJournalState::LaterUnrelated
                     }
                     Err(error) => v5_post_conflict_or_propagate(error)?,
@@ -10147,6 +10147,11 @@ mod tests {
         LaterUnrelatedAfterMove,
         OldLiveRebindAfterClassification,
         IndexLockReappearsAfterClassification,
+        DeleteLiveAfterInitialClassification,
+        ForeignLiveAfterInitialClassification,
+        IndexLockReappearsAfterInitialClassification,
+        DeleteLiveAfterFinalClassification,
+        ForeignLiveAfterFinalClassification,
     }
 
     #[derive(Debug)]
@@ -10258,6 +10263,83 @@ mod tests {
                 destination_parent_sync: ParentSyncStatus::Synced,
             })
         }
+
+        fn apply_classification_fault(
+            &mut self,
+            checkpoint: candidate_bundle_v5::PostJournalIndexCheckpointV5,
+            context: &candidate_bundle_v5::PostJournalIndexContextV5<'_>,
+        ) -> Result<bool, GitError> {
+            use candidate_bundle_v5::PostJournalIndexCheckpointV5::{
+                AfterFinalLiveIndexClassification, AfterInitialLiveIndexClassification,
+            };
+            let fired = match (self.action, checkpoint) {
+                (
+                    PostJournalIndexTestActionV5::OldLiveRebindAfterClassification,
+                    AfterFinalLiveIndexClassification,
+                ) => {
+                    let retained = self
+                        .retained_path
+                        .take()
+                        .ok_or(GitError::RecoveryConflict)?;
+                    fs::remove_file(context.index_path)
+                        .and_then(|()| fs::rename(retained, context.index_path))
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    true
+                }
+                (
+                    PostJournalIndexTestActionV5::IndexLockReappearsAfterClassification,
+                    AfterFinalLiveIndexClassification,
+                ) => {
+                    fs::write(
+                        context.lock_path,
+                        b"foreign lock after completed-index classification",
+                    )
+                    .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    true
+                }
+                (
+                    PostJournalIndexTestActionV5::DeleteLiveAfterInitialClassification,
+                    AfterInitialLiveIndexClassification,
+                )
+                | (
+                    PostJournalIndexTestActionV5::DeleteLiveAfterFinalClassification,
+                    AfterFinalLiveIndexClassification,
+                ) => {
+                    fs::remove_file(context.index_path)
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    true
+                }
+                (
+                    PostJournalIndexTestActionV5::ForeignLiveAfterInitialClassification,
+                    AfterInitialLiveIndexClassification,
+                )
+                | (
+                    PostJournalIndexTestActionV5::ForeignLiveAfterFinalClassification,
+                    AfterFinalLiveIndexClassification,
+                ) => {
+                    fs::remove_file(context.index_path)
+                        .and_then(|()| {
+                            fs::write(context.index_path, b"foreign classified live index")
+                        })
+                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    true
+                }
+                (
+                    PostJournalIndexTestActionV5::IndexLockReappearsAfterInitialClassification,
+                    AfterInitialLiveIndexClassification,
+                ) => {
+                    fs::write(
+                        context.lock_path,
+                        b"foreign lock after initial live-index classification",
+                    )
+                    .map_err(|_| GitError::DurabilityNotConfirmed)?;
+                    true
+                }
+                _ => false,
+            };
+            self.action_fired |= fired;
+            Ok(fired)
+        }
     }
 
     impl candidate_bundle_v5::PostJournalIndexHooksV5 for PostJournalIndexTestHooksV5 {
@@ -10267,6 +10349,9 @@ mod tests {
             context: &candidate_bundle_v5::PostJournalIndexContextV5<'_>,
         ) -> Result<(), GitError> {
             self.root = Some(context.root.to_path_buf());
+            if self.apply_classification_fault(checkpoint, context)? {
+                return Ok(());
+            }
             let before = matches!(
                 checkpoint,
                 candidate_bundle_v5::PostJournalIndexCheckpointV5::BeforePublishOverMarker
@@ -10315,27 +10400,6 @@ mod tests {
                     if !test_git(context.root, ["add", "after-live-move.bin"]) {
                         return Err(GitError::DurabilityNotConfirmed);
                     }
-                }
-                PostJournalIndexTestActionV5::OldLiveRebindAfterClassification
-                    if checkpoint
-                        == candidate_bundle_v5::PostJournalIndexCheckpointV5::AfterFinalLiveIndexClassification =>
-                {
-                    self.action_fired = true;
-                    let retained = self.retained_path.take().ok_or(GitError::RecoveryConflict)?;
-                    fs::remove_file(context.index_path)
-                        .and_then(|()| fs::rename(retained, context.index_path))
-                        .map_err(|_| GitError::DurabilityNotConfirmed)?;
-                }
-                PostJournalIndexTestActionV5::IndexLockReappearsAfterClassification
-                    if checkpoint
-                        == candidate_bundle_v5::PostJournalIndexCheckpointV5::AfterFinalLiveIndexClassification =>
-                {
-                    self.action_fired = true;
-                    fs::write(
-                        context.lock_path,
-                        b"foreign lock after completed-index classification",
-                    )
-                    .map_err(|_| GitError::DurabilityNotConfirmed)?;
                 }
                 PostJournalIndexTestActionV5::FailAfterMove if after => {
                     self.action_fired = true;
@@ -10431,7 +10495,12 @@ mod tests {
                 | PostJournalIndexTestActionV5::OwnerDriftBeforeMove
                 | PostJournalIndexTestActionV5::LiveIndexDriftBeforeMove
                 | PostJournalIndexTestActionV5::LaterUnrelatedAfterMove
-                | PostJournalIndexTestActionV5::IndexLockReappearsAfterClassification => {
+                | PostJournalIndexTestActionV5::IndexLockReappearsAfterClassification
+                | PostJournalIndexTestActionV5::DeleteLiveAfterInitialClassification
+                | PostJournalIndexTestActionV5::ForeignLiveAfterInitialClassification
+                | PostJournalIndexTestActionV5::IndexLockReappearsAfterInitialClassification
+                | PostJournalIndexTestActionV5::DeleteLiveAfterFinalClassification
+                | PostJournalIndexTestActionV5::ForeignLiveAfterFinalClassification => {
                     atomic_replace_verified_file(source, source_file, destination, destination_file)
                 }
             }
@@ -15552,7 +15621,12 @@ mod tests {
             PostJournalIndexTestActionV5::LiveIndexDriftBeforeMove
             | PostJournalIndexTestActionV5::LaterUnrelatedAfterMove
             | PostJournalIndexTestActionV5::OldLiveRebindAfterClassification
-            | PostJournalIndexTestActionV5::IndexLockReappearsAfterClassification => {
+            | PostJournalIndexTestActionV5::IndexLockReappearsAfterClassification
+            | PostJournalIndexTestActionV5::DeleteLiveAfterInitialClassification
+            | PostJournalIndexTestActionV5::ForeignLiveAfterInitialClassification
+            | PostJournalIndexTestActionV5::IndexLockReappearsAfterInitialClassification
+            | PostJournalIndexTestActionV5::DeleteLiveAfterFinalClassification
+            | PostJournalIndexTestActionV5::ForeignLiveAfterFinalClassification => {
                 unreachable!()
             }
         };
@@ -15671,6 +15745,78 @@ mod tests {
         (fixture, hooks, result)
     }
 
+    fn assert_v5_live_irregular_fault(
+        action: PostJournalIndexTestActionV5,
+        root: &Path,
+        result: &Result<(), GitError>,
+    ) -> bool {
+        if action == PostJournalIndexTestActionV5::LiveIndexDriftBeforeMove {
+            assert!(matches!(
+                result,
+                Err(GitError::GitCommandFailed {
+                    operation: GitOperation::ReadIndex
+                })
+            ));
+            assert!(index_lock_path(root).is_file());
+            return true;
+        }
+        if matches!(
+            action,
+            PostJournalIndexTestActionV5::DeleteLiveAfterInitialClassification
+                | PostJournalIndexTestActionV5::DeleteLiveAfterFinalClassification
+        ) {
+            assert!(!index_path(root).exists());
+            assert!(!index_lock_path(root).exists());
+            return true;
+        }
+        if matches!(
+            action,
+            PostJournalIndexTestActionV5::ForeignLiveAfterInitialClassification
+                | PostJournalIndexTestActionV5::ForeignLiveAfterFinalClassification
+        ) {
+            assert!(matches!(
+                inspect_test_v5_postjournal_state(root),
+                Err(GitError::GitCommandFailed {
+                    operation: GitOperation::ReadIndex
+                })
+            ));
+            assert!(!index_lock_path(root).exists());
+            return true;
+        }
+        false
+    }
+
+    fn expected_v5_live_fault_state(action: PostJournalIndexTestActionV5) -> V5PostJournalState {
+        match action {
+            PostJournalIndexTestActionV5::MoveThenError
+            | PostJournalIndexTestActionV5::MoveWithUnsyncedParent
+            | PostJournalIndexTestActionV5::JournalCloneDuringMove
+            | PostJournalIndexTestActionV5::FailAfterMove => V5PostJournalState::ExactFinal,
+            PostJournalIndexTestActionV5::LaterUnrelatedAfterMove => {
+                V5PostJournalState::LaterUnrelated
+            }
+            PostJournalIndexTestActionV5::ForeignDuringMove
+            | PostJournalIndexTestActionV5::OldLiveRebindAfterClassification
+            | PostJournalIndexTestActionV5::IndexLockReappearsAfterClassification
+            | PostJournalIndexTestActionV5::IndexLockReappearsAfterInitialClassification => {
+                V5PostJournalState::Conflict
+            }
+            PostJournalIndexTestActionV5::MoveErrorBeforeMove
+            | PostJournalIndexTestActionV5::MoveErrorWithOperationalPost
+            | PostJournalIndexTestActionV5::SourceCloneDuringMove
+            | PostJournalIndexTestActionV5::DestinationCloneDuringMove
+            | PostJournalIndexTestActionV5::WorktreeDriftBeforeMove
+            | PostJournalIndexTestActionV5::OwnerDriftBeforeMove => {
+                V5PostJournalState::CandidateInLock
+            }
+            PostJournalIndexTestActionV5::LiveIndexDriftBeforeMove
+            | PostJournalIndexTestActionV5::DeleteLiveAfterInitialClassification
+            | PostJournalIndexTestActionV5::ForeignLiveAfterInitialClassification
+            | PostJournalIndexTestActionV5::DeleteLiveAfterFinalClassification
+            | PostJournalIndexTestActionV5::ForeignLiveAfterFinalClassification => unreachable!(),
+        }
+    }
+
     fn assert_v5_live_index_fault_action(
         action: PostJournalIndexTestActionV5,
         fixture: &CandidateBundlePreparationFixture,
@@ -15697,41 +15843,21 @@ mod tests {
             PostJournalIndexTestActionV5::MoveWithUnsyncedParent => {
                 assert!(matches!(result, Err(GitError::DurabilityNotConfirmed)));
             }
+            PostJournalIndexTestActionV5::MoveErrorWithOperationalPost => {
+                assert!(matches!(
+                    result,
+                    Err(GitError::Io {
+                        operation: GitIoOperation::SyncGitState,
+                        kind: io::ErrorKind::Other
+                    })
+                ));
+            }
             _ => assert!(result.is_err(), "{action:?} must surface its boundary"),
         }
-        if action == PostJournalIndexTestActionV5::LiveIndexDriftBeforeMove {
-            assert!(matches!(
-                result,
-                Err(GitError::GitCommandFailed {
-                    operation: GitOperation::ReadIndex
-                })
-            ));
-            assert!(index_lock_path(root).is_file());
+        if assert_v5_live_irregular_fault(action, root, result) {
             return;
         }
-        let expected = match action {
-            PostJournalIndexTestActionV5::MoveThenError
-            | PostJournalIndexTestActionV5::MoveWithUnsyncedParent
-            | PostJournalIndexTestActionV5::JournalCloneDuringMove
-            | PostJournalIndexTestActionV5::FailAfterMove => V5PostJournalState::ExactFinal,
-            PostJournalIndexTestActionV5::LaterUnrelatedAfterMove => {
-                V5PostJournalState::LaterUnrelated
-            }
-            PostJournalIndexTestActionV5::ForeignDuringMove
-            | PostJournalIndexTestActionV5::OldLiveRebindAfterClassification
-            | PostJournalIndexTestActionV5::IndexLockReappearsAfterClassification => {
-                V5PostJournalState::Conflict
-            }
-            PostJournalIndexTestActionV5::MoveErrorBeforeMove
-            | PostJournalIndexTestActionV5::MoveErrorWithOperationalPost
-            | PostJournalIndexTestActionV5::SourceCloneDuringMove
-            | PostJournalIndexTestActionV5::DestinationCloneDuringMove
-            | PostJournalIndexTestActionV5::WorktreeDriftBeforeMove
-            | PostJournalIndexTestActionV5::OwnerDriftBeforeMove => {
-                V5PostJournalState::CandidateInLock
-            }
-            PostJournalIndexTestActionV5::LiveIndexDriftBeforeMove => unreachable!(),
-        };
+        let expected = expected_v5_live_fault_state(action);
         let inspected = inspect_test_v5_postjournal_state(root);
         if action == PostJournalIndexTestActionV5::ForeignDuringMove {
             assert!(matches!(
@@ -15770,6 +15896,7 @@ mod tests {
             PostJournalIndexTestActionV5::MoveThenError,
             PostJournalIndexTestActionV5::MoveWithUnsyncedParent,
             PostJournalIndexTestActionV5::MoveErrorBeforeMove,
+            PostJournalIndexTestActionV5::MoveErrorWithOperationalPost,
             PostJournalIndexTestActionV5::ForeignDuringMove,
             PostJournalIndexTestActionV5::SourceCloneDuringMove,
             PostJournalIndexTestActionV5::DestinationCloneDuringMove,
@@ -15781,6 +15908,11 @@ mod tests {
             PostJournalIndexTestActionV5::LaterUnrelatedAfterMove,
             PostJournalIndexTestActionV5::OldLiveRebindAfterClassification,
             PostJournalIndexTestActionV5::IndexLockReappearsAfterClassification,
+            PostJournalIndexTestActionV5::DeleteLiveAfterInitialClassification,
+            PostJournalIndexTestActionV5::ForeignLiveAfterInitialClassification,
+            PostJournalIndexTestActionV5::IndexLockReappearsAfterInitialClassification,
+            PostJournalIndexTestActionV5::DeleteLiveAfterFinalClassification,
+            PostJournalIndexTestActionV5::ForeignLiveAfterFinalClassification,
         ] {
             let (fixture, hooks, result) = run_v5_live_index_fault_action(action);
             assert_v5_live_index_fault_action(action, &fixture, &hooks, &result);
