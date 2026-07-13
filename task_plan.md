@@ -326,6 +326,7 @@ Phase 7 — 跨平台验证、打包与发布准备
 | First partial-canary/RAII hardening Clippy pass found a 101-line rename assertion and identical best-effort cleanup match arms | 1 | Extract a small repeated rename-canary assertion helper and collapse the cleanup terminal branches without widening any lint allowance; rerun the full native pedantic gate |
 | First fixed hardening snapshot received one GO, but process-security review found mutation regressions could pass on any scanner operational panic | 1 | Move Git enumeration, status validation and file reads outside `catch_unwind`, prove injected fragment is present, and catch only the detector assertion before repeating dual review |
 | Fixed hardening review found narrow setup-owner and guard-regression coverage gaps | 1 | Declare parent cleanup ownership before setup spawn and arm it without an unowned parse window; add durable park-ready plus Drop-path evidence and make the RAII regression exercise real unwinding |
+| Second hardening Clippy pass found one collapsible nested `if let` in best-effort owner evidence cleanup | 1 | Apply the equivalent let-chain, retain the same bounded cleanup behavior, and rerun the complete native and Windows GNU pedantic gates |
 
 ## Notes
 
