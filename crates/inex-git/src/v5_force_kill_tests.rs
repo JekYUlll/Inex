@@ -1360,7 +1360,12 @@ fn remove_directory_checked(path: &Path) {
             }
         }
     }
-    assert!(!path.exists(), "force-kill directory remains after cleanup");
+    assert!(
+        !path
+            .try_exists()
+            .expect("force-kill cleanup path metadata remains readable"),
+        "force-kill directory remains after cleanup"
+    );
 }
 
 fn force_kill_targets(kind: CandidatePayloadKindV5) -> Vec<(ForceKillTarget, bool)> {
