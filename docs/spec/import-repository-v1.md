@@ -1093,6 +1093,7 @@ order:
 ```text
 import-mode: repository-reconcile
 terminal-operation: repository-reconcile
+existing-vault: yes
 source-policy: path-disjointness-only
 source-git-replanned: no
 password-prompted: no
@@ -1122,19 +1123,69 @@ manifests that produce candidate seal v1. No source count is copied from a new
 source plan, and no opaque seal or physical identity is printed.
 
 After parameter/path validation reaches an existing destination, every
-existing-only nonzero exit prints this independent terminal block before its
-scrubbed diagnostic:
+existing-only nonzero exit whose stdout transport remains writable prints this
+independent terminal block before its scrubbed diagnostic. An output-transport
+error is the sole nonzero outcome for which a complete stdout block cannot be
+promised:
 
 ```text
 import-mode: repository-reconcile
 terminal-operation: repository-reconcile
-marker-state: absent | legacy-unverifiable | v2-invalid | v2-conflict | v2-exact | post-unlink-absent-indeterminate
+existing-vault: yes
+marker-state: reserved-inspection-indeterminate | absent | legacy-unverifiable | reserved-conflict | v2-invalid | v2-exact | marker-replaced | marker-poststate-indeterminate | post-unlink-absent-indeterminate
 candidate-root: existing-unattributed | publication-indeterminate | existing-published
 vault-publication: reconcile-not-started | reconcile-conflict | durable-with-marker | indeterminate
 git-repository: existing-unaudited | existing-audited
-marker-cleanup: not-attempted | retained | indeterminate
+marker-cleanup: not-attempted | retained | replacement-retained | indeterminate
 recovery-required: publication-reconcile | manual-audit
+result: <fixed reconciliation result category>
 ```
+
+The `marker-state` alternatives above are exactly
+`reserved-inspection-indeterminate`, `absent`, `legacy-unverifiable`,
+`reserved-conflict`, `v2-invalid`, `v2-exact`, `marker-replaced`,
+`marker-poststate-indeterminate`, and `post-unlink-absent-indeterminate`.
+Reserved-namespace routing applies this priority before any lock or candidate
+audit:
+
+1. an existing destination, or a present marker parent, that cannot be proved
+   a supported non-link directory, or any incomplete/failed enumeration,
+   identity revalidation, or entry inspection, is
+   `reserved-inspection-indeterminate`;
+2. an exactly absent marker parent, or a complete inventory with no basename
+   having the portable-casefolded reserved prefix, is `absent`;
+3. one exact `import-publish-marker-v1` single-link regular entry whose body
+   has exactly 16 bytes, with no externally expected random value and no other
+   reserved entry, is
+   `legacy-unverifiable`;
+4. more than one reserved entry, both recognized names, any portable-case
+   alias, any unknown reserved basename, or an unsafe/malformed sole legacy
+   entry is `reserved-conflict`;
+5. one exact `import-publish-marker-v2` entry and no other reserved entry is
+   `v2-invalid` when its path properties or bytes fail the canonical parser,
+   and is `v2-exact` only after both are exact.
+
+No later content audit changes one namespace class into another. In
+particular, absence of the exact v2 pathname is not `absent` when any legacy,
+alias, or unknown reserved entry exists.
+
+The exact nonzero terminal tuples are frozen as follows; an implementation
+must not substitute a tuple merely because a later audit happened to produce
+the same file counts:
+
+| Condition | `marker-state` | `candidate-root` | `vault-publication` | `git-repository` | `marker-cleanup` | `recovery-required` | `result` |
+|---|---|---|---|---|---|---|---|
+| Destination/marker-parent safety or complete reserved inventory cannot be proved | `reserved-inspection-indeterminate` | `existing-unattributed` | `reconcile-conflict` | `existing-unaudited` | `not-attempted` | `manual-audit` | `publication marker namespace inspection failed` |
+| Reserved namespace is empty | `absent` | `existing-unattributed` | `reconcile-not-started` | `existing-unaudited` | `not-attempted` | `manual-audit` | `existing repository is unattributed` |
+| Sole exact legacy v1 marker | `legacy-unverifiable` | `existing-unattributed` | `reconcile-conflict` | `existing-unaudited` | `retained` | `manual-audit` | `legacy publication marker is unverifiable` |
+| Multiple, aliased, unknown, or unsafe legacy reserved entries | `reserved-conflict` | `existing-unattributed` | `reconcile-conflict` | `existing-unaudited` | `retained` | `manual-audit` | `publication marker namespace conflicts` |
+| Sole exact v2 pathname has noncanonical path properties or marker bytes | `v2-invalid` | `existing-unattributed` | `reconcile-conflict` | `existing-unaudited` | `retained` | `manual-audit` | `publication marker is invalid` |
+| Canonical v2, but before a complete target audit is accepted the lock is missing/replaced/busy, private recovery state exists, an identity drifts, or the seal/audit mismatches | `v2-exact` | `publication-indeterminate` | `reconcile-conflict` | `existing-unaudited` | `retained` | `manual-audit` | `publication claim failed audit` |
+| Complete target audit was accepted, but a later required reproof or destination/common-parent durability barrier is not confirmed before cleanup | `v2-exact` | `existing-published` | `indeterminate` | `existing-audited` | `retained` | `publication-reconcile` | `publication durability is indeterminate` |
+| Publication is durable, but verified removal leaves the exact old marker present | `v2-exact` | `existing-published` | `durable-with-marker` | `existing-audited` | `retained` | `publication-reconcile` | `publication marker remains` |
+| The cleanup classifier observes a replacement at the marker pathname and preserves it | `marker-replaced` | `existing-published` | `indeterminate` | `existing-audited` | `replacement-retained` | `manual-audit` | `publication marker was replaced` |
+| The cleanup classifier cannot prove old-present, exact-absent, or replacement | `marker-poststate-indeterminate` | `existing-published` | `indeterminate` | `existing-audited` | `indeterminate` | `manual-audit` | `publication marker post-state is indeterminate` |
+| The same live process proves the held marker absent but marker-parent sync or clean audit is indeterminate | `post-unlink-absent-indeterminate` | `existing-published` | `indeterminate` | `existing-audited` | `indeterminate` | `publication-reconcile` | `post-unlink publication state is indeterminate` |
 
 For a fresh process, `marker-state: absent` remains a hard
 existing-destination error. `post-unlink-absent-indeterminate` is reportable
@@ -1143,6 +1194,86 @@ only by the same live process that previously held and removed the exact marker;
 all foreign states use `manual-audit` and perform zero mutation. These terminal
 fields describe reconciliation of an already existing root and can never be
 reported as a newly initialized repository.
+
+When `--dry-run` encounters an exact canonical v2 claim, it acquires the exact
+existing OS lock with the same nonblocking/bounded attempt through a distinct
+read-only guard type. That type exposes audit and final-revalidation methods
+but no synchronization, unlink, core-recovery, or other mutation method. It
+opens and retains the exact marker, reopens all inputs under the lock, performs
+the target-only audit, and revalidates them at the end. It then assembles the
+bounded output snapshot and releases the lock before writing stdout. Thus a
+cooperative concurrent reconcile either completes before the snapshot, fails
+the preview's revalidation, or waits until the snapshot is complete; the
+preview never obtains cleanup authority or mutates persistent state. Every
+preview terminal field describes the instant of final revalidation immediately
+before guard release; it does not claim that the same state remains current
+while stdout is later written.
+
+A valid read-only audit exits zero and prints this complete block, in this
+order, with every key appearing exactly once:
+
+```text
+import-mode: repository-reconcile-dry-run
+terminal-operation: repository-reconcile-preview
+existing-vault: yes
+source-policy: path-disjointness-only
+source-git-replanned: no
+password-prompted: no
+kdf-ran: no
+destination-policy: existing-v2-publication-reconcile-only
+publication-marker-version: 2
+candidate-seal-version: repository-candidate-seal-v1
+target-worktree-files: <decimal>
+target-encrypted-markdown: <decimal>
+target-encrypted-assets: <decimal>
+target-git-objects: <decimal>
+target-root-commit: <40 lowercase hex>
+target-root-parent-count: 0
+target-plaintext-file-objects: 0
+candidate-physical-audit: passed
+candidate-git-object-audit: passed
+marker-state: v2-exact
+candidate-root: existing-published
+vault-publication: indeterminate
+git-repository: existing-audited
+marker-cleanup: retained
+recovery-required: publication-reconcile
+result: repository reconciliation plan valid
+```
+
+This is a valid plan, not publication success: it never prints
+`vault-publication: reconciled`, `marker-cleanup: removed`,
+`git-repository: initialized`, or `result: repository import complete`.
+Invalid or conflicting existing state under `--dry-run` can use only the first
+six observational rows of the nonzero table:
+`reserved-inspection-indeterminate`, `absent`, `legacy-unverifiable`,
+`reserved-conflict`, `v2-invalid`, or the pre-audit `v2-exact` failure. A
+preview never reports a durability, cleanup, replacement, or post-unlink row
+because it attempts none of those operations. An absent destination continues
+to use the ordinary creation dry-run output.
+
+Every structured stdout block is first serialized completely into a bounded
+memory buffer. The block, including its final `result` line, followed by an
+explicit flush is one acknowledgement; partial stdout is never an
+acknowledgement. Existing-only nonzero blocks and dry-run blocks perform no
+cleanup and retain any marker; after their final read-only snapshot is
+assembled, any held guard may be released before output. Their optional
+scrubbed fixed-category diagnostic is written only to stderr and is never part
+of the stdout tuple.
+
+Normal exact-v2 success is different: the complete success block is assembled
+while the existing-only mutation lock remains held, but no success byte is
+written before verified marker removal, marker-parent synchronization, and the
+clean audit reach `PublishedClean`. The process then writes and flushes that
+block before releasing the lock. Lock acquisition is nonblocking or has an
+explicit deadline, and all inventories, files, and iteration counts are
+bounded. A synchronous local-filesystem call that the host kernel does not
+make cancellable, and stdout consumer backpressure after `PublishedClean`, are
+explicit availability boundaries and may delay lock release. If the success
+write or flush fails, the process returns an output error, never recreates the
+marker, and exposes the documented marker-free acknowledgement gap; a fresh
+process still may not infer success. Any nonzero path selected before cleanup
+retains the marker regardless of a later output failure.
 
 After a trustworthy source plan, nonzero exits print the last proven terminal
 fields before a scrubbed fixed-category diagnostic:
