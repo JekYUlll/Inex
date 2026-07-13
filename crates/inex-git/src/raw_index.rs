@@ -28,7 +28,6 @@ const EOIE_DATA_BYTES: usize = 4 + SHA1_BYTES;
 const TREE_EXTENSION: [u8; 4] = *b"TREE";
 const REUC_EXTENSION: [u8; 4] = *b"REUC";
 const UNTR_EXTENSION: [u8; 4] = *b"UNTR";
-const FSMN_EXTENSION: [u8; 4] = *b"FSMN";
 const EOIE_EXTENSION: [u8; 4] = *b"EOIE";
 const IEOT_EXTENSION: [u8; 4] = *b"IEOT";
 
@@ -418,12 +417,7 @@ fn parse_extensions(
 fn is_allowed_extension(signature: [u8; 4]) -> bool {
     matches!(
         signature,
-        TREE_EXTENSION
-            | REUC_EXTENSION
-            | UNTR_EXTENSION
-            | FSMN_EXTENSION
-            | EOIE_EXTENSION
-            | IEOT_EXTENSION
+        TREE_EXTENSION | REUC_EXTENSION | UNTR_EXTENSION | EOIE_EXTENSION | IEOT_EXTENSION
     )
 }
 
@@ -920,12 +914,11 @@ mod tests {
             extension(TREE_EXTENSION, b"opaque-tree"),
             extension(REUC_EXTENSION, b"opaque-reuc"),
             extension(UNTR_EXTENSION, b"opaque-untracked"),
-            extension(FSMN_EXTENSION, b"opaque-fsmonitor"),
         ];
         let bytes = finish(parts.bytes.clone(), &allowed, Checksum::Exact);
         assert!(parse_sha1_index(&bytes).is_ok());
 
-        for signature in [*b"ABCD", *b"link", *b"sdir"] {
+        for signature in [*b"ABCD", *b"FSMN", *b"link", *b"sdir"] {
             let bytes = finish(
                 parts.bytes.clone(),
                 &[extension(signature, b"")],

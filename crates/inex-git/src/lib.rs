@@ -49,10 +49,7 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 mod candidate_bundle_v5;
-#[allow(
-    dead_code,
-    reason = "the raw index parser is integrated by the repository-import hardening follow-up"
-)]
+#[cfg(any(target_os = "linux", test))]
 mod raw_index;
 mod repository_import;
 

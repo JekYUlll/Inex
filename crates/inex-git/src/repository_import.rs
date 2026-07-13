@@ -36,6 +36,8 @@ use thiserror::Error;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+#[cfg(target_os = "linux")]
+use super::raw_index::{RawIndex, RawIndexError, parse_sha1_index};
 use super::{
     DRIVER_NAME, copy_platform_process_environment, discover_git_executable,
     installed_driver_command, validate_git_version,
@@ -507,6 +509,8 @@ struct SourceCommandBinding {
     config: BoundControlFile,
     head: BoundControlFile,
     index: BoundControlFile,
+    #[cfg(target_os = "linux")]
+    raw_index: RawIndex,
 }
 
 impl fmt::Debug for SourceCommandBinding {
@@ -535,6 +539,25 @@ impl BoundControlFile {
             size: held.bytes.len() as u64,
             sha256: sha256(&held.bytes),
         })
+    }
+
+    fn capture_index(root: &Path) -> Result<(Self, RawIndex), RepositoryImportError> {
+        let held = read_secure_relative_file_with_limit_error(
+            root,
+            Path::new(".git/index"),
+            MAX_GIT_OUTPUT,
+            &RepositoryImportError::UnsafeSourceControl,
+            &RepositoryImportError::ResourceLimit,
+        )?;
+        let raw_index = parse_sha1_index(&held.bytes).map_err(map_raw_index_error)?;
+        let binding = Self {
+            relative_path: ".git/index",
+            maximum_bytes: MAX_GIT_OUTPUT,
+            identity: held.identity,
+            size: held.bytes.len() as u64,
+            sha256: sha256(&held.bytes),
+        };
+        Ok((binding, raw_index))
     }
 
     fn verify(&self, root: &Path) -> Result<(), RepositoryImportError> {
@@ -575,6 +598,7 @@ impl SourceCommandBinding {
         if observed_git != git_identity {
             return Err(RepositoryImportError::UnsafeSourceControl);
         }
+        let (index, raw_index) = BoundControlFile::capture_index(root)?;
         Ok(Self {
             root: root.to_path_buf(),
             root_identity,
@@ -586,7 +610,8 @@ impl SourceCommandBinding {
             )?,
             config: BoundControlFile::capture(root, ".git/config", MAX_CONFIG_BYTES)?,
             head: BoundControlFile::capture(root, ".git/HEAD", MAX_CONFIG_BYTES)?,
-            index: BoundControlFile::capture(root, ".git/index", MAX_GIT_OUTPUT)?,
+            index,
+            raw_index,
         })
     }
 
@@ -610,6 +635,15 @@ impl SourceCommandBinding {
         self.config.verify(&self.root)?;
         self.head.verify(&self.root)?;
         self.index.verify(&self.root)
+    }
+}
+
+#[cfg(target_os = "linux")]
+const fn map_raw_index_error(error: RawIndexError) -> RepositoryImportError {
+    match error {
+        RawIndexError::Malformed => RepositoryImportError::UnsafeSourceControl,
+        RawIndexError::Unsupported => RepositoryImportError::UnsafeSourceEntry,
+        RawIndexError::ResourceLimit => RepositoryImportError::ResourceLimit,
     }
 }
 
@@ -656,7 +690,6 @@ fn plan_source_repository_with_executable(
         MAX_CONFIG_BYTES,
         &RepositoryImportError::UnsafeSourceControl,
     )?;
-    validate_source_config(executable, &root, &config.bytes)?;
     let config_sha256 = sha256(&config.bytes);
     let command_binding = Arc::new(SourceCommandBinding::capture(
         &root,
@@ -674,6 +707,7 @@ fn plan_source_repository_with_executable(
         root.clone(),
         Arc::clone(&command_binding),
     );
+    validate_source_config(&runner, &config.bytes)?;
     let version = runner.run(
         RepositoryGitOperation::DiscoverSource,
         &[OsString::from("version")],
@@ -724,11 +758,12 @@ fn plan_source_repository_with_executable(
         None,
     )?;
     let index = parse_source_index(&index_output)?;
-    if tree.len() != index.len()
-        || tree
-            .iter()
-            .any(|(path, entry)| index.get(path) != Some(&entry.oid))
-    {
+    let raw_index = raw_index_semantic_map(&command_binding.raw_index)?;
+    let head_tree = tree
+        .iter()
+        .map(|(path, entry)| (path.clone(), entry.oid.clone()))
+        .collect::<BTreeMap<_, _>>();
+    if raw_index != index || index != head_tree {
         return Err(RepositoryImportError::SourceChanged);
     }
     require_normal_index_tags(&runner, &tree, false)?;
@@ -927,6 +962,27 @@ fn parse_source_index(output: &[u8]) -> Result<BTreeMap<String, String>, Reposit
     Ok(result)
 }
 
+#[cfg(target_os = "linux")]
+fn raw_index_semantic_map(
+    raw_index: &RawIndex,
+) -> Result<BTreeMap<String, String>, RepositoryImportError> {
+    let mut result = BTreeMap::new();
+    for entry in &raw_index.entries {
+        let path = std::str::from_utf8(&entry.path)
+            .map_err(|_| RepositoryImportError::UnsafeSourceEntry)?;
+        validate_relative_path_shape(path)?;
+        let mut oid = String::with_capacity(40);
+        for byte in entry.oid {
+            oid.push(char::from(LOWER_HEX[usize::from(byte >> 4)]));
+            oid.push(char::from(LOWER_HEX[usize::from(byte & 0x0f)]));
+        }
+        if result.insert(path.to_owned(), oid).is_some() {
+            return Err(RepositoryImportError::UnsafeSourceEntry);
+        }
+    }
+    Ok(result)
+}
+
 #[allow(clippy::too_many_lines)] // Keep related endpoint equivalence proofs together.
 #[cfg(target_os = "linux")]
 fn prove_source_endpoints(
@@ -1060,12 +1116,7 @@ fn command_path(
 }
 
 #[cfg(target_os = "linux")]
-fn validate_source_config(
-    executable: &Path,
-    root: &Path,
-    config: &[u8],
-) -> Result<(), RepositoryImportError> {
-    let runner = GitRunner::source(executable.to_path_buf(), root.to_path_buf());
+fn validate_source_config(runner: &GitRunner, config: &[u8]) -> Result<(), RepositoryImportError> {
     let output = runner.run_without_prefix(
         RepositoryGitOperation::InspectConfiguration,
         &os_args(["config", "--file", "-", "--no-includes", "--null", "--list"]),
@@ -1695,6 +1746,17 @@ fn read_secure_relative_file(
     maximum: usize,
     unsafe_error: &RepositoryImportError,
 ) -> Result<HeldFile, RepositoryImportError> {
+    read_secure_relative_file_with_limit_error(root, relative, maximum, unsafe_error, unsafe_error)
+}
+
+#[cfg(target_os = "linux")]
+fn read_secure_relative_file_with_limit_error(
+    root: &Path,
+    relative: &Path,
+    maximum: usize,
+    unsafe_error: &RepositoryImportError,
+    limit_error: &RepositoryImportError,
+) -> Result<HeldFile, RepositoryImportError> {
     let root = open_secure_source_root(root).map_err(|_| unsafe_error.clone())?;
     let mut directories = vec![root];
     let mut components = relative.components().peekable();
@@ -1723,9 +1785,9 @@ fn read_secure_relative_file(
     let mut file = file.ok_or_else(|| unsafe_error.clone())?;
     let length = file.observed_len().map_err(|_| unsafe_error.clone())?;
     if length > u64::try_from(maximum).unwrap_or(u64::MAX) {
-        return Err(unsafe_error.clone());
+        return Err(limit_error.clone());
     }
-    let length = usize::try_from(length).map_err(|_| unsafe_error.clone())?;
+    let length = usize::try_from(length).map_err(|_| limit_error.clone())?;
     file.verify_binding().map_err(|_| unsafe_error.clone())?;
     let identity = file.identity().map_err(|_| unsafe_error.clone())?;
     let mut bytes = Zeroizing::new(vec![0_u8; length]);
@@ -3415,18 +3477,6 @@ struct GitIdentityEnvironment<'a> {
 }
 
 impl GitRunner {
-    #[cfg(target_os = "linux")]
-    fn source(executable: PathBuf, root: PathBuf) -> Self {
-        Self {
-            executable,
-            root,
-            target: false,
-            source_binding: None,
-            #[cfg(target_os = "linux")]
-            target_hooks: None,
-        }
-    }
-
     fn source_bound(
         executable: PathBuf,
         root: PathBuf,
@@ -4450,6 +4500,145 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn force_index_version(root: &Path, version: u32) {
+        let version = version.to_string();
+        test_git(
+            root,
+            &[
+                "-c",
+                "index.threads=1",
+                "update-index",
+                "--index-version",
+                &version,
+                "--force-write-index",
+            ],
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn mutate_and_resign_index(root: &Path, mutate: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
+        let path = root.join(".git/index");
+        let mut bytes = fs::read(&path).expect("raw test index reads");
+        assert!(bytes.len() >= 20, "raw test index has a SHA-1 trailer");
+        bytes.truncate(bytes.len() - 20);
+        mutate(&mut bytes);
+        let digest = Sha1::digest(bytes.as_slice());
+        bytes.extend_from_slice(&digest);
+        fs::write(path, &bytes).expect("re-signed raw test index writes");
+        bytes
+    }
+
+    #[cfg(target_os = "linux")]
+    fn append_index_extension(root: &Path, signature: [u8; 4], data: &[u8]) -> Vec<u8> {
+        mutate_and_resign_index(root, |bytes| {
+            bytes.extend_from_slice(&signature);
+            bytes.extend_from_slice(
+                &u32::try_from(data.len())
+                    .expect("test extension length fits u32")
+                    .to_be_bytes(),
+            );
+            bytes.extend_from_slice(data);
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_snapshot_accepts_real_v2_and_v4_indexes_and_ieot_without_eoie() {
+        for version in [2_u32, 4_u32] {
+            let source = create_source();
+            force_index_version(source.path(), version);
+            let index_path = source.path().join(".git/index");
+            let initial = fs::read(&index_path).expect("real Git index reads");
+            let parsed = parse_sha1_index(&initial).expect("real Git index parses strictly");
+            assert_eq!(parsed.version, version);
+
+            if version == 4 {
+                assert!(
+                    !initial.windows(4).any(|window| window == b"EOIE"),
+                    "single-threaded real Git fixture must not contain EOIE"
+                );
+                let mut ieot = 1_u32.to_be_bytes().to_vec();
+                ieot.extend_from_slice(&12_u32.to_be_bytes());
+                ieot.extend_from_slice(
+                    &u32::try_from(parsed.entries.len())
+                        .expect("test entry count fits u32")
+                        .to_be_bytes(),
+                );
+                let with_ieot = append_index_extension(source.path(), *b"IEOT", &ieot);
+                assert!(with_ieot.windows(4).any(|window| window == b"IEOT"));
+                assert!(!with_ieot.windows(4).any(|window| window == b"EOIE"));
+                let reparsed =
+                    parse_sha1_index(&with_ieot).expect("IEOT-without-EOIE index parses strictly");
+                assert_eq!(reparsed.version, 4);
+                assert_eq!(reparsed.entries, parsed.entries);
+            }
+
+            let snapshot = plan_source_repository(source.path())
+                .expect("strict real Git index agrees with ls-files and HEAD");
+            assert_eq!(snapshot.entries().len(), 3);
+            snapshot
+                .revalidate()
+                .expect("raw index binding revalidates");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_snapshot_rejects_resigned_unsupported_index_extensions_and_entry_flag() {
+        assert!(matches!(
+            map_raw_index_error(RawIndexError::Malformed),
+            RepositoryImportError::UnsafeSourceControl
+        ));
+        assert!(matches!(
+            map_raw_index_error(RawIndexError::Unsupported),
+            RepositoryImportError::UnsafeSourceEntry
+        ));
+        assert!(matches!(
+            map_raw_index_error(RawIndexError::ResourceLimit),
+            RepositoryImportError::ResourceLimit
+        ));
+        let note_oid = typed_git_object_oid("blob", b"# exact\r\n")
+            .expect("test source Markdown blob id computes");
+
+        for signature in [*b"FSMN", *b"ZZZZ"] {
+            let extension_source = create_source();
+            force_index_version(extension_source.path(), 2);
+            let unsupported_extension =
+                append_index_extension(extension_source.path(), signature, b"opaque");
+            assert!(matches!(
+                parse_sha1_index(&unsupported_extension),
+                Err(RawIndexError::Unsupported)
+            ));
+            let error = plan_source_repository(extension_source.path())
+                .expect_err("unsupported raw index extension is rejected before Git inspection");
+            assert!(matches!(&error, RepositoryImportError::UnsafeSourceEntry));
+            let diagnostic = format!("{error:?} {error}");
+            assert!(!diagnostic.contains("note.md"));
+            assert!(!diagnostic.contains(&note_oid));
+        }
+
+        let flag_source = create_source();
+        force_index_version(flag_source.path(), 2);
+        let unknown_flag = mutate_and_resign_index(flag_source.path(), |bytes| {
+            let flag_high_byte = 12 + 60;
+            let flag = bytes
+                .get_mut(flag_high_byte)
+                .expect("first real Git v2 entry has a flag field");
+            *flag |= 0x40;
+        });
+        assert!(matches!(
+            parse_sha1_index(&unknown_flag),
+            Err(RawIndexError::Unsupported)
+        ));
+        let error = plan_source_repository(flag_source.path())
+            .expect_err("unsupported re-signed raw index entry flag is rejected");
+        assert!(matches!(&error, RepositoryImportError::UnsafeSourceEntry));
+        let diagnostic = format!("{error:?} {error}");
+        assert!(!diagnostic.contains("note.md"));
+        assert!(!diagnostic.contains(&note_oid));
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn source_snapshot_binds_head_index_namespace_and_raw_bytes() {
         let source = create_source();
@@ -4468,6 +4657,27 @@ mod tests {
             b"# exact\r\n"
         );
         snapshot.revalidate().expect("unchanged source revalidates");
+
+        let index_path = source.path().join(".git/index");
+        let original_index = fs::read(&index_path).expect("bound index reads");
+        let mut changed_index = original_index.clone();
+        let last = changed_index
+            .last_mut()
+            .expect("bound index contains its SHA-1 trailer");
+        *last ^= 1;
+        fs::write(&index_path, &changed_index).expect("same-size index mutation writes");
+        assert!(matches!(
+            snapshot.revalidate(),
+            Err(RepositoryImportError::SourceChanged | RepositoryImportError::UnsafeSourceControl)
+        ));
+        assert!(matches!(
+            snapshot.read_entry(note),
+            Err(RepositoryImportError::SourceChanged)
+        ));
+        fs::write(&index_path, &original_index).expect("exact index bytes restore");
+        snapshot
+            .revalidate()
+            .expect("restored exact bound index revalidates");
 
         fs::write(source.path().join("ignored.tmp"), b"ignored but untracked")
             .expect("ignored file writes");
