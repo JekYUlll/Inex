@@ -223,14 +223,24 @@ process memory, writes only the new EDRY envelope to
 `hash-object -w --stdin`, and changes the worktree/index under a
 ciphertext-only `.vault-local/git-merge-journal-v1.json`. The stable filename
 accepts legacy strict version 1 in-place, version 2 split-rename, and version 3
-detected-rename metadata. New transactions write version 4, which wraps one of
-those semantic payloads with the repository object format, a random lock
-token, and exact old/candidate index SHA-256 and length bindings. A clean result
-clears the merge flag. A conflict result contains encrypted diff3 markers and
-sets authenticated `ContentFlags::UNRESOLVED_MERGE`; a later ordinary editor
-save clears the flag only after all canonical marker lines have been removed.
-`inex git recover <vault>` authenticates the journal's Git object and safely
-finishes an interrupted worktree/index transition.
+detected-rename metadata; version 4 CAS journals and their pre-lock reservation
+and receipts also remain readable for legacy recovery. New transactions write
+version 5. They first build the final alternate index and canonical manifest in
+a private scratch directory, verify its exact two-member inventory
+(`candidate.index` plus `manifest-v5.json`), and publish that complete immutable
+directory to a stable token-bound name with a verified no-replace move. The
+manifest is the sole complete copy of the semantic payload and binds the object
+format and exact old/final index/member sizes and SHA-256 digests. On Windows,
+this current inventory binds entry names and each member's unnamed stream but
+does not enumerate alternate data
+streams on the bundle directory or members; ADS enumeration and mutation tests
+remain an explicit native release gate. A clean result clears the merge flag.
+A conflict result contains encrypted diff3
+markers and sets authenticated `ContentFlags::UNRESOLVED_MERGE`; a later
+ordinary editor save clears the flag only after all canonical marker lines have
+been removed. `inex git recover <vault>` authenticates the v5 reference,
+manifest, Git object, owners, and stage-map provenance before safely finishing
+an interrupted worktree/index transition.
 
 Git is resolved to one absolute regular executable before use. Plumbing uses a
 fixed argument grammar, bounded stdin/stdout, a cleared environment with only
@@ -240,15 +250,33 @@ one full `.git/index`. Object IDs must match the repository's full SHA-1 or
 SHA-256 width; abbreviated prefixes are rejected. Diagnostics use scrubbed
 stderr and validated portable paths/modes/OIDs; no password, key, session token,
 or plaintext reaches Git. Fully automatic locked Git integration remains
-deferred until an authenticated local broker exists. For v4, Inex first
-publishes a durable token-bound pre-lock reservation, then builds the final
-index through an absolute alternate `GIT_INDEX_FILE`. Initial/final
-create-only ownership receipts bind the candidate before mutation and before
-lock publication. Inex then owns the real `.git/index.lock` across the final
-semantic recheck, worktree
-advancement, and atomic candidate publication. Deliberate parallel porcelain
-is still unsupported because ref-only mutations, legacy journal recovery, and
-native Windows crash/power-loss behavior are not closed by that index lock.
+deferred until an authenticated local broker exists. For v5, Inex copies the
+verified final index out of the immutable bundle to a separate publish-staging
+file, installs a canonical `INEXIDX5\0` marker at the real `.git/index.lock`,
+and publishes a compact durable v5 journal that binds the stable bundle and
+exact marker bytes. It owns that Git lock across the final semantic recheck,
+worktree advancement, marker-to-candidate replacement, and candidate-to-live
+index publication. Normal writes and recovery use the same forward-only
+completion and accept either the exact final index or a later index whose
+unrelated stages changed while the transaction's exact result remains valid.
+
+After publication, durable cleanup moves the stable bundle to a token-bound
+cleanup name and atomically retires the unchanged journal to a cleanup receipt.
+It then verified-removes the candidate member, manifest, empty directory, and
+receipt through the exact seven-state chain `StableJ`, `CleanupFullJ`,
+`CleanupFullR`, `CleanupManifestR`, `CleanupEmptyR`, `ReceiptOnly`, `Clean`.
+Each edge retains or reopens filesystem identity proof, permits only an
+adjacent transition, and confirms the relevant namespace durability before
+continuing. This active-capability cleanup is separate from retained scratch: a
+kill before any scratch no-replace publication may leave one nonblocking
+directory (bundle preparation) or regular file (publish/marker/journal
+preparation), which remains for audit because an unpublished namespace entry
+does not prove ownership. Deliberate parallel porcelain is still unsupported
+because ref-only mutations and legacy v1-v4 recovery are outside the v5 index-lock
+protocol. Linux SHA-1/SHA-256 coverage across all three payloads has passed a
+230-case native OS force-kill/restart matrix, but that proves Linux only.
+Native Windows Job Object/handle behavior, NTFS/ReFS abrupt-kill and power-loss
+evidence remain open and are not inferred from Windows GNU compile checks.
 The final cross-platform namespace move is path based after handle/path
 identity validation; it is not a kernel-level handle-bound compare-exchange
 against a same-OS-user process that directly rebinds transaction paths.

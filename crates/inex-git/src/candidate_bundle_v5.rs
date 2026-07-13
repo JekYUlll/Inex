@@ -116,7 +116,7 @@ pub(super) struct CanonicalBytesReferenceV5 {
 /// mutation.
 #[allow(
     dead_code,
-    reason = "the recovery-first v5 writer consumes this strict classifier in the next slice"
+    reason = "the private v5 writer/recovery state machine consumes selected classifier paths"
 )]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum IndexLockStateV5 {
@@ -147,16 +147,15 @@ struct CandidateBundleInventorySealV5 {
     manifest_file: File,
 }
 
-/// Complete stable bundle prepared for the future v5 writer.
+/// Complete stable bundle prepared for the production v5 writer.
 ///
 /// This value proves only the immutable candidate preparation boundary. The
-/// future writer must still acquire the real Git index lock, revalidate the
+/// caller must still acquire the real Git index lock, revalidate the
 /// live expected-old index and stage map, publish its marker/journal, and
-/// advance the worktree. The current v4 production writer does not call this
-/// seam.
+/// advance the worktree through the single-guard v5 state machine.
 #[allow(
     dead_code,
-    reason = "the v5 preparation seam is intentionally isolated until the next writer slice"
+    reason = "the production v5 writer and focused tests consume different prepared fields"
 )]
 #[derive(Debug)]
 pub(super) struct PreparedCandidateBundleV5 {
@@ -173,7 +172,7 @@ pub(super) struct PreparedCandidateBundleV5 {
 /// acquisition nor any journal, worktree, or live-index mutation.
 #[allow(
     dead_code,
-    reason = "the next writer slice consumes the held publish-staging proof"
+    reason = "the private v5 writer consumes selected held publish-staging fields"
 )]
 #[derive(Debug)]
 pub(super) struct PreparedCandidatePublishStagingV5 {
@@ -188,7 +187,7 @@ pub(super) struct PreparedCandidatePublishStagingV5 {
 /// callers cannot accidentally reuse a pre-crash held file identity.
 #[allow(
     dead_code,
-    reason = "the next recovery slice consumes the fresh held publish-staging proof"
+    reason = "the production v5 writer/recovery state machine consumes this fresh proof"
 )]
 #[derive(Debug)]
 pub(super) struct LoadedCandidatePublishStagingV5 {
@@ -203,7 +202,7 @@ pub(super) struct LoadedCandidatePublishStagingV5 {
 /// or retire it.
 #[allow(
     dead_code,
-    reason = "the next recovery slice consumes the held real-index-lock proof"
+    reason = "the production v5 writer/recovery path consumes the held real-index-lock proof"
 )]
 #[derive(Debug)]
 pub(super) struct AcquiredIndexLockMarkerV5 {
@@ -793,7 +792,7 @@ pub(super) fn index_lock_marker_bytes_v5(
 
 #[allow(
     dead_code,
-    reason = "the next writer slice consumes the strict marker parser after no-replace publication"
+    reason = "the private v5 writer and recovery paths share the strict marker parser"
 )]
 pub(super) fn parse_index_lock_marker_v5(
     bytes: &[u8],
@@ -886,7 +885,7 @@ where
 /// bytes while leaving Git stage-map validation to the caller.
 #[allow(
     dead_code,
-    reason = "the recovery-first v5 writer consumes this strict classifier in the next slice"
+    reason = "the private v5 writer/recovery state machine consumes selected classifier paths"
 )]
 pub(super) fn classify_index_lock_v5(
     root: &Path,
@@ -1582,7 +1581,7 @@ fn verify_bundle_git_semantics_v5(
 /// index and expected final stage map without mutating Git or the worktree.
 #[allow(
     dead_code,
-    reason = "the next writer/recovery slice consumes the fresh-process semantic loader"
+    reason = "the production v5 writer and fresh recovery consume selected loader paths"
 )]
 pub(super) fn load_candidate_bundle_for_git_v5(
     guard: &VaultMutationGuard,
@@ -1803,7 +1802,7 @@ fn reconcile_publish_move_error_v5(
 /// index and its result remains pre-lock state.
 #[allow(
     dead_code,
-    reason = "the next writer slice consumes the publish-staging helper"
+    reason = "the private production v5 writer consumes the publish-staging helper"
 )]
 pub(super) fn prepare_candidate_publish_staging_v5(
     guard: &VaultMutationGuard,
@@ -1926,7 +1925,7 @@ fn prepare_candidate_publish_staging_v5_impl<H: CandidatePublishStagingHooksV5>(
 
 #[allow(
     dead_code,
-    reason = "the next writer slice revalidates the held publish staging before lock acquisition"
+    reason = "the production v5 writer revalidates held publish staging before lock acquisition"
 )]
 pub(super) fn revalidate_candidate_publish_staging_v5(
     guard: &VaultMutationGuard,
@@ -1984,7 +1983,7 @@ fn revalidate_candidate_publish_staging_v5_impl(
 /// publish candidate are each checked again using newly opened file handles.
 #[allow(
     dead_code,
-    reason = "the next recovery slice consumes the fresh-process publish-staging loader"
+    reason = "the production v5 writer/recovery state machine consumes this fresh loader"
 )]
 pub(super) fn load_candidate_publish_staging_v5(
     guard: &VaultMutationGuard,
@@ -2204,7 +2203,7 @@ fn reconcile_index_lock_marker_move_error_v5(
 /// visible it is never removed here, including on post-move failures.
 #[allow(
     dead_code,
-    reason = "the next recovery slice consumes the bounded marker acquisition helper"
+    reason = "the production v5 writer/recovery path consumes the bounded marker helper"
 )]
 pub(super) fn acquire_index_lock_marker_v5(
     guard: &VaultMutationGuard,
@@ -3459,20 +3458,20 @@ fn create_private_file_retaining_v5(path: &Path, bytes: &[u8]) -> Result<File, G
     Ok(file)
 }
 
-/// Prepare and publish one immutable v5 candidate bundle without touching the
-/// real Git index lock, journal, worktree, or the current v4 writer path.
+/// Prepare and publish one immutable v5 candidate bundle without yet touching
+/// the real Git index lock, journal, or worktree.
 ///
 /// Once scratch creation succeeds, every subsequent failure deliberately
 /// retains that exact partial scratch directory (or an already published
 /// stable bundle) for later inspection. The caller must not infer transaction
-/// ownership from an unpublished scratch entry. A future writer must still
+/// ownership from an unpublished scratch entry. The caller must still
 /// acquire and bind the real Git index lock before it may authorize any
 /// repository mutation. The inventory proof covers named directory entries
 /// and each file's unnamed data stream; native NTFS ADS enumeration and
 /// abrupt-power-loss evidence remain separate release gates.
 #[allow(
     dead_code,
-    reason = "the v5 preparation seam is intentionally isolated until the next writer slice"
+    reason = "the production v5 writer and focused preparation tests use different paths"
 )]
 pub(super) fn prepare_candidate_bundle_v5(
     guard: &VaultMutationGuard,
@@ -3714,7 +3713,7 @@ fn prepare_candidate_bundle_v5_impl<H: CandidateBundlePrepareHooksV5>(
 
 #[allow(
     dead_code,
-    reason = "the v5 preparation seam is intentionally isolated until the next writer slice"
+    reason = "the production v5 writer and focused preparation tests use different paths"
 )]
 pub(super) fn revalidate_prepared_candidate_bundle_v5(
     root: &Path,

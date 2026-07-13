@@ -126,21 +126,40 @@ state.
 
 Stop every editor-integrated or command-line Git operation before running
 `inex git merge` or `inex git recover` in the supported release workflow. New
-transactions now generate and verify an alternate index, install an
-Inex-owned marker at the real `.git/index.lock`, bind old/candidate index
-digests in journal v4, and publish the candidate only after the locked
-worktree/owner/provenance recheck. Before the alternate candidate is created, a
-durable create-only pre-lock reservation binds its random private name and the
-old index digest; a fresh process can therefore classify a pre-lock abrupt exit
-without relying on destructors. Create-only initial/final ownership receipts
-then bind candidate bytes before mutation and before real-lock publication;
-ambiguous receipt gaps preserve all state and require investigation instead of
-guessing ownership. A normal Git index writer either wins before the real lock
-or fails while it is held. This does not serialize ref-only commands,
-legacy v1/v2/v3 journal recovery, or a same-OS-user process that directly
-unlinks or rewrites transaction files. Native Windows abrupt-kill and
-power-loss behavior is also not yet binding evidence, so deliberate concurrent
-Git remains outside the supported checkpoint.
+transactions build and verify the complete alternate index plus a canonical
+manifest inside an unpublished scratch directory, then publish that exact
+two-member immutable v5 bundle with a verified no-replace directory move. An
+`INEXIDX5` marker at the real `.git/index.lock` and a strict v5 journal bind the
+bundle before any worktree or live-index transition. Completion rechecks the
+worktree, owners, provenance, full stage map, and live-index identity; cleanup
+then retires the bundle through a durable journal-to-receipt state machine
+instead of guessing ownership from partial files. A normal Git index writer
+either wins before the real lock or fails while it is held.
+
+The current bundle inventory binds directory entry names and each file's
+unnamed data stream. It does not enumerate NTFS alternate data streams on the
+bundle directory, candidate, or manifest. Native Windows ADS enumeration and
+mutation tests are therefore an open production-validation gate, not a property
+inferred from the exact two-member check or Windows GNU compilation.
+
+On Linux, six SHA-1/SHA-256 shards have killed the writer in 230
+InPlace/DetectedRename/SplitRename cases spanning the durable checkpoints. Each
+case uses two fresh recovery processes plus a final verifier to prove
+convergence and plaintext-residue checks. That evidence does not serialize
+ref-only commands or legacy v1-v4
+recovery, cover a same-OS-user process that directly unlinks or rewrites
+transaction paths, prove native Windows Job Object/handle behavior, or prove
+NTFS/ReFS power-loss durability. Deliberate concurrent Git therefore remains
+outside the supported checkpoint.
+
+A kill before any scratch entry's verified no-replace publication may leave one
+token-derived private entry: a directory during immutable-bundle preparation,
+or a regular file during publish-staging, marker, or journal preparation. This
+scratch is orthogonal to the active transaction capability, does not block a
+later merge, and is retained for audit instead of being guessed clean. Active
+recovery and cleanup intentionally do not delete it. Consequently the current
+CLI `verify` pending boolean can report `none` while such nonblocking scratch
+exists; do not interpret that boolean as a zero-residue inventory report.
 
 Password add/change/remove operations rewrap the same stable master key; they
 are not master-key rotation. A person who retains an older `vault.json` from Git

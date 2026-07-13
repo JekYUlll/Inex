@@ -42,9 +42,10 @@
   decrypts and re-encrypts under the new authenticated path instead of moving
   ciphertext blindly.
 - Local mutations use conditional etags, verified ciphertext staging,
-  cross-process locking, and explicit recovery journals. Git merge v4 uses an
-  alternate index candidate, durable pre-lock reservation, phase-bound
-  ownership receipts, and an Inex-owned real `index.lock` transaction.
+  cross-process locking, and explicit recovery journals. New Git transactions
+  use a v5 immutable alternate-index bundle, canonical `INEXIDX5` marker and
+  journal, live-index identity checks, and a durable cleanup receipt under one
+  mutation guard.
 - Parsers reject duplicate or unknown security-sensitive fields,
   noncanonical identifiers, invalid UTF-8 passwords, malformed framing, and
   unsupported future states.
@@ -54,12 +55,22 @@
 
 ## Current evidence
 
-- The Rust workspace, TypeScript client tests, Sublime pure-Python tests, and
-  strict release-tool tests pass on the local Linux x64 development host.
+- The predecessor full Rust workspace aggregate passed 333/333 before Git v5;
+  a current-HEAD aggregate is still required. The current default `inex-git`
+  suite passes 164 with 0 failures and 11 intentionally ignored child/shard
+  entries, and all six ignored full shards were executed separately for the
+  230-case matrix below. TypeScript, Sublime pure-Python, and strict
+  release-tool suites pass on the local Linux x64 development host.
 - Linux subprocess force-kill tests prove atomic ciphertext writes expose only
-  a complete old or new target at four commit boundaries. Git pre-lock tests
-  prove ambiguous/foreign/partial/link states are detected and preserved
-  rather than silently cleaned; receipt-gap automatic recovery remains open.
+  a complete old or new target at four commit boundaries. Separately, six
+  native Linux Git shards cover 230 SHA-1/SHA-256 ×
+  InPlace/DetectedRename/SplitRename cases spanning the writer's durable state
+  matrix, using fresh recovery processes and plaintext-residue scans. A kill
+  before any scratch no-replace publication may retain one orthogonal
+  nonblocking entry for audit: a directory during bundle preparation or a
+  regular file during publish/marker/journal preparation. Active cleanup does
+  not guess-delete it. Native Windows and device power-loss remain separate
+  open evidence rows.
 - The Linux x64 binding workflow requires two standalone clean system-GCC
   release builds to be byte-identical and pass strict release-set,
   native-dependency, package, VSIX installation, and bundled-sidecar smoke
@@ -107,7 +118,7 @@ ReFS, physical power loss, signed distribution, or independent legal review.
   master-key rotation, in-place plaintext conversion, shared daemon sessions,
   and native Search-sidebar integration are not supported in v1.
 - Deliberately concurrent Git porcelain, ref-only concurrency during recovery,
-  native abrupt power-loss claims, receipt-gap automatic recovery, and
+  native Windows Job/handle claims, NTFS/ReFS abrupt power-loss claims, and
   same-user hostile namespace replacement remain outside this checkpoint.
 - The system does not protect against administrators, malware or untrusted
   editor extensions while unlocked, memory forensics, swap/hibernation, crash

@@ -262,13 +262,24 @@ explicitly.
 Preserve `.git`, worktree ciphertext, and `.vault-local`. Ambiguous rename
 provenance, rename/rename, multiple merge bases, split index, mode, attribute,
 object-format, owner, concurrent-change, or journal facts fail closed. Stop all
-other Git porcelain before retrying. New v4 transactions also reject a foreign
-`.git/index.lock`, a changed old/candidate index digest, or a target result that
-was changed after publication. Legacy v1/v2/v3 recovery still requires an
-exclusive Git worktree. If `inex git recover` reports a conflict, do not delete
-the journal, candidate, or lock and do not force stage zero; compare current
+other Git porcelain before retrying. New v5 transactions also reject a foreign
+`.git/index.lock`, noncanonical/link/rebound bundle or cleanup state, a changed
+old/final index digest, or a target result changed after publication. Legacy
+v1-v4 recovery still requires an exclusive Git worktree. If `inex git recover`
+reports a conflict, do not delete the journal, bundle, cleanup receipt,
+candidate, or lock and do not force stage zero; compare current
 OIDs/digests and the recorded fixed provenance against a copy and the
 [Git recovery contract](spec/git-merge-v1.md).
+
+A kill before any v5 scratch no-replace publication can retain one
+token-derived private entry: a directory during bundle preparation or a regular
+file during publish/marker/journal preparation. It is orthogonal to active
+transaction recovery, so it can remain after recovery or while `inex verify`
+reports no active pending Git transaction. This is deliberate: the unpublished
+entry is nonblocking and is not enough ownership proof for automatic deletion.
+Do not remove it merely by matching its basename; preserve it for
+audit until an authenticated cleanup procedure explicitly covers retained
+scratch.
 
 ### Git reports a conflict in `vault.json`
 

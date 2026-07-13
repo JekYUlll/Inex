@@ -236,8 +236,13 @@ This command does not prompt for a password and does **not** authenticate
 `vault.json` or decrypt/authenticate document bodies. It acquires the mutation
 lock and may recover a pending core ciphertext transaction, so it is not a pure
 read-only inspection. It reports either a structurally present Git merge
-journal or an Inex-marked abandoned v4 index reservation, but does not
-authenticate a journal result or advance it without `inex git recover`.
+journal, a pending v5 bundle/marker/cleanup state, or a recognized legacy v4
+reservation, but does not authenticate a journal result or advance it without
+`inex git recover`. A v5 kill before any scratch no-replace publication may
+leave one orthogonal nonblocking entry for audit: a directory during bundle
+preparation or a regular file during publish/marker/journal preparation. Active
+cleanup does not guess-delete it, and the CLI pending boolean does not expose
+that retained count, so `none` is not a zero-scratch assertion.
 
 ### Password slots
 

@@ -438,10 +438,10 @@ workspace/package version. The required job runs the binding pedantic/
 all-features and whitespace gates; each package target reruns native x64 tests
 or compiles ARM test targets, enforces canonical repository/origin provenance,
 and installs/smokes its platform VSIX with VS Code 1.125.0. The workflow files
-pass local `actionlint`, but they have not been pushed or
-executed by the remote service. Runner-label availability, native builds,
-tests, and uploaded artifacts are therefore configuration intent, not binding
-evidence.
+pass local `actionlint`. Two hosted CI runs have executed and both failed, most
+recently for source `b9ad906`; exact log diagnosis, fixes, and a green rerun are
+pending. The package workflow has no recorded run. Runner-label availability,
+native builds, tests, and uploaded artifacts therefore remain non-binding.
 
 ## Installation sanity checks
 

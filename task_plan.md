@@ -106,9 +106,12 @@ Phase 7 — 跨平台验证、打包与发布准备
         - [x] 完成 production writer 接线：三payload真实入口统一走single-guard v5 disk-classified driver，旧v4手工tail结构性移除，private composite hooks与双路复审通过
         - [ ] 完成端到端 OS force-kill recovery；Linux/Windows native分别绑定，强杀证据不冒充power-loss
           - [x] Linux native：SHA-1/SHA-256 × InPlace/DetectedRename/SplitRename 六分片精确230-case真实强杀矩阵通过
-          - [ ] Windows native：绑定Job Object active-process-zero、句柄释放与同一230-case矩阵
+          - [ ] Windows native：
+            - [ ] 在 core Windows 平台层枚举并 fail-closed 拒绝 v5 bundle 目录、candidate 与 manifest 的 NTFS ADS，接入 initial/held/cleanup 重验证
+            - [ ] 绑定 Job Object suspended-before-assignment、active-process-zero 与句柄释放证据
+            - [ ] 在原生 NTFS/ReFS 宿主运行同一 230-case 矩阵
   - [ ] 原生 Windows NTFS/ReFS 复验 replace/write-through/power-loss，并由绑定证据决定是否取消 no-parallel-Git 边界
-- [x] 配置 Linux/Windows x64/arm64 CI、Rust 二进制、VSIX 与 Sublime 包产物；远端 hosted jobs 尚待执行
+- [x] 配置 Linux/Windows x64/arm64 CI、Rust 二进制、VSIX 与 Sublime 包产物；两次 hosted CI 已执行但失败，精确日志诊断、修复与绿色重跑待完成，package workflow 尚无运行记录
 - [x] 完成 threat model、用户指南、安全配置、迁移/升级与故障恢复文档
 - [ ] 审计磁盘明文残留、日志秘密、依赖许可与发布清单
   - [x] 将 target-bound Cargo graph、固定四 workspace member、精确许可策略/checksum、许可文本摘要与 libsodium 声明绑定到严格 `THIRD_PARTY_LICENSES.json`

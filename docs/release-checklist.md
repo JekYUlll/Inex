@@ -9,7 +9,7 @@ required native/editor/package black-box result.
 
 > **NO-GO for GA, supported VS Code MVP, or supported Sublime release.**
 
-The 2026-07-12 source checkpoint has strong Linux and cross-platform
+The 2026-07-13 source checkpoint has strong Linux and cross-platform
 development evidence, but the release gates below are intentionally incomplete.
 The project must keep its pre-alpha warning and must not present any generated
 archive as a supported install.
@@ -27,18 +27,18 @@ Status terms in this document mean:
 
 | Area | Status | Evidence and exact boundary |
 |------|--------|-----------------------------|
-| Linux Rust workspace | verified source checkpoint | 333/333 workspace tests pass with calibrated Argon2id creation/rewrap and its CLI evidence path, index-CAS v4, native force-kill atomic-write, pre-lock ownership, and exact runtime-info regressions, plus rustfmt, all-target/all-feature pedantic Clippy with warnings denied, rustdoc warnings denied, and whitespace checks |
+| Linux Rust workspace | verified source slices; current aggregate pending | The predecessor full-workspace checkpoint passed 333/333 before Git v5 landed. On the current Git slice, the default suite passes 164 with 0 failures and 11 intentionally ignored entries: five child-only helpers plus six full-shard tests. All six full shards were then run explicitly and covered 230/230 native Linux force-kill cases. Rustfmt, native all-target/all-feature pedantic Clippy, Windows GNU check/Clippy/no-run, and whitespace checks pass. Do not add these unlike counters into a fabricated workspace total; rerun the current-HEAD aggregate for final-candidate evidence |
 | EDRY/vault compatibility | checkpoint | Frozen v1 fixture rebuild/unlock/decrypt and broad format/path/tamper tests pass on Linux; Windows GNU compiles and earlier Wine suites pass, but this is not native Windows evidence |
 | Import | verified source checkpoint; artifact evidence external | Copy-only absent-destination staging, re-open/seal/allowlist/publication, source-preservation, and failure-class tests pass. A binding artifact report must additionally import a five-document synthetic tree including exact 16 MiB content, preserve every source hash, and produce no plaintext Markdown in the vault; publication ambiguity and native-platform fault cases remain pending |
-| Argon2id creation policy and diagnostic | verified Linux source checkpoint; native packaged evidence pending | Default create/init/import process-cache an ops-only 3–20 calibration at fixed 64 MiB toward a 250–750 ms public-dummy selector observation. Deterministic injected tests cover all five outcomes and are authoritative for search semantics. The CLI-only, no-argument `kdf-calibration-info` path runs before password/query setup and emits the exact 20-line `inex-kdf-calibration-v1` report without persistent product state. Explicit RPC creation uses the independent 3–20/exact-64-MiB cap and fails before root creation; reader compatibility remains 20/1 GiB. Core and real CLI process tests prove password add/change retains both stronger authenticated components. Three-attempt native packaged timing/resource evidence on all four targets remains pending |
-| Git | verified Linux fail-closed source checkpoint | Locked-safe driver, local installer, encrypted diff3, fixed tree provenance, full-width SHA-1/SHA-256, detected/split rename/modify, and legacy v1/v2/v3 recovery pass. New v4 transactions publish a canonical pre-lock reservation plus initial/final ownership receipts before holding the real `.git/index.lock`; Linux regressions cover orphan/partial/wrong-case/link/foreign state, pre-lock winner, lock-held Git failure, marker/candidate/published recovery, target drift, and foreign-lock preservation. A kill between candidate mutation and its matching receipt is detected and preserved as `RecoveryConflict`, not automatically recovered. Native Windows abrupt-kill/power-loss, ref-only concurrency, and legacy recovery CAS remain pending |
+| Argon2id creation policy and diagnostic | verified Linux source policy; predecessor Linux x64 package checkpoint | Default create/init/import process-cache an ops-only 3–20 calibration at fixed 64 MiB toward a 250–750 ms public-dummy selector observation. Deterministic injected tests cover all five outcomes and are authoritative for search semantics. The CLI-only, no-argument `kdf-calibration-info` path runs before password/query setup and emits the exact 20-line `inex-kdf-calibration-v1` report without persistent product state. Explicit RPC creation uses the independent 3–20/exact-64-MiB cap and fails before root creation; reader compatibility remains 20/1 GiB. Core and real CLI process tests prove password add/change retains both stronger authenticated components. A clean predecessor Linux x64 package retained exactly three valid ordinal fresh-process observations with no retries; the final candidate must repeat that evidence, and Linux arm64 plus both Windows MSVC targets remain pending |
+| Git | verified Linux fail-closed source checkpoint | Locked-safe driver, local installer, encrypted diff3, fixed tree provenance, full-width SHA-1/SHA-256, detected/split rename/modify, and legacy v1-v4 recovery pass. New production transactions use a v5 immutable candidate bundle, canonical marker/journal, live-index identity checks, and durable cleanup receipt under one mutation guard. Six Linux-native shards cover 230 SHA-1/SHA-256 × InPlace/DetectedRename/SplitRename OS force-kill cases spanning the durable state matrix with fresh-process recovery. A kill before any scratch no-replace publication may retain one orthogonal nonblocking directory or regular file for audit; active cleanup intentionally leaves it. The exact bundle inventory currently binds entries and unnamed streams but does not enumerate NTFS ADS. Native Windows needs ADS mutation tests and the same matrix with Job Object active-process-zero and handle-release proof; NTFS/ReFS power-loss, ref-only concurrency, and legacy recovery serialization remain pending |
 | VS Code unit/bundle | verified checkpoint | Strict TypeScript, 23/23 Node tests, production bundle, and integration bundle pass |
 | VS Code Extension Host | partial | The current local build and 1.125.0 directly drive the production create/folder-create/file-rename/file-delete actions plus encrypted backup/recovery against the daemon/custom editor. Close refusal, rename collision, Unix delete-I/O failure recovery, command registration, and isolated-root residue pass. InputBox/QuickPick mouse interaction is not automated, and test-mode workbench storage is in-memory, so persistent cross-process restore/Local History is unproven |
 | Sublime source and exact packaged Linux baseline | partial | Python tests pass 84/84: 61 product tests plus 23 runner/evidence tests. Separately preserved canonical reports bind exact packaged Build 4200 normal v2, plugin-host SIGKILL v2, and full-application SIGKILL/restart v4 scenarios. Each starts from a fresh isolated profile and the same audited package bytes; restart v4 alone reuses its profile/install across both launches. The normal flow drives unlock/open/edit/save/close and real-panel CRUD. The crash flow remains `PASS_WITH_DOCUMENTED_BOUNDARY`: the visible buffer is copyable, the host does not restart in-process, and a full Sublime restart is required; this is not crash-time plaintext erasure. The restart binds a subreaper/pidfd process closure, requires zero root-bound process or mount survivors, observes clean views for two seconds before the second unlock, then reopens the same encrypted saved-content fingerprint. That passes one isolated harness path, not a real-user persistent-profile matrix. Keyboard/menu Save, other kill variants, Hot Exit/history/sync, other platforms, and signing remain pending, so Sublime remains experimental |
 | Linux x64 packaging | binding evidence must be external | Two independent standalone system-GCC release builds must bind one clean source commit and produce byte-identical binaries, Rust ZIP, VSIX, Sublime ZIP, and SHA256SUMS. Both must pass strict release-set/native audit and isolated VS Code install/bundled-sidecar smoke; runtime must report GNU x64, release profile, and reviewed libsodium version/ABI/non-minimal status. Exact hashes cannot be self-attested by this bundled document |
 | Linux x64 artifact lifecycle | binding evidence must be external | A third standalone clean clone must re-audit the exact artifact hashes and same product commit. Five expected bodies including exact 16 MiB content must authenticate after import, password rewrap, single-ref/single-commit Git bundle and clean tree-copy restores. CLI wrong-password, RPC auth-failure, locked merge-driver, driver relocation, frozen-v1, physical allowlist and descendant cleanup must pass with all three nondisclosure flags true and outside-source sensitive hits zero. Scope remains lifecycle-only, not release approval, independent build attestation, native fault-state, or two-version evidence |
 | License collection | verified mechanism; artifact digest external | Strict audit requires all three packages to share one target-bound Cargo inventory, complete hashed license/NOTICE texts, and one sidecar digest. Exact counts and hashes must come from the external report matching the package manifests. Independent all-native artifact runs, legal review, and license-choice/signature policy remain pending |
-| CI configuration | source-only, non-binding | Linux x64, Windows x64, Linux arm64, and Windows arm64 labels are configured; actions are immutable-SHA pinned and local `actionlint` passes. Push/manual tag refs bind the exact version; the required job runs binding source-quality gates; package targets rerun x64 native tests or ARM no-run compilation, enforce canonical provenance, and install/smoke each platform VSIX. Linux package jobs additionally capture external KDF evidence; Windows KDF capture is intentionally disabled until its ADS/Job boundary closes. The workflows have not been pushed or run remotely, so every matrix result remains unproven |
+| CI configuration | hosted CI executed and failed; package workflow unproven | Linux x64, Windows x64, Linux arm64, and Windows arm64 labels are configured; actions are immutable-SHA pinned and local `actionlint` passes. Push/manual tag refs bind the exact version; the required job runs source-quality gates; package targets rerun x64 native tests or ARM no-run compilation, enforce canonical provenance, and install/smoke each platform VSIX. Linux package jobs additionally capture external KDF evidence; Windows KDF capture is intentionally disabled until its ADS/Job boundary closes. Two hosted CI runs are recorded and both failed, most recently for source `b9ad906`; exact log diagnosis, fixes, and a green rerun remain pending. No package workflow result is available, so no hosted matrix or artifact row is binding evidence |
 | Native Windows | pending | No native MSVC/NTFS/ReFS/FAT/exFAT release host result is available; GNU cross-check and Wine are non-binding |
 | arm64 | pending | Linux arm64 and Windows arm64 native build/package/runtime matrices are not available |
 
@@ -64,14 +64,16 @@ These are not documentation polish items; each changes the release decision:
    Save, macro/export/clipboard, draft, project/non-project, additional
    forced-kill, real-user Hot Exit/history/sync, canary-residue, platform, and
    signing matrix.
-4. Close the remaining GA Git transaction boundary. New v4 index updates have
-   a held-lock expected-old CAS on Linux, but native Windows NTFS/ReFS
-   abrupt-kill/power-loss remains unproven. Candidate/initial/final receipt-gap
-   exits are visible and preserved as `RecoveryConflict` but still require
-   manual investigation; legacy v1/v2/v3 recovery and concurrent ref-only
-   mutation are not covered by the v4 index lock. Keep the supported
-   operational rule that other Git is stopped until those cases have binding
-   evidence.
+4. Close the remaining GA Git transaction boundary. Production v5 index
+   updates now use an immutable bundle and durable cleanup state machine, and
+   the complete 230-case Linux OS force-kill matrix passes. Native Windows must
+   reproduce that matrix with Job Object active-process-zero and handle-release
+   proof, and production inventory must reject unexpected NTFS alternate data
+   streams on the bundle directory and members. Separate NTFS/ReFS
+   replace/write-through and power-loss behavior is still unproven. Legacy
+   v1-v4 recovery and concurrent ref-only mutation are
+   not covered by the same v5 index lock. Keep the supported operational rule
+   that other Git is stopped until those cases have binding evidence.
 5. Repeat the bounded Argon2id creation/explicit-cap/no-downgrade matrix on each
    native release target. For each final packaged CLI, retain exactly three
    fresh-process `kdf-calibration-info` attempts in ordinal order, with no
@@ -298,8 +300,10 @@ directory explicitly after triage.
 - [x] Rename/modify is implemented for exact detected and split Git shapes,
       with fixed tree provenance, source-aware recovery, ambiguity rejection,
       and Linux real-repository tests for both renamed sides.
-- [ ] Native supported filesystems reproduce v4 marker/candidate/index
-      publication and rename recovery under abrupt termination/power loss;
+- [ ] Native supported filesystems reproduce v5 bundle/marker/journal/index/
+      cleanup publication and rename recovery under abrupt termination; run a
+      separate write-through/power-loss matrix rather than treating OS kill as
+      device-loss evidence;
       ref-only concurrency and legacy-journal recovery are either serialized or
       retained as explicit no-parallel-Git scope before GA.
 - [ ] Plaintext/password/query/token canaries are absent from Git argv,

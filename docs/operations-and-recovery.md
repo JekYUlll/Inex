@@ -219,15 +219,21 @@ copies, rename/rename, multiple merge bases, executable/mode disagreement, and
 ambiguous identities fail closed. Versioned source-aware journals recover both
 paths without deleting an unexpected source. Split indexes, unsafe Git
 directories, attribute overrides, non-regular modes, and observed concurrent
-changes also fail closed. New transactions publish a v4 pre-lock reservation
-before creating the alternate-index candidate, then use an Inex-owned real
-`.git/index.lock`, phase-bound candidate ownership receipts, and exact
-old/candidate index digest
-bindings. Ordinary index writers that win before the lock are detected by the
-locked recheck; writers started while it is held fail instead of being
-overwritten. Continue to avoid deliberate parallel Git: legacy v1/v2/v3
-recovery and ref-only mutations are not serialized by v4, and native Windows
-abrupt-kill/power-loss evidence remains pending.
+changes also fail closed. New transactions use v5: Inex finishes the alternate
+index and canonical manifest inside private scratch, verifies the exact
+two-member `candidate.index`/`manifest-v5.json` inventory, and publishes the
+whole immutable bundle to a stable name with a verified no-replace move. It
+binds directory entry names and each member's unnamed data stream; native
+Windows enumeration and mutation tests for alternate streams on the bundle
+directory and both members remain open. The writer then copies the candidate
+to private publish staging, acquires the real
+`.git/index.lock` with a canonical `INEXIDX5\0` marker, publishes a compact v5
+journal, and moves the authenticated worktree and index only forward. Ordinary
+index writers that win before the lock are detected by the locked recheck;
+writers started while it is held fail instead of being overwritten. Continue
+to avoid deliberate parallel Git: legacy v1/v2/v3/v4 recovery and ref-only
+mutations are outside the v5 lock protocol. Native Windows Job Object/handle,
+NTFS/ReFS abrupt-kill, and power-loss evidence remains pending.
 
 ### Resolve a `vault.json` conflict
 
@@ -247,9 +253,8 @@ vault/Git snapshot.
 
 ### Recover an interrupted encrypted merge
 
-`inex verify <vault>` reports a structurally valid pending Git journal or an
-Inex-marked pre-journal v4 reservation, including the reservation that precedes
-candidate creation, as:
+`inex verify <vault>` reports a structurally valid pending Git journal, legacy
+v4 reservation, v5 bundle/marker prefix, or v5 cleanup capability as:
 
 ```text
 pending-git-merge-transaction: present-authenticated-recovery-required
@@ -261,20 +266,46 @@ Authenticate and reconcile it with:
 "$INEX" git recover /absolute/inex-vault
 ```
 
-For v4, recovery recognizes only `old index + pre-lock reservation` with its
-token-derived transient files, `old index + marker + candidate`, `old index +
-candidate lock`, or a published index whose owned names were consumed. It
-re-authenticates the EDRY result, owner set, fixed rename provenance, target
-stage, and worktree before moving forward. A later unrelated stage may remain;
-a changed/removed result stage is a conflict. Exact abandoned pre-journal
-marker/candidate state is cleaned without changing the index/worktree. Unknown
-or foreign locks are preserved. A force-kill between candidate creation or
-mutation and its matching ownership receipt is also preserved as a recovery
-conflict; do not delete those files by hand. Legacy v1/v2/v3 journals remain readable but
-must be recovered with all other Git stopped. A recovery conflict leaves the
-current state for audit. Do not delete the journal, run `git reset --hard`,
-abort the Git operation, or retry merge writes until the state has been copied
-and understood.
+For v5, recovery can resume from the immutable stable bundle alone, verified
+publish staging, the `INEXIDX5\0` marker, durable journal, a partial worktree
+advance, candidate-in-lock, exact-final/later-unrelated index, or an adjacent
+cleanup state. It re-authenticates the EDRY result, complete stage map, owner
+and protected alias projection, fixed rename provenance, target stage, and
+worktree before moving forward. A later unrelated stage may remain; a
+changed/removed result stage is a conflict. Cleanup is also forward-only: move
+the stable bundle to its token-bound cleanup name, retire the unchanged
+canonical journal atomically to a cleanup receipt, then verified-remove the
+candidate, manifest, empty directory, and receipt. The seven accepted states
+are `StableJ`, `CleanupFullJ`, `CleanupFullR`, `CleanupManifestR`,
+`CleanupEmptyR`, `ReceiptOnly`, and `Clean`; each step confirms identity and
+directory durability before the next.
+
+A kill before any scratch entry's no-replace publication may retain one
+token-derived nonblocking entry: a directory during bundle preparation, or a
+regular file during publish-staging, marker, or journal preparation. Before
+stable-bundle publication there is no active transaction and recovery returns
+zero; later scratch can remain even after the active capability has converged
+to clean. In both cases an unpublished namespace entry is not sufficient
+ownership proof, so active cleanup intentionally leaves it for audit. The
+current `inex verify` CLI prints only the active pending-transaction boolean;
+`none` does not assert
+that the retained-scratch count is zero. Do not delete a similarly named entry
+by guessing ownership.
+
+Linux native testing has passed 230 OS force-kill/restart cases over SHA-1 and
+SHA-256 repositories and the in-place, detected-rename, and split-rename
+payloads, including later-unrelated index cases. This proves the tested Linux
+process-kill path only; it does not prove power-cut behavior or native Windows
+Job Object descendant termination, handle release, or NTFS/ReFS semantics.
+
+Legacy v1/v2/v3 journals and v4 CAS journals/reservations/receipts remain
+readable, including the v4 candidate-to-phase-receipt gap that deliberately
+remains a recovery conflict for audit. Recover every legacy transaction with
+all other Git stopped. Unknown or foreign locks are preserved. A recovery
+conflict leaves the current state for audit. Do not delete a journal, bundle,
+cleanup receipt, or candidate by hand; do not run `git reset --hard`, abort the
+Git operation, or retry merge writes until the state has been copied and
+understood.
 
 ## Password operation recovery
 
