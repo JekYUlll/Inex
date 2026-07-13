@@ -383,3 +383,4 @@
 - Setup owner的严格转移不能依赖“成功child退出后再parse control”：parent应在spawn前声明cleanup guard，并在一旦可认证取得root时arm；drop order必须保证setup/writer/recovery child先有界reap、fixture后删除。Guard回归也应有durable ready证明目标已park，并分别覆盖显式kill与Drop路径。
 - Linux v5 force-kill绑定最终是六个原生shard、精确230个case，而不是6个代表点：两object formats分别覆盖InPlace 37、DetectedRename 37、SplitRename 38，所有case均执行setup退出、writer OS kill/reap、两次fresh recovery、final verifier与plaintext/object residue检查。634秒全绿只关闭Linux进程强杀；Windows进程树、NTFS ADS与设备掉电仍是独立门禁。
 - 默认`cargo test -p inex-git`不会执行full shard是刻意设计：本轮164个非ignored测试全绿，11个ignored由5个child entry和6个full shard组成；发布证据必须同时保留默认套件结果与显式六分片230/230结果，不能仅引用其中一个。
+- 可体验artifact与当前产品提交必须精确区分：本机现存VSIX最新只到`5aa0b8c`，历史planning记录的`86285ce`四文件artifact虽通过A/B reproducibility、strict audit与exact VS Code smoke，但原文件已清理；`389d9fb`又包含其后的Git v5 production writer与强杀闭环。若要给出当前进度下的安装体验，应从clean current HEAD重新生成并审计engineering demo，同时继续保留pre-alpha/NO-GO声明；旧包的成功安装不能证明新源码可打包。
