@@ -12,6 +12,7 @@ diffy.workspace = true
 inex-core = { path = "../inex-core" }
 serde.workspace = true
 serde_json.workspace = true
+sha1.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
