@@ -130,6 +130,7 @@ Phase 7 — 跨平台验证、打包与发布准备
 - [x] 将最终 commit/hash/lifecycle 只写入不参与 package input 的外部 evidence 与 planning successor；artifact source 保持 `5aa0b8c`，不 relabel 为后续证据提交
 - [x] 从 clean `eeca0bc` 以 Node 22.23.1/Rust 1.97.0/system GCC 完成两次逐字节一致的 Linux x64 package/audit/native-dependency/exact VS Code 1.125.0 smoke，并采集三次原生 KDF external evidence
 - [x] 从第三个 standalone clean `eeca0bc` harness clone 对同一最终 artifact 重跑完整 lifecycle；旧 `5aa0b8c` lifecycle 不继承到新 CLI/package checkpoint
+- [x] 从 standalone clean `bd2b58e` 以 Node 22.23.1/Rust 1.97.0/system GCC 构建当前 Linux x64 pre-alpha engineering demo；23/23 VS Code 测试、strict package/audit/native-dependency、SHA256SUMS、冻结 VS Code 1.125.0 smoke 与本机 1.128.0 隔离安装均通过。该单次构建不替代 A/B reproducibility、完整 lifecycle、签名或发布批准
 - **Status:** in_progress
 
 ## Key Questions
