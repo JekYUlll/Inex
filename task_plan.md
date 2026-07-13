@@ -87,8 +87,11 @@ Phase 6 extension — 现有 Markdown Git 仓库与加密附件迁移（Phase 7 
   - [ ] 完成冻结GA对象证明与生产接线
     - [x] 实现strict SHA-1 raw index v2/v3/v4 parser，校验entry/extension/trailer、排序、canonical v4 varint与资源边界（`62fa0aa`）
     - [x] 从approved path/OID trie独立typed-SHA-1序列化每棵raw tree，并用单个bounded streaming `cat-file --batch`逐对象比较blob/tree/commit body与exact inventory（`d8805bd`）
-    - [ ] 将同一次secure-handle raw index读取接入repository import，证明raw index、`ls-files -s`与HEAD tree三方完全一致；随后闭合恶意Git后代持pipe、hostile same-UID TOCTOU及全资源边界
-  - [ ] 完成跨进程publication ambiguity恢复：设计通用持久publication claim/seal与existing-only reconcile guard，真实SIGKILL后同命令只对账并删除exact marker，绝不在final补建Git或触碰foreign destination
+    - [x] 将同一次secure-handle raw index读取接入repository import，证明raw index、`ls-files -s`与HEAD tree三方完全一致，并拒绝raw `FSMN` bitmap状态（`b4ab8cf`）
+    - [ ] 以Unix进程组/Windows Job或等价机制闭合恶意Git后代持pipe、hostile same-UID TOCTOU及完整process-tree资源边界
+  - [ ] 完成跨进程publication ambiguity恢复
+    - [x] 冻结并独立复审generic marker v2、candidate seal v1、existing-only no-create reconcile、initial held-lock与reserved marker mutation barrier契约（`3fd797e`）
+    - [ ] 实现上述claim/seal/guard；真实SIGKILL后同命令只对账并删除exact held marker，绝不在final补建Git或触碰foreign destination
   - [ ] 完成repository import构造/durability/publication每一边界的Linux force-kill、hostile same-UID source/target race、artifact-bound residue与原生Windows矩阵
 - **Status:** in_progress（用户实测驱动的迁移/附件扩展；原Markdown-only实现仍保持已验证基线）
 
@@ -214,6 +217,9 @@ Phase 6 extension — 现有 Markdown Git 仓库与加密附件迁移（Phase 7 
 | raw index parser首版拒绝“有IEOT但无EOIE”的真实Git 2.43 index | 1 | 以真实Git生成的v4 index和Git格式契约确认IEOT可独立存在；放宽该组合但保持唯一extension、分区与block独立解码校验，定向测试和Windows GNU检查通过 |
 | `cat-file --batch`初版在错误清理路径调用无界`Child::wait` | 1 | 改为固定2秒`try_wait`轮询并绑定reaped/finished状态；直接子进程路径闭合，恶意后代继承pipe仍保留为GA进程组/Windows Job门禁 |
 | 独立对象审计后的完整`inex-git`套件一次触发既有v5 recovery时序性`RecoveryConflict` | 1 | 精确隔离复跑该test 1/1通过；不把该次完整套件写成全绿，也未把它归因于repository import，后续整套继续观察 |
+| raw parser与首版publication规范把`FSMN`当作可忽略optional extension，但`CE_FSMONITOR_VALID`实际来自其EWAH bitmap且会被强制`core.fsmonitor=false`的Git探针隐藏 | 1 | 从raw allowlist彻底移除`FSMN`，增加unit与重签plan-level拒绝/诊断scrub回归，并同步source profile、seal与acceptance；独立复审GO |
+| publication v2初版未要求initial publisher在move到marker清理窗口持续持有既有`mutation.lock` | 1 | 在marker-free baseline后以no-create/no-recovery API获取同一lock，跨seal/move/sync/unlink/clean audit/result持续持有；普通mutation阻断全部reserved marker prefix，最终复审GO |
+| exact index-byte mutation回归首次只接受`SourceChanged`，而完整重新规划先在坏checksum处返回更严格的`UnsafeSourceControl` | 1 | 保留fail-closed产品行为；测试区分revalidate的结构不可信与read_entry的既有binding漂移，并证明恢复exact bytes后重新通过 |
 | Opaque asset 收口后的 workspace rustfmt check 发现 daemon 测试中一个多行 `assert_eq!` 仅有规范格式漂移 | 1 | 运行 canonical `cargo fmt --all`，随后 workspace pedantic Clippy 与 warnings-as-errors rustdoc 全部通过 |
 | Repository-import 规范的一次组合patch因上下文已变化而整体拒绝 | 1 | 确认无部分写入，按source config、journal、output和acceptance matrix拆成精确小patch并逐次`git diff --check` |
 | Repository-import 命令段与Git runner的组合patch因现有换行上下文不完全匹配而拒绝 | 1 | 确认无部分写入，读取精确行后以同一语义的窄上下文patch成功替换 |
