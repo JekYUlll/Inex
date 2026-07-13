@@ -362,6 +362,294 @@ impl fmt::Debug for VaultMutationLock {
     }
 }
 
+/// Failure from the existing-only, nonblocking publication mutation lock.
+///
+/// The variants and their debug/display output deliberately contain no paths
+/// or filesystem identity bytes.
+#[derive(Debug, Error)]
+pub enum ExistingVaultMutationLockError {
+    /// The candidate root path is not an absolute, link-free directory chain.
+    #[error("existing vault root is unsafe")]
+    UnsafeRoot,
+    /// The current root does not reproduce the caller's audited identity.
+    #[error("existing vault root identity changed")]
+    RootIdentityMismatch,
+    /// The exact `.vault-local` path is not a link-free directory.
+    #[error("existing vault private directory is unsafe")]
+    UnsafeLocalDirectory,
+    /// The private directory does not reproduce the audited identity.
+    #[error("existing vault private directory identity changed")]
+    LocalIdentityMismatch,
+    /// The opened lock or its filesystem/stream proof is structurally unsafe.
+    #[error("existing vault mutation lock is unsafe")]
+    UnsafeLock,
+    /// The held lock does not reproduce the caller's audited identity.
+    #[error("existing vault mutation lock identity changed")]
+    LockIdentityMismatch,
+    /// Another process or handle already holds the cooperative mutation lock.
+    #[error("existing vault mutation lock is busy")]
+    Busy,
+    /// The target platform cannot provide the required existing-only lock.
+    #[error("existing-only vault mutation locking is unsupported")]
+    Unsupported,
+    /// A read-only filesystem or identity query failed.
+    #[error("existing-only vault mutation lock validation failed")]
+    Io(#[source] io::Error),
+}
+
+impl ExistingVaultMutationLockError {
+    fn io(source: io::Error) -> Self {
+        if source.kind() == io::ErrorKind::Unsupported {
+            Self::Unsupported
+        } else {
+            Self::Io(source)
+        }
+    }
+}
+
+/// Held existing-only publication lock for one already-audited vault root.
+///
+/// Acquisition opens only the exact pre-existing zero-byte
+/// `.vault-local/mutation.lock`, never creates or chmods a path, never runs
+/// ciphertext staging cleanup, and never replays rebind recovery. The
+/// platform lock attempt is nonblocking. Dropping this value closes the held
+/// file and releases the lock.
+pub struct ExistingVaultMutationLock {
+    root_identity: FilesystemDirectoryIdentity,
+    local_identity: FilesystemDirectoryIdentity,
+    lock_identity: FilesystemFileIdentity,
+    file: File,
+}
+
+impl fmt::Debug for ExistingVaultMutationLock {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ExistingVaultMutationLock { .. }")
+    }
+}
+
+impl ExistingVaultMutationLock {
+    /// Opens and nonblockingly locks one exact, already-audited mutation lock.
+    ///
+    /// The expected identities must come from a prior marker-free/seal audit.
+    /// This function performs no persistent mutation and does not invoke any
+    /// vault recovery path.
+    ///
+    /// # Errors
+    ///
+    /// Returns a scrubbed structural/identity error,
+    /// [`ExistingVaultMutationLockError::Busy`] when the cooperative lock is
+    /// already held, or [`ExistingVaultMutationLockError::Unsupported`] when
+    /// the host cannot provide the required primitive.
+    pub fn acquire(
+        vault_root: &Path,
+        expected_root_identity: &FilesystemDirectoryIdentity,
+        expected_local_identity: &FilesystemDirectoryIdentity,
+        expected_lock_identity: &FilesystemFileIdentity,
+    ) -> Result<Self, ExistingVaultMutationLockError> {
+        #[cfg(not(any(target_os = "linux", windows)))]
+        {
+            let _ = (
+                vault_root,
+                expected_root_identity,
+                expected_local_identity,
+                expected_lock_identity,
+            );
+            return Err(ExistingVaultMutationLockError::Unsupported);
+        }
+        validate_existing_vault_directories(
+            vault_root,
+            expected_root_identity,
+            expected_local_identity,
+        )?;
+        let lock_path = vault_root
+            .join(VAULT_LOCAL_DIRECTORY)
+            .join(VAULT_MUTATION_LOCK_FILE);
+        let file = platform::open_existing_mutation_lock(&lock_path)
+            .map_err(ExistingVaultMutationLockError::io)?;
+        validate_existing_vault_lock_state(
+            vault_root,
+            expected_root_identity,
+            expected_local_identity,
+            expected_lock_identity,
+            &file,
+        )?;
+        if !platform::try_lock_exclusive(&file).map_err(ExistingVaultMutationLockError::io)? {
+            return Err(ExistingVaultMutationLockError::Busy);
+        }
+        validate_existing_vault_lock_state(
+            vault_root,
+            expected_root_identity,
+            expected_local_identity,
+            expected_lock_identity,
+            &file,
+        )?;
+        Ok(Self {
+            root_identity: expected_root_identity.clone(),
+            local_identity: expected_local_identity.clone(),
+            lock_identity: expected_lock_identity.clone(),
+            file,
+        })
+    }
+
+    /// Revalidates the exact held root/private-directory/lock identities at a
+    /// candidate path, including after a whole-root rename.
+    ///
+    /// # Errors
+    ///
+    /// Returns a scrubbed error if the candidate path, any identity, the empty
+    /// lock body, single-link binding, or alternate-stream proof has drifted.
+    pub fn revalidate(&self, candidate_root: &Path) -> Result<(), ExistingVaultMutationLockError> {
+        validate_existing_vault_lock_state(
+            candidate_root,
+            &self.root_identity,
+            &self.local_identity,
+            &self.lock_identity,
+            &self.file,
+        )
+    }
+
+    /// Returns the audited physical vault-root identity.
+    #[must_use]
+    pub const fn root_identity(&self) -> &FilesystemDirectoryIdentity {
+        &self.root_identity
+    }
+
+    /// Returns the audited physical `.vault-local` identity.
+    #[must_use]
+    pub const fn local_identity(&self) -> &FilesystemDirectoryIdentity {
+        &self.local_identity
+    }
+
+    /// Returns the audited physical zero-byte lock-file identity.
+    #[must_use]
+    pub const fn lock_identity(&self) -> &FilesystemFileIdentity {
+        &self.lock_identity
+    }
+}
+
+fn validate_existing_vault_directories(
+    vault_root: &Path,
+    expected_root_identity: &FilesystemDirectoryIdentity,
+    expected_local_identity: &FilesystemDirectoryIdentity,
+) -> Result<(), ExistingVaultMutationLockError> {
+    if !vault_root.is_absolute() || !path_is_lexically_normal(vault_root) {
+        return Err(ExistingVaultMutationLockError::UnsafeRoot);
+    }
+    if !path_ancestors_are_non_link_directories(vault_root)
+        .map_err(ExistingVaultMutationLockError::io)?
+    {
+        return Err(ExistingVaultMutationLockError::UnsafeRoot);
+    }
+    if !path_is_supported_local_filesystem(vault_root)
+        .map_err(ExistingVaultMutationLockError::io)?
+    {
+        return Err(ExistingVaultMutationLockError::UnsafeRoot);
+    }
+    let root_identity =
+        filesystem_directory_identity(vault_root).map_err(ExistingVaultMutationLockError::io)?;
+    if root_identity != *expected_root_identity {
+        return Err(ExistingVaultMutationLockError::RootIdentityMismatch);
+    }
+
+    let local = vault_root.join(VAULT_LOCAL_DIRECTORY);
+    if !path_ancestors_are_non_link_directories(&local)
+        .map_err(ExistingVaultMutationLockError::io)?
+    {
+        return Err(ExistingVaultMutationLockError::UnsafeLocalDirectory);
+    }
+    if !path_is_supported_local_filesystem(&local).map_err(ExistingVaultMutationLockError::io)?
+        || !paths_share_mount(vault_root, &local).map_err(ExistingVaultMutationLockError::io)?
+    {
+        return Err(ExistingVaultMutationLockError::UnsafeLocalDirectory);
+    }
+    let local_identity =
+        filesystem_directory_identity(&local).map_err(ExistingVaultMutationLockError::io)?;
+    if local_identity != *expected_local_identity {
+        return Err(ExistingVaultMutationLockError::LocalIdentityMismatch);
+    }
+    Ok(())
+}
+
+fn validate_existing_vault_lock_location(
+    vault_root: &Path,
+    lock_path: &Path,
+) -> Result<(), ExistingVaultMutationLockError> {
+    if !path_is_supported_local_filesystem(lock_path).map_err(ExistingVaultMutationLockError::io)?
+        || !paths_share_mount(vault_root, lock_path).map_err(ExistingVaultMutationLockError::io)?
+    {
+        return Err(ExistingVaultMutationLockError::UnsafeLock);
+    }
+    Ok(())
+}
+
+fn validate_existing_vault_lock_binding(
+    lock_path: &Path,
+    expected_lock_identity: &FilesystemFileIdentity,
+    file: &File,
+) -> Result<(), ExistingVaultMutationLockError> {
+    let path_metadata =
+        fs::symlink_metadata(lock_path).map_err(ExistingVaultMutationLockError::io)?;
+    let held_metadata = file
+        .metadata()
+        .map_err(ExistingVaultMutationLockError::io)?;
+    if is_link_or_reparse_point(&path_metadata)
+        || !path_metadata.file_type().is_file()
+        || path_metadata.len() != 0
+        || !held_metadata.file_type().is_file()
+        || held_metadata.len() != 0
+    {
+        return Err(ExistingVaultMutationLockError::UnsafeLock);
+    }
+    let held_identity = filesystem_file_identity(file).map_err(|source| {
+        if source.kind() == io::ErrorKind::InvalidInput {
+            ExistingVaultMutationLockError::UnsafeLock
+        } else {
+            ExistingVaultMutationLockError::io(source)
+        }
+    })?;
+    if held_identity != *expected_lock_identity {
+        return Err(ExistingVaultMutationLockError::LockIdentityMismatch);
+    }
+    if !open_file_matches_path_and_is_single_link(lock_path, file)
+        .map_err(ExistingVaultMutationLockError::io)?
+    {
+        return Err(ExistingVaultMutationLockError::LockIdentityMismatch);
+    }
+    Ok(())
+}
+
+fn validate_existing_vault_lock_state(
+    vault_root: &Path,
+    expected_root_identity: &FilesystemDirectoryIdentity,
+    expected_local_identity: &FilesystemDirectoryIdentity,
+    expected_lock_identity: &FilesystemFileIdentity,
+    file: &File,
+) -> Result<(), ExistingVaultMutationLockError> {
+    validate_existing_vault_directories(
+        vault_root,
+        expected_root_identity,
+        expected_local_identity,
+    )?;
+    let lock_path = vault_root
+        .join(VAULT_LOCAL_DIRECTORY)
+        .join(VAULT_MUTATION_LOCK_FILE);
+    validate_existing_vault_lock_location(vault_root, &lock_path)?;
+    validate_existing_vault_lock_binding(&lock_path, expected_lock_identity, file)?;
+    verify_regular_file_has_no_alternate_data_streams(&lock_path, file).map_err(|source| {
+        if matches!(
+            source.kind(),
+            io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData
+        ) {
+            ExistingVaultMutationLockError::UnsafeLock
+        } else {
+            ExistingVaultMutationLockError::io(source)
+        }
+    })?;
+    validate_existing_vault_lock_binding(&lock_path, expected_lock_identity, file)?;
+    validate_existing_vault_lock_location(vault_root, &lock_path)?;
+    validate_existing_vault_directories(vault_root, expected_root_identity, expected_local_identity)
+}
+
 /// Vault-scoped mutation guard for composing structural validation and commit
 /// under one cross-process lock.
 ///
@@ -4300,10 +4588,11 @@ mod platform {
     use std::io;
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::path::{Path, PathBuf};
 
     const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
     const AT_FDCWD: i32 = -100;
     const RENAME_NOREPLACE: u32 = 1;
     const O_DIRECTORY: i32 = 0o200_000;
@@ -4346,6 +4635,30 @@ mod platform {
             let error = io::Error::last_os_error();
             if error.kind() != io::ErrorKind::Interrupted {
                 return Err(error);
+            }
+        }
+    }
+
+    pub(super) fn open_existing_mutation_lock(path: &Path) -> io::Result<File> {
+        let mut options = fs::OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+        options.open(path)
+    }
+
+    pub(super) fn try_lock_exclusive(file: &File) -> io::Result<bool> {
+        loop {
+            // SAFETY: `file` owns a valid descriptor for this call; LOCK_EX
+            // requests the exclusive lock and LOCK_NB forbids waiting.
+            if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0 {
+                return Ok(true);
+            }
+            let error = io::Error::last_os_error();
+            match error.kind() {
+                io::ErrorKind::Interrupted => {}
+                io::ErrorKind::WouldBlock => return Ok(false),
+                _ => return Err(error),
             }
         }
     }
@@ -4689,6 +5002,8 @@ mod platform {
     use std::path::Path;
 
     const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
+    const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x0000_0001;
+    const ERROR_LOCK_VIOLATION: i32 = 33;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
     const FILE_STREAM_INFO_CLASS: i32 = 7;
@@ -4828,6 +5143,40 @@ mod platform {
             Err(io::Error::last_os_error())
         } else {
             Ok(())
+        }
+    }
+
+    pub(super) fn open_existing_mutation_lock(path: &Path) -> io::Result<File> {
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        options.open(path)
+    }
+
+    pub(super) fn try_lock_exclusive(file: &File) -> io::Result<bool> {
+        let mut overlapped = Overlapped::zeroed();
+        // SAFETY: the handle remains owned by `file`; the live OVERLAPPED has
+        // the documented layout, and FAIL_IMMEDIATELY forbids lock waiting.
+        let result = unsafe {
+            LockFileEx(
+                file.as_raw_handle(),
+                LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                0,
+                u32::MAX,
+                u32::MAX,
+                &raw mut overlapped,
+            )
+        };
+        if result != 0 {
+            return Ok(true);
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(ERROR_LOCK_VIOLATION) {
+            Ok(false)
+        } else {
+            Err(error)
         }
     }
 
@@ -5370,6 +5719,20 @@ mod platform {
         ))
     }
 
+    pub(super) fn open_existing_mutation_lock(_path: &Path) -> io::Result<File> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "existing-only mutation locking is unsupported",
+        ))
+    }
+
+    pub(super) fn try_lock_exclusive(_file: &File) -> io::Result<bool> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "existing-only mutation locking is unsupported",
+        ))
+    }
+
     pub(super) fn metadata_is_same_filesystem(_first: &Metadata, _second: &Metadata) -> bool {
         false
     }
@@ -5477,10 +5840,11 @@ mod tests {
 
     use super::{
         AtomicDirectoryPublishError, AtomicWriteError, AtomicWriteStage, CIPHERTEXT_STAGING_PREFIX,
-        CIPHERTEXT_STAGING_SUFFIX, CurrentTarget, FaultInjector, FaultPoint, IMPORT_STAGING_PREFIX,
-        MAX_ATOMIC_TARGET_BYTES, ParentSyncStatus, RebindJournal, VAULT_LOCAL_DIRECTORY,
-        VAULT_MUTATION_LOCK_FILE, VaultMutationGuard, VaultMutationLock, WriteCondition,
-        atomic_delete_ciphertext, atomic_move_verified_file_no_replace,
+        CIPHERTEXT_STAGING_SUFFIX, CurrentTarget, ExistingVaultMutationLock,
+        ExistingVaultMutationLockError, FaultInjector, FaultPoint, IMPORT_STAGING_PREFIX,
+        MAX_ATOMIC_TARGET_BYTES, PENDING_REBIND_FILE, ParentSyncStatus, RebindJournal,
+        VAULT_LOCAL_DIRECTORY, VAULT_MUTATION_LOCK_FILE, VaultMutationGuard, VaultMutationLock,
+        WriteCondition, atomic_delete_ciphertext, atomic_move_verified_file_no_replace,
         atomic_publish_directory_no_replace, atomic_publish_directory_no_replace_with_fault,
         atomic_rebind_ciphertext, atomic_replace_verified_file, atomic_write_ciphertext,
         atomic_write_ciphertext_with_faults, digest_bytes, install_rebind_journal,
@@ -5494,6 +5858,373 @@ mod tests {
 
     const OLD_CIPHERTEXT: &[u8] = b"EDRY-old-authenticated-ciphertext";
     const NEW_CIPHERTEXT: &[u8] = b"EDRY-new-authenticated-ciphertext";
+
+    #[cfg(any(target_os = "linux", windows))]
+    struct ExistingLockIdentities {
+        root: super::FilesystemDirectoryIdentity,
+        local: super::FilesystemDirectoryIdentity,
+        lock: super::FilesystemFileIdentity,
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    fn initialize_existing_lock(root: &Path) -> io::Result<ExistingLockIdentities> {
+        let local = root.join(VAULT_LOCAL_DIRECTORY);
+        fs::create_dir(&local)?;
+        let lock_path = local.join(VAULT_MUTATION_LOCK_FILE);
+        fs::write(&lock_path, [])?;
+        let lock_file = fs::File::open(&lock_path)?;
+        Ok(ExistingLockIdentities {
+            root: super::filesystem_directory_identity(root)?,
+            local: super::filesystem_directory_identity(&local)?,
+            lock: super::filesystem_file_identity(&lock_file)?,
+        })
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn existing_only_lock_preserves_mode_and_private_recovery_state() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        let identities = initialize_existing_lock(fixture.root())?;
+        let local = fixture.local();
+        let pending = local.join(PENDING_REBIND_FILE);
+        let ciphertext_staging = exact_staging_path(&local, 'a');
+        let rebind_staging = local.join(format!(".inex-rebind-stage-{}", "b".repeat(32)));
+        fs::write(&pending, b"pending-rebind-canary")?;
+        fs::write(&ciphertext_staging, b"ciphertext-staging-canary")?;
+        fs::write(&rebind_staging, b"rebind-staging-canary")?;
+
+        #[cfg(unix)]
+        let mode_before = {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::metadata(local.join(VAULT_MUTATION_LOCK_FILE))?
+                .permissions()
+                .mode()
+        };
+
+        let held = ExistingVaultMutationLock::acquire(
+            fixture.root(),
+            &identities.root,
+            &identities.local,
+            &identities.lock,
+        )
+        .map_err(io::Error::other)?;
+        held.revalidate(fixture.root()).map_err(io::Error::other)?;
+        assert_eq!(held.root_identity(), &identities.root);
+        assert_eq!(held.local_identity(), &identities.local);
+        assert_eq!(held.lock_identity(), &identities.lock);
+        assert_eq!(format!("{held:?}"), "ExistingVaultMutationLock { .. }");
+
+        assert_eq!(fs::read(&pending)?, b"pending-rebind-canary");
+        assert_eq!(fs::read(&ciphertext_staging)?, b"ciphertext-staging-canary");
+        assert_eq!(fs::read(&rebind_staging)?, b"rebind-staging-canary");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                fs::metadata(local.join(VAULT_MUTATION_LOCK_FILE))?
+                    .permissions()
+                    .mode(),
+                mode_before
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn existing_only_lock_never_creates_missing_root_local_or_lock() -> io::Result<()> {
+        let donor = TestVault::new()?;
+        let donor_identities = initialize_existing_lock(donor.root())?;
+
+        let missing_root = std::env::temp_dir().join(format!(
+            "inex-existing-lock-missing-root-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let missing_error = ExistingVaultMutationLock::acquire(
+            &missing_root,
+            &donor_identities.root,
+            &donor_identities.local,
+            &donor_identities.lock,
+        )
+        .expect_err("a missing root must fail without creation");
+        assert!(matches!(
+            missing_error,
+            ExistingVaultMutationLockError::Io(ref source)
+                if source.kind() == io::ErrorKind::NotFound
+        ));
+        assert!(!missing_root.exists());
+        assert!(!format!("{missing_error:?}").contains("missing-root"));
+
+        let missing_local = TestVault::new()?;
+        let missing_local_root = super::filesystem_directory_identity(missing_local.root())?;
+        let missing_local_error = ExistingVaultMutationLock::acquire(
+            missing_local.root(),
+            &missing_local_root,
+            &donor_identities.local,
+            &donor_identities.lock,
+        )
+        .expect_err("a missing private directory must fail without creation");
+        assert!(matches!(
+            missing_local_error,
+            ExistingVaultMutationLockError::Io(ref source)
+                if source.kind() == io::ErrorKind::NotFound
+        ));
+        assert!(!missing_local.local().exists());
+
+        let missing_lock = TestVault::new()?;
+        fs::create_dir(missing_lock.local())?;
+        let missing_lock_root = super::filesystem_directory_identity(missing_lock.root())?;
+        let missing_lock_local = super::filesystem_directory_identity(&missing_lock.local())?;
+        let missing_lock_path = missing_lock.local().join(VAULT_MUTATION_LOCK_FILE);
+        let missing_lock_error = ExistingVaultMutationLock::acquire(
+            missing_lock.root(),
+            &missing_lock_root,
+            &missing_lock_local,
+            &donor_identities.lock,
+        )
+        .expect_err("a missing lock must fail without creation");
+        assert!(matches!(
+            missing_lock_error,
+            ExistingVaultMutationLockError::Io(ref source)
+                if source.kind() == io::ErrorKind::NotFound
+        ));
+        assert!(!missing_lock_path.exists());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn existing_only_lock_rejects_unsupported_mount_without_creation() -> io::Result<()> {
+        let unsupported_root = Path::new("/sys/fs/fuse/connections");
+        if !unsupported_root.is_dir()
+            || super::path_is_supported_local_filesystem(unsupported_root)?
+        {
+            return Ok(());
+        }
+        let local = unsupported_root.join(VAULT_LOCAL_DIRECTORY);
+        if local.exists() {
+            return Ok(());
+        }
+
+        let donor = TestVault::new()?;
+        let identities = initialize_existing_lock(donor.root())?;
+        assert!(matches!(
+            ExistingVaultMutationLock::acquire(
+                unsupported_root,
+                &identities.root,
+                &identities.local,
+                &identities.lock,
+            ),
+            Err(ExistingVaultMutationLockError::UnsafeRoot)
+        ));
+        assert!(!local.exists());
+
+        let other_mount = Path::new("/dev/shm");
+        if other_mount.is_dir() {
+            use std::os::unix::fs::MetadataExt as _;
+            if fs::metadata(donor.root())?.dev() != fs::metadata(other_mount)?.dev() {
+                assert!(!super::paths_share_mount(donor.root(), other_mount)?);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn existing_only_lock_rejects_wrong_expected_and_rebound_identities() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        let identities = initialize_existing_lock(fixture.root())?;
+        let donor = TestVault::new()?;
+        let donor_identities = initialize_existing_lock(donor.root())?;
+
+        assert!(matches!(
+            ExistingVaultMutationLock::acquire(
+                fixture.root(),
+                &donor_identities.root,
+                &identities.local,
+                &identities.lock,
+            ),
+            Err(ExistingVaultMutationLockError::RootIdentityMismatch)
+        ));
+        assert!(matches!(
+            ExistingVaultMutationLock::acquire(
+                fixture.root(),
+                &identities.root,
+                &donor_identities.local,
+                &identities.lock,
+            ),
+            Err(ExistingVaultMutationLockError::LocalIdentityMismatch)
+        ));
+        assert!(matches!(
+            ExistingVaultMutationLock::acquire(
+                fixture.root(),
+                &identities.root,
+                &identities.local,
+                &donor_identities.lock,
+            ),
+            Err(ExistingVaultMutationLockError::LockIdentityMismatch)
+        ));
+
+        let lock_path = fixture.local().join(VAULT_MUTATION_LOCK_FILE);
+        let retired = fixture.local().join("retired-existing-lock");
+        fs::rename(&lock_path, &retired)?;
+        fs::write(&lock_path, [])?;
+        assert!(matches!(
+            ExistingVaultMutationLock::acquire(
+                fixture.root(),
+                &identities.root,
+                &identities.local,
+                &identities.lock,
+            ),
+            Err(ExistingVaultMutationLockError::LockIdentityMismatch)
+        ));
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn existing_only_lock_rejects_symlink_hardlink_and_nonzero_lock() -> io::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let nonzero = TestVault::new()?;
+        let nonzero_identities = initialize_existing_lock(nonzero.root())?;
+        fs::write(nonzero.local().join(VAULT_MUTATION_LOCK_FILE), b"not-empty")?;
+        assert!(matches!(
+            ExistingVaultMutationLock::acquire(
+                nonzero.root(),
+                &nonzero_identities.root,
+                &nonzero_identities.local,
+                &nonzero_identities.lock,
+            ),
+            Err(ExistingVaultMutationLockError::UnsafeLock)
+        ));
+
+        let hardlink = TestVault::new()?;
+        let hardlink_identities = initialize_existing_lock(hardlink.root())?;
+        let hardlink_lock = hardlink.local().join(VAULT_MUTATION_LOCK_FILE);
+        fs::hard_link(&hardlink_lock, hardlink.local().join("lock-alias"))?;
+        assert!(matches!(
+            ExistingVaultMutationLock::acquire(
+                hardlink.root(),
+                &hardlink_identities.root,
+                &hardlink_identities.local,
+                &hardlink_identities.lock,
+            ),
+            Err(ExistingVaultMutationLockError::UnsafeLock)
+        ));
+
+        let symlinked = TestVault::new()?;
+        let symlink_identities = initialize_existing_lock(symlinked.root())?;
+        let symlink_lock = symlinked.local().join(VAULT_MUTATION_LOCK_FILE);
+        let actual = symlinked.local().join("actual-lock");
+        fs::rename(&symlink_lock, &actual)?;
+        symlink(&actual, &symlink_lock)?;
+        assert!(
+            ExistingVaultMutationLock::acquire(
+                symlinked.root(),
+                &symlink_identities.root,
+                &symlink_identities.local,
+                &symlink_identities.lock,
+            )
+            .is_err()
+        );
+        assert!(
+            fs::symlink_metadata(&symlink_lock)?
+                .file_type()
+                .is_symlink()
+        );
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn existing_only_lock_reports_busy_without_waiting() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        let identities = initialize_existing_lock(fixture.root())?;
+        let held = ExistingVaultMutationLock::acquire(
+            fixture.root(),
+            &identities.root,
+            &identities.local,
+            &identities.lock,
+        )
+        .map_err(io::Error::other)?;
+
+        let started = Instant::now();
+        assert!(matches!(
+            ExistingVaultMutationLock::acquire(
+                fixture.root(),
+                &identities.root,
+                &identities.local,
+                &identities.lock,
+            ),
+            Err(ExistingVaultMutationLockError::Busy)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(held);
+
+        drop(
+            ExistingVaultMutationLock::acquire(
+                fixture.root(),
+                &identities.root,
+                &identities.local,
+                &identities.lock,
+            )
+            .map_err(io::Error::other)?,
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn existing_only_lock_revalidates_after_whole_root_rename() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        let identities = initialize_existing_lock(fixture.root())?;
+        let held = ExistingVaultMutationLock::acquire(
+            fixture.root(),
+            &identities.root,
+            &identities.local,
+            &identities.lock,
+        )
+        .map_err(io::Error::other)?;
+        let original = fixture.root().to_path_buf();
+        let renamed = original.with_file_name(format!(
+            "inex-existing-lock-renamed-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        fs::rename(&original, &renamed)?;
+        assert!(held.revalidate(&original).is_err());
+        held.revalidate(&renamed).map_err(io::Error::other)?;
+        fs::rename(&renamed, &original)?;
+        held.revalidate(&original).map_err(io::Error::other)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn existing_only_held_lock_revalidate_rejects_path_rebind() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        let identities = initialize_existing_lock(fixture.root())?;
+        let held = ExistingVaultMutationLock::acquire(
+            fixture.root(),
+            &identities.root,
+            &identities.local,
+            &identities.lock,
+        )
+        .map_err(io::Error::other)?;
+        let lock_path = fixture.local().join(VAULT_MUTATION_LOCK_FILE);
+        let retired = fixture.local().join("held-retired-lock");
+        fs::rename(&lock_path, &retired)?;
+        fs::write(&lock_path, [])?;
+
+        assert!(matches!(
+            held.revalidate(fixture.root()),
+            Err(ExistingVaultMutationLockError::LockIdentityMismatch)
+        ));
+        assert!(lock_path.is_file());
+        assert!(retired.is_file());
+        Ok(())
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
