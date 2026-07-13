@@ -9597,6 +9597,10 @@ mod tests {
 
     use super::*;
 
+    mod v5_force_kill_tests {
+        include!("v5_force_kill_tests.rs");
+    }
+
     const PASSWORD: &[u8] = b"recovery test password";
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
