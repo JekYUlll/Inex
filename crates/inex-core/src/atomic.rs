@@ -2141,6 +2141,291 @@ pub fn filesystem_directory_identity(path: &Path) -> io::Result<FilesystemDirect
     platform::filesystem_directory_identity(path, &metadata)
 }
 
+/// Proves that one held regular file has no Windows alternate data streams.
+///
+/// The path must name the exact single-link, non-reparse regular file held by
+/// `file` before and after the stream query. Linux has no NTFS-style named data
+/// streams, so it performs only those common path/identity checks. Windows
+/// queries `FileStreamInfo` on the held handle and accepts only the sole
+/// unnamed/default stream. Other platforms fail closed as unsupported.
+///
+/// # Errors
+///
+/// Returns an I/O error if the path or handle is unsafe, their identity drifts,
+/// the platform cannot enumerate streams reliably, the returned stream chain
+/// is malformed, or any named/duplicate stream is present.
+pub fn verify_regular_file_has_no_alternate_data_streams(
+    path: &Path,
+    file: &File,
+) -> io::Result<()> {
+    if !open_file_matches_path_and_is_single_link(path, file)? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "alternate-stream proof requires the held single-link regular file",
+        ));
+    }
+    platform::verify_regular_file_has_no_alternate_data_streams(file)?;
+    if !open_file_matches_path_and_is_single_link(path, file)? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "alternate-stream proof lost the held file binding",
+        ));
+    }
+    Ok(())
+}
+
+/// Proves that one identity-bound directory has no Windows data streams.
+///
+/// Windows opens the final directory without following a reparse point,
+/// compares that handle with `expected_identity`, and queries `FileStreamInfo`
+/// on the same handle. The path identity is checked again after the query.
+/// Linux performs the common identity checks and otherwise succeeds because
+/// it has no NTFS-style named streams. Other platforms fail closed.
+///
+/// # Errors
+///
+/// Returns an I/O error if the path is unsafe or drifts, a handle cannot be
+/// identity-bound, stream enumeration is unavailable or malformed, or any
+/// directory data stream is present.
+pub fn verify_directory_has_no_alternate_data_streams(
+    path: &Path,
+    expected_identity: &FilesystemDirectoryIdentity,
+) -> io::Result<()> {
+    if filesystem_directory_identity(path)? != *expected_identity {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "alternate-stream proof requires the expected directory identity",
+        ));
+    }
+    platform::verify_directory_has_no_alternate_data_streams(path, expected_identity)?;
+    if filesystem_directory_identity(path)? != *expected_identity {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "alternate-stream proof lost the directory binding",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(test, windows))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WindowsStreamObjectKind {
+    RegularFile,
+    Directory,
+}
+
+#[cfg(any(test, windows))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WindowsStreamQueryFailure {
+    NoStreams,
+    InventoryTooLarge,
+    Other,
+}
+
+#[cfg(any(test, windows))]
+fn classify_windows_stream_query_failure(raw_os_error: Option<i32>) -> WindowsStreamQueryFailure {
+    match raw_os_error {
+        Some(38) => WindowsStreamQueryFailure::NoStreams,
+        Some(122 | 234) => WindowsStreamQueryFailure::InventoryTooLarge,
+        Some(_) | None => WindowsStreamQueryFailure::Other,
+    }
+}
+
+#[cfg(any(test, windows))]
+fn windows_stream_info_has_no_alternate_data_streams(
+    buffer: &[u8],
+    object_kind: WindowsStreamObjectKind,
+) -> io::Result<bool> {
+    const HEADER_BYTES: usize = 24;
+    const UNNAMED_DATA_STREAM_UTF16_LE: &[u8] = b":\0:\0$\0D\0A\0T\0A\0";
+
+    let mut offset = 0_usize;
+    let mut entry_count = 0_usize;
+    loop {
+        let header_end = offset
+            .checked_add(HEADER_BYTES)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "stream offset overflow"))?;
+        if header_end > buffer.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stream header exceeds the query buffer",
+            ));
+        }
+        let next_offset = u32::from_le_bytes(
+            buffer[offset..offset + 4]
+                .try_into()
+                .map_err(|_| io::Error::other("stream offset slice is invalid"))?,
+        );
+        let name_length = usize::try_from(u32::from_le_bytes(
+            buffer[offset + 4..offset + 8]
+                .try_into()
+                .map_err(|_| io::Error::other("stream length slice is invalid"))?,
+        ))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "stream name is too long"))?;
+        if name_length % 2 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stream name is not complete UTF-16",
+            ));
+        }
+        let name_end = header_end.checked_add(name_length).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "stream name length overflow")
+        })?;
+        let entry_end = if next_offset == 0 {
+            buffer.len()
+        } else {
+            let next_offset = usize::try_from(next_offset).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "stream next offset overflow")
+            })?;
+            if next_offset % 8 != 0 || next_offset < HEADER_BYTES.saturating_add(name_length) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "stream next offset is not aligned or forward",
+                ));
+            }
+            offset.checked_add(next_offset).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "stream chain offset overflow")
+            })?
+        };
+        if name_end > entry_end || entry_end > buffer.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stream entry exceeds the query buffer",
+            ));
+        }
+
+        entry_count = entry_count.saturating_add(1);
+        let name = &buffer[header_end..name_end];
+        let unnamed = name.is_empty() || name == UNNAMED_DATA_STREAM_UTF16_LE;
+        if object_kind == WindowsStreamObjectKind::Directory || !unnamed || entry_count != 1 {
+            return Ok(false);
+        }
+        if next_offset == 0 {
+            return Ok(true);
+        }
+        offset = entry_end;
+    }
+}
+
+#[cfg(test)]
+mod windows_stream_info_tests {
+    use std::io;
+
+    use super::{
+        WindowsStreamObjectKind, WindowsStreamQueryFailure, classify_windows_stream_query_failure,
+        windows_stream_info_has_no_alternate_data_streams,
+    };
+
+    #[test]
+    fn query_failures_accept_only_eof_and_bound_inventory_growth() {
+        assert_eq!(
+            classify_windows_stream_query_failure(Some(38)),
+            WindowsStreamQueryFailure::NoStreams,
+        );
+        for raw_error in [122, 234] {
+            assert_eq!(
+                classify_windows_stream_query_failure(Some(raw_error)),
+                WindowsStreamQueryFailure::InventoryTooLarge,
+            );
+        }
+        for raw_error in [None, Some(1), Some(5), Some(87)] {
+            assert_eq!(
+                classify_windows_stream_query_failure(raw_error),
+                WindowsStreamQueryFailure::Other,
+            );
+        }
+    }
+
+    #[test]
+    fn regular_file_accepts_only_one_default_stream() -> io::Result<()> {
+        assert!(parse(&chain(&[""]))?);
+        assert!(parse(&chain(&["::$DATA"]))?);
+        assert!(!parse(&chain(&[":named:$DATA"]))?);
+        assert!(!parse(&chain(&[":$DATA:$DATA"]))?);
+        assert!(!parse(&chain(&["::$DATA", ":named:$DATA"]))?);
+        assert!(!parse(&chain(&["::$DATA", "::$DATA"]))?);
+        Ok(())
+    }
+
+    #[test]
+    fn directory_rejects_every_returned_data_stream_entry() -> io::Result<()> {
+        for name in ["", "::$DATA", ":named:$DATA"] {
+            assert!(!windows_stream_info_has_no_alternate_data_streams(
+                &chain(&[name]),
+                WindowsStreamObjectKind::Directory,
+            )?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_stream_chains_fail_closed() {
+        assert_invalid_data(&[0_u8; 23]);
+
+        let mut odd_name = vec![0_u8; 25];
+        odd_name[4..8].copy_from_slice(&1_u32.to_le_bytes());
+        assert_invalid_data(&odd_name);
+
+        let mut unaligned_next = vec![0_u8; 32];
+        unaligned_next[..4].copy_from_slice(&25_u32.to_le_bytes());
+        assert_invalid_data(&unaligned_next);
+
+        let mut short_next = vec![0_u8; 32];
+        short_next[..4].copy_from_slice(&16_u32.to_le_bytes());
+        assert_invalid_data(&short_next);
+
+        let mut next_beyond_buffer = vec![0_u8; 31];
+        next_beyond_buffer[..4].copy_from_slice(&32_u32.to_le_bytes());
+        assert_invalid_data(&next_beyond_buffer);
+
+        let mut name_beyond_entry = vec![0_u8; 32];
+        name_beyond_entry[..4].copy_from_slice(&32_u32.to_le_bytes());
+        name_beyond_entry[4..8].copy_from_slice(&10_u32.to_le_bytes());
+        assert_invalid_data(&name_beyond_entry);
+    }
+
+    fn parse(buffer: &[u8]) -> io::Result<bool> {
+        windows_stream_info_has_no_alternate_data_streams(
+            buffer,
+            WindowsStreamObjectKind::RegularFile,
+        )
+    }
+
+    fn assert_invalid_data(buffer: &[u8]) {
+        let error = parse(buffer).expect_err("a malformed stream chain must fail closed");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    fn chain(names: &[&str]) -> Vec<u8> {
+        assert!(!names.is_empty());
+        let mut buffer = Vec::new();
+        for (index, name) in names.iter().enumerate() {
+            let encoded_name = name
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>();
+            let minimum_bytes = 24 + encoded_name.len();
+            let entry_bytes = if index + 1 == names.len() {
+                minimum_bytes
+            } else {
+                minimum_bytes.next_multiple_of(8)
+            };
+            let next_offset = if index + 1 == names.len() {
+                0
+            } else {
+                u32::try_from(entry_bytes).unwrap_or(u32::MAX)
+            };
+            let name_length = u32::try_from(encoded_name.len()).unwrap_or(u32::MAX);
+            let start = buffer.len();
+            buffer.resize(start + entry_bytes, 0);
+            buffer[start..start + 4].copy_from_slice(&next_offset.to_le_bytes());
+            buffer[start + 4..start + 8].copy_from_slice(&name_length.to_le_bytes());
+            buffer[start + 24..start + minimum_bytes].copy_from_slice(&encoded_name);
+        }
+        buffer
+    }
+}
+
 /// A Linux directory handle used for source import traversal without resolving
 /// intermediate components through mutable path strings.
 #[cfg(target_os = "linux")]
@@ -3405,6 +3690,21 @@ mod platform {
         })
     }
 
+    #[allow(clippy::unnecessary_wraps)]
+    pub(super) fn verify_regular_file_has_no_alternate_data_streams(
+        _file: &File,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+
+    #[allow(clippy::unnecessary_wraps)]
+    pub(super) fn verify_directory_has_no_alternate_data_streams(
+        _path: &Path,
+        _expected_identity: &super::FilesystemDirectoryIdentity,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+
     pub(super) fn paths_share_mount(first: &Path, second: &Path) -> io::Result<bool> {
         let mountinfo = std::fs::read_to_string("/proc/self/mountinfo")?;
         let first = std::fs::canonicalize(first)?;
@@ -3616,7 +3916,9 @@ mod platform {
     const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    const FILE_STREAM_INFO_CLASS: i32 = 7;
     const FILE_ID_INFO_CLASS: i32 = 18;
+    const STREAM_INFO_BUFFER_BYTES: usize = 64 * 1024;
     const DRIVE_REMOVABLE: u32 = 2;
     const DRIVE_FIXED: u32 = 3;
     const DRIVE_RAMDISK: u32 = 6;
@@ -3764,6 +4066,11 @@ mod platform {
         path: &Path,
         _metadata: &Metadata,
     ) -> io::Result<super::FilesystemDirectoryIdentity> {
+        let file = open_directory_no_follow(path)?;
+        directory_identity_from_file(&file)
+    }
+
+    fn open_directory_no_follow(path: &Path) -> io::Result<File> {
         let encoded = extended_path(path)?;
         // SAFETY: the path is live/NUL terminated and the returned handle is
         // checked before ownership is transferred exactly once to `File`.
@@ -3783,15 +4090,25 @@ mod platform {
         }
         // SAFETY: `handle` is live and uniquely owned after successful
         // CreateFileW; `File` closes it once on drop.
-        let file = unsafe { File::from_raw_handle(handle) };
-        let legacy = handle_information(&file)?;
+        Ok(unsafe { File::from_raw_handle(handle) })
+    }
+
+    fn directory_identity_from_file(file: &File) -> io::Result<super::FilesystemDirectoryIdentity> {
+        let metadata = file.metadata()?;
+        let legacy = handle_information(file)?;
+        if !metadata.file_type().is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "directory identity requires a directory handle",
+            ));
+        }
         if legacy.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "directory identity rejected a reparse point",
             ));
         }
-        let modern = file_id_information(&file)?;
+        let modern = file_id_information(file)?;
         if modern.file_id.identifier.iter().any(|byte| *byte != 0) {
             return Ok(super::FilesystemDirectoryIdentity {
                 volume: modern.volume_serial_number,
@@ -3843,6 +4160,41 @@ mod platform {
             volume: u64::from(legacy.volume_serial_number),
             identifier,
         })
+    }
+
+    pub(super) fn verify_regular_file_has_no_alternate_data_streams(file: &File) -> io::Result<()> {
+        let metadata = file.metadata()?;
+        let information = handle_information(file)?;
+        if !metadata.file_type().is_file()
+            || information.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || information.number_of_links != 1
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "alternate-stream proof requires a non-reparse single-link regular file",
+            ));
+        }
+        verify_handle_has_no_alternate_data_streams(
+            file,
+            super::WindowsStreamObjectKind::RegularFile,
+        )
+    }
+
+    pub(super) fn verify_directory_has_no_alternate_data_streams(
+        path: &Path,
+        expected_identity: &super::FilesystemDirectoryIdentity,
+    ) -> io::Result<()> {
+        let file = open_directory_no_follow(path)?;
+        if directory_identity_from_file(&file)? != *expected_identity {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "alternate-stream proof opened a different directory",
+            ));
+        }
+        verify_handle_has_no_alternate_data_streams(
+            &file,
+            super::WindowsStreamObjectKind::Directory,
+        )
     }
 
     #[allow(clippy::unnecessary_wraps)]
@@ -4114,6 +4466,54 @@ mod platform {
         }
     }
 
+    fn verify_handle_has_no_alternate_data_streams(
+        file: &File,
+        object_kind: super::WindowsStreamObjectKind,
+    ) -> io::Result<()> {
+        let mut aligned_buffer = vec![0_u64; STREAM_INFO_BUFFER_BYTES / std::mem::size_of::<u64>()];
+        let buffer_size = u32::try_from(STREAM_INFO_BUFFER_BYTES)
+            .map_err(|_| io::Error::other("FILE_STREAM_INFO buffer size overflow"))?;
+        // SAFETY: `file` owns a valid handle and `aligned_buffer` provides a
+        // live, writable, 8-byte-aligned region of exactly `buffer_size`
+        // bytes for the synchronous FileStreamInfo query.
+        let result = unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                FILE_STREAM_INFO_CLASS,
+                aligned_buffer.as_mut_ptr().cast(),
+                buffer_size,
+            )
+        };
+        if result == 0 {
+            let error = io::Error::last_os_error();
+            return match super::classify_windows_stream_query_failure(error.raw_os_error()) {
+                super::WindowsStreamQueryFailure::NoStreams => Ok(()),
+                super::WindowsStreamQueryFailure::InventoryTooLarge => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "alternate-stream inventory exceeds the bounded query buffer",
+                )),
+                super::WindowsStreamQueryFailure::Other => Err(error),
+            };
+        }
+        // SAFETY: the vector remains live and contains exactly
+        // STREAM_INFO_BUFFER_BYTES initialized bytes. The parser performs no
+        // typed dereferences and validates every offset before slicing.
+        let buffer = unsafe {
+            std::slice::from_raw_parts(
+                aligned_buffer.as_ptr().cast::<u8>(),
+                STREAM_INFO_BUFFER_BYTES,
+            )
+        };
+        if super::windows_stream_info_has_no_alternate_data_streams(buffer, object_kind)? {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "named or duplicate data stream is present",
+            ))
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use std::path::Path;
@@ -4244,6 +4644,25 @@ mod platform {
         ))
     }
 
+    pub(super) fn verify_regular_file_has_no_alternate_data_streams(
+        _file: &File,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "alternate-stream verification is supported only on Linux and Windows",
+        ))
+    }
+
+    pub(super) fn verify_directory_has_no_alternate_data_streams(
+        _path: &Path,
+        _expected_identity: &super::FilesystemDirectoryIdentity,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "alternate-stream verification is supported only on Linux and Windows",
+        ))
+    }
+
     #[allow(clippy::unnecessary_wraps)]
     pub(super) fn paths_share_mount(_first: &Path, _second: &Path) -> io::Result<bool> {
         Ok(false)
@@ -4317,6 +4736,8 @@ mod tests {
         atomic_rebind_ciphertext, atomic_replace_verified_file, atomic_write_ciphertext,
         atomic_write_ciphertext_with_faults, digest_bytes, install_rebind_journal,
         pending_rebind_path, reconcile_failed_namespace_commit, recover_pending_rebind,
+        verify_directory_has_no_alternate_data_streams,
+        verify_regular_file_has_no_alternate_data_streams,
     };
 
     #[cfg(windows)]
@@ -4324,6 +4745,77 @@ mod tests {
 
     const OLD_CIPHERTEXT: &[u8] = b"EDRY-old-authenticated-ciphertext";
     const NEW_CIPHERTEXT: &[u8] = b"EDRY-new-authenticated-ciphertext";
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn alternate_data_stream_proofs_preserve_linux_identity_checks() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        let file_path = fixture.root().join("inventory-file");
+        fs::write(&file_path, b"inventory")?;
+        let file = fs::File::open(&file_path)?;
+        verify_regular_file_has_no_alternate_data_streams(&file_path, &file)?;
+
+        let directory = fixture.root().join("inventory-directory");
+        fs::create_dir(&directory)?;
+        let identity = super::filesystem_directory_identity(&directory)?;
+        verify_directory_has_no_alternate_data_streams(&directory, &identity)?;
+
+        let replacement = fixture.root().join("inventory-replacement");
+        fs::write(&replacement, b"replacement")?;
+        fs::rename(&replacement, &file_path)?;
+        assert_eq!(
+            verify_regular_file_has_no_alternate_data_streams(&file_path, &file)
+                .expect_err("a rebound path must fail the stream proof")
+                .kind(),
+            io::ErrorKind::InvalidInput,
+        );
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn alternate_data_stream_proofs_reject_windows_file_and_directory_streams() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        let file_path = fixture.root().join("inventory-file");
+        fs::write(&file_path, b"inventory")?;
+        let file = fs::File::open(&file_path)?;
+        verify_regular_file_has_no_alternate_data_streams(&file_path, &file)?;
+
+        let file_stream = windows_stream_path(&file_path, "inex-test");
+        fs::write(&file_stream, b"hidden")?;
+        assert_eq!(
+            verify_regular_file_has_no_alternate_data_streams(&file_path, &file)
+                .expect_err("a file ADS must fail the stream proof")
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
+        fs::remove_file(&file_stream)?;
+        verify_regular_file_has_no_alternate_data_streams(&file_path, &file)?;
+
+        let directory = fixture.root().join("inventory-directory");
+        fs::create_dir(&directory)?;
+        let identity = super::filesystem_directory_identity(&directory)?;
+        verify_directory_has_no_alternate_data_streams(&directory, &identity)?;
+
+        let directory_stream = windows_stream_path(&directory, "inex-test");
+        fs::write(&directory_stream, b"hidden")?;
+        assert_eq!(
+            verify_directory_has_no_alternate_data_streams(&directory, &identity)
+                .expect_err("a directory ADS must fail the stream proof")
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
+        fs::remove_file(&directory_stream)?;
+        verify_directory_has_no_alternate_data_streams(&directory, &identity)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn windows_stream_path(path: &Path, name: &str) -> PathBuf {
+        let mut stream_path = path.as_os_str().to_os_string();
+        stream_path.push(format!(":{name}"));
+        PathBuf::from(stream_path)
+    }
 
     #[cfg(any(target_os = "linux", windows))]
     fn assert_verified_remove_sync_status(status: ParentSyncStatus) {
