@@ -109,7 +109,10 @@ Phase 7 — 跨平台验证、打包与发布准备
           - [ ] Windows native：
             - [ ] 在 core Windows 平台层枚举并 fail-closed 拒绝 v5 bundle 目录、candidate 与 manifest 的 NTFS ADS，接入 initial/held/cleanup 重验证
               - [x] 实现handle-bound `FileStreamInfo` core原语、严格bounded parser、Linux/unsupported语义、Windows native测试源码与Windows GNU/Wine结构门禁，并经独立复审确认无代码阻断项
-              - [ ] 接入v5 full/manifest-only/empty bundle、journal/receipt与每个move/delete临界重验证
+              - [x] 接入v5 full/manifest-only/empty bundle、journal/receipt与每个move/delete临界重验证
+                - [x] full/manifest-only/empty inventory、stable inventory连续持有及journal/receipt held proof已接线，Linux v5回归与Windows GNU静态门禁通过
+                - [x] 补齐publish staging、marker/candidate `index.lock`与completed live index的held ADS proof，避免named stream随move/replace传播或被静默删除
+                - [x] 补齐stable→cleanup、worktree split边界、真实journal→receipt、ReceiptOnly及transient/index owner的Windows-only对抗测试
               - [ ] 在原生NTFS/ReFS执行file/directory与v5七态ADS对抗矩阵；Wine unsupported fail-closed不替代该门禁
             - [ ] 绑定 Job Object suspended-before-assignment、active-process-zero 与句柄释放证据
             - [ ] 在原生 NTFS/ReFS 宿主运行同一 230-case 矩阵

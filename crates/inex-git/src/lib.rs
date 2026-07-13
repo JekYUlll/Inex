@@ -29,6 +29,7 @@ use inex_core::atomic::{
     atomic_move_verified_file_no_replace, atomic_remove_verified_file,
     atomic_replace_verified_file, open_file_matches_path_and_is_single_link,
     path_is_supported_local_filesystem, sync_directory,
+    verify_regular_file_has_no_alternate_data_streams,
 };
 use inex_core::crypto::{DecryptedDocument, EncryptedDocument};
 use inex_core::format;
@@ -1045,6 +1046,12 @@ where
     let source_path = journal_path(root);
     let receipt_path =
         candidate_bundle_v5::candidate_bundle_cleanup_receipt_path_v5(root, &receipt_basename)?;
+    verify_held_durable_journal_v5(
+        &source_path,
+        &journal.file,
+        &journal.bytes,
+        &journal.journal,
+    )?;
     let move_result = move_file(&source_path, &journal.file, &receipt_path)
         .map(|outcome| {
             if outcome.source_parent_sync == ParentSyncStatus::Synced
@@ -1492,6 +1499,7 @@ where
                 .ok_or(GitError::RecoveryConflict)?(old, root);
             let mut manifest = None;
             let physical = drive_v5_cleanup_physical(directive, || {
+                revalidate_held_bundle_cleanup_receipt_v5(root, &receipt)?;
                 candidate_bundle_v5::remove_cleanup_candidate_v5(root, &reference, cleanup).map(
                     |(status, held)| {
                         manifest = Some(held);
@@ -1526,6 +1534,7 @@ where
                 .ok_or(GitError::RecoveryConflict)?(old, root);
             let mut empty = None;
             let physical = drive_v5_cleanup_physical(directive, || {
+                revalidate_held_bundle_cleanup_receipt_v5(root, &receipt)?;
                 candidate_bundle_v5::remove_cleanup_manifest_v5(root, &reference, cleanup).map(
                     |(status, held)| {
                         empty = Some(held);
@@ -1559,6 +1568,7 @@ where
                 .take()
                 .ok_or(GitError::RecoveryConflict)?(old, root);
             let physical = drive_v5_cleanup_physical(directive, || {
+                revalidate_held_bundle_cleanup_receipt_v5(root, &receipt)?;
                 candidate_bundle_v5::remove_empty_cleanup_directory_v5(root, &reference, cleanup)
             });
             let hook = if physical.attempted {
@@ -1594,6 +1604,7 @@ where
                 .take()
                 .ok_or(GitError::RecoveryConflict)?(old, root);
             let physical = drive_v5_cleanup_physical(directive, || {
+                revalidate_held_bundle_cleanup_receipt_v5(root, &receipt)?;
                 atomic_remove_verified_file(&receipt_path, receipt.file)
                     .map_err(map_cleanup_remove_error_v5)
                     .map(|outcome| outcome.parent_sync)
@@ -7021,10 +7032,10 @@ fn recover_cas_pending(
     Err(GitError::RecoveryConflict)
 }
 
-fn v5_payload_from_reference(
+fn v5_inventory_from_reference(
     root: &Path,
     reference: &candidate_bundle_v5::CandidateBundleTransactionReferenceV5,
-) -> Result<MergeJournalPayload, GitError> {
+) -> Result<candidate_bundle_v5::InventoryVerifiedCandidateBundleV5, GitError> {
     let inventory = candidate_bundle_v5::validate_candidate_bundle_inventory_v5(
         root,
         &reference.bundle_basename,
@@ -7036,7 +7047,152 @@ fn v5_payload_from_reference(
     {
         return Err(GitError::RecoveryConflict);
     }
-    Ok(inventory.manifest.transaction)
+    candidate_bundle_v5::revalidate_held_stable_inventory_v5(root, reference, &inventory)?;
+    Ok(inventory)
+}
+
+fn revalidate_v5_postjournal_capabilities(
+    root: &Path,
+    reference: &candidate_bundle_v5::CandidateBundleTransactionReferenceV5,
+    inventory: &candidate_bundle_v5::InventoryVerifiedCandidateBundleV5,
+    journal: &HeldBundleJournalV5,
+) -> Result<(), GitError> {
+    revalidate_held_bundle_journal_v5(root, journal)?;
+    candidate_bundle_v5::revalidate_held_stable_inventory_v5(root, reference, inventory)?;
+    revalidate_held_bundle_journal_v5(root, journal)
+}
+
+fn verify_v5_payload_ready_with_capabilities(
+    vault: &Vault,
+    git: &Git,
+    guard: &VaultMutationGuard,
+    reference: &candidate_bundle_v5::CandidateBundleTransactionReferenceV5,
+    inventory: &candidate_bundle_v5::InventoryVerifiedCandidateBundleV5,
+    journal: &HeldBundleJournalV5,
+) -> Result<(), GitError> {
+    revalidate_v5_postjournal_capabilities(vault.root(), reference, inventory, journal)?;
+    verify_payload_ready_for_v5_index(vault, git, guard, &inventory.manifest.transaction)?;
+    revalidate_v5_postjournal_capabilities(vault.root(), reference, inventory, journal)
+}
+
+fn verify_v5_payload_completed_with_capabilities(
+    vault: &Vault,
+    git: &Git,
+    guard: &VaultMutationGuard,
+    reference: &candidate_bundle_v5::CandidateBundleTransactionReferenceV5,
+    inventory: &candidate_bundle_v5::InventoryVerifiedCandidateBundleV5,
+    journal: &HeldBundleJournalV5,
+) -> Result<(), GitError> {
+    revalidate_v5_postjournal_capabilities(vault.root(), reference, inventory, journal)?;
+    verify_payload_completed_v5(vault, git, guard, &inventory.manifest.transaction)?;
+    revalidate_v5_postjournal_capabilities(vault.root(), reference, inventory, journal)
+}
+
+fn advance_v5_journal_ready_with_hooks<H: V5WriterHooks>(
+    vault: &Vault,
+    git: &Git,
+    guard: &VaultMutationGuard,
+    reference: &candidate_bundle_v5::CandidateBundleTransactionReferenceV5,
+    held_journal: &HeldBundleJournalV5,
+    hooks: &mut H,
+) -> Result<V5PostJournalState, GitError> {
+    let inventory = v5_inventory_from_reference(vault.root(), reference)?;
+    revalidate_v5_postjournal_capabilities(vault.root(), reference, &inventory, held_journal)?;
+    prepare_payload_worktree_for_v5_index_with_hooks(
+        vault,
+        git,
+        guard,
+        reference,
+        &inventory,
+        held_journal,
+        hooks,
+    )?;
+    revalidate_v5_postjournal_capabilities(vault.root(), reference, &inventory, held_journal)?;
+    let loaded =
+        candidate_bundle_v5::load_candidate_publish_staging_with_journal_v5(guard, git, reference)?;
+    let marker = candidate_bundle_v5::load_acquired_index_lock_marker_with_journal_v5(
+        guard,
+        git,
+        reference,
+        &loaded.inventory,
+        &loaded.staging,
+    )?;
+    verify_v5_payload_ready_with_capabilities(
+        vault,
+        git,
+        guard,
+        reference,
+        &inventory,
+        held_journal,
+    )?;
+    candidate_bundle_v5::publish_staging_over_marker_with_journal_v5(
+        guard,
+        git,
+        reference,
+        loaded,
+        marker,
+        &held_journal.file,
+        || {
+            verify_v5_payload_ready_with_capabilities(
+                vault,
+                git,
+                guard,
+                reference,
+                &inventory,
+                held_journal,
+            )
+        },
+    )?;
+    hooks.checkpoint(
+        V5WriterCheckpoint::CandidatePublishedToLock,
+        &V5WriterContext { vault, git, guard },
+    )?;
+    revalidate_v5_postjournal_capabilities(vault.root(), reference, &inventory, held_journal)?;
+    Ok(V5PostJournalState::CandidateInLock)
+}
+
+fn advance_v5_candidate_in_lock_with_hooks<H: V5WriterHooks>(
+    vault: &Vault,
+    git: &Git,
+    guard: &VaultMutationGuard,
+    reference: &candidate_bundle_v5::CandidateBundleTransactionReferenceV5,
+    held_journal: &HeldBundleJournalV5,
+    hooks: &mut H,
+) -> Result<V5PostJournalState, GitError> {
+    let inventory = v5_inventory_from_reference(vault.root(), reference)?;
+    let loaded =
+        candidate_bundle_v5::load_candidate_index_lock_with_journal_v5(guard, git, reference)?;
+    verify_v5_payload_ready_with_capabilities(
+        vault,
+        git,
+        guard,
+        reference,
+        &inventory,
+        held_journal,
+    )?;
+    candidate_bundle_v5::publish_candidate_lock_over_live_index_with_journal_v5(
+        guard,
+        git,
+        reference,
+        loaded,
+        &held_journal.file,
+        || {
+            verify_v5_payload_ready_with_capabilities(
+                vault,
+                git,
+                guard,
+                reference,
+                &inventory,
+                held_journal,
+            )
+        },
+    )?;
+    hooks.checkpoint(
+        V5WriterCheckpoint::LiveIndexPublished,
+        &V5WriterContext { vault, git, guard },
+    )?;
+    revalidate_v5_postjournal_capabilities(vault.root(), reference, &inventory, held_journal)?;
+    Ok(V5PostJournalState::ExactFinal)
 }
 
 fn recover_bundle_v5_pending(
@@ -7059,75 +7215,36 @@ fn recover_bundle_v5_pending_with_hooks<H: V5WriterHooks>(
     }
     let reference = load_v5_reference_from_disk(vault.root())?;
     let held_journal = load_held_bundle_journal_v5(vault.root(), &reference)?;
-    let context = V5WriterContext { vault, git, guard };
     let mut state =
         inspect_v5_postjournal_state(guard, vault.root())?.ok_or(GitError::RecoveryConflict)?;
     for _ in 0..3 {
         let expected = match state {
-            V5PostJournalState::JournalReady => {
-                let payload = v5_payload_from_reference(vault.root(), &reference)?;
-                revalidate_held_bundle_journal_v5(vault.root(), &held_journal)?;
-                prepare_payload_worktree_for_v5_index_with_hooks(
-                    vault, git, guard, &payload, hooks,
-                )?;
-                revalidate_held_bundle_journal_v5(vault.root(), &held_journal)?;
-                let loaded = candidate_bundle_v5::load_candidate_publish_staging_with_journal_v5(
-                    guard, git, &reference,
-                )?;
-                let marker = candidate_bundle_v5::load_acquired_index_lock_marker_with_journal_v5(
-                    guard,
-                    git,
-                    &reference,
-                    &loaded.inventory,
-                    &loaded.staging,
-                )?;
-                verify_payload_ready_for_v5_index(vault, git, guard, &payload)?;
-                revalidate_held_bundle_journal_v5(vault.root(), &held_journal)?;
-                candidate_bundle_v5::publish_staging_over_marker_with_journal_v5(
-                    guard,
-                    git,
-                    &reference,
-                    loaded,
-                    marker,
-                    &held_journal.file,
-                    || {
-                        revalidate_held_bundle_journal_v5(vault.root(), &held_journal)?;
-                        verify_payload_ready_for_v5_index(vault, git, guard, &payload)?;
-                        revalidate_held_bundle_journal_v5(vault.root(), &held_journal)
-                    },
-                )?;
-                hooks.checkpoint(V5WriterCheckpoint::CandidatePublishedToLock, &context)?;
-                revalidate_held_bundle_journal_v5(vault.root(), &held_journal)?;
-                V5PostJournalState::CandidateInLock
-            }
-            V5PostJournalState::CandidateInLock => {
-                let payload = v5_payload_from_reference(vault.root(), &reference)?;
-                let loaded = candidate_bundle_v5::load_candidate_index_lock_with_journal_v5(
-                    guard, git, &reference,
-                )?;
-                revalidate_held_bundle_journal_v5(vault.root(), &held_journal)?;
-                verify_payload_ready_for_v5_index(vault, git, guard, &payload)?;
-                candidate_bundle_v5::publish_candidate_lock_over_live_index_with_journal_v5(
-                    guard,
-                    git,
-                    &reference,
-                    loaded,
-                    &held_journal.file,
-                    || {
-                        revalidate_held_bundle_journal_v5(vault.root(), &held_journal)?;
-                        verify_payload_ready_for_v5_index(vault, git, guard, &payload)?;
-                        revalidate_held_bundle_journal_v5(vault.root(), &held_journal)
-                    },
-                )?;
-                hooks.checkpoint(V5WriterCheckpoint::LiveIndexPublished, &context)?;
-                revalidate_held_bundle_journal_v5(vault.root(), &held_journal)?;
-                V5PostJournalState::ExactFinal
-            }
+            V5PostJournalState::JournalReady => advance_v5_journal_ready_with_hooks(
+                vault,
+                git,
+                guard,
+                &reference,
+                &held_journal,
+                hooks,
+            )?,
+            V5PostJournalState::CandidateInLock => advance_v5_candidate_in_lock_with_hooks(
+                vault,
+                git,
+                guard,
+                &reference,
+                &held_journal,
+                hooks,
+            )?,
             V5PostJournalState::ExactFinal | V5PostJournalState::LaterUnrelated => {
-                let payload = v5_payload_from_reference(vault.root(), &reference)?;
-                revalidate_held_bundle_journal_v5(vault.root(), &held_journal)?;
-                verify_payload_completed_v5(vault, git, guard, &payload)?;
-                revalidate_held_bundle_journal_v5(vault.root(), &held_journal)?;
+                let inventory = v5_inventory_from_reference(vault.root(), &reference)?;
+                verify_v5_payload_completed_with_capabilities(
+                    vault,
+                    git,
+                    guard,
+                    &reference,
+                    &inventory,
+                    &held_journal,
+                )?;
                 return Ok(state);
             }
             V5PostJournalState::Conflict => return Err(GitError::RecoveryConflict),
@@ -8418,17 +8535,34 @@ fn advance_authenticated_worktree_v5(
     verify_authenticated_worktree_final_v5(vault, guard, payload)
 }
 
+#[derive(Clone, Copy)]
+struct V5PostJournalCapabilities<'a> {
+    reference: &'a candidate_bundle_v5::CandidateBundleTransactionReferenceV5,
+    inventory: &'a candidate_bundle_v5::InventoryVerifiedCandidateBundleV5,
+    journal: &'a HeldBundleJournalV5,
+}
+
+impl V5PostJournalCapabilities<'_> {
+    fn revalidate(&self, root: &Path) -> Result<(), GitError> {
+        revalidate_v5_postjournal_capabilities(root, self.reference, self.inventory, self.journal)
+    }
+}
+
 fn advance_authenticated_worktree_v5_with_hooks<H: V5WriterHooks>(
     vault: &Vault,
     git: &Git,
     guard: &VaultMutationGuard,
+    capabilities: V5PostJournalCapabilities<'_>,
     payload: &AuthenticatedMergePayloadV5<'_>,
     hooks: &mut H,
 ) -> Result<(), GitError> {
     let context = V5WriterContext { vault, git, guard };
+    let revalidate_capabilities = || capabilities.revalidate(vault.root());
     match payload {
         AuthenticatedMergePayloadV5::InPlace { authenticated, .. } => {
+            revalidate_capabilities()?;
             advance_in_place_worktree_v5(vault.root(), guard, authenticated)?;
+            revalidate_capabilities()?;
             hooks.checkpoint(
                 V5WriterCheckpoint::WorktreeMutation {
                     completed: 1,
@@ -8436,9 +8570,12 @@ fn advance_authenticated_worktree_v5_with_hooks<H: V5WriterHooks>(
                 },
                 &context,
             )?;
+            revalidate_capabilities()?;
         }
         AuthenticatedMergePayloadV5::DetectedRename { authenticated, .. } => {
+            revalidate_capabilities()?;
             advance_detected_rename_worktree_v5(vault.root(), guard, authenticated)?;
+            revalidate_capabilities()?;
             hooks.checkpoint(
                 V5WriterCheckpoint::WorktreeMutation {
                     completed: 1,
@@ -8446,17 +8583,22 @@ fn advance_authenticated_worktree_v5_with_hooks<H: V5WriterHooks>(
                 },
                 &context,
             )?;
+            revalidate_capabilities()?;
         }
         AuthenticatedMergePayloadV5::SplitRename { authenticated, .. } => {
+            revalidate_capabilities()?;
             advance_split_rename_worktree_v5_with_hook(vault.root(), guard, authenticated, || {
+                revalidate_capabilities()?;
                 hooks.checkpoint(
                     V5WriterCheckpoint::WorktreeMutation {
                         completed: 1,
                         total: 2,
                     },
                     &context,
-                )
+                )?;
+                revalidate_capabilities()
             })?;
+            revalidate_capabilities()?;
             hooks.checkpoint(
                 V5WriterCheckpoint::WorktreeMutation {
                     completed: 2,
@@ -8464,9 +8606,11 @@ fn advance_authenticated_worktree_v5_with_hooks<H: V5WriterHooks>(
                 },
                 &context,
             )?;
+            revalidate_capabilities()?;
         }
     }
-    verify_authenticated_worktree_final_v5(vault, guard, payload)
+    verify_authenticated_worktree_final_v5(vault, guard, payload)?;
+    revalidate_capabilities()
 }
 
 #[cfg(test)]
@@ -8487,14 +8631,36 @@ fn prepare_payload_worktree_for_v5_index_with_hooks<H: V5WriterHooks>(
     vault: &Vault,
     git: &Git,
     guard: &VaultMutationGuard,
-    payload: &MergeJournalPayload,
+    reference: &candidate_bundle_v5::CandidateBundleTransactionReferenceV5,
+    inventory: &candidate_bundle_v5::InventoryVerifiedCandidateBundleV5,
+    journal: &HeldBundleJournalV5,
     hooks: &mut H,
 ) -> Result<(), GitError> {
+    let payload = &inventory.manifest.transaction;
+    let capabilities = V5PostJournalCapabilities {
+        reference,
+        inventory,
+        journal,
+    };
+    let revalidate_capabilities = || capabilities.revalidate(vault.root());
+    revalidate_capabilities()?;
     let authenticated = authenticate_merge_payload_v5(vault, git, payload)?;
+    revalidate_capabilities()?;
     verify_authenticated_payload_old_index_v5(vault, git, guard, &authenticated)?;
-    advance_authenticated_worktree_v5_with_hooks(vault, git, guard, &authenticated, hooks)?;
+    revalidate_capabilities()?;
+    advance_authenticated_worktree_v5_with_hooks(
+        vault,
+        git,
+        guard,
+        capabilities,
+        &authenticated,
+        hooks,
+    )?;
+    revalidate_capabilities()?;
     verify_authenticated_payload_old_index_v5(vault, git, guard, &authenticated)?;
-    verify_authenticated_worktree_final_v5(vault, guard, &authenticated)
+    revalidate_capabilities()?;
+    verify_authenticated_worktree_final_v5(vault, guard, &authenticated)?;
+    revalidate_capabilities()
 }
 
 fn verify_payload_ready_for_v5_index(
@@ -8623,6 +8789,24 @@ fn map_expected_journal_state_error(error: GitError) -> GitError {
     }
 }
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Result::map_err requires ownership even though diagnostics retain only the error kind"
+)]
+fn map_held_journal_stream_error(error: io::Error) -> GitError {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::NotFound
+            | io::ErrorKind::InvalidInput
+            | io::ErrorKind::InvalidData
+            | io::ErrorKind::Unsupported
+    ) {
+        GitError::RecoveryConflict
+    } else {
+        io_error(GitIoOperation::ReadJournal, &error)
+    }
+}
+
 fn verify_held_durable_journal_v5_impl<F: FnOnce()>(
     path: &Path,
     file: &File,
@@ -8639,6 +8823,8 @@ fn verify_held_durable_journal_v5_impl<F: FnOnce()>(
     if !held_matches(path, file)? {
         return Err(GitError::RecoveryConflict);
     }
+    verify_regular_file_has_no_alternate_data_streams(path, file)
+        .map_err(map_held_journal_stream_error)?;
     after_initial_match();
     let actual = read_regular_exact(path, bytes.len()).map_err(map_expected_journal_state_error)?;
     let rebound = read_journal_file(path).map_err(map_expected_journal_state_error)?;
@@ -8648,6 +8834,8 @@ fn verify_held_durable_journal_v5_impl<F: FnOnce()>(
     {
         return Err(GitError::RecoveryConflict);
     }
+    verify_regular_file_has_no_alternate_data_streams(path, file)
+        .map_err(map_held_journal_stream_error)?;
     Ok(())
 }
 
@@ -9596,6 +9784,28 @@ mod tests {
     use inex_core::vault_config::KdfPolicy;
 
     use super::*;
+
+    #[cfg(windows)]
+    fn windows_test_stream_path(path: &Path, name: &str) -> PathBuf {
+        let mut stream = path.as_os_str().to_os_string();
+        stream.push(format!(":{name}"));
+        PathBuf::from(stream)
+    }
+
+    #[cfg(windows)]
+    fn write_windows_test_stream(path: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+        let stream = windows_test_stream_path(path, name);
+        fs::write(&stream, bytes).expect("Windows test ADS writes");
+        stream
+    }
+
+    #[cfg(windows)]
+    fn assert_windows_test_stream(stream: &Path, expected: &[u8]) {
+        assert_eq!(
+            fs::read(stream).expect("rejected Windows test ADS remains"),
+            expected
+        );
+    }
 
     mod v5_force_kill_tests {
         include!("v5_force_kill_tests.rs");
@@ -10582,6 +10792,8 @@ mod tests {
     enum CandidatePublishTestAction {
         FailAt(candidate_bundle_v5::CandidatePublishStagingCheckpointV5),
         PartialScratch,
+        #[cfg(windows)]
+        ScratchStream,
         ForeignPublish,
         PartialPublish,
         WrongCasePublish,
@@ -10666,6 +10878,9 @@ mod tests {
                     CandidatePublishTestAction::FailAt(expected) => checkpoint == expected,
                     CandidatePublishTestAction::PartialScratch => checkpoint
                         == candidate_bundle_v5::CandidatePublishStagingCheckpointV5::ScratchCreated,
+                    #[cfg(windows)]
+                    CandidatePublishTestAction::ScratchStream => checkpoint
+                        == candidate_bundle_v5::CandidatePublishStagingCheckpointV5::CriticalAudit,
                     CandidatePublishTestAction::ForeignPublish
                     | CandidatePublishTestAction::PartialPublish
                     | CandidatePublishTestAction::WrongCasePublish
@@ -10694,6 +10909,14 @@ mod tests {
                     sync_regular_file(context.scratch_path, MAX_GIT_OUTPUT_BYTES)?;
                     sync_directory(context.local).map_err(|_| GitError::DurabilityNotConfirmed)?;
                     return Err(GitError::DurabilityNotConfirmed);
+                }
+                #[cfg(windows)]
+                CandidatePublishTestAction::ScratchStream => {
+                    self.created_path = Some(write_windows_test_stream(
+                        context.scratch_path,
+                        "inex-test-publish-scratch",
+                        b"hidden publish scratch",
+                    ));
                 }
                 CandidatePublishTestAction::ForeignPublish => {
                     fs::write(context.publish_path, b"foreign publish owner")
@@ -10792,6 +11015,8 @@ mod tests {
     enum IndexLockMarkerTestAction {
         FailAt(candidate_bundle_v5::IndexLockMarkerCheckpointV5),
         PartialScratch,
+        #[cfg(windows)]
+        ScratchStream,
         LiveIndexDrift,
         StableCloneSwap,
         PublishCloneSwap,
@@ -10848,6 +11073,10 @@ mod tests {
                 IndexLockMarkerTestAction::PartialScratch => {
                     checkpoint == candidate_bundle_v5::IndexLockMarkerCheckpointV5::ScratchCreated
                 }
+                #[cfg(windows)]
+                IndexLockMarkerTestAction::ScratchStream => {
+                    checkpoint == candidate_bundle_v5::IndexLockMarkerCheckpointV5::CriticalAudit
+                }
                 IndexLockMarkerTestAction::LiveIndexDrift
                 | IndexLockMarkerTestAction::StableCloneSwap
                 | IndexLockMarkerTestAction::PublishCloneSwap
@@ -10875,6 +11104,14 @@ mod tests {
                     sync_regular_file(context.scratch_path, MAX_GIT_OUTPUT_BYTES)?;
                     sync_directory(context.local).map_err(|_| GitError::DurabilityNotConfirmed)?;
                     return Err(GitError::DurabilityNotConfirmed);
+                }
+                #[cfg(windows)]
+                IndexLockMarkerTestAction::ScratchStream => {
+                    self.retained_path = Some(write_windows_test_stream(
+                        context.scratch_path,
+                        "inex-test-marker-scratch",
+                        b"hidden marker scratch",
+                    ));
                 }
                 IndexLockMarkerTestAction::LiveIndexDrift => {
                     fs::write(
@@ -10977,6 +11214,8 @@ mod tests {
     enum DurableJournalTestActionV5 {
         FailAt(DurableJournalCheckpointV5),
         PartialScratch,
+        #[cfg(windows)]
+        ScratchStream,
         ScratchTamper,
         ScratchRebind,
         StableRebind,
@@ -11038,6 +11277,10 @@ mod tests {
                 DurableJournalTestActionV5::PartialScratch => {
                     checkpoint == DurableJournalCheckpointV5::ScratchCreated
                 }
+                #[cfg(windows)]
+                DurableJournalTestActionV5::ScratchStream => {
+                    checkpoint == DurableJournalCheckpointV5::CriticalAudit
+                }
                 DurableJournalTestActionV5::ScratchTamper
                 | DurableJournalTestActionV5::ScratchRebind
                 | DurableJournalTestActionV5::StableRebind
@@ -11068,6 +11311,14 @@ mod tests {
                     sync_regular_file(context.scratch_path, MAX_JOURNAL_BYTES)?;
                     sync_directory(context.local).map_err(|_| GitError::DurabilityNotConfirmed)?;
                     return Err(GitError::DurabilityNotConfirmed);
+                }
+                #[cfg(windows)]
+                DurableJournalTestActionV5::ScratchStream => {
+                    self.retained_path = Some(write_windows_test_stream(
+                        context.scratch_path,
+                        "inex-test-journal-scratch",
+                        b"hidden journal scratch",
+                    ));
                 }
                 DurableJournalTestActionV5::ScratchTamper => {
                     let mut bytes = fs::read(context.scratch_path)
@@ -18155,6 +18406,605 @@ mod tests {
             },
         );
         assert!(matches!(verify_result, Err(GitError::RecoveryConflict)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn v5_journal_and_receipt_streams_fail_closed_and_remain_preserved() {
+        let fixture = create_candidate_payload_fixture_v5(
+            GitObjectFormat::Sha1,
+            CandidatePayloadKindV5::InPlace,
+        );
+        let root = fixture.vault.root();
+        let prepared = prepare_test_postjournal_state(&fixture);
+        let held = load_held_bundle_journal_v5(root, &prepared.transaction_reference)
+            .expect("journal holds before ADS injection");
+        let path = journal_path(root);
+        let stream = windows_test_stream_path(&path, "inex-test-journal");
+        let result = verify_held_durable_journal_v5_with_hook(
+            &path,
+            &held.file,
+            &held.bytes,
+            &held.journal,
+            || fs::write(&stream, b"hidden journal").expect("journal ADS writes"),
+        );
+        assert!(matches!(result, Err(GitError::RecoveryConflict)));
+        assert_windows_test_stream(&stream, b"hidden journal");
+
+        let fixture = create_candidate_payload_fixture_v5(
+            GitObjectFormat::Sha1,
+            CandidatePayloadKindV5::InPlace,
+        );
+        let root = fixture.vault.root();
+        let prepared = prepare_test_postjournal_state(&fixture);
+        let held = load_held_bundle_journal_v5(root, &prepared.transaction_reference)
+            .expect("journal holds before receipt move");
+        let receipt_basename = candidate_bundle_v5::candidate_bundle_cleanup_receipt_basename_v5(
+            &held.journal.reference.token,
+        )
+        .expect("receipt basename derives");
+        let receipt =
+            candidate_bundle_v5::candidate_bundle_cleanup_receipt_path_v5(root, &receipt_basename)
+                .expect("receipt path derives");
+        fs::rename(journal_path(root), &receipt).expect("journal moves to held receipt");
+        let stream = write_windows_test_stream(&receipt, "inex-test-receipt", b"hidden receipt");
+        assert!(matches!(
+            revalidate_held_bundle_cleanup_receipt_v5(root, &held),
+            Err(GitError::RecoveryConflict)
+        ));
+        assert!(receipt.is_file());
+        assert_windows_test_stream(&stream, b"hidden receipt");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn v5_publish_staging_streams_reject_held_and_fresh_proofs() {
+        let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+        let root = fixture.vault.root();
+        let (prepared, publish) = prepare_test_marker_state(&fixture);
+        let path = candidate_bundle_v5::candidate_bundle_publish_path_v5(
+            root,
+            &prepared.transaction_reference.publish_staging_basename,
+        )
+        .expect("held publish path derives");
+        let stream = write_windows_test_stream(&path, "inex-test-held-publish", b"hidden held");
+        let guard = VaultMutationGuard::acquire(root).expect("held publish guard acquires");
+        assert!(matches!(
+            candidate_bundle_v5::revalidate_candidate_publish_staging_v5(
+                &guard,
+                &fixture.git,
+                &prepared.transaction_reference,
+                &prepared.inventory,
+                &publish,
+            ),
+            Err(GitError::RecoveryConflict)
+        ));
+        assert!(path.is_file());
+        assert_windows_test_stream(&stream, b"hidden held");
+
+        let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+        let root = fixture.vault.root();
+        let (prepared, publish) = prepare_test_marker_state(&fixture);
+        let path = candidate_bundle_v5::candidate_bundle_publish_path_v5(
+            root,
+            &prepared.transaction_reference.publish_staging_basename,
+        )
+        .expect("fresh publish path derives");
+        drop(publish);
+        let stream = write_windows_test_stream(&path, "inex-test-fresh-publish", b"hidden fresh");
+        let guard = VaultMutationGuard::acquire(root).expect("fresh publish guard acquires");
+        assert!(matches!(
+            candidate_bundle_v5::load_candidate_publish_staging_v5(
+                &guard,
+                &fixture.git,
+                &prepared.transaction_reference,
+            ),
+            Err(GitError::RecoveryConflict)
+        ));
+        assert!(path.is_file());
+        assert_windows_test_stream(&stream, b"hidden fresh");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn v5_publish_scratch_stream_blocks_move_and_remains_preserved() {
+        let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+        let root = fixture.vault.root();
+        let mut prepare_hooks = CandidateBundleTestHooks::new(None);
+        let prepared = prepare_test_candidate_bundle(&fixture, &mut prepare_hooks)
+            .expect("stable candidate bundle prepares");
+        let guard = VaultMutationGuard::acquire(root).expect("publish scratch guard acquires");
+        let mut hooks =
+            CandidatePublishTestHooks::new(Some(CandidatePublishTestAction::ScratchStream));
+        assert!(matches!(
+            candidate_bundle_v5::prepare_candidate_publish_staging_v5_with_hooks(
+                &guard,
+                &fixture.git,
+                &prepared.transaction_reference,
+                &prepared.inventory,
+                &mut hooks,
+            ),
+            Err(GitError::RecoveryConflict)
+        ));
+        assert!(hooks.action_fired);
+        assert_eq!(candidate_bundle_scratch_paths(root).len(), 1);
+        let publish_path = candidate_bundle_v5::candidate_bundle_publish_path_v5(
+            root,
+            &prepared.transaction_reference.publish_staging_basename,
+        )
+        .expect("publish path derives");
+        assert!(!publish_path.exists());
+        let stream = hooks.created_path.expect("publish scratch stream records");
+        assert_windows_test_stream(&stream, b"hidden publish scratch");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn v5_marker_scratch_stream_blocks_move_and_remains_preserved() {
+        let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+        let root = fixture.vault.root();
+        let (prepared, publish) = prepare_test_marker_state(&fixture);
+        let guard = VaultMutationGuard::acquire(root).expect("marker scratch guard acquires");
+        let mut hooks =
+            IndexLockMarkerTestHooks::new(Some(IndexLockMarkerTestAction::ScratchStream));
+        assert!(matches!(
+            candidate_bundle_v5::acquire_index_lock_marker_v5_with_hooks(
+                &guard,
+                &fixture.git,
+                &prepared.transaction_reference,
+                &prepared.inventory,
+                &publish,
+                &mut hooks,
+            ),
+            Err(GitError::RecoveryConflict)
+        ));
+        assert!(hooks.action_fired);
+        assert_eq!(candidate_bundle_scratch_paths(root).len(), 1);
+        assert!(!index_lock_path(root).exists());
+        let stream = hooks.retained_path.expect("marker scratch stream records");
+        assert_windows_test_stream(&stream, b"hidden marker scratch");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn v5_journal_scratch_stream_blocks_move_and_remains_preserved() {
+        let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+        let root = fixture.vault.root();
+        let (prepared, loaded, marker) = prepare_test_durable_journal_state(&fixture);
+        let guard = VaultMutationGuard::acquire(root).expect("journal scratch guard acquires");
+        let mut hooks =
+            DurableJournalTestHooksV5::new(Some(DurableJournalTestActionV5::ScratchStream));
+        assert!(matches!(
+            publish_durable_journal_v5_with_hooks(
+                &fixture.vault,
+                &fixture.git,
+                &guard,
+                &prepared.transaction_reference,
+                &loaded.inventory,
+                &loaded.staging,
+                &marker,
+                &mut hooks,
+            ),
+            Err(GitError::RecoveryConflict)
+        ));
+        assert!(hooks.action_fired);
+        assert_eq!(candidate_bundle_scratch_paths(root).len(), 1);
+        assert!(!journal_path(root).exists());
+        assert!(index_lock_path(root).is_file());
+        let stream = hooks.retained_path.expect("journal scratch stream records");
+        assert_windows_test_stream(&stream, b"hidden journal scratch");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn v5_marker_candidate_and_live_index_streams_classify_conflict() {
+        let fixture = create_candidate_bundle_preparation_fixture(GitObjectFormat::Sha1);
+        let root = fixture.vault.root();
+        let (prepared, loaded, marker) = prepare_test_durable_journal_state(&fixture);
+        let marker_path = index_lock_path(root);
+        let marker_stream =
+            write_windows_test_stream(&marker_path, "inex-test-marker", b"hidden marker");
+        let guard = VaultMutationGuard::acquire(root).expect("marker stream guard acquires");
+        assert!(matches!(
+            candidate_bundle_v5::revalidate_acquired_index_lock_marker_v5(
+                &guard,
+                &fixture.git,
+                &prepared.transaction_reference,
+                &loaded.inventory,
+                &loaded.staging,
+                &marker,
+            ),
+            Err(GitError::RecoveryConflict)
+        ));
+        assert!(marker_path.is_file());
+        assert_windows_test_stream(&marker_stream, b"hidden marker");
+
+        let (fixture, _, hooks, result) =
+            run_v5_marker_fault_action(PostJournalIndexTestActionV5::FailAfterMove);
+        assert!(hooks.action_fired);
+        assert!(matches!(result, Err(GitError::DurabilityNotConfirmed)));
+        let root = fixture.vault.root();
+        assert_eq!(
+            inspect_test_v5_postjournal_state(root).expect("candidate state inspects"),
+            Some(V5PostJournalState::CandidateInLock)
+        );
+        let candidate_path = index_lock_path(root);
+        let candidate_stream = write_windows_test_stream(
+            &candidate_path,
+            "inex-test-candidate-lock",
+            b"hidden candidate",
+        );
+        assert_eq!(
+            inspect_test_v5_postjournal_state(root).expect("candidate ADS classifies"),
+            Some(V5PostJournalState::Conflict)
+        );
+        assert!(matches!(
+            recovery_status(root),
+            Err(GitError::RecoveryConflict)
+        ));
+        assert!(candidate_path.is_file());
+        assert_windows_test_stream(&candidate_stream, b"hidden candidate");
+
+        let (fixture, hooks, result) =
+            run_v5_live_index_fault_action(PostJournalIndexTestActionV5::FailAfterMove);
+        assert!(hooks.action_fired);
+        assert!(matches!(result, Err(GitError::DurabilityNotConfirmed)));
+        let root = fixture.vault.root();
+        assert_eq!(
+            inspect_test_v5_postjournal_state(root).expect("exact-final state inspects"),
+            Some(V5PostJournalState::ExactFinal)
+        );
+        let live_path = index_path(root);
+        let live_stream =
+            write_windows_test_stream(&live_path, "inex-test-live-index", b"hidden live");
+        assert_eq!(
+            inspect_test_v5_postjournal_state(root).expect("live ADS classifies"),
+            Some(V5PostJournalState::Conflict)
+        );
+        assert!(matches!(
+            recovery_status(root),
+            Err(GitError::RecoveryConflict)
+        ));
+        assert!(live_path.is_file());
+        assert_windows_test_stream(&live_stream, b"hidden live");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn v5_cleanup_streams_block_journal_move_and_final_receipt_delete() {
+        let fixture = create_candidate_payload_fixture_v5(
+            GitObjectFormat::Sha1,
+            CandidatePayloadKindV5::InPlace,
+        );
+        let root = fixture.vault.root();
+        prepare_test_cleanup_stable_j(&fixture);
+        let stable = inspect_held_v5_cleanup_state(root).expect("stable cleanup proof loads");
+        let full_j = advance_test_cleanup_one(&fixture, stable).expect("stable bundle retires");
+        let HeldV5CleanupState::CleanupFullJ { journal, .. } = full_j else {
+            panic!("full J state is required");
+        };
+        let journal_stream = write_windows_test_stream(
+            &journal_path(root),
+            "inex-test-journal-move",
+            b"hidden move",
+        );
+        let receipt_basename = candidate_bundle_v5::candidate_bundle_cleanup_receipt_basename_v5(
+            &journal.journal.reference.token,
+        )
+        .expect("move receipt basename derives");
+        let receipt_path =
+            candidate_bundle_v5::candidate_bundle_cleanup_receipt_path_v5(root, &receipt_basename)
+                .expect("move receipt path derives");
+        assert!(matches!(
+            move_cleanup_journal_to_receipt_v5(root, &journal, || Ok(())),
+            Err(GitError::RecoveryConflict)
+        ));
+        assert!(journal_path(root).is_file());
+        assert!(!receipt_path.exists());
+        assert_windows_test_stream(&journal_stream, b"hidden move");
+
+        let fixture = create_candidate_payload_fixture_v5(
+            GitObjectFormat::Sha1,
+            CandidatePayloadKindV5::InPlace,
+        );
+        let root = fixture.vault.root();
+        let prepared = prepare_test_cleanup_stable_j(&fixture);
+        let mut state = inspect_held_v5_cleanup_state(root).expect("stable cleanup state loads");
+        for expected in [
+            V5CleanupState::CleanupFullJ,
+            V5CleanupState::CleanupFullR,
+            V5CleanupState::CleanupManifestR,
+            V5CleanupState::CleanupEmptyR,
+            V5CleanupState::ReceiptOnly,
+        ] {
+            state = advance_test_cleanup_one(&fixture, state).expect("cleanup edge advances");
+            assert_eq!(state.kind(), expected);
+        }
+        let receipt_basename = candidate_bundle_v5::candidate_bundle_cleanup_receipt_basename_v5(
+            &prepared.transaction_reference.token,
+        )
+        .expect("final receipt basename derives");
+        let receipt_path =
+            candidate_bundle_v5::candidate_bundle_cleanup_receipt_path_v5(root, &receipt_basename)
+                .expect("final receipt path derives");
+        let receipt_stream = windows_test_stream_path(&receipt_path, "inex-test-final-receipt");
+        let result = advance_test_cleanup_one_with_faults(
+            &fixture,
+            state,
+            |actual, _| {
+                assert_eq!(actual, V5CleanupState::ReceiptOnly);
+                fs::write(&receipt_stream, b"hidden final receipt")
+                    .expect("final receipt ADS injects immediately before delete");
+                V5CleanupPhysicalDirective::Run
+            },
+            |_, _| Ok(()),
+        );
+        assert!(matches!(result, Err(GitError::RecoveryConflict)));
+        assert!(receipt_path.is_file());
+        assert_windows_test_stream(&receipt_stream, b"hidden final receipt");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn v5_receipt_stream_blocks_every_cleanup_target_removal() {
+        for (target_state, steps) in [
+            (V5CleanupState::CleanupFullR, 2),
+            (V5CleanupState::CleanupManifestR, 3),
+            (V5CleanupState::CleanupEmptyR, 4),
+        ] {
+            let fixture = create_candidate_payload_fixture_v5(
+                GitObjectFormat::Sha1,
+                CandidatePayloadKindV5::InPlace,
+            );
+            let root = fixture.vault.root();
+            let prepared = prepare_test_cleanup_stable_j(&fixture);
+            let mut state =
+                inspect_held_v5_cleanup_state(root).expect("stable cleanup state loads");
+            for _ in 0..steps {
+                state = advance_test_cleanup_one(&fixture, state)
+                    .expect("cleanup reaches receipt-backed target state");
+            }
+            assert_eq!(state.kind(), target_state);
+            let cleanup_basename = candidate_bundle_v5::candidate_bundle_cleanup_basename_v5(
+                &prepared.transaction_reference.token,
+            )
+            .expect("cleanup basename derives");
+            let cleanup_path =
+                candidate_bundle_v5::candidate_bundle_cleanup_path_v5(root, &cleanup_basename)
+                    .expect("cleanup path derives");
+            let target_path = match target_state {
+                V5CleanupState::CleanupFullR => {
+                    cleanup_path.join(candidate_bundle_v5::CANDIDATE_BUNDLE_INDEX_V5)
+                }
+                V5CleanupState::CleanupManifestR => {
+                    cleanup_path.join(candidate_bundle_v5::CANDIDATE_BUNDLE_MANIFEST_V5)
+                }
+                V5CleanupState::CleanupEmptyR => cleanup_path,
+                _ => unreachable!(),
+            };
+            let receipt_basename =
+                candidate_bundle_v5::candidate_bundle_cleanup_receipt_basename_v5(
+                    &prepared.transaction_reference.token,
+                )
+                .expect("receipt basename derives");
+            let receipt_path = candidate_bundle_v5::candidate_bundle_cleanup_receipt_path_v5(
+                root,
+                &receipt_basename,
+            )
+            .expect("receipt path derives");
+            let stream = windows_test_stream_path(&receipt_path, "inex-test-cleanup-receipt");
+            let result = advance_test_cleanup_one_with_faults(
+                &fixture,
+                state,
+                |actual, _| {
+                    assert_eq!(actual, target_state);
+                    fs::write(&stream, b"hidden cleanup receipt")
+                        .expect("receipt ADS injects immediately before target removal");
+                    V5CleanupPhysicalDirective::Run
+                },
+                |_, _| Ok(()),
+            );
+            assert!(matches!(result, Err(GitError::RecoveryConflict)));
+            assert!(target_path.exists(), "{target_state:?}");
+            assert_windows_test_stream(&stream, b"hidden cleanup receipt");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn v5_stable_stream_before_first_mutation_preserves_worktree_and_index() {
+        let fixture = ProductionEntryFixtureV5::create(
+            GitObjectFormat::Sha1,
+            CandidatePayloadKindV5::SplitRename,
+        );
+        let (source, destination) = match &fixture {
+            ProductionEntryFixtureV5::SplitRename(fixture) => (
+                fixture.source_target.clone(),
+                fixture.destination_target.clone(),
+            ),
+            ProductionEntryFixtureV5::InPlace(_) | ProductionEntryFixtureV5::DetectedRename(_) => {
+                unreachable!()
+            }
+        };
+        let source_before = fs::read(&source).expect("split source snapshots");
+        let destination_before = fs::read(&destination).expect("split destination snapshots");
+        let index_before = fs::read(index_path(fixture.vault().root())).expect("index snapshots");
+        let injected = Rc::new(RefCell::new(None));
+        let injected_from_hook = Rc::clone(&injected);
+        let mutated = Rc::new(RefCell::new(false));
+        let mutated_from_hook = Rc::clone(&mutated);
+        let mut hooks = TestV5WriterHooks {
+            checkpoint: move |checkpoint, context: &V5WriterContext<'_>| {
+                if checkpoint == V5WriterCheckpoint::JournalPublished {
+                    let reference = load_v5_reference_from_disk(context.vault.root())?;
+                    let stable = candidate_bundle_v5::candidate_bundle_stable_path_v5(
+                        context.vault.root(),
+                        &reference.bundle_basename,
+                    )?;
+                    let candidate = stable.join(candidate_bundle_v5::CANDIDATE_BUNDLE_INDEX_V5);
+                    let stream = write_windows_test_stream(
+                        &candidate,
+                        "inex-test-before-first-mutation",
+                        b"hidden stable owner",
+                    );
+                    *injected_from_hook.borrow_mut() = Some(stream);
+                }
+                if matches!(checkpoint, V5WriterCheckpoint::WorktreeMutation { .. }) {
+                    *mutated_from_hook.borrow_mut() = true;
+                }
+                Ok(())
+            },
+        };
+
+        assert!(matches!(
+            fixture.commit_payload_with_hooks(&mut hooks),
+            Err(GitError::RecoveryConflict)
+        ));
+        assert!(!*mutated.borrow(), "no worktree checkpoint may run");
+        assert_eq!(
+            fs::read(&source).expect("split source re-reads"),
+            source_before
+        );
+        assert_eq!(
+            fs::read(&destination).expect("split destination re-reads"),
+            destination_before
+        );
+        assert_eq!(
+            fs::read(index_path(fixture.vault().root())).expect("index re-reads"),
+            index_before
+        );
+        let stream = injected
+            .borrow()
+            .clone()
+            .expect("journal checkpoint injects ADS");
+        assert_windows_test_stream(&stream, b"hidden stable owner");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn v5_split_rename_stream_after_first_mutation_preserves_source() {
+        let fixture = ProductionEntryFixtureV5::create(
+            GitObjectFormat::Sha1,
+            CandidatePayloadKindV5::SplitRename,
+        );
+        let source = match &fixture {
+            ProductionEntryFixtureV5::SplitRename(fixture) => fixture.source_target.clone(),
+            ProductionEntryFixtureV5::InPlace(_) | ProductionEntryFixtureV5::DetectedRename(_) => {
+                unreachable!()
+            }
+        };
+        let injected = Rc::new(RefCell::new(None));
+        let injected_from_hook = Rc::clone(&injected);
+        let saw_second = Rc::new(RefCell::new(false));
+        let saw_second_from_hook = Rc::clone(&saw_second);
+        let mut hooks = TestV5WriterHooks {
+            checkpoint: move |checkpoint, context: &V5WriterContext<'_>| {
+                if checkpoint
+                    == (V5WriterCheckpoint::WorktreeMutation {
+                        completed: 1,
+                        total: 2,
+                    })
+                {
+                    let reference = load_v5_reference_from_disk(context.vault.root())?;
+                    let stable = candidate_bundle_v5::candidate_bundle_stable_path_v5(
+                        context.vault.root(),
+                        &reference.bundle_basename,
+                    )?;
+                    let candidate = stable.join(candidate_bundle_v5::CANDIDATE_BUNDLE_INDEX_V5);
+                    let stream = write_windows_test_stream(
+                        &candidate,
+                        "inex-test-split-boundary",
+                        b"hidden stable owner",
+                    );
+                    *injected_from_hook.borrow_mut() = Some(stream);
+                }
+                if checkpoint
+                    == (V5WriterCheckpoint::WorktreeMutation {
+                        completed: 2,
+                        total: 2,
+                    })
+                {
+                    *saw_second_from_hook.borrow_mut() = true;
+                }
+                Ok(())
+            },
+        };
+
+        assert!(matches!(
+            fixture.commit_payload_with_hooks(&mut hooks),
+            Err(GitError::RecoveryConflict)
+        ));
+        assert!(source.is_file(), "split source must not be deleted");
+        assert!(
+            !*saw_second.borrow(),
+            "second mutation checkpoint must not run"
+        );
+        let stream = injected
+            .borrow()
+            .clone()
+            .expect("first mutation checkpoint injects ADS");
+        assert_windows_test_stream(&stream, b"hidden stable owner");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn v5_split_rename_journal_stream_after_first_mutation_preserves_source() {
+        let fixture = ProductionEntryFixtureV5::create(
+            GitObjectFormat::Sha1,
+            CandidatePayloadKindV5::SplitRename,
+        );
+        let source = match &fixture {
+            ProductionEntryFixtureV5::SplitRename(fixture) => fixture.source_target.clone(),
+            ProductionEntryFixtureV5::InPlace(_) | ProductionEntryFixtureV5::DetectedRename(_) => {
+                unreachable!()
+            }
+        };
+        let injected = Rc::new(RefCell::new(None));
+        let injected_from_hook = Rc::clone(&injected);
+        let saw_second = Rc::new(RefCell::new(false));
+        let saw_second_from_hook = Rc::clone(&saw_second);
+        let mut hooks = TestV5WriterHooks {
+            checkpoint: move |checkpoint, context: &V5WriterContext<'_>| {
+                if checkpoint
+                    == (V5WriterCheckpoint::WorktreeMutation {
+                        completed: 1,
+                        total: 2,
+                    })
+                {
+                    let journal = journal_path(context.vault.root());
+                    let stream = write_windows_test_stream(
+                        &journal,
+                        "inex-test-split-journal-boundary",
+                        b"hidden active journal",
+                    );
+                    *injected_from_hook.borrow_mut() = Some(stream);
+                }
+                if checkpoint
+                    == (V5WriterCheckpoint::WorktreeMutation {
+                        completed: 2,
+                        total: 2,
+                    })
+                {
+                    *saw_second_from_hook.borrow_mut() = true;
+                }
+                Ok(())
+            },
+        };
+
+        assert!(matches!(
+            fixture.commit_payload_with_hooks(&mut hooks),
+            Err(GitError::RecoveryConflict)
+        ));
+        assert!(source.is_file(), "split source must not be deleted");
+        assert!(
+            !*saw_second.borrow(),
+            "second mutation checkpoint must not run"
+        );
+        let stream = injected
+            .borrow()
+            .clone()
+            .expect("first mutation checkpoint injects journal ADS");
+        assert_windows_test_stream(&stream, b"hidden active journal");
     }
 
     #[test]

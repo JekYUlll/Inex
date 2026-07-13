@@ -11,6 +11,8 @@ use inex_core::atomic::{
     atomic_remove_verified_file, atomic_replace_verified_file, filesystem_directory_identity,
     filesystem_file_identity, open_file_matches_path_and_is_single_link,
     path_matches_file_identity_and_is_single_link, sync_directory,
+    verify_directory_has_no_alternate_data_streams,
+    verify_regular_file_has_no_alternate_data_streams,
 };
 use inex_core::path::raw_portable_case_fold_key;
 use serde::{Deserialize, Serialize};
@@ -837,7 +839,9 @@ where
     {
         return Err(GitError::RecoveryConflict);
     }
+    verify_runtime_owner_stream_inventory_v5(path, &file, GitIoOperation::ReadMetadata)?;
     after_open()?;
+    verify_runtime_owner_stream_inventory_v5(path, &file, GitIoOperation::ReadMetadata)?;
     if metadata.len() > u64::try_from(MAX_GIT_OUTPUT_BYTES).unwrap_or(u64::MAX) {
         return Ok(Some(Vec::new()));
     }
@@ -861,6 +865,7 @@ where
     {
         return Err(GitError::RecoveryConflict);
     }
+    verify_runtime_owner_stream_inventory_v5(path, &file, GitIoOperation::ReadMetadata)?;
     Ok(Some(bytes))
 }
 
@@ -1000,7 +1005,10 @@ fn read_single_link_regular(
 fn inventory_identity_error(error: io::Error) -> GitError {
     if matches!(
         error.kind(),
-        io::ErrorKind::NotFound | io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported
+        io::ErrorKind::NotFound
+            | io::ErrorKind::InvalidInput
+            | io::ErrorKind::InvalidData
+            | io::ErrorKind::Unsupported
     ) {
         GitError::InvalidJournal
     } else {
@@ -1015,11 +1023,37 @@ fn inventory_identity_error(error: io::Error) -> GitError {
 fn cleanup_identity_error(error: io::Error) -> GitError {
     if matches!(
         error.kind(),
-        io::ErrorKind::NotFound | io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported
+        io::ErrorKind::NotFound
+            | io::ErrorKind::InvalidInput
+            | io::ErrorKind::InvalidData
+            | io::ErrorKind::Unsupported
     ) {
         GitError::RecoveryConflict
     } else {
         io_error(GitIoOperation::InspectMetadata, &error)
+    }
+}
+
+fn verify_runtime_owner_stream_inventory_v5(
+    path: &Path,
+    file: &File,
+    operation: GitIoOperation,
+) -> Result<(), GitError> {
+    verify_regular_file_has_no_alternate_data_streams(path, file)
+        .map_err(|error| runtime_owner_identity_error(operation, &error))
+}
+
+fn runtime_owner_identity_error(operation: GitIoOperation, error: &io::Error) -> GitError {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::NotFound
+            | io::ErrorKind::InvalidInput
+            | io::ErrorKind::InvalidData
+            | io::ErrorKind::Unsupported
+    ) {
+        GitError::RecoveryConflict
+    } else {
+        io_error(operation, error)
     }
 }
 
@@ -1039,6 +1073,41 @@ fn cleanup_path_matches_held_file(path: &Path, file: &File) -> Result<bool, GitE
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(io_error(GitIoOperation::InspectMetadata, &error)),
     }
+}
+
+fn verify_bundle_stream_inventory_v5(
+    bundle_path: &Path,
+    directory_identity: &FilesystemDirectoryIdentity,
+    candidate_file: &File,
+    manifest_file: &File,
+    map_error: fn(io::Error) -> GitError,
+) -> Result<(), GitError> {
+    verify_directory_has_no_alternate_data_streams(bundle_path, directory_identity)
+        .map_err(map_error)?;
+    verify_regular_file_has_no_alternate_data_streams(
+        &bundle_path.join(CANDIDATE_BUNDLE_INDEX_V5),
+        candidate_file,
+    )
+    .map_err(map_error)?;
+    verify_regular_file_has_no_alternate_data_streams(
+        &bundle_path.join(CANDIDATE_BUNDLE_MANIFEST_V5),
+        manifest_file,
+    )
+    .map_err(map_error)
+}
+
+fn verify_cleanup_manifest_stream_inventory_v5(
+    cleanup_path: &Path,
+    directory_identity: &FilesystemDirectoryIdentity,
+    manifest_file: &File,
+) -> Result<(), GitError> {
+    verify_directory_has_no_alternate_data_streams(cleanup_path, directory_identity)
+        .map_err(cleanup_identity_error)?;
+    verify_regular_file_has_no_alternate_data_streams(
+        &cleanup_path.join(CANDIDATE_BUNDLE_MANIFEST_V5),
+        manifest_file,
+    )
+    .map_err(cleanup_identity_error)
 }
 
 fn exact_bundle_members(path: &Path) -> Result<BTreeSet<String>, GitError> {
@@ -1078,11 +1147,15 @@ fn validate_candidate_bundle_inventory_at_path_v5(
     let token = parse_candidate_bundle_stable_basename_v5(expected_bundle_basename)?;
     let directory_identity =
         filesystem_directory_identity(bundle_path).map_err(inventory_identity_error)?;
+    verify_directory_has_no_alternate_data_streams(bundle_path, &directory_identity)
+        .map_err(inventory_identity_error)?;
     exact_bundle_members(bundle_path)?;
 
     let manifest_path = bundle_path.join(CANDIDATE_BUNDLE_MANIFEST_V5);
     let (manifest_bytes, manifest_file) =
         read_single_link_regular(&manifest_path, MAX_JOURNAL_BYTES, false)?;
+    verify_regular_file_has_no_alternate_data_streams(&manifest_path, &manifest_file)
+        .map_err(inventory_identity_error)?;
     let manifest = parse_candidate_bundle_manifest_v5(&manifest_bytes)?;
     if manifest.token != token || manifest.bundle_basename != expected_bundle_basename {
         return Err(GitError::InvalidJournal);
@@ -1098,6 +1171,8 @@ fn validate_candidate_bundle_inventory_at_path_v5(
     let candidate_path = bundle_path.join(CANDIDATE_BUNDLE_INDEX_V5);
     let (candidate_bytes, candidate_file) =
         read_single_link_regular(&candidate_path, MAX_GIT_OUTPUT_BYTES, false)?;
+    verify_regular_file_has_no_alternate_data_streams(&candidate_path, &candidate_file)
+        .map_err(inventory_identity_error)?;
     if u64::try_from(candidate_bytes.len()).unwrap_or(u64::MAX) != manifest.candidate_member.size
         || hex_digest(digest(&candidate_bytes)) != manifest.candidate_member.sha256
     {
@@ -1110,6 +1185,13 @@ fn validate_candidate_bundle_inventory_at_path_v5(
         return Err(GitError::RecoveryConflict);
     }
     exact_bundle_members(bundle_path)?;
+    verify_bundle_stream_inventory_v5(
+        bundle_path,
+        &directory_identity,
+        &candidate_file,
+        &manifest_file,
+        inventory_identity_error,
+    )?;
     Ok(InventoryVerifiedCandidateBundleV5 {
         manifest,
         manifest_reference,
@@ -1126,14 +1208,21 @@ fn held_inventory_matches_path_v5(
     expected_bundle_basename: &str,
     expected: &InventoryVerifiedCandidateBundleV5,
 ) -> Result<(), GitError> {
+    let candidate_path = bundle_path.join(CANDIDATE_BUNDLE_INDEX_V5);
+    let manifest_path = bundle_path.join(CANDIDATE_BUNDLE_MANIFEST_V5);
     if filesystem_directory_identity(bundle_path).map_err(cleanup_identity_error)?
         != expected.seal.directory_identity
     {
         return Err(GitError::RecoveryConflict);
     }
+    verify_bundle_stream_inventory_v5(
+        bundle_path,
+        &expected.seal.directory_identity,
+        &expected.seal.candidate_file,
+        &expected.seal.manifest_file,
+        cleanup_identity_error,
+    )?;
     exact_bundle_members(bundle_path)?;
-    let candidate_path = bundle_path.join(CANDIDATE_BUNDLE_INDEX_V5);
-    let manifest_path = bundle_path.join(CANDIDATE_BUNDLE_MANIFEST_V5);
     if !open_file_matches_path_and_is_single_link(&candidate_path, &expected.seal.candidate_file)
         .map_err(|error| io_error(GitIoOperation::InspectMetadata, &error))?
         || !open_file_matches_path_and_is_single_link(&manifest_path, &expected.seal.manifest_file)
@@ -1145,7 +1234,8 @@ fn held_inventory_matches_path_v5(
         bundle_path,
         expected_bundle_basename,
         Some(&expected.manifest_reference),
-    )?;
+    )
+    .map_err(cleanup_semantic_or_operational)?;
     if current.manifest != expected.manifest
         || current.manifest_reference != expected.manifest_reference
         || current.seal.directory_identity != expected.seal.directory_identity
@@ -1159,6 +1249,13 @@ fn held_inventory_matches_path_v5(
     {
         return Err(GitError::RecoveryConflict);
     }
+    verify_bundle_stream_inventory_v5(
+        bundle_path,
+        &expected.seal.directory_identity,
+        &expected.seal.candidate_file,
+        &expected.seal.manifest_file,
+        cleanup_identity_error,
+    )?;
     Ok(())
 }
 
@@ -1221,6 +1318,8 @@ fn load_cleanup_manifest_v5(
 ) -> Result<HeldCleanupManifestV5, GitError> {
     let directory_identity =
         filesystem_directory_identity(cleanup_path).map_err(cleanup_identity_error)?;
+    verify_directory_has_no_alternate_data_streams(cleanup_path, &directory_identity)
+        .map_err(cleanup_identity_error)?;
     if cleanup_member_names_v5(cleanup_path)?
         != BTreeSet::from([CANDIDATE_BUNDLE_MANIFEST_V5.to_owned()])
     {
@@ -1230,6 +1329,8 @@ fn load_cleanup_manifest_v5(
     let (manifest_bytes, manifest_file) =
         read_single_link_regular(&manifest_path, MAX_JOURNAL_BYTES, false)
             .map_err(cleanup_semantic_or_operational)?;
+    verify_regular_file_has_no_alternate_data_streams(&manifest_path, &manifest_file)
+        .map_err(cleanup_identity_error)?;
     let manifest = parse_candidate_bundle_manifest_v5(&manifest_bytes)
         .map_err(cleanup_semantic_or_operational)?;
     if manifest.object_format != reference.object_format
@@ -1244,6 +1345,7 @@ fn load_cleanup_manifest_v5(
     {
         return Err(GitError::RecoveryConflict);
     }
+    verify_cleanup_manifest_stream_inventory_v5(cleanup_path, &directory_identity, &manifest_file)?;
     Ok(HeldCleanupManifestV5 {
         directory_identity,
         manifest_file,
@@ -1296,12 +1398,16 @@ pub(super) fn load_candidate_cleanup_v5(
     }
     if names.is_empty() {
         let first = filesystem_directory_identity(&cleanup_path).map_err(cleanup_identity_error)?;
+        verify_directory_has_no_alternate_data_streams(&cleanup_path, &first)
+            .map_err(cleanup_identity_error)?;
         if !cleanup_member_names_v5(&cleanup_path)?.is_empty()
             || filesystem_directory_identity(&cleanup_path).map_err(cleanup_identity_error)?
                 != first
         {
             return Err(GitError::RecoveryConflict);
         }
+        verify_directory_has_no_alternate_data_streams(&cleanup_path, &first)
+            .map_err(cleanup_identity_error)?;
         return Ok(HeldCandidateCleanupV5::Empty(HeldCleanupEmptyV5 {
             directory_identity: first,
         }));
@@ -1329,26 +1435,31 @@ pub(super) fn revalidate_held_cleanup_manifest_v5(
 ) -> Result<(), GitError> {
     let cleanup_basename = candidate_bundle_cleanup_basename_v5(&reference.token)?;
     let cleanup_path = candidate_bundle_cleanup_path_v5(root, &cleanup_basename)?;
+    let manifest_path = cleanup_path.join(CANDIDATE_BUNDLE_MANIFEST_V5);
+    verify_cleanup_manifest_stream_inventory_v5(
+        &cleanup_path,
+        &held.directory_identity,
+        &held.manifest_file,
+    )?;
     if filesystem_directory_identity(&cleanup_path).map_err(cleanup_identity_error)?
         != held.directory_identity
         || cleanup_member_names_v5(&cleanup_path)?
             != BTreeSet::from([CANDIDATE_BUNDLE_MANIFEST_V5.to_owned()])
-        || !cleanup_path_matches_held_file(
-            &cleanup_path.join(CANDIDATE_BUNDLE_MANIFEST_V5),
-            &held.manifest_file,
-        )?
+        || !cleanup_path_matches_held_file(&manifest_path, &held.manifest_file)?
     {
         return Err(GitError::RecoveryConflict);
     }
     let rebound = load_cleanup_manifest_v5(&cleanup_path, reference)?;
     if rebound.directory_identity != held.directory_identity
-        || !cleanup_path_matches_held_file(
-            &cleanup_path.join(CANDIDATE_BUNDLE_MANIFEST_V5),
-            &held.manifest_file,
-        )?
+        || !cleanup_path_matches_held_file(&manifest_path, &held.manifest_file)?
     {
         return Err(GitError::RecoveryConflict);
     }
+    verify_cleanup_manifest_stream_inventory_v5(
+        &cleanup_path,
+        &held.directory_identity,
+        &held.manifest_file,
+    )?;
     Ok(())
 }
 
@@ -1359,12 +1470,16 @@ pub(super) fn revalidate_held_cleanup_empty_v5(
 ) -> Result<(), GitError> {
     let cleanup_basename = candidate_bundle_cleanup_basename_v5(&reference.token)?;
     let cleanup_path = candidate_bundle_cleanup_path_v5(root, &cleanup_basename)?;
+    verify_directory_has_no_alternate_data_streams(&cleanup_path, &held.directory_identity)
+        .map_err(cleanup_identity_error)?;
     if filesystem_directory_identity(&cleanup_path).map_err(cleanup_identity_error)?
         != held.directory_identity
         || !cleanup_member_names_v5(&cleanup_path)?.is_empty()
     {
         return Err(GitError::RecoveryConflict);
     }
+    verify_directory_has_no_alternate_data_streams(&cleanup_path, &held.directory_identity)
+        .map_err(cleanup_identity_error)?;
     Ok(())
 }
 
@@ -1393,7 +1508,13 @@ where
             critical_audit().map_err(|error| {
                 critical_error = Some(error);
                 io::Error::other("candidate cleanup critical audit failed")
-            })
+            })?;
+            held_inventory_matches_path_v5(current, &reference.bundle_basename, inventory).map_err(
+                |error| {
+                    critical_error = Some(error);
+                    io::Error::other("candidate cleanup inventory changed after critical audit")
+                },
+            )
         });
     match outcome {
         Ok(outcome) => {
@@ -1447,8 +1568,8 @@ pub(super) fn remove_cleanup_candidate_v5(
     let cleanup_basename = candidate_bundle_cleanup_basename_v5(&reference.token)?;
     let cleanup_path = candidate_bundle_cleanup_path_v5(root, &cleanup_basename)?;
     let inventory = held.inventory;
-    held_inventory_matches_path_v5(&cleanup_path, &reference.bundle_basename, &inventory)?;
     validate_reference_inventory_binding_v5(reference, &inventory)?;
+    held_inventory_matches_path_v5(&cleanup_path, &reference.bundle_basename, &inventory)?;
     let CandidateBundleInventorySealV5 {
         directory_identity,
         candidate_file,
@@ -1474,11 +1595,7 @@ pub(super) fn remove_cleanup_manifest_v5(
 ) -> Result<(ParentSyncStatus, HeldCleanupEmptyV5), GitError> {
     let cleanup_basename = candidate_bundle_cleanup_basename_v5(&reference.token)?;
     let cleanup_path = candidate_bundle_cleanup_path_v5(root, &cleanup_basename)?;
-    if filesystem_directory_identity(&cleanup_path).map_err(cleanup_identity_error)?
-        != held.directory_identity
-    {
-        return Err(GitError::RecoveryConflict);
-    }
+    revalidate_held_cleanup_manifest_v5(root, reference, &held)?;
     let outcome = atomic_remove_verified_file(
         &cleanup_path.join(CANDIDATE_BUNDLE_MANIFEST_V5),
         held.manifest_file,
@@ -1498,10 +1615,8 @@ pub(super) fn remove_empty_cleanup_directory_v5(
 ) -> Result<ParentSyncStatus, GitError> {
     let cleanup_basename = candidate_bundle_cleanup_basename_v5(&reference.token)?;
     let cleanup_path = candidate_bundle_cleanup_path_v5(root, &cleanup_basename)?;
+    revalidate_held_cleanup_empty_v5(root, reference, &held)?;
     let directory_identity = held.directory_identity;
-    if !cleanup_member_names_v5(&cleanup_path)?.is_empty() {
-        return Err(GitError::RecoveryConflict);
-    }
     let outcome = atomic_remove_verified_empty_directory(&cleanup_path, &directory_identity)
         .map_err(map_verified_remove_error_v5)?;
     Ok(outcome.parent_sync)
@@ -1726,6 +1841,7 @@ fn verify_candidate_publish_file_v5(
     {
         return Err(GitError::RecoveryConflict);
     }
+    verify_runtime_owner_stream_inventory_v5(path, file, GitIoOperation::InspectMetadata)?;
     let snapshot = read_index_snapshot(path)?;
     if snapshot.size != manifest.final_index.size || snapshot.sha256 != manifest.final_index.sha256
     {
@@ -1742,6 +1858,7 @@ fn verify_candidate_publish_file_v5(
     if rebound.size != manifest.final_index.size || rebound.sha256 != manifest.final_index.sha256 {
         return Err(GitError::RecoveryConflict);
     }
+    verify_runtime_owner_stream_inventory_v5(path, file, GitIoOperation::InspectMetadata)?;
     Ok(())
 }
 
@@ -2054,8 +2171,10 @@ fn verify_held_index_lock_marker_file_v5(
     {
         return Err(GitError::RecoveryConflict);
     }
+    verify_runtime_owner_stream_inventory_v5(path, file, GitIoOperation::ReadMetadata)?;
     let (bytes, reopened) = read_single_link_regular(path, MAX_INDEX_LOCK_MARKER_BYTES_V5, false)
         .map_err(|_| GitError::RecoveryConflict)?;
+    verify_runtime_owner_stream_inventory_v5(path, &reopened, GitIoOperation::ReadMetadata)?;
     if bytes != index_lock_marker_bytes_v5(reference)?
         || !open_file_matches_path_and_is_single_link(path, &reopened)
             .map_err(|_| GitError::RecoveryConflict)?
@@ -2064,6 +2183,8 @@ fn verify_held_index_lock_marker_file_v5(
     {
         return Err(GitError::RecoveryConflict);
     }
+    verify_runtime_owner_stream_inventory_v5(path, file, GitIoOperation::ReadMetadata)?;
+    verify_runtime_owner_stream_inventory_v5(path, &reopened, GitIoOperation::ReadMetadata)?;
     canonical_bytes_reference_v5(&bytes)
 }
 
@@ -2473,6 +2594,10 @@ fn verify_held_active_journal_identity_v5(git: &Git, journal_file: &File) -> Res
     if !required_open_file_matches_path_v5(&path, journal_file)? {
         return Err(GitError::RecoveryConflict);
     }
+    verify_runtime_owner_stream_inventory_v5(&path, journal_file, GitIoOperation::ReadJournal)?;
+    if !required_open_file_matches_path_v5(&path, journal_file)? {
+        return Err(GitError::RecoveryConflict);
+    }
     Ok(())
 }
 
@@ -2493,6 +2618,26 @@ fn required_path_matches_file_identity_v5(
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(io_error(GitIoOperation::InspectMetadata, &error)),
     }
+}
+
+fn verify_identity_bound_runtime_owner_stream_inventory_v5(
+    path: &Path,
+    expected_identity: &FilesystemFileIdentity,
+    operation: GitIoOperation,
+) -> Result<(), GitError> {
+    let file = File::open(path).map_err(|error| runtime_owner_identity_error(operation, &error))?;
+    let first_identity = filesystem_file_identity(&file)
+        .map_err(|error| runtime_owner_identity_error(operation, &error))?;
+    if first_identity != *expected_identity || !required_open_file_matches_path_v5(path, &file)? {
+        return Err(GitError::RecoveryConflict);
+    }
+    verify_runtime_owner_stream_inventory_v5(path, &file, operation)?;
+    let second_identity = filesystem_file_identity(&file)
+        .map_err(|error| runtime_owner_identity_error(operation, &error))?;
+    if second_identity != *expected_identity || !required_open_file_matches_path_v5(path, &file)? {
+        return Err(GitError::RecoveryConflict);
+    }
+    Ok(())
 }
 
 fn candidate_stage_map_at_bundle_path_v5(
@@ -2625,6 +2770,11 @@ pub(super) fn classify_completed_live_index_with_journal_v5(
     if !required_open_file_matches_path_v5(&live_path, &live_file)? {
         return Err(GitError::RecoveryConflict);
     }
+    verify_runtime_owner_stream_inventory_v5(
+        &live_path,
+        &live_file,
+        GitIoOperation::InspectMetadata,
+    )?;
     let live_identity = filesystem_file_identity(&live_file)
         .map_err(|error| io_error(GitIoOperation::InspectMetadata, &error))?;
     let first = read_index_snapshot(&live_path)?;
@@ -2656,6 +2806,11 @@ pub(super) fn classify_completed_live_index_with_journal_v5(
     {
         return Err(GitError::RecoveryConflict);
     }
+    verify_runtime_owner_stream_inventory_v5(
+        &live_path,
+        &live_file,
+        GitIoOperation::InspectMetadata,
+    )?;
     let state = if first.size == inventory.manifest.final_index.size
         && first.sha256 == inventory.manifest.final_index.sha256
         && current == candidate
@@ -2694,6 +2849,11 @@ pub(super) fn classify_completed_live_index_with_cleanup_v5(
     if !required_open_file_matches_path_v5(&live_path, &live_file)? {
         return Err(GitError::RecoveryConflict);
     }
+    verify_runtime_owner_stream_inventory_v5(
+        &live_path,
+        &live_file,
+        GitIoOperation::InspectMetadata,
+    )?;
     let live_identity = filesystem_file_identity(&live_file)
         .map_err(|error| io_error(GitIoOperation::InspectMetadata, &error))?;
     let first = read_index_snapshot(&live_path)?;
@@ -2724,6 +2884,11 @@ pub(super) fn classify_completed_live_index_with_cleanup_v5(
     {
         return Err(GitError::RecoveryConflict);
     }
+    verify_runtime_owner_stream_inventory_v5(
+        &live_path,
+        &live_file,
+        GitIoOperation::InspectMetadata,
+    )?;
     let state = if first.size == cleanup.inventory.manifest.final_index.size
         && first.sha256 == cleanup.inventory.manifest.final_index.sha256
         && current == candidate
@@ -2753,12 +2918,22 @@ pub(super) fn revalidate_completed_live_index_capability_v5(
     {
         return Err(GitError::RecoveryConflict);
     }
+    verify_identity_bound_runtime_owner_stream_inventory_v5(
+        &live_path,
+        classified_identity,
+        GitIoOperation::InspectMetadata,
+    )?;
     if !required_path_matches_file_identity_v5(&live_path, classified_identity)?
         || classify_index_lock_v5(&git.root, reference, inventory)? != IndexLockStateV5::Absent
         || !guard.is_for_root(&git.root)
     {
         return Err(GitError::RecoveryConflict);
     }
+    verify_identity_bound_runtime_owner_stream_inventory_v5(
+        &live_path,
+        classified_identity,
+        GitIoOperation::InspectMetadata,
+    )?;
     Ok(())
 }
 
@@ -2775,6 +2950,7 @@ fn verify_held_candidate_index_lock_v5(
     {
         return Err(GitError::RecoveryConflict);
     }
+    verify_runtime_owner_stream_inventory_v5(&lock_path, file, GitIoOperation::InspectMetadata)?;
     let before = verify_bundle_git_semantics_v5(guard, git, reference, inventory, None)?;
     let lock_git = git.with_index_file(lock_path.clone())?;
     verify_candidate_index(&lock_git, &inventory.manifest.transaction, &before)?;
@@ -2784,6 +2960,7 @@ fn verify_held_candidate_index_lock_v5(
     {
         return Err(GitError::RecoveryConflict);
     }
+    verify_runtime_owner_stream_inventory_v5(&lock_path, file, GitIoOperation::InspectMetadata)?;
     Ok(())
 }
 
@@ -2898,6 +3075,31 @@ fn verify_synced_postjournal_replace_v5(outcome: AtomicFileMoveOutcome) -> Resul
     Ok(())
 }
 
+fn bind_publish_over_marker_replace_owners_v5(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+    loaded: &LoadedCandidatePublishStagingV5,
+    marker: &AcquiredIndexLockMarkerV5,
+    journal_file: &File,
+) -> Result<(FilesystemFileIdentity, FilesystemFileIdentity), GitError> {
+    verify_held_active_journal_identity_v5(git, journal_file)?;
+    revalidate_acquired_index_lock_marker_with_journal_v5(
+        guard,
+        git,
+        reference,
+        &loaded.inventory,
+        &loaded.staging,
+        marker,
+    )?;
+    verify_held_active_journal_identity_v5(git, journal_file)?;
+    let publish_identity = filesystem_file_identity(&loaded.staging.file)
+        .map_err(|error| io_error(GitIoOperation::SyncGitState, &error))?;
+    let marker_identity = filesystem_file_identity(&marker.file)
+        .map_err(|error| io_error(GitIoOperation::SyncGitState, &error))?;
+    Ok((publish_identity, marker_identity))
+}
+
 /// Atomically consumes the publish staging file over the held v5 marker. Both
 /// path handles are consumed before the Windows namespace move; opaque file-ID
 /// receipts distinguish the moved inode from byte-identical replacements.
@@ -2977,8 +3179,7 @@ fn publish_staging_over_marker_with_journal_v5_impl<
     let stable_path = candidate_bundle_stable_path_v5(&git.root, &reference.bundle_basename)?;
     let publish_path =
         candidate_bundle_publish_path_v5(&git.root, &reference.publish_staging_basename)?;
-    let lock_path = index_lock_path(&git.root);
-    let live_path = index_path(&git.root);
+    let (lock_path, live_path) = (index_lock_path(&git.root), index_path(&git.root));
     let context = PostJournalIndexContextV5 {
         root: &git.root,
         stable_path: &stable_path,
@@ -3000,11 +3201,14 @@ fn publish_staging_over_marker_with_journal_v5_impl<
     )?;
     verify_held_active_journal_identity_v5(git, journal_file)?;
     critical_audit()?;
-    verify_held_active_journal_identity_v5(git, journal_file)?;
-    let publish_identity = filesystem_file_identity(&loaded.staging.file)
-        .map_err(|error| io_error(GitIoOperation::SyncGitState, &error))?;
-    let marker_identity = filesystem_file_identity(&marker.file)
-        .map_err(|error| io_error(GitIoOperation::SyncGitState, &error))?;
+    let (publish_identity, marker_identity) = bind_publish_over_marker_replace_owners_v5(
+        guard,
+        git,
+        reference,
+        &loaded,
+        &marker,
+        journal_file,
+    )?;
     let LoadedCandidatePublishStagingV5 { inventory, staging } = loaded;
     let PreparedCandidatePublishStagingV5 {
         file: source,
@@ -3067,6 +3271,7 @@ fn open_held_live_old_index_v5(
 ) -> Result<File, GitError> {
     let path = index_path(&git.root);
     let file = File::open(&path).map_err(|error| io_error(GitIoOperation::ReadMetadata, &error))?;
+    verify_runtime_owner_stream_inventory_v5(&path, &file, GitIoOperation::InspectMetadata)?;
     let snapshot = read_index_snapshot(&path)?;
     if snapshot.size != inventory.manifest.old_index.size
         || snapshot.sha256 != inventory.manifest.old_index.sha256
@@ -3074,6 +3279,7 @@ fn open_held_live_old_index_v5(
     {
         return Err(GitError::IndexChanged);
     }
+    verify_runtime_owner_stream_inventory_v5(&path, &file, GitIoOperation::InspectMetadata)?;
     Ok(file)
 }
 
@@ -3094,6 +3300,7 @@ fn audit_candidate_lock_before_index_v5(
     {
         return Err(GitError::IndexChanged);
     }
+    verify_runtime_owner_stream_inventory_v5(&path, live_file, GitIoOperation::InspectMetadata)?;
     Ok(())
 }
 
@@ -3112,6 +3319,11 @@ fn revalidate_completed_live_index_identity_v5(
     {
         return Err(GitError::RecoveryConflict);
     }
+    verify_identity_bound_runtime_owner_stream_inventory_v5(
+        &live_path,
+        classified_identity,
+        GitIoOperation::InspectMetadata,
+    )?;
     let candidate_matches =
         required_path_matches_file_identity_v5(&live_path, proof.candidate_identity)?;
     if !matches!(
@@ -3123,6 +3335,11 @@ fn revalidate_completed_live_index_identity_v5(
     {
         return Err(GitError::RecoveryConflict);
     }
+    verify_identity_bound_runtime_owner_stream_inventory_v5(
+        &live_path,
+        classified_identity,
+        GitIoOperation::InspectMetadata,
+    )?;
     Ok(())
 }
 
@@ -3218,8 +3435,31 @@ fn audit_candidate_lock_before_index_by_identity_v5(
     {
         return Err(GitError::RecoveryConflict);
     }
+    verify_identity_bound_runtime_owner_stream_inventory_v5(
+        &live_path,
+        old_live_identity,
+        GitIoOperation::InspectMetadata,
+    )?;
     drop(loaded);
     Ok(())
+}
+
+fn bind_candidate_over_live_index_replace_owners_v5(
+    guard: &VaultMutationGuard,
+    git: &Git,
+    reference: &CandidateBundleTransactionReferenceV5,
+    loaded: &LoadedCandidateIndexLockV5,
+    live_file: &File,
+    journal_file: &File,
+) -> Result<(FilesystemFileIdentity, FilesystemFileIdentity), GitError> {
+    verify_held_active_journal_identity_v5(git, journal_file)?;
+    audit_candidate_lock_before_index_v5(guard, git, reference, loaded, live_file)?;
+    verify_held_active_journal_identity_v5(git, journal_file)?;
+    let candidate_identity = filesystem_file_identity(&loaded.file)
+        .map_err(|error| io_error(GitIoOperation::SyncGitState, &error))?;
+    let old_live_identity = filesystem_file_identity(live_file)
+        .map_err(|error| io_error(GitIoOperation::SyncGitState, &error))?;
+    Ok((candidate_identity, old_live_identity))
 }
 
 pub(super) fn publish_candidate_lock_over_live_index_with_journal_v5<F>(
@@ -3303,11 +3543,14 @@ fn publish_candidate_lock_over_live_index_with_journal_v5_impl<
     audit_candidate_lock_before_index_v5(guard, git, reference, &loaded, &live_file)?;
     verify_held_active_journal_identity_v5(git, journal_file)?;
     critical_audit()?;
-    verify_held_active_journal_identity_v5(git, journal_file)?;
-    let candidate_identity = filesystem_file_identity(&loaded.file)
-        .map_err(|error| io_error(GitIoOperation::SyncGitState, &error))?;
-    let old_live_identity = filesystem_file_identity(&live_file)
-        .map_err(|error| io_error(GitIoOperation::SyncGitState, &error))?;
+    let (candidate_identity, old_live_identity) = bind_candidate_over_live_index_replace_owners_v5(
+        guard,
+        git,
+        reference,
+        &loaded,
+        &live_file,
+        journal_file,
+    )?;
     let proof = PostJournalLiveIndexProofV5 {
         candidate_identity: &candidate_identity,
         old_live_identity: &old_live_identity,
@@ -3466,9 +3709,9 @@ fn create_private_file_retaining_v5(path: &Path, bytes: &[u8]) -> Result<File, G
 /// stable bundle) for later inspection. The caller must not infer transaction
 /// ownership from an unpublished scratch entry. The caller must still
 /// acquire and bind the real Git index lock before it may authorize any
-/// repository mutation. The inventory proof covers named directory entries
-/// and each file's unnamed data stream; native NTFS ADS enumeration and
-/// abrupt-power-loss evidence remain separate release gates.
+/// repository mutation. The inventory proof covers exact named directory
+/// entries and rejects alternate streams on the directory and both files;
+/// native NTFS runtime and abrupt-power-loss evidence remain release gates.
 #[allow(
     dead_code,
     reason = "the production v5 writer and focused preparation tests use different paths"
@@ -3934,6 +4177,51 @@ mod tests {
         (basename, manifest, reference)
     }
 
+    #[cfg(windows)]
+    fn windows_stream_path(path: &Path, name: &str) -> PathBuf {
+        let mut stream_path = path.as_os_str().to_os_string();
+        stream_path.push(format!(":{name}"));
+        PathBuf::from(stream_path)
+    }
+
+    #[cfg(windows)]
+    fn install_verified_bundle(
+        root: &TestRoot,
+    ) -> (
+        CandidateBundleTransactionReferenceV5,
+        InventoryVerifiedCandidateBundleV5,
+    ) {
+        let (basename, manifest, manifest_reference) = install_bundle(root, TOKEN);
+        let reference = candidate_bundle_transaction_reference_v5(
+            &basename,
+            manifest.object_format,
+            manifest_reference.clone(),
+        )
+        .expect("transaction reference builds");
+        let inventory = validate_candidate_bundle_inventory_v5(
+            root.path(),
+            &basename,
+            Some(&manifest_reference),
+        )
+        .expect("clean bundle validates");
+        (reference, inventory)
+    }
+
+    #[cfg(windows)]
+    fn install_cleanup_full(
+        root: &TestRoot,
+    ) -> (CandidateBundleTransactionReferenceV5, HeldCleanupFullV5) {
+        let (reference, inventory) = install_verified_bundle(root);
+        retire_stable_bundle_to_cleanup_v5(root.path(), &reference, &inventory, || Ok(()))
+            .expect("stable bundle retires to cleanup");
+        let HeldCandidateCleanupV5::Full(cleanup) =
+            load_candidate_cleanup_v5(root.path(), &reference).expect("full cleanup reloads")
+        else {
+            panic!("full cleanup shape expected");
+        };
+        (reference, *cleanup)
+    }
+
     #[test]
     fn v5_manifest_round_trips_only_as_exact_canonical_duplicate_free_json() {
         let candidate = b"canonical candidate";
@@ -4210,6 +4498,23 @@ mod tests {
             GitError::RecoveryConflict
         ));
         assert!(matches!(
+            runtime_owner_identity_error(
+                GitIoOperation::ReadMetadata,
+                &io::Error::from(io::ErrorKind::InvalidData),
+            ),
+            GitError::RecoveryConflict
+        ));
+        assert!(matches!(
+            runtime_owner_identity_error(
+                GitIoOperation::ReadMetadata,
+                &io::Error::from(io::ErrorKind::PermissionDenied),
+            ),
+            GitError::Io {
+                operation: GitIoOperation::ReadMetadata,
+                kind: io::ErrorKind::PermissionDenied,
+            }
+        ));
+        assert!(matches!(
             map_directory_publish_error_v5(&AtomicDirectoryPublishError::Io {
                 source: io::Error::from(io::ErrorKind::PermissionDenied),
             }),
@@ -4244,6 +4549,177 @@ mod tests {
         )
         .expect("candidate tampers");
         assert!(validate_candidate_bundle_inventory_v5(root.path(), &basename, None).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn exact_bundle_inventory_rejects_initial_windows_streams_on_every_owner() {
+        for owner in ["directory", "candidate", "manifest"] {
+            let root = TestRoot::new();
+            let (basename, _, _) = install_bundle(&root, TOKEN);
+            let bundle = root.local().join(&basename);
+            let owner_path = match owner {
+                "directory" => bundle,
+                "candidate" => bundle.join(CANDIDATE_BUNDLE_INDEX_V5),
+                "manifest" => bundle.join(CANDIDATE_BUNDLE_MANIFEST_V5),
+                _ => unreachable!(),
+            };
+            let stream_path = windows_stream_path(&owner_path, "inex-test");
+            fs::write(&stream_path, b"hidden inventory").expect("ADS writes");
+            assert!(matches!(
+                validate_candidate_bundle_inventory_v5(root.path(), &basename, None),
+                Err(GitError::InvalidJournal)
+            ));
+            assert_eq!(
+                fs::read(&stream_path).expect("rejected ADS remains"),
+                b"hidden inventory",
+                "{owner}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn held_bundle_inventory_rejects_later_windows_streams_on_every_owner() {
+        for owner in ["directory", "candidate", "manifest"] {
+            let root = TestRoot::new();
+            let (reference, inventory) = install_verified_bundle(&root);
+            let bundle = root.local().join(&reference.bundle_basename);
+            let owner_path = match owner {
+                "directory" => bundle,
+                "candidate" => bundle.join(CANDIDATE_BUNDLE_INDEX_V5),
+                "manifest" => bundle.join(CANDIDATE_BUNDLE_MANIFEST_V5),
+                _ => unreachable!(),
+            };
+            let stream_path = windows_stream_path(&owner_path, "inex-test");
+            fs::write(&stream_path, b"hidden inventory").expect("ADS writes");
+            assert!(matches!(
+                revalidate_held_stable_inventory_v5(root.path(), &reference, &inventory),
+                Err(GitError::RecoveryConflict)
+            ));
+            assert_eq!(
+                fs::read(&stream_path).expect("rejected ADS remains"),
+                b"hidden inventory",
+                "{owner}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stable_to_cleanup_move_rejects_late_streams_on_every_owner() {
+        for owner in ["directory", "candidate", "manifest"] {
+            let root = TestRoot::new();
+            let (reference, inventory) = install_verified_bundle(&root);
+            let stable_path = root.local().join(&reference.bundle_basename);
+            let owner_path = match owner {
+                "directory" => stable_path.clone(),
+                "candidate" => stable_path.join(CANDIDATE_BUNDLE_INDEX_V5),
+                "manifest" => stable_path.join(CANDIDATE_BUNDLE_MANIFEST_V5),
+                _ => unreachable!(),
+            };
+            let stream_path = windows_stream_path(&owner_path, "inex-test-retire");
+            assert!(matches!(
+                retire_stable_bundle_to_cleanup_v5(root.path(), &reference, &inventory, || {
+                    fs::write(&stream_path, b"hidden retire owner")
+                        .expect("retire ADS writes inside critical audit");
+                    Ok(())
+                },),
+                Err(GitError::RecoveryConflict)
+            ));
+            assert!(stable_path.is_dir(), "{owner}");
+            let cleanup_path = root.local().join(
+                candidate_bundle_cleanup_basename_v5(&reference.token)
+                    .expect("cleanup basename derives"),
+            );
+            assert!(!cleanup_path.exists(), "{owner}");
+            assert_eq!(
+                fs::read(&stream_path).expect("rejected retire ADS remains"),
+                b"hidden retire owner",
+                "{owner}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cleanup_full_rejects_streams_on_every_owner_before_candidate_removal() {
+        for owner in ["directory", "candidate", "manifest"] {
+            let root = TestRoot::new();
+            let (reference, cleanup) = install_cleanup_full(&root);
+            let cleanup_path = root.local().join(
+                candidate_bundle_cleanup_basename_v5(&reference.token)
+                    .expect("cleanup basename derives"),
+            );
+            let owner_path = match owner {
+                "directory" => cleanup_path.clone(),
+                "candidate" => cleanup_path.join(CANDIDATE_BUNDLE_INDEX_V5),
+                "manifest" => cleanup_path.join(CANDIDATE_BUNDLE_MANIFEST_V5),
+                _ => unreachable!(),
+            };
+            let stream_path = windows_stream_path(&owner_path, "inex-test-remove-candidate");
+            fs::write(&stream_path, b"hidden cleanup owner").expect("cleanup ADS writes");
+            assert!(matches!(
+                remove_cleanup_candidate_v5(root.path(), &reference, cleanup),
+                Err(GitError::RecoveryConflict)
+            ));
+            assert!(
+                cleanup_path.join(CANDIDATE_BUNDLE_INDEX_V5).is_file(),
+                "{owner}"
+            );
+            assert_eq!(
+                fs::read(&stream_path).expect("cleanup ADS remains"),
+                b"hidden cleanup owner",
+                "{owner}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cleanup_manifest_and_empty_reject_streams_before_physical_removal() {
+        let root = TestRoot::new();
+        let (reference, cleanup) = install_cleanup_full(&root);
+        let (_, manifest) = remove_cleanup_candidate_v5(root.path(), &reference, cleanup)
+            .expect("candidate removes to manifest-only");
+        let cleanup_path = root.local().join(
+            candidate_bundle_cleanup_basename_v5(&reference.token)
+                .expect("cleanup basename derives"),
+        );
+        let manifest_path = cleanup_path.join(CANDIDATE_BUNDLE_MANIFEST_V5);
+        let manifest_stream = windows_stream_path(&manifest_path, "inex-test");
+        fs::write(&manifest_stream, b"hidden manifest").expect("manifest ADS writes");
+        assert!(matches!(
+            remove_cleanup_manifest_v5(root.path(), &reference, manifest),
+            Err(GitError::RecoveryConflict)
+        ));
+        assert!(manifest_path.is_file());
+        assert_eq!(
+            fs::read(&manifest_stream).expect("manifest ADS remains"),
+            b"hidden manifest"
+        );
+
+        let root = TestRoot::new();
+        let (reference, cleanup) = install_cleanup_full(&root);
+        let (_, manifest) = remove_cleanup_candidate_v5(root.path(), &reference, cleanup)
+            .expect("candidate removes to manifest-only");
+        let (_, empty) = remove_cleanup_manifest_v5(root.path(), &reference, manifest)
+            .expect("manifest removes to empty");
+        let cleanup_path = root.local().join(
+            candidate_bundle_cleanup_basename_v5(&reference.token)
+                .expect("cleanup basename derives"),
+        );
+        let directory_stream = windows_stream_path(&cleanup_path, "inex-test");
+        fs::write(&directory_stream, b"hidden directory").expect("directory ADS writes");
+        assert!(matches!(
+            remove_empty_cleanup_directory_v5(root.path(), &reference, empty),
+            Err(GitError::RecoveryConflict)
+        ));
+        assert!(cleanup_path.is_dir());
+        assert_eq!(
+            fs::read(&directory_stream).expect("directory ADS remains"),
+            b"hidden directory"
+        );
     }
 
     #[test]

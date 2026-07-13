@@ -857,6 +857,120 @@ fn commit_payload_v5_force_kill_test(
     Ok(())
 }
 
+fn force_kill_publish_candidate_to_lock(
+    vault: &Vault,
+    git: &Git,
+    guard: &VaultMutationGuard,
+    hooks: &mut ForceKillWriterHooks,
+    reference: &candidate_bundle_v5::CandidateBundleTransactionReferenceV5,
+    held_journal: &HeldBundleJournalV5,
+    inventory: &candidate_bundle_v5::InventoryVerifiedCandidateBundleV5,
+) -> Result<(), GitError> {
+    revalidate_v5_postjournal_capabilities(vault.root(), reference, inventory, held_journal)?;
+    prepare_payload_worktree_for_v5_index_with_hooks(
+        vault,
+        git,
+        guard,
+        reference,
+        inventory,
+        held_journal,
+        hooks,
+    )?;
+    revalidate_v5_postjournal_capabilities(vault.root(), reference, inventory, held_journal)?;
+    let loaded = candidate_bundle_v5::load_candidate_publish_staging_with_journal_v5(
+        guard, git, reference,
+    )?;
+    let marker = candidate_bundle_v5::load_acquired_index_lock_marker_with_journal_v5(
+        guard,
+        git,
+        reference,
+        &loaded.inventory,
+        &loaded.staging,
+    )?;
+    verify_v5_payload_ready_with_capabilities(
+        vault,
+        git,
+        guard,
+        reference,
+        inventory,
+        held_journal,
+    )?;
+    let authorization = candidate_bundle_v5::PostJournalIndexAuthorizationV5::new(
+        &held_journal.file,
+        || {
+            verify_v5_payload_ready_with_capabilities(
+                vault,
+                git,
+                guard,
+                reference,
+                inventory,
+                held_journal,
+            )
+        },
+    );
+    let mut component = ComponentForceKillHooks { writer: hooks };
+    candidate_bundle_v5::publish_staging_over_marker_with_journal_v5_with_hooks(
+        guard,
+        git,
+        reference,
+        loaded,
+        marker,
+        authorization,
+        &mut component,
+    )?;
+    hooks.checkpoint(
+        V5WriterCheckpoint::CandidatePublishedToLock,
+        &V5WriterContext { vault, git, guard },
+    )?;
+    revalidate_v5_postjournal_capabilities(vault.root(), reference, inventory, held_journal)
+}
+
+fn force_kill_publish_live_index(
+    vault: &Vault,
+    git: &Git,
+    guard: &VaultMutationGuard,
+    hooks: &mut ForceKillWriterHooks,
+    reference: &candidate_bundle_v5::CandidateBundleTransactionReferenceV5,
+    held_journal: &HeldBundleJournalV5,
+    inventory: &candidate_bundle_v5::InventoryVerifiedCandidateBundleV5,
+) -> Result<(), GitError> {
+    let loaded = candidate_bundle_v5::load_candidate_index_lock_with_journal_v5(
+        guard, git, reference,
+    )?;
+    verify_v5_payload_ready_with_capabilities(
+        vault,
+        git,
+        guard,
+        reference,
+        inventory,
+        held_journal,
+    )?;
+    let mut component = ComponentForceKillHooks { writer: hooks };
+    candidate_bundle_v5::publish_candidate_lock_over_live_index_with_journal_v5_with_hooks(
+        guard,
+        git,
+        reference,
+        loaded,
+        &held_journal.file,
+        || {
+            verify_v5_payload_ready_with_capabilities(
+                vault,
+                git,
+                guard,
+                reference,
+                inventory,
+                held_journal,
+            )
+        },
+        &mut component,
+    )?;
+    hooks.checkpoint(
+        V5WriterCheckpoint::LiveIndexPublished,
+        &V5WriterContext { vault, git, guard },
+    )?;
+    revalidate_v5_postjournal_capabilities(vault.root(), reference, inventory, held_journal)
+}
+
 fn recover_postjournal_force_kill_test(
     vault: &Vault,
     git: &Git,
@@ -865,77 +979,35 @@ fn recover_postjournal_force_kill_test(
 ) -> Result<(), GitError> {
     let reference = load_v5_reference_from_disk(vault.root())?;
     let held_journal = load_held_bundle_journal_v5(vault.root(), &reference)?;
-    let payload = v5_payload_from_reference(vault.root(), &reference)?;
+    let inventory = v5_inventory_from_reference(vault.root(), &reference)?;
     if inspect_v5_postjournal_state(guard, vault.root())?
         != Some(V5PostJournalState::JournalReady)
     {
         return Err(GitError::RecoveryConflict);
     }
-    revalidate_held_bundle_journal_v5(vault.root(), &held_journal)?;
-    prepare_payload_worktree_for_v5_index_with_hooks(vault, git, guard, &payload, hooks)?;
-    revalidate_held_bundle_journal_v5(vault.root(), &held_journal)?;
-    let loaded = candidate_bundle_v5::load_candidate_publish_staging_with_journal_v5(
-        guard, git, &reference,
-    )?;
-    let marker = candidate_bundle_v5::load_acquired_index_lock_marker_with_journal_v5(
-        guard,
+    force_kill_publish_candidate_to_lock(
+        vault,
         git,
+        guard,
+        hooks,
         &reference,
-        &loaded.inventory,
-        &loaded.staging,
+        &held_journal,
+        &inventory,
     )?;
-    verify_payload_ready_for_v5_index(vault, git, guard, &payload)?;
-    revalidate_held_bundle_journal_v5(vault.root(), &held_journal)?;
-    {
-        let authorization = candidate_bundle_v5::PostJournalIndexAuthorizationV5::new(
-            &held_journal.file,
-            || {
-                revalidate_held_bundle_journal_v5(vault.root(), &held_journal)?;
-                verify_payload_ready_for_v5_index(vault, git, guard, &payload)?;
-                revalidate_held_bundle_journal_v5(vault.root(), &held_journal)
-            },
-        );
-        let mut component = ComponentForceKillHooks { writer: hooks };
-        candidate_bundle_v5::publish_staging_over_marker_with_journal_v5_with_hooks(
-            guard,
-            git,
-            &reference,
-            loaded,
-            marker,
-            authorization,
-            &mut component,
-        )?;
-    }
-    let context = V5WriterContext { vault, git, guard };
-    hooks.checkpoint(V5WriterCheckpoint::CandidatePublishedToLock, &context)?;
     if inspect_v5_postjournal_state(guard, vault.root())?
         != Some(V5PostJournalState::CandidateInLock)
     {
         return Err(GitError::RecoveryConflict);
     }
-
-    let loaded = candidate_bundle_v5::load_candidate_index_lock_with_journal_v5(
-        guard, git, &reference,
+    force_kill_publish_live_index(
+        vault,
+        git,
+        guard,
+        hooks,
+        &reference,
+        &held_journal,
+        &inventory,
     )?;
-    revalidate_held_bundle_journal_v5(vault.root(), &held_journal)?;
-    verify_payload_ready_for_v5_index(vault, git, guard, &payload)?;
-    {
-        let mut component = ComponentForceKillHooks { writer: hooks };
-        candidate_bundle_v5::publish_candidate_lock_over_live_index_with_journal_v5_with_hooks(
-            guard,
-            git,
-            &reference,
-            loaded,
-            &held_journal.file,
-            || {
-                revalidate_held_bundle_journal_v5(vault.root(), &held_journal)?;
-                verify_payload_ready_for_v5_index(vault, git, guard, &payload)?;
-                revalidate_held_bundle_journal_v5(vault.root(), &held_journal)
-            },
-            &mut component,
-        )?;
-    }
-    hooks.checkpoint(V5WriterCheckpoint::LiveIndexPublished, &context)?;
     let completed = inspect_v5_postjournal_state(guard, vault.root())?
         .ok_or(GitError::RecoveryConflict)?;
     if !matches!(
@@ -944,9 +1016,14 @@ fn recover_postjournal_force_kill_test(
     ) {
         return Err(GitError::RecoveryConflict);
     }
-    revalidate_held_bundle_journal_v5(vault.root(), &held_journal)?;
-    verify_payload_completed_v5(vault, git, guard, &payload)?;
-    revalidate_held_bundle_journal_v5(vault.root(), &held_journal)
+    verify_v5_payload_completed_with_capabilities(
+        vault,
+        git,
+        guard,
+        &reference,
+        &inventory,
+        &held_journal,
+    )
 }
 
 fn assert_bound_secret_fragments(
