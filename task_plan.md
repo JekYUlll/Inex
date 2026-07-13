@@ -91,7 +91,11 @@ Phase 6 extension — 现有 Markdown Git 仓库与加密附件迁移（Phase 7 
     - [ ] 以Unix进程组/Windows Job或等价机制闭合恶意Git后代持pipe、hostile same-UID TOCTOU及完整process-tree资源边界
   - [ ] 完成跨进程publication ambiguity恢复
     - [x] 冻结并独立复审generic marker v2、candidate seal v1、existing-only no-create reconcile、initial held-lock与reserved marker mutation barrier契约（`3fd797e`）
-    - [ ] 实现上述claim/seal/guard；真实SIGKILL后同命令只对账并删除exact held marker，绝不在final补建Git或触碰foreign destination
+    - [x] 冻结reconcile终态、dry-run观察态、输出确认与reserved namespace分类，三轮独立复审GO（`3a7c622`）
+    - [x] 实现Linux/Windows单一主scheme的目录/文件publication identity投影，禁止现代/legacy回退或重标（`f14e7ff`）
+    - [x] 实现强类型角色的canonical marker v2 codec、bounded reader、digest与portable child-name校验（`3fd7434`）
+    - [x] 实现existing-only、no-create/no-recovery、nonblocking held mutation lock与整根rename后revalidation（`339b554`）
+    - [ ] 实现candidate seal、reserved marker classifier/barrier、claim创建/发布/reconcile生产状态机；真实SIGKILL后同命令只对账并删除exact held marker，绝不在final补建Git或触碰foreign destination
   - [ ] 完成repository import构造/durability/publication每一边界的Linux force-kill、hostile same-UID source/target race、artifact-bound residue与原生Windows矩阵
 - **Status:** in_progress（用户实测驱动的迁移/附件扩展；原Markdown-only实现仍保持已验证基线）
 
