@@ -1004,3 +1004,9 @@
 - 提交 `e93a1a9`、`f788818`、`b027052` 先后加入 `umbra.document.open`、RenderMap shape/range 边界；本轮将这些检查收敛为 canonical parser，并新增 apply/edit/remove 客户端接口。generation 必须是 canonical 32-byte base64url，slot ID 唯一且 slot/outer ranges 有序、不重叠、投影长度精确一致。
 - 所有标注 mutation 只序列化同一 authenticated projection、ETag 和完整 RenderMap；返回内容亦需重新验证 feature-2 metadata、durability 与 RenderMap 后才交给 Sublime host。annotation spec 只接受 block/comment、规范排序去重 tag ID 和与 cover mode 一致的公开 cover text。
 - 验证：`PYTHONPATH=editors/sublime python3 -m unittest discover -s editors/sublime/tests -v` 为 85/85 通过、1 项平台跳过；`python3 -m py_compile`、`git diff --check` 通过。下一步在 scratch-buffer 生命周期中接入 Umbra projection 与 stateful picker，绝不将 catalog 标签写入普通设置。
+
+## 2026-07-15 — VS Code 最新导入路径与发布基线复验
+
+- 当前 `repositoryImport.ts` 已实际支持 absent create 与 exact existing-v2 target reconciliation：既有目标必须经 modal confirmation，且交互明确说明 target-only reconcile 不应索取密码；`INEX_PASSWORD_STDIN` 仍在 extension 边界无条件拒绝。release smoke 的 CLI usage 已为 `<destination-vault>`，不是旧的 `<new-vault>`。
+- 验证：`pnpm --dir editors/vscode check && pnpm --dir editors/vscode test && pnpm --dir editors/vscode build` 全部通过，测试为 57/57。发布工具必须从仓库根目录以 `PYTHONPATH=scripts python3 -m unittest discover -s scripts/tests -p 'test_*release*.py' -v` 运行；省略 PYTHONPATH 的首次启动仅发生模块导入错误，未作为产品回归。
+- 正确启动的 release tests 为 58/61；3 项依赖 Linux pidfd/subreaper descendant-control 的 lifecycle gate 在当前容器以 `Linux pidfd descendant control is unavailable` fail closed。该宿主缺少 required capability，不能把当前机的结果升级为 release evidence；后续需在具备 pidfd gate 的 clean release host 重新跑 package/audit/smoke。
