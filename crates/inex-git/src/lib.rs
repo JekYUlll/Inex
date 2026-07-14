@@ -55,7 +55,7 @@ mod repository_import;
 pub use repository_import::candidate_transaction::{
     PublishedRepositoryCandidate, RepositoryCandidatePublicationFailure,
     RepositoryCandidatePublicationFailureKind, initial_repository_publication_supported,
-    publish_initial_repository_candidate,
+    publish_initial_repository_candidate, reconcile_existing_repository_candidate,
 };
 pub use repository_import::{
     RepositoryImportError, SourceSnapshot, SourceSnapshotEntry, TargetRepository,

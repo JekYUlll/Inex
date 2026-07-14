@@ -1038,6 +1038,7 @@ const fn publication_terminal(
         Kind::UnsupportedPlatform
         | Kind::InitialAuthorityRejected
         | Kind::InitialClaimRejected
+        | Kind::ExistingClaimRejected
         | Kind::InitialPublicationNotMoved
         | Kind::DestinationExists
         | Kind::InitialPublicationRejected => RepositoryImportTerminal::StagingAudited,

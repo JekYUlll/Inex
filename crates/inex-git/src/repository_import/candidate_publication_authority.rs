@@ -1276,7 +1276,7 @@ fn failed_post_open_claim(
 }
 
 #[cfg(all(test, target_os = "linux"))]
-mod tests {
+pub(crate) mod tests {
     use std::cell::Cell;
     use std::fs;
     use std::path::PathBuf;
@@ -1310,7 +1310,7 @@ mod tests {
         counts: (u32, u32, u32, u32),
     }
 
-    struct PublishedFixture {
+    pub(crate) struct PublishedFixture {
         parent: PathBuf,
         destination_root: PathBuf,
         destination_child_name: String,
@@ -1354,7 +1354,7 @@ mod tests {
             );
         }
 
-        fn assert_lock_busy(&self) {
+        pub(crate) fn assert_lock_busy(&self) {
             assert!(matches!(
                 ExistingVaultMutationLock::acquire(
                     &self.destination_root,
@@ -1366,7 +1366,7 @@ mod tests {
             ));
         }
 
-        fn assert_lock_available(&self) {
+        pub(crate) fn assert_lock_available(&self) {
             drop(
                 ExistingVaultMutationLock::acquire(
                     &self.destination_root,
@@ -1376,6 +1376,24 @@ mod tests {
                 )
                 .expect("terminal owner drop releases the exact lock"),
             );
+        }
+    }
+
+    impl PublishedFixture {
+        pub(crate) fn coordinates(&self) -> (&Path, &FilesystemDirectoryIdentity, &str) {
+            (
+                &self.destination_root,
+                &self.common_parent_identity,
+                &self.destination_child_name,
+            )
+        }
+
+        pub(crate) const fn expected_counts(&self) -> (u32, u32, u32, u32) {
+            self.expected.counts
+        }
+
+        pub(crate) const fn expected_root_commit_oid(&self) -> [u8; 20] {
+            self.expected.root_commit_oid
         }
     }
 
@@ -1499,7 +1517,7 @@ mod tests {
         )
     }
 
-    fn fixture(label: &str) -> PublishedFixture {
+    pub(crate) fn fixture(label: &str) -> PublishedFixture {
         let (fixture, claim) = claimed_fixture(label);
         fs::rename(claim.root(), &fixture.destination_root)
             .expect("fixture performs whole-root publication rename");

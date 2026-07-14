@@ -27,10 +27,11 @@ use super::candidate_initial_authority::{
 #[cfg(target_os = "linux")]
 use super::candidate_publication_authority::{
     CleanAuditOutcome, CleanAuditPending, CleanAuditTerminalFailure, FailedCleanAudit,
-    FailedPublicationDurability, FailedPublicationMarkerUnlink, ParentSyncPending,
-    PublicationDurabilityOutcome, PublicationDurableWithMarker, PublicationMarkerUnlinkFailure,
-    PublicationMarkerUnlinkOutcome, PublicationParentSyncOutcome, PublishedClean,
-    PublishedWithMarker, RetryablePublicationDurability,
+    FailedPublicationDurability, FailedPublicationMarkerUnlink, FreshExistingClaimError,
+    FreshExistingClaimInput, ParentSyncPending, PublicationDurabilityOutcome,
+    PublicationDurableWithMarker, PublicationMarkerUnlinkFailure, PublicationMarkerUnlinkOutcome,
+    PublicationParentSyncOutcome, PublishedClean, PublishedWithMarker,
+    RetryablePublicationDurability, claim_fresh_existing_candidate,
 };
 #[cfg(target_os = "linux")]
 use super::candidate_seal::CandidateSealContext;
@@ -63,6 +64,8 @@ pub enum RepositoryCandidatePublicationFailureKind {
     InitialAuthorityRejected,
     /// The initial authority could not be converted into a durable marker claim.
     InitialClaimRejected,
+    /// An existing canonical v2 claim could not be opened and fully audited.
+    ExistingClaimRejected,
     /// The verified no-replace move remained provably not performed.
     InitialPublicationNotMoved,
     /// The destination appeared before the verified no-replace move.
@@ -95,6 +98,7 @@ impl fmt::Display for RepositoryCandidatePublicationFailureKind {
                 "initial repository publication authority was rejected"
             }
             Self::InitialClaimRejected => "initial repository publication claim was rejected",
+            Self::ExistingClaimRejected => "existing repository publication claim was rejected",
             Self::InitialPublicationNotMoved => "repository publication was not performed",
             Self::DestinationExists => "repository publication destination exists",
             Self::PublicationIndeterminate => "repository publication outcome is indeterminate",
@@ -122,6 +126,7 @@ impl fmt::Display for RepositoryCandidatePublicationFailureKind {
 enum RetainedPublicationOwner {
     None,
     InitialClaim(Box<InitialCandidateClaimError>),
+    FreshClaim(Box<FreshExistingClaimError>),
     InitialRetry(RetryableInitialPublication),
     InitialTerminal(Box<FailedHeldInitialPublication>),
     DurabilityRetry(RetryablePublicationDurability),
@@ -140,6 +145,10 @@ impl fmt::Debug for RetainedPublicationOwner {
             Self::None => formatter.write_str("RetainedPublicationOwner::None"),
             Self::InitialClaim(owner) => formatter
                 .debug_tuple("RetainedPublicationOwner::InitialClaim")
+                .field(owner)
+                .finish(),
+            Self::FreshClaim(owner) => formatter
+                .debug_tuple("RetainedPublicationOwner::FreshClaim")
                 .field(owner)
                 .finish(),
             Self::InitialRetry(owner) => formatter
@@ -379,6 +388,52 @@ pub fn publish_initial_repository_candidate(
             target,
             vault,
             expected_profile,
+            common_parent_identity,
+            destination_child_name,
+        );
+        Err(RepositoryCandidatePublicationFailure::unsupported())
+    }
+}
+
+/// Reconcile one existing canonical v2 repository publication claim.
+///
+/// This target-only path accepts no source repository, password, vault, KDF,
+/// candidate seed, or caller-provided seal. Linux opens the pre-existing lock
+/// and marker through the fused existing-only guard, rebuilds the complete
+/// target audit, confirms publication durability, removes only the exact held
+/// marker, synchronizes its parent, and performs the marker-free clean audit.
+///
+/// # Errors
+///
+/// Returns an opaque failure owner that retains any acquired publication
+/// authority until the caller has emitted its terminal result and drops it.
+pub fn reconcile_existing_repository_candidate(
+    destination_root: &Path,
+    common_parent_identity: &FilesystemDirectoryIdentity,
+    destination_child_name: &str,
+) -> Result<PublishedRepositoryCandidate, RepositoryCandidatePublicationFailure> {
+    #[cfg(target_os = "linux")]
+    {
+        let published = claim_fresh_existing_candidate(FreshExistingClaimInput {
+            destination_root,
+            common_parent_identity,
+            destination_child_name,
+        })
+        .map_err(|error| {
+            RepositoryCandidatePublicationFailure::retained(
+                RepositoryCandidatePublicationFailureKind::ExistingClaimRejected,
+                RetainedPublicationOwner::FreshClaim(Box::new(error)),
+            )
+        })?;
+        let durable = drive_publication_durability(published)?;
+        let clean_pending = drive_marker_cleanup(durable)?;
+        drive_clean_audit(clean_pending).map(PublishedRepositoryCandidate::from_clean)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (
+            destination_root,
             common_parent_identity,
             destination_child_name,
         );
@@ -660,5 +715,61 @@ mod tests {
         assert!(durability < cleanup && cleanup < clean);
         assert!(!entry.contains("atomic_publish_directory_no_replace_checked"));
         assert!(!entry.contains("IMPORT_PUBLISH_MARKER_V1"));
+
+        let reconcile = source
+            .split("pub fn reconcile_existing_repository_candidate")
+            .nth(1)
+            .and_then(|tail| tail.split("fn drive_initial_publication").next())
+            .expect("fresh reconcile entry exists");
+        let claim = reconcile
+            .find("claim_fresh_existing_candidate(")
+            .expect("fresh claim");
+        let durability = reconcile
+            .find("drive_publication_durability(published)")
+            .expect("fresh durability");
+        let cleanup = reconcile
+            .find("drive_marker_cleanup(durable)")
+            .expect("fresh cleanup");
+        let clean = reconcile
+            .find("drive_clean_audit(clean_pending)")
+            .expect("fresh clean audit");
+        assert!(claim < durability && durability < cleanup && cleanup < clean);
+        for forbidden in ["source", "password", "Vault", "Kdf", "TargetRepository"] {
+            assert!(
+                !reconcile.contains(forbidden),
+                "fresh reconcile accepts forbidden authority: {forbidden}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fresh_reconcile_reaches_clean_and_holds_the_lock_until_drop() {
+        use inex_core::atomic::IMPORT_PUBLISH_MARKER_V2;
+
+        let fixture =
+            super::super::candidate_publication_authority::tests::fixture("transaction-reconcile");
+        let (destination, parent_identity, child_name) = fixture.coordinates();
+        let reconciled =
+            reconcile_existing_repository_candidate(destination, parent_identity, child_name)
+                .unwrap_or_else(|error| panic!("fresh reconcile failed: {error:?}"));
+        let (worktree, markdown, assets, objects) = fixture.expected_counts();
+        assert_eq!(reconciled.worktree_files(), worktree);
+        assert_eq!(reconciled.encrypted_markdown(), markdown);
+        assert_eq!(reconciled.encrypted_assets(), assets);
+        assert_eq!(reconciled.git_objects(), objects);
+        assert_eq!(
+            reconciled.root_commit_oid(),
+            lower_hex(&fixture.expected_root_commit_oid())
+        );
+        assert!(
+            !destination
+                .join(inex_core::atomic::VAULT_LOCAL_DIRECTORY)
+                .join(IMPORT_PUBLISH_MARKER_V2)
+                .exists()
+        );
+        fixture.assert_lock_busy();
+        drop(reconciled);
+        fixture.assert_lock_available();
     }
 }
