@@ -505,3 +505,4 @@
 - Private slot ciphertext 的 AAD 必须覆盖公开 Outer strategy；否则攻击者可把 `drop`、`placeholder`、cover text 等公开语义替换而仍让私密正文解密成功。slot key 还须绑定 logical document path 与 slot ID，禁止 slot 在文档间移植。
 - feature negotiation 必须按能力包含关系判断、而不是比较整个 feature vector：启用 Umbra 后已有 opaque-asset vault 的 authenticated metadata 合法值是 `[1,2]`。但每个 Umbra Outer EDRY envelope 仍必须精确声明 `[2]`，确保容器 reader 选择不会与普通 Markdown/asset 混淆。
 - Outer projection 不需要 `K_umbra` 才能读取（它只含公开 Markdown、slot ID、公开 outer strategy 和 slot ciphertext），但创建或保存 feature-2 container 必须要求 live Umbra session；常规 `Vault::read` 必须拒绝 feature-2 envelope，避免普通客户端把内部 JSON 误当 Markdown 展示或回存。
+- 私密 slot 的“移除/解包”必须先在同一 live session 解密并验证 ciphertext，再在内存中移除并执行 ETag 条件保存；只有保存成功才能把 payload 返回给上层 RenderMap/编辑器。这样失败写回不会让上层把尚未持久化的私密 Markdown当作已恢复的普通正文。
