@@ -210,6 +210,22 @@ impl EncryptedUmbraConfigV1 {
         let _ = decode_canonical(&self.ciphertext)?;
         serde_json::to_vec(self).map_err(|_| UmbraConfigError::InvalidEnvelope)
     }
+
+    /// Parse public envelope metadata without decrypting private configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed public envelope JSON or non-canonical
+    /// ciphertext encoding.
+    pub fn from_json(bytes: &[u8]) -> Result<Self, UmbraConfigError> {
+        let value: Self =
+            serde_json::from_slice(bytes).map_err(|_| UmbraConfigError::InvalidEnvelope)?;
+        if value.format != ENVELOPE_FORMAT || value.version != 1 {
+            return Err(UmbraConfigError::InvalidEnvelope);
+        }
+        let _ = decode_canonical(&value.ciphertext)?;
+        Ok(value)
+    }
 }
 
 fn key_context(vault_id: Uuid, key_id: Uuid) -> Vec<u8> {

@@ -31,6 +31,9 @@ use crate::search::{
 };
 use crate::sodium::Argon2idParams;
 use crate::tree::{self, TreeEntryKind, TreeError, VaultTree, VaultTreeProfile};
+use crate::umbra_config::{
+    EncryptedUmbraConfigV1, UMBRA_CONFIG_PATH, UmbraConfigError, UmbraConfigV1,
+};
 use crate::umbra_keyslot::{
     UMBRA_DEFAULT_KEYSLOT_PATH, UmbraKey, UmbraKeyslotError, UmbraKeyslotV1,
 };
@@ -195,6 +198,9 @@ pub enum VaultError {
     /// Umbra keyslot creation, authentication, or persistence failed.
     #[error(transparent)]
     UmbraKeyslot(#[from] UmbraKeyslotError),
+    /// Umbra encrypted catalog/profile processing failed.
+    #[error(transparent)]
+    UmbraConfig(#[from] UmbraConfigError),
     /// An operation requires a currently unlocked Umbra session.
     #[error("Umbra is locked")]
     UmbraLocked,
@@ -268,6 +274,7 @@ struct UmbraSession {
     slot: UmbraKeyslotV1,
     key: UmbraKey,
     slot_etag: [u8; 32],
+    config_etag: Option<[u8; 32]>,
 }
 
 /// Non-secret Umbra session state.
@@ -600,6 +607,7 @@ impl Vault {
             slot,
             key,
             slot_etag: outcome.etag,
+            config_etag: None,
         });
         self.umbra_status()
     }
@@ -617,6 +625,7 @@ impl Vault {
             slot,
             key,
             slot_etag,
+            config_etag: None,
         });
         self.umbra_status()
     }
@@ -653,6 +662,71 @@ impl Vault {
         let session = self.umbra.as_mut().ok_or(VaultError::UmbraLocked)?;
         session.slot = replacement;
         session.slot_etag = outcome.etag;
+        Ok(())
+    }
+
+    /// Load the encrypted shared tag catalog and annotation profiles.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError::UmbraLocked`] when no live `K_umbra` exists, or
+    /// fails closed for unsafe paths, malformed ciphertext, and AEAD failure.
+    pub fn load_umbra_config(&mut self) -> Result<UmbraConfigV1, VaultError> {
+        if self.umbra.is_none() {
+            return Err(VaultError::UmbraLocked);
+        }
+        let Some((bytes, etag)) = load_umbra_config_bytes(&self.root)? else {
+            let session = self.umbra.as_mut().ok_or(VaultError::UmbraLocked)?;
+            session.config_etag = None;
+            return Ok(UmbraConfigV1::empty());
+        };
+        let session = self.umbra.as_mut().ok_or(VaultError::UmbraLocked)?;
+        let envelope = EncryptedUmbraConfigV1::from_json(&bytes)?;
+        let config = envelope.decrypt(self.config.vault_id, session.slot.key_id(), &session.key)?;
+        session.config_etag = Some(etag);
+        Ok(config)
+    }
+
+    /// Encrypt and atomically save the shared tag catalog and profiles.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError::UmbraLocked`] when no live `K_umbra` exists, or
+    /// an error if CAS persistence or post-commit authentication fails.
+    pub fn save_umbra_config(&mut self, config: &UmbraConfigV1) -> Result<(), VaultError> {
+        let session = self.umbra.as_ref().ok_or(VaultError::UmbraLocked)?;
+        let envelope = EncryptedUmbraConfigV1::encrypt(
+            self.config.vault_id,
+            session.slot.key_id(),
+            &session.key,
+            config,
+        )?;
+        let bytes = envelope.to_json()?;
+        let target = self.root.join(UMBRA_CONFIG_PATH);
+        let condition = match session.config_etag {
+            Some(etag) => WriteCondition::IfMatch(etag),
+            None => WriteCondition::IfNoneMatch,
+        };
+        let guard = self.acquire_mutation_guard()?;
+        let outcome = guard
+            .write(&target, &bytes, condition)
+            .map_err(map_atomic_error)?;
+        let (committed, committed_etag) =
+            load_umbra_config_bytes(&self.root)?.ok_or(VaultError::AtomicVerificationFailed)?;
+        if committed_etag != outcome.etag || committed != bytes {
+            return Err(VaultError::AtomicVerificationFailed);
+        }
+        let session = self.umbra.as_mut().ok_or(VaultError::UmbraLocked)?;
+        let committed_envelope = EncryptedUmbraConfigV1::from_json(&committed)?;
+        let verified = committed_envelope.decrypt(
+            self.config.vault_id,
+            session.slot.key_id(),
+            &session.key,
+        )?;
+        if &verified != config {
+            return Err(VaultError::AtomicVerificationFailed);
+        }
+        session.config_etag = Some(outcome.etag);
         Ok(())
     }
 
@@ -2035,6 +2109,34 @@ fn load_umbra_keyslot(root: &Path) -> Result<(UmbraKeyslotV1, [u8; 32]), VaultEr
     Ok((slot, etag))
 }
 
+type UmbraConfigBytes = (Vec<u8>, [u8; 32]);
+
+fn load_umbra_config_bytes(root: &Path) -> Result<Option<UmbraConfigBytes>, VaultError> {
+    let internal = root.join(".inex");
+    reject_ascii_case_alias(root, ".inex")?;
+    let metadata = match fs::symlink_metadata(&internal) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_error(VaultIoOperation::Inspect, &error)),
+    };
+    if is_link_or_reparse_point(&metadata) || !metadata.file_type().is_dir() {
+        return Err(VaultError::UnsafeFilesystemEntry);
+    }
+    ensure_same_mount(root, &internal)?;
+    reject_ascii_case_alias(&internal, "config.umbra.inex")?;
+    let path = root.join(UMBRA_CONFIG_PATH);
+    if !exact_child_exists(&internal, std::ffi::OsStr::new("config.umbra.inex"))? {
+        return match entry_state(&path)? {
+            EntryState::Absent => Ok(None),
+            EntryState::Regular | EntryState::Unsafe => Err(VaultError::UnsafeFilesystemEntry),
+        };
+    }
+    ensure_same_mount(root, &path)?;
+    let bytes = read_regular_bounded(&path, 1024 * 1024)?;
+    let etag = digest(&bytes);
+    Ok(Some((bytes, etag)))
+}
+
 fn reject_ascii_case_alias(parent: &Path, expected: &str) -> Result<(), VaultError> {
     for entry in
         fs::read_dir(parent).map_err(|error| io_error(VaultIoOperation::Inspect, &error))?
@@ -2341,6 +2443,40 @@ mod tests {
         vault
             .unlock_umbra(b"new Umbra password")
             .expect("unlock with reset password");
+    }
+
+    #[test]
+    fn umbra_config_requires_live_session_and_is_ciphertext_only_on_disk() {
+        let directory = TestDirectory::new();
+        let mut vault = create_test_vault(&directory);
+        assert!(matches!(
+            vault.load_umbra_config(),
+            Err(VaultError::UmbraLocked)
+        ));
+        vault
+            .initialize_umbra(b"Umbra config password")
+            .expect("initialize Umbra");
+        let mut config = UmbraConfigV1::empty();
+        config
+            .tag_catalog
+            .push(crate::umbra_config::PrivateTagDefinition {
+                id: "secret-tag".to_owned(),
+                label: "INEX_SECRET_TAG_CANARY".to_owned(),
+                description: String::new(),
+                aliases: Vec::new(),
+                sort_order: 1,
+                default_selected: false,
+                archived: false,
+            });
+        vault.save_umbra_config(&config).expect("save config");
+        let disk = fs::read(directory.path().join(UMBRA_CONFIG_PATH)).expect("read ciphertext");
+        assert!(!String::from_utf8_lossy(&disk).contains("INEX_SECRET_TAG_CANARY"));
+        assert_eq!(vault.load_umbra_config().expect("load config"), config);
+        vault.lock_umbra();
+        assert!(matches!(
+            vault.load_umbra_config(),
+            Err(VaultError::UmbraLocked)
+        ));
     }
 
     #[test]

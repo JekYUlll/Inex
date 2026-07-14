@@ -6582,6 +6582,7 @@ fn ensure_write_target_in_root(vault_root: &Path, target: &Path) -> Result<(), A
         || relative == Path::new(GIT_ATTRIBUTES_FILE)
         || relative == Path::new(GIT_IGNORE_FILE)
         || relative == Path::new(".inex/keyslots/umbra-default.inex-keyslot")
+        || relative == Path::new(".inex/config.umbra.inex")
     {
         if case_alias_exists(target)
             .map_err(|source| AtomicWriteError::io(AtomicWriteStage::ReadCurrent, source))?
