@@ -37,6 +37,34 @@ pub struct OuterSlotStrategy {
     pub cover_text: Option<String>,
 }
 
+/// One validated private-annotation choice shared by all ranges in a single
+/// atomic wrap operation. Tag IDs remain private once copied into slot payloads.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrivateAnnotationSpec {
+    pub kind: PrivateAnnotationKind,
+    pub tag_ids: Vec<String>,
+    pub outer: OuterSlotStrategy,
+}
+
+impl PrivateAnnotationSpec {
+    /// Validate the v1 selection before any document mutation begins.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsorted/invalid tag IDs or invalid public cover
+    /// semantics.
+    pub fn validate(&self) -> Result<(), UmbraDocumentError> {
+        if !self.tag_ids.windows(2).all(|pair| pair[0] < pair[1])
+            || self.tag_ids.iter().any(|id| !valid_tag_id(id))
+            || matches!(self.outer.mode, OuterMode::Cover) != self.outer.cover_text.is_some()
+            || self.outer.cover_text.as_deref().is_some_and(str::is_empty)
+        {
+            return Err(UmbraDocumentError::InvalidPrivatePayload);
+        }
+        Ok(())
+    }
+}
+
 /// Public AEAD metadata around private slot ciphertext.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -84,7 +112,9 @@ impl PrivateSlotPayloadV1 {
         {
             return Err(UmbraDocumentError::InvalidPrivatePayload);
         }
-        if !self.tag_ids.windows(2).all(|pair| pair[0] < pair[1]) {
+        if !self.tag_ids.windows(2).all(|pair| pair[0] < pair[1])
+            || self.tag_ids.iter().any(|id| !valid_tag_id(id))
+        {
             return Err(UmbraDocumentError::InvalidPrivatePayload);
         }
         Ok(())
@@ -355,6 +385,16 @@ fn valid_slot_id(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn valid_tag_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || (index > 0 && matches!(byte, b'.' | b'_' | b'-'))
+        })
 }
 fn decode_canonical(value: &str) -> Result<Vec<u8>, UmbraDocumentError> {
     let decoded = URL_SAFE_NO_PAD
