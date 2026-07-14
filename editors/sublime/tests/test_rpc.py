@@ -514,6 +514,30 @@ class RequestAndResponseTests(unittest.TestCase):
             inconsistent.umbra_status()
         self.assertIsInstance(inconsistent._terminal_error, RpcProtocolError)
 
+    def test_umbra_document_conversion_is_etag_bound_and_feature_two_only(self):
+        client = InexRpcClient("/unused")
+        client._session = "A" * SESSION_TOKEN_TEXT_BYTES
+        etag = "sha256:" + "1" * 64
+        metadata = {
+            "fileId": "00000000-0000-4000-8000-000000000000",
+            "logicalPath": "today.md", "createdAt": 1, "modifiedAt": 2, "flags": 2,
+        }
+        calls = []
+        client._call_raw = lambda method, params: calls.append((method, params)) or {
+            "etag": "sha256:" + "2" * 64, "metadata": metadata, "durability": "synced",
+        }
+        self.assertEqual(client.convert_document_to_umbra("today.md", etag), ("sha256:" + "2" * 64, "synced"))
+        self.assertEqual(calls, [("umbra.document.convert", {
+            "session": "A" * SESSION_TOKEN_TEXT_BYTES, "logicalPath": "today.md", "ifMatch": etag,
+        })])
+
+        invalid = InexRpcClient("/unused")
+        invalid._session = "A" * SESSION_TOKEN_TEXT_BYTES
+        invalid._call_raw = lambda method, params: {"etag": etag, "metadata": dict(metadata, flags=0), "durability": "synced"}
+        with self.assertRaises(RpcProtocolError):
+            invalid.convert_document_to_umbra("today.md", etag)
+        self.assertIsInstance(invalid._terminal_error, RpcProtocolError)
+
 
 class SidecarResolutionTests(unittest.TestCase):
     def test_no_path_fallback_and_regular_executable_required(self):

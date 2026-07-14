@@ -637,6 +637,26 @@ class InexRpcClient:
             wipe(content)
             self._terminate_protocol(error)
 
+    def convert_document_to_umbra(self, logical_path: str, etag: str) -> Tuple[str, str]:
+        """CAS-upgrade an ordinary document before opening its Umbra projection."""
+        try:
+            result = _expect_exact_object(
+                self._call_raw(
+                    "umbra.document.convert",
+                    dict(
+                        self._protected_params(), logicalPath=logical_path,
+                        ifMatch=_expect_etag(etag),
+                    ),
+                ),
+                {"etag", "metadata", "durability"},
+                "Umbra document convert result",
+            )
+            next_etag = _expect_etag(result.get("etag"))
+            _validate_metadata(result.get("metadata"), logical_path, (2,))
+            return next_etag, _expect_durability(result.get("durability"), "Umbra document convert")
+        except RpcProtocolError as error:
+            self._terminate_protocol(error)
+
     def apply_private_annotation(
         self,
         logical_path: str,
