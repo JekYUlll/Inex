@@ -1,5 +1,9 @@
 # Inex Progress Log
 
+## 2026-07-15 — Vault feature-2 启用事务
+
+- 提交 `538168d`：`Vault::enable_umbra_private_annotations` 只接受 live Umbra session；它调用已认证 core metadata upgrader，并以 vault.json etag CAS 提交，随后重新 parse 确认 exact committed metadata 才更新内存 config。锁定 session 的调用被拒绝。
+
 ## 2026-07-15 — 已认证 feature-2 metadata 升级基础
 
 - 提交 `92c0bc6`：新增 `enable_umbra_private_annotations`，先验证当前 metadata MAC，再排序加入 feature-2、重算 MAC 并通过 reader policy 复验；不改变 master key 或 Outer password slots。该函数为 Vault 后续原子启用事务提供核心基础。
