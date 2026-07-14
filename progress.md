@@ -1016,3 +1016,8 @@
 
 - 提交 `5069253`（`feat(sublime): manage independent Umbra keyslot`）：strict client 增加 `umbra.initialize`、`umbra.unlock`、`umbra.enable` 与 `umbra.lock`。初始化/解锁只发送当前 Outer session 和一次密码；lock 仅要求 `{ok: true, unlocked: false}`，不会锁定 Outer vault。
 - 认证响应要求 initialized/unlocked 逻辑一致，所有 status、durability、精确字段形状和密码长度均在 host 前验证；不一致或异常协议响应终止 sidecar session。验证：定向 RPC 26/26、Python compile、diff-check 通过。下一步将此会话接入 Sublime command/UI 并在锁定时清空 picker state。
+
+## 2026-07-15 — Sublime Umbra 解锁与锁定命令
+
+- 提交 `cae72cf`（`feat(sublime): expose Umbra unlock and lock commands`）：新增命令 palette 项。Outer 尚未解锁时拒绝 Umbra 操作；读取 status 后，已有 slot 走独立密码解锁，未初始化时显示冻结的不可恢复警告并经确认后初始化。
+- 每个异步阶段重查 client/generation；密码只在 worker 局部引用，完成后续期 authenticated Outer idle deadline。`Inex: Lock Umbra Private Mode` 只调用 `umbra.lock`，不会执行 vault lock 或 scrub 普通 Outer buffer。验证：Sublime 86/86、1 项 pidfd platform skip、Python compile/JSON/diff-check 通过。
