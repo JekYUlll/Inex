@@ -1,5 +1,12 @@
 # Inex Progress Log
 
+## 2026-07-15 — Neovim Outer 受控 buffer 生命周期
+
+- 完成 `InexUnlock`、`InexNew`、`InexOpen` 与 `InexLock` 的最小 Outer 闭环：仅经 `inexd` 的 `vault.unlock`、`file.write`、`document.open/close` 和 `vault.lock` 调用；普通 buffer 显式拒绝 feature-2，保持只读。
+- 新增 `outer_lifecycle.lua`：在一次性临时 vault 内验证解锁、创建、打开、swap/持久 undo/modeline/buflisted 禁用、只读、锁定前清空 session 以及 managed buffer wipe。真实 headless 运行通过；既有 `headless_smoke.lua` transport/hello 回归也通过。
+- 修复 Neovim 内置 decoder 对 unpadded Base64URL 尾部填充的兼容性：客户端严格限制字符集与长度、转换 URL alphabet 后补齐再 decode；不改变 daemon canonical wire format。空新文档使用单个换行的 canonical `Cg`，渲染为纯空白 Markdown buffer。
+- `InexOpen`/`InexNew` 不再提供宿主普通文件系统补全，避免把逻辑密文路径误导为本地明文路径；嵌套目录创建、树浏览、保存、搜索及 Umbra 仍未实现。
+
 ## 2026-07-15 — Neovim 正式目标补充与优先级冻结
 
 - 用户将 Neovim Lua 插件补充为正式交付目标，并明确它必须排在最后：CLI/daemon 与 VS Code 维持最高优先级，Sublime 维持既定 experimental 范围。
