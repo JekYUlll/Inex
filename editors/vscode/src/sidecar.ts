@@ -427,6 +427,23 @@ export class InexSidecar {
     return expectDurability(result.durability, "Umbra enable durability");
   }
 
+  public async convertDocumentToUmbra(
+    logicalPath: string,
+    ifMatch: string,
+  ): Promise<WriteResult> {
+    this.requireUmbraV1();
+    logicalFileComponents(logicalPath);
+    validateEtag(ifMatch);
+    return parseWriteResult(
+      await this.callRaw("umbra.document.convert", {
+        ...this.protectedParams(),
+        logicalPath,
+        ifMatch,
+      }),
+      logicalPath,
+    );
+  }
+
   public async openUmbraDocument(logicalPath: string): Promise<UmbraProjection> {
     this.requireUmbraV1();
     logicalFileComponents(logicalPath);
