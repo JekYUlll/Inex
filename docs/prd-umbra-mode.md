@@ -116,9 +116,10 @@ keybindings file:
 }
 ```
 
-The MVP currently requires an explicit single textarea selection. Multi-cursor
-adapters, no-selection paragraph/line expansion, cursor-inside metadata edit,
-and tag/profile management commands remain pending. Outer projection editing
+The MVP supports one textarea selection; with an empty selection it applies to
+the current non-empty line (the current paragraph approximation). Multi-cursor
+adapters, heading-section expansion, cursor-inside metadata edit, and
+tag/profile management commands remain pending. Outer projection editing
 and Umbra draft recovery are deliberately fail-closed until their dedicated
 authenticated save paths are implemented.
 

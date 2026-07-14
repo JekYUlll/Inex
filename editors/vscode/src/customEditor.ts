@@ -998,8 +998,20 @@ export class InexCustomEditorProvider
     }
     const selection = document.currentSelection();
     const renderMap = document.renderMap();
-    if (selection === undefined || selection.startByte === selection.endByte || renderMap === undefined) {
-      throw new Error("Select Markdown content before adding a private annotation");
+    if (selection === undefined || renderMap === undefined) {
+      throw new Error("Place the cursor in Markdown content before adding a private annotation");
+    }
+    let resolvedSelection: EditorSelection | undefined = selection;
+    if (selection.startByte === selection.endByte) {
+      const selectionSnapshot = document.snapshot();
+      try {
+        resolvedSelection = paragraphRange(selectionSnapshot.content, selection.startByte);
+      } finally {
+        selectionSnapshot.content.fill(0);
+      }
+    }
+    if (resolvedSelection === undefined) {
+      throw new Error("Current Markdown paragraph is empty or unavailable for private annotation");
     }
     const snapshot = document.snapshot();
     try {
@@ -1007,7 +1019,7 @@ export class InexCustomEditorProvider
       const applied = await sidecar.applyUmbraAnnotation(
         document.logicalPath,
         { content: snapshot.content, etag: document.etag, metadata: document.metadata, renderMap },
-        [selection],
+        [resolvedSelection],
         spec,
       );
       this.requireCurrentDocumentSession(document);
@@ -1560,6 +1572,16 @@ export class InexCustomEditorProvider
       snapshot.content.fill(0);
     }
   }
+}
+
+function paragraphRange(content: Buffer, offset: number): EditorSelection | undefined {
+  if (offset < 0 || offset > content.byteLength) return undefined;
+  let start = offset;
+  while (start > 0 && content[start - 1] !== 0x0a) start -= 1;
+  let end = offset;
+  while (end < content.byteLength && content[end] !== 0x0a) end += 1;
+  if (start === end) return undefined;
+  return { startByte: start, endByte: end };
 }
 
 function editorHtml(): string {
