@@ -114,8 +114,12 @@ Phase 6 extension — 现有 Markdown Git 仓库与加密附件迁移（Phase 7 
             - [ ] 在existing-only mutation lock窗口内部重新构造全部runtime/auth/content证据、最终whole-tree exact revalidation，并保持同一fresh-audited Vault生产接线
               - [x] 返回不可Clone/Copy且继续持锁的owned `InitialCandidateAuthority`；构造器内部创建全部proof且不接受锁外预制proof（`3205a49`）
               - [x] CLI以不可Clone的`IndependentlyAuditedVault`延长fresh unlock+逐envelope/source审计owner生命周期，并按值接管/尽早清零password；仍在旧v1 seam前显式消费，未错误串联v2（`88e2837`）
+              - [x] core以不可Clone/Copy的`HeldPublicationMarkerV2`消费同一existing-only lock与held root，descriptor-relative create/open canonical v2 marker并持有root/local/file authority（`347b4cd`）
               - [ ] 以v2 consuming publisher整体替换旧v1 publisher，复用同一held lock且禁止串联两套marker/lock
       - [ ] 实现held-marker owner、完整live/fresh九段collector、v2 claim创建/发布/reconcile状态机与终态输出
+        - [x] held-marker core owner、existing opener、canonical双读、held directory sync与rename revalidation（`347b4cd`）
+        - [ ] marker-aware physical/live collector只排除exact held marker identity，并重新形成完整九段candidate evidence
+        - [ ] publication-specific exact unlink outcome与Initial/Fresh consuming typestate
   - [ ] 完成repository import构造/durability/publication每一边界的Linux force-kill、hostile same-UID source/target race、artifact-bound residue与原生Windows矩阵
 - **Status:** in_progress（用户实测驱动的迁移/附件扩展；原Markdown-only实现仍保持已验证基线）
 
@@ -237,7 +241,8 @@ Phase 6 extension — 现有 Markdown Git 仓库与加密附件迁移（Phase 7 
 
 | Error | Attempt | Resolution |
 |-------|---------|------------|
-| `create_goal` 拒绝新的迁移objective，因为线程已有paused但unfinished的长期Goal | 3 | 不伪造complete/blocked；把可执行细化Goal写入根`task_plan.md`并继续Git开发，待产品侧恢复/替换后端Goal |
+| `create_goal` 拒绝新的迁移objective，因为线程已有paused但unfinished的长期Goal | 4 | 不伪造complete/blocked；把可执行细化Goal写入根`task_plan.md`并继续Git开发，待产品侧恢复/替换后端Goal |
+| 完整core回归中的既有OS-lock竞争测试偶发得到一条成功和一条pre-lock fail-closed错误，而非预期Conflict | 2 | 在竞争前先建立并释放稳定lock namespace，让测试只测同一既有lock上的串行语义；精确50轮及完整254/254通过（`70fc0b2`） |
 | raw index parser首版拒绝“有IEOT但无EOIE”的真实Git 2.43 index | 1 | 以真实Git生成的v4 index和Git格式契约确认IEOT可独立存在；放宽该组合但保持唯一extension、分区与block独立解码校验，定向测试和Windows GNU检查通过 |
 | `cat-file --batch`初版在错误清理路径调用无界`Child::wait` | 1 | 改为固定2秒`try_wait`轮询并绑定reaped/finished状态；直接子进程路径闭合，恶意后代继承pipe仍保留为GA进程组/Windows Job门禁 |
 | 独立对象审计后的完整`inex-git`套件一次触发既有v5 recovery时序性`RecoveryConflict` | 1 | 精确隔离复跑该test 1/1通过；不把该次完整套件写成全绿，也未把它归因于repository import，后续整套继续观察 |
