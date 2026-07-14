@@ -1102,3 +1102,8 @@
 
 - 新增 `Inex: Manage Private Annotation Profiles` repeated panel：create 采集 label/stable ID，edit 保留 ID 但可更新 label/kind/tags/Outer，remove 经确认，set default 可选择 profile 或明确清空。所有动作经 strict daemon profile RPC，成功后重新 load encrypted catalog。
 - profile 专用 picker 复用多标签 state，但只传 kind/tag IDs/Outer/`promptForCover` metadata；不会向用户索取、缓存或写入一次性公开 cover text。验证：Sublime 96/96（1 项 pidfd platform skip）、compile、commands JSON、diff-check 通过。
+
+## 2026-07-15 — CLI/daemon and VS Code main-delivery regression
+
+- 在完成 Sublime experimental 增量后，重新运行主交付质量门：`cargo test --workspace --locked` 通过；`cargo fmt --all -- --check` 与 `cargo clippy --workspace --all-targets --locked -- -D warnings` 通过。VS Code `pnpm check && test && build` 通过，Node tests 为 57/57，产出 `dist/extension.js`。
+- 本机发布 lifecycle 仍不能因此视为完成：其 Linux pidfd/subreaper descendant-control prerequisite 缺失时应继续 fail closed。当前工作树 clean，下一步优先针对可安装 artifact 与主客户端集成门禁，而非把该环境限制降级。
