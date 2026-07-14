@@ -509,4 +509,5 @@
 - Slot 表与 Outer marker 不是可独立保存的两份状态：缺 marker 会丢失 Umbra 可见性，dangling marker 会使渲染失败，重复 marker 会使同一私密正文多次进入投影。因此所有 feature-2 create/save/insert/remove 路径均需验证“每个 slot 恰一个 canonical marker”，而包裹/解包必须把 Outer Markdown 替换与 slot 密文变化放在同一 ETag 条件事务中。
 - `apply_private_annotation` 的安全提交边界是“当前 feature-2 ETag + 完整 Umbra 投影 + 完整 RenderMap”三者同时一致；单靠投影 hash 不能表达存储并发，因此写入仍由 feature-2 ciphertext ETag CAS 收尾。纯文本区先通过 RenderMap 映射回一个完整 Outer 段，随后按倒序替换 marker，才能在已有私密块周围安全处理多选且不发生坐标漂移。
 - daemon 不能把 Umbra 复用成普通 `document.open`：后者会调用普通 EDRY 读取路径并按设计拒绝 feature-2。独立 `umbra.document.open` 仅在同一 Outer capability session 已持有 `K_umbra` 时渲染 projection，锁定后统一映射为认证失败；RPC capability `umbraV1` 让客户端在发送密码或私密投影请求前先协商支持。
+- `umbra.annotation.apply` 必须接收完整、由同一 `umbra.document.open` 返回的 RenderMap，而不是仅接受 client 的 range：handler 逐项限定 map/selection/spec 的结构与资源上限后，核心仍以传入投影 hash、RenderMap 等值和 ciphertext ETag 重新认证。响应只在成功提交后附带新 ETag、投影和 RenderMap，客户端不得自行推演 slot ID 或 marker。
 - RenderMap 不仅要记录私密 fenced block 范围，还必须记录普通 projection 段到 Outer Markdown 的一对一坐标；否则多选 wrap 无法在已有私密块周围安全地回写 Outer 容器。跨段或跨私密块的普通选区统一按 mixed/partial 拒绝。

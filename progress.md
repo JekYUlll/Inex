@@ -791,3 +791,9 @@
 - 提交 `f2660b3`（`feat(daemon): expose Umbra session controls`）：协议新增 `umbraV1` capability 和 `umbra.status`、`umbra.initialize`、`umbra.unlock`、`umbra.lock`、`umbra.enable`、`umbra.document.open`。Umbra 密码只由 zeroizing 参数读取；公开 feature-2 启用仍要求 live K_umbra；投影读取返回 base64 Markdown、ETag 与完整 RenderMap。
 - daemon 错误映射现覆盖 Umbra keyslot/config/document/render 错误：锁定/错误 Umbra 密码只给通用认证失败，stale RenderMap 给 ETag conflict，结构损坏给 integrity failure，绝不输出 slot/tag/正文。
 - 服务级回归覆盖 Outer 解锁→Umbra 初始化→feature-2 启用→投影读取→Umbra 锁定拒绝→再次解锁。`cargo test -p inex-daemon --lib` 71/71、严格 Clippy、fmt 和 diff-check 全通过。下一步接入严格 annotation apply RPC，再开始 VS Code picker。
+
+## 2026-07-15 — Umbra 标注 RPC
+
+- 提交 `9bd5297`（`feat(daemon): apply Umbra annotations over RPC`）：新增 `umbra.annotation.apply`；请求包含 ETag、base64 projection、完整 RenderMap、多选 byte ranges、kind/tag IDs/Outer strategy 和 mergeAdjacent。新增受限 object-array/sensitive-string-array 参数提取器，所有未消费或无效嵌套 JSON 在 drop 时递归清理。
+- handler 在交给 `Vault::apply_private_annotation` 前只做 schema/resource 验证；核心仍负责 projection/RenderMap/ETag 三重一致性、private boundary 分类和单次条件保存。成功后返回刚提交的 ETag、metadata、投影与 RenderMap；stale map 映射 ETag conflict、非法范围映射 invalid params、损坏容器映射 integrity failure。
+- 服务级 RPC 用真实返回的 projection/RenderMap 包裹选区，并验证 disk 上没有正文或 tag canary。`cargo test -p inex-daemon --lib` 71/71、严格 Clippy、fmt、diff-check 全通过。下一优先级进入 VS Code 选择器/命令与可配置 keybindings。
