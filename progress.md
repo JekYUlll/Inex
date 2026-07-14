@@ -1202,3 +1202,8 @@
 
 - 新增 `:InexTogglePrivateAnnotation`，不提供硬编码 keymap，因而用户可按普通 Neovim mapping 机制绑定。它将一个 visual range 转成 UTF-8 byte range：plain range 使用 default comment/no-tags/drop 调用 apply；精确等于 RenderMap private range 时先确认再调用 remove；任何 partial private overlap 在 RPC 前 fail closed。
 - headless lifecycle 覆盖 visual plain apply 与 linewise complete-block confirm/remove，最终恢复原 Umbra projection。该回归先暴露 visual mark API 的坐标差异：`nvim_buf_get_mark` 给出 1-based row / 0-based byte column，且 fenced private block 的末尾换行只能用 linewise visual range 完整表达；现已分别转换并验证。
+
+## 2026-07-15 — Neovim private-annotation edit route
+
+- `toggle_private_annotation` 现在将单一 RenderMap private block 内的非空 visual range 路由到 `umbra.annotation.edit`；完整 block 仍只会确认后 remove，partial crossing 继续拒绝。新增显式 `:InexEditPrivateAnnotation startByte endByte` 默认-spec 命令，供正常 mapping 或后续 picker 调用。
+- 真实 headless lifecycle 已覆盖 apply → in-block edit（comment/drop 改为 block/placeholder）→ complete block remove；每一步只采用 daemon 新 projection/RenderMap。标签/Profile picker 仍未实现。

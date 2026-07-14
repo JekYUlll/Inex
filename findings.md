@@ -567,3 +567,4 @@
 - 产品语义中的 private tag 是“零或多个”。daemon annotation spec 和 annotation profile parser 先前错误给 `required_sensitive_string_array` 传入最小长度 1；这会让空标签的合法标注不能通过 RPC。该最小长度已更正为 0，而 tag reorder 仍正确要求非空完整 permutation。
 - Neovim `nvim_create_user_command` 的 `nargs` 不是任意整数；只允许 `0`、`1`、`?`、`*`、`+`。多参数安全命令应使用 `*` 并在 callback 内对参数数量/数字性做明确校验，不能依赖注册 API 隐式强制。
 - Neovim visual mark 的 API 坐标不可混用：`nvim_buf_get_mark` 返回 1-based row、0-based byte column，而 `nvim_buf_get_offset` 接受 0-based row。私密 selection 要传 UTF-8 byte range，必须在这两个边界显式转换。canonical private fenced block 末尾含换行，字符级 visual range 不能表达完整 block；linewise selection 应把 end 扩到下一行的起始 offset（或文件末尾），才能安全路由到 confirmed remove。
+- Toggle 分类不能只分 plain/complete/partial：RenderMap 单一 private block 内的严格非空 range 应走 `umbra.annotation.edit`，而完整 block 必须继续只走需确认的 remove。客户端只负责 range 路由，不可从 visible fence/slot ID 重建 metadata；daemon 的 projection+ETag+RenderMap 复核仍是授权边界。
