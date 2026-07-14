@@ -535,6 +535,34 @@ pub fn remove_password_slot(
     Ok(updated)
 }
 
+/// Add required feature 2 to authenticated metadata without changing the
+/// master key or its password slots.
+///
+/// # Errors
+///
+/// Returns an error if current metadata cannot authenticate, feature ordering
+/// is invalid, or the refreshed metadata cannot satisfy reader policy.
+pub fn enable_umbra_private_annotations(
+    config: &VaultConfig,
+    master_key: &VaultMasterKey,
+    policy: KdfPolicy,
+) -> Result<VaultConfig, CryptoError> {
+    config.validate_untrusted(policy)?;
+    verify_metadata_mac(config, master_key)?;
+    let mut updated = config.clone();
+    if updated
+        .required_features
+        .binary_search(&UMBRA_PRIVATE_ANNOTATIONS_V1)
+        .is_err()
+    {
+        updated.required_features.push(UMBRA_PRIVATE_ANNOTATIONS_V1);
+        updated.required_features.sort_unstable();
+    }
+    refresh_metadata_mac(&mut updated, master_key)?;
+    updated.validate_untrusted(policy)?;
+    Ok(updated)
+}
+
 /// Encrypt exact UTF-8 Markdown into a committed EDRY file or encrypted draft.
 ///
 /// `identity` is `None` for a new document and preserves file id/creation time
@@ -1280,6 +1308,19 @@ mod tests {
             encrypted.header.required_features,
             vec![UMBRA_PRIVATE_ANNOTATIONS_V1]
         );
+    }
+
+    #[test]
+    fn enabling_umbra_authenticates_metadata_without_changing_master_key() {
+        let created = created();
+        let updated =
+            enable_umbra_private_annotations(&created.config, &created.master_key, test_policy())
+                .expect("enable feature two");
+        assert_eq!(
+            updated.required_features,
+            vec![UMBRA_PRIVATE_ANNOTATIONS_V1]
+        );
+        verify_metadata_mac(&updated, &created.master_key).expect("authenticated metadata");
     }
 
     fn path() -> LogicalPath {
