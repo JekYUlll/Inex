@@ -13,7 +13,12 @@ import {
   parseMarkdownNavigation,
   resolveMarkdownTarget,
 } from "./markdown.ts";
-import type { DocumentMetadata, RenderMap, UmbraProjection } from "./sidecar.ts";
+import type {
+  DocumentMetadata,
+  PrivateAnnotationSpec,
+  RenderMap,
+  UmbraProjection,
+} from "./sidecar.ts";
 import { showSensitiveQuickPick } from "./sensitiveUi.ts";
 
 const MAX_DOCUMENT_BYTES = 16 * 1024 * 1024;
@@ -99,6 +104,16 @@ class InexDocument implements vscode.CustomDocument {
     return this.selection;
   }
 
+  public restoreSelection(selection: EditorSelection | undefined): void {
+    if (
+      selection !== undefined &&
+      selection.endByte <= this.content.byteLength &&
+      selection.startByte <= selection.endByte
+    ) {
+      this.selection = selection;
+    }
+  }
+
   public updateSelection(text: string, startByte: number, endByte: number): boolean {
     this.requireUsable();
     if (
@@ -164,6 +179,7 @@ class InexDocument implements vscode.CustomDocument {
     this.revision += 1;
     this.savedRevision = this.revision;
     this.staleBackup = false;
+    this.selection = undefined;
     this.broadcast();
   }
 
@@ -927,6 +943,7 @@ export class InexCustomEditorProvider
     const synchronization = new vscode.CancellationTokenSource();
     try {
       await document.flushWebview(synchronization.token);
+      const selection = document.currentSelection();
       if (document.isDirty) {
         await this.saveCustomDocument(document, synchronization.token);
       }
@@ -942,6 +959,7 @@ export class InexCustomEditorProvider
       try {
         this.requireCurrentDocumentSession(document);
         document.replaceFromUmbraProjection(projection, converted.metadata);
+        document.restoreSelection(selection);
         this.previews.refreshDocument(document, 0);
         adopted = true;
       } finally {
@@ -953,6 +971,40 @@ export class InexCustomEditorProvider
       return document;
     } finally {
       synchronization.dispose();
+    }
+  }
+
+  public async applyPrivateAnnotationToActive(
+    spec: PrivateAnnotationSpec,
+  ): Promise<void> {
+    const document = this.activeDocument;
+    if (
+      document === undefined ||
+      !document.isUmbraProjection ||
+      !this.documents.has(document) ||
+      !this.controller.isSessionCurrent(document.session)
+    ) {
+      throw new Error("Open an unlocked Umbra projection before adding a private annotation");
+    }
+    const selection = document.currentSelection();
+    const renderMap = document.renderMap();
+    if (selection === undefined || selection.startByte === selection.endByte || renderMap === undefined) {
+      throw new Error("Select Markdown content before adding a private annotation");
+    }
+    const snapshot = document.snapshot();
+    try {
+      const sidecar = this.requireCurrentDocumentSession(document);
+      const applied = await sidecar.applyUmbraAnnotation(
+        document.logicalPath,
+        { content: snapshot.content, etag: document.etag, metadata: document.metadata, renderMap },
+        [selection],
+        spec,
+      );
+      this.requireCurrentDocumentSession(document);
+      document.replaceFromUmbraProjection(applied, applied.metadata);
+      this.previews.refreshDocument(document, 0);
+    } finally {
+      snapshot.content.fill(0);
     }
   }
 

@@ -6,6 +6,7 @@ import { InexCustomEditorProvider } from "./customEditor.ts";
 import { offerToOpenImportedVault } from "./importCompletion.ts";
 import { RpcRemoteError } from "./rpc.ts";
 import { importMarkdownRepository } from "./repositoryImport.ts";
+import { choosePrivateAnnotation } from "./privateAnnotationPicker.ts";
 import { showSensitiveInputBox, showSensitiveQuickPick } from "./sensitiveUi.ts";
 import { InexTreeProvider } from "./tree.ts";
 
@@ -222,6 +223,16 @@ export function activate(
         }
       });
     }),
+    vscode.commands.registerCommand("inex.togglePrivateAnnotation", async () => {
+      await runUiAction(async () => {
+        await applyChosenPrivateAnnotation(controller, editor);
+      });
+    }),
+    vscode.commands.registerCommand("inex.choosePrivateAnnotation", async () => {
+      await runUiAction(async () => {
+        await applyChosenPrivateAnnotation(controller, editor);
+      });
+    }),
     vscode.commands.registerCommand("inex.showSecurityStatus", async () => {
       const sidecar = controller.isUnlocked ? "unlocked in memory" : "locked";
       await vscode.window.showInformationMessage(
@@ -310,6 +321,66 @@ async function ensureVaultUnlocked(controller: VaultController): Promise<boolean
     await vscode.commands.executeCommand("inex.importRepository");
   }
   return false;
+}
+
+async function applyChosenPrivateAnnotation(
+  controller: VaultController,
+  editor: InexCustomEditorProvider,
+): Promise<void> {
+  if (!(await ensureVaultUnlocked(controller))) {
+    return;
+  }
+  const session = controller.acquireSession();
+  const sidecar = session.sidecar;
+  const status = await sidecar.umbraStatus();
+  if (!controller.isSessionCurrent(session)) {
+    throw new Error("Inex vault session changed before Umbra unlock");
+  }
+  if (!status.unlocked) {
+    if (!status.initialized) {
+      const warning = await vscode.window.showWarningMessage(
+        "Umbra passwords cannot be recovered. Forgetting it permanently loses Umbra private content. Continue?",
+        { modal: true },
+        "Initialize Umbra",
+      );
+      if (warning !== "Initialize Umbra") return;
+    }
+    let password = await showSensitiveInputBox(
+      {
+        ignoreFocusOut: true,
+        password: true,
+        prompt: status.initialized ? "Umbra password" : "New Umbra password",
+        title: status.initialized ? "Unlock Umbra" : "Initialize Umbra",
+        validateInput: (value) => {
+          const bytes = Buffer.byteLength(value, "utf8");
+          return bytes >= 1 && bytes <= 1024 ? undefined : "Password must be 1–1024 UTF-8 bytes";
+        },
+      },
+      controller.onDidLock,
+    );
+    if (password === undefined) return;
+    try {
+      if (status.initialized) {
+        await sidecar.unlockUmbra(password);
+      } else {
+        await sidecar.initializeUmbra(password);
+      }
+      await sidecar.enableUmbra();
+    } finally {
+      password = undefined;
+    }
+  }
+  if (!controller.isSessionCurrent(session)) {
+    throw new Error("Inex vault session changed during Umbra unlock");
+  }
+  await editor.convertActiveDocumentToUmbra();
+  const config = await sidecar.loadUmbraAnnotationConfig();
+  const spec = await choosePrivateAnnotation(config, controller.onDidLock);
+  if (spec === undefined) return;
+  if (!controller.isSessionCurrent(session)) {
+    throw new Error("Inex vault session changed during private annotation selection");
+  }
+  await editor.applyPrivateAnnotationToActive(spec);
 }
 
 async function runUiAction(action: () => Promise<void>): Promise<void> {

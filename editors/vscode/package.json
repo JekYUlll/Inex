@@ -34,7 +34,9 @@
     "onCommand:inex.newEncryptedMarkdown",
     "onCommand:inex.newFolder",
     "onCommand:inex.rename",
-    "onCommand:inex.delete"
+    "onCommand:inex.delete",
+    "onCommand:inex.togglePrivateAnnotation",
+    "onCommand:inex.choosePrivateAnnotation"
   ],
   "contributes": {
     "commands": [
@@ -61,6 +63,16 @@
       {
         "command": "inex.search",
         "title": "Inex: Search Encrypted Vault",
+        "enablement": "inex.vaultUnlocked"
+      },
+      {
+        "command": "inex.togglePrivateAnnotation",
+        "title": "Inex: Toggle Private Annotation",
+        "enablement": "inex.vaultUnlocked"
+      },
+      {
+        "command": "inex.choosePrivateAnnotation",
+        "title": "Inex: Choose Private Annotation",
         "enablement": "inex.vaultUnlocked"
       },
       {
@@ -204,6 +216,18 @@
           }
         ],
         "priority": "default"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "inex.togglePrivateAnnotation",
+        "key": "ctrl+alt+/",
+        "when": "inex.vaultUnlocked"
+      },
+      {
+        "command": "inex.choosePrivateAnnotation",
+        "key": "ctrl+alt+shift+/",
+        "when": "inex.vaultUnlocked"
       }
     ],
     "configuration": {
