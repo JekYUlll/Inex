@@ -1107,3 +1107,8 @@
 
 - 在完成 Sublime experimental 增量后，重新运行主交付质量门：`cargo test --workspace --locked` 通过；`cargo fmt --all -- --check` 与 `cargo clippy --workspace --all-targets --locked -- -D warnings` 通过。VS Code `pnpm check && test && build` 通过，Node tests 为 57/57，产出 `dist/extension.js`。
 - 本机发布 lifecycle 仍不能因此视为完成：其 Linux pidfd/subreaper descendant-control prerequisite 缺失时应继续 fail closed。当前工作树 clean，下一步优先针对可安装 artifact 与主客户端集成门禁，而非把该环境限制降级。
+
+## 2026-07-15 — 当前 Linux x64 artifact construction and structure audit
+
+- 在独立 `--no-local` clean checkout（origin 固定为 canonical Git URL）中，以显式 `/usr/bin/gcc` 构建当前 `739b9f0` 的 `inex`/`inexd`；两者 ELF interpreter 都是标准 `/lib64/ld-linux-x86-64.so.2`。该 checkout 内以 lockfile offline 安装 VS Code/vsce deps 并生成 production bundle，然后 `package_release.py` 成功构建 Linux x64 Rust ZIP、Sublime ZIP 与 VSIX。
+- `audit_release_artifacts.py` 通过：artifact hashes 为 Rust `9892df55…`、Sublime `caa35300…`、VSIX `738effbc…`、SHA256SUMS `63d501ab…`；共享 CLI `4dbd6433…`、sidecar `f0f50b06…`，source 绑定 clean commit `739b9f0`。报告明确仍不覆盖签名/发布、独立法律审查或 native runtime/install/editor behavior；pidfd lifecycle gate 仍未通过本机环境。
