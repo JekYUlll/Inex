@@ -1,5 +1,11 @@
 # Inex Progress Log
 
+## 2026-07-15 — Neovim 正式目标补充与优先级冻结
+
+- 用户将 Neovim Lua 插件补充为正式交付目标，并明确它必须排在最后：CLI/daemon 与 VS Code 维持最高优先级，Sublime 维持既定 experimental 范围。
+- 当前 Goal 服务仍为 active，但其接口不支持改写 active objective；没有将未完成的旧 Goal 伪造为 complete/blocked。根 `task_plan.md` 是本轮可执行目标与优先级的权威记录。
+- Phase 5.5 已有通过 headless RPC smoke 的 Lua 传输骨架，以及进行中的 Outer 受控 buffer 增量，故状态从 pending 校正为 in_progress。后续 Neovim 只复用 `inexd`，不引入第二套协议、密码学或 feature-2 容器解析。
+
 ## 2026-07-15 — Sublime Umbra catalog boundary
 
 - 提交 `c5005b1`、`c9b7bc6`：Sublime 独立 Python RPC client 新增已认证 `umbra.status` / `umbra.config.get`，并拒绝超量、无 ID、profile 引用未知 tag 或 default 引用未知 profile 的响应。
