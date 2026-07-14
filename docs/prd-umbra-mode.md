@@ -126,6 +126,11 @@ management commands remain pending. Outer projection editing
 and Umbra draft recovery are deliberately fail-closed until their dedicated
 authenticated save paths are implemented.
 
+`Inex: Manage Private Tags` uses the same Umbra unlock session as annotation
+commands. It currently supports create, rename, and archive; it reloads the
+encrypted catalog from the daemon after each mutation. Reordering and profile
+management remain pending rather than being represented by editor-local files.
+
 `Inex: Edit Private Annotation` requires the cursor or a non-complete selection
 inside exactly one private block. It preselects the block's current kind, tags,
 and Outer strategy from the unlocked canonical projection, then sends a

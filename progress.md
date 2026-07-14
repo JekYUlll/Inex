@@ -931,3 +931,9 @@
 
 - 提交 `ea6d44a`（`feat(vscode): add encrypted tag management RPC client`）：sidecar 提供 create/rename/archive/reorder typed methods。调用前验证 canonical stable ID、UTF-8 文本长度、alias 数量、safe sort order 和完整无重复 reorder 列表；RPC acknowledgement 仍走严格 parser。
 - VS Code check 与 55/55 tests 通过。下一步抽取 Umbra session 准备逻辑后接入 `Inex: Manage Private Tags` UI；客户端不缓存、也不直接写加密 catalog。
+
+## 2026-07-15 — VS Code 私密标签管理 UI
+
+- 提交 `a94ce38`（`feat(vscode): manage encrypted private tags`）：抽取 `ensureUmbraReady`，annotation 和 tag 管理共享 vault unlock、不可恢复初始化警告、Umbra password、enable 与 session-epoch 检查。`Inex: Manage Private Tags` 可创建、重命名、归档 tag；每个 mutation 后重新向 daemon 读取 catalog。
+- 创建流程的 display label 与 stable ID 都经 sensitive input，第二次输入取消也会在 finally 中丢弃第一次的 label；UI 不缓存 catalog、不写 `.inex`。reorder/profile 管理未伪装为已完成。
+- 验证：`git diff --check`、VS Code check、55/55 tests、build 通过；PRD 与计划同步。
