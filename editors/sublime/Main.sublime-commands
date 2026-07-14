@@ -40,6 +40,14 @@
     "command": "inex_lock"
   },
   {
+    "caption": "Inex: Unlock Umbra Private Mode",
+    "command": "inex_unlock_umbra"
+  },
+  {
+    "caption": "Inex: Lock Umbra Private Mode",
+    "command": "inex_lock_umbra"
+  },
+  {
     "caption": "Inex: Show Security Status",
     "command": "inex_show_security_status"
   }

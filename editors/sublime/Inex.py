@@ -1621,6 +1621,105 @@ def _prompt_lock(window: sublime.Window) -> None:
     window.show_quick_panel(choices, selected, placeholder="Lock Inex vault")
 
 
+def _begin_umbra_unlock(window: sublime.Window) -> None:
+    """Unlock only K_umbra; Outer session and ordinary buffers stay intact."""
+    if insecure_preferences():
+        _show_security_block(window)
+        return
+    client, _vault, generation = _runtime_snapshot()
+    if client is None or not client.has_session:
+        _show_error(RpcLifecycleError("Unlock the Outer Inex vault first"))
+        return
+    settings = _settings()
+    zenity_path = settings.get("zenity_path", "")
+    if not isinstance(zenity_path, str):
+        _show_error(PasswordPromptError("zenity_path must be a string"))
+        return
+
+    def request_password(initialize: bool) -> None:
+        def worker() -> None:
+            password = ""
+            try:
+                password = prompt_password(sublime.platform(), zenity_path) or ""
+                if not password:
+                    raise PasswordPromptError("Umbra unlock canceled")
+                current, _vault_now, current_generation = _runtime_snapshot()
+                if current is not client or current_generation != generation:
+                    raise RpcLifecycleError("Inex session changed during Umbra unlock")
+                status = (
+                    client.initialize_umbra(password)
+                    if initialize
+                    else client.unlock_umbra(password)
+                )
+                if not status["initialized"] or not status["unlocked"]:
+                    raise RpcProtocolError("Umbra did not enter an unlocked state")
+                authenticated_at = time.monotonic()
+                sublime.set_timeout(lambda: completed(authenticated_at), 0)
+            except Exception as error:
+                sublime.set_timeout(lambda error=error: _show_error(error), 0)
+            finally:
+                password = ""
+
+        sublime.set_timeout_async(worker, 0)
+
+    def completed(authenticated_at: float) -> None:
+        current, _vault_now, current_generation = _runtime_snapshot()
+        if current is not client or current_generation != generation:
+            return
+        _renew_idle_deadline(client, authenticated_at)
+        window.status_message("Inex Umbra unlocked")
+
+    def present(status: Dict[str, bool]) -> None:
+        current, _vault_now, current_generation = _runtime_snapshot()
+        if current is not client or current_generation != generation:
+            return
+        if status["unlocked"]:
+            window.status_message("Inex Umbra is already unlocked")
+            return
+        if status["initialized"]:
+            request_password(False)
+            return
+        warning = (
+            "Umbra password cannot be recovered. Forgetting it permanently loses "
+            "all Umbra private content."
+        )
+        if sublime.ok_cancel_dialog(warning, "Set Umbra Password"):
+            request_password(True)
+
+    def status_worker() -> None:
+        try:
+            status = client.umbra_status()
+            sublime.set_timeout(lambda: present(status), 0)
+        except Exception as error:
+            sublime.set_timeout(lambda error=error: _show_error(error), 0)
+
+    sublime.set_timeout_async(status_worker, 0)
+
+
+def _lock_umbra(window: sublime.Window) -> None:
+    try:
+        client, _vault, generation = _runtime_snapshot()
+        if client is None or not client.has_session:
+            raise RpcLifecycleError("Inex vault is locked")
+    except Exception as error:
+        _show_error(error)
+        return
+
+    def worker() -> None:
+        try:
+            client.lock_umbra()
+            sublime.set_timeout(done, 0)
+        except Exception as error:
+            sublime.set_timeout(lambda error=error: _show_error(error), 0)
+
+    def done() -> None:
+        current, _vault_now, current_generation = _runtime_snapshot()
+        if current is client and current_generation == generation:
+            window.status_message("Inex Umbra locked; Outer vault remains unlocked")
+
+    sublime.set_timeout_async(worker, 0)
+
+
 def _search(window: sublime.Window, query: str) -> None:
     try:
         if insecure_preferences():
@@ -2148,6 +2247,16 @@ class InexBrowseCommand(sublime_plugin.WindowCommand):
 class InexLockCommand(sublime_plugin.WindowCommand):
     def run(self) -> None:
         _prompt_lock(self.window)
+
+
+class InexUnlockUmbraCommand(sublime_plugin.WindowCommand):
+    def run(self) -> None:
+        _begin_umbra_unlock(self.window)
+
+
+class InexLockUmbraCommand(sublime_plugin.WindowCommand):
+    def run(self) -> None:
+        _lock_umbra(self.window)
 
 
 class InexSearchCommand(sublime_plugin.WindowCommand):
