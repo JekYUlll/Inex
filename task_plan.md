@@ -117,6 +117,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
     - [x] CustomEditor 现可保存最多 64 个明确 range，并通过 Add range/Clear ranges 工具栏将其作为一个 selection array 原子交给 daemon；wrap/unwrap 支持多范围，metadata edit 仍只接受一个 slot（`1a2d665`）
     - [x] 接入 CustomEditor webview 选区、QuickPick、多标签及配置化命令/keybindings
   - [ ] 扩展Sublime stateful picker、profile命令和keymap示例
+    - [x] Sublime strict RPC client 已支持 `umbra.status` 与 `umbra.config.get`，并在将 catalog 交给 UI 前限制条目数、tag/profile/default 引用（`c5005b1`、`c9b7bc6`）
   - [x] 加密 tag catalog 现支持 stable-ID create/rename/archive/reorder：配置验证唯一性、canonical order、profile/default 引用与 Cover profile 语义；Vault 通过 load→mutate→CAS encrypted save 原子提交（`1298641`）
   - [x] daemon 已提供 `umbra.tag.create/rename/archive/reorder`：所有 tag 文本经 zeroizing 参数层读取，生命周期回归验证 create→rename→archive→reorder 后只有 Umbra 已解锁才能读回（`f46d2ff`）
   - [x] VS Code sidecar 已增加对应 typed tag RPC client，并在发出请求前验证 ID/文本/别名/排序资源约束（`ea6d44a`）

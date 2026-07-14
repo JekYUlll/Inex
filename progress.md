@@ -1,5 +1,11 @@
 # Inex Progress Log
 
+## 2026-07-15 — Sublime Umbra catalog boundary
+
+- 提交 `c5005b1`、`c9b7bc6`：Sublime 独立 Python RPC client 新增已认证 `umbra.status` / `umbra.config.get`，并拒绝超量、无 ID、profile 引用未知 tag 或 default 引用未知 profile 的响应。
+- `PYTHONPATH=editors/sublime python3 -m unittest discover -s editors/sublime/tests -v` 通过 84 tests（1 个 Linux pidfd/subreaper 环境 test skipped）；直接从根 discover 的模块导入失败已确认只是缺 `PYTHONPATH`，不记录为产品失败。
+- 下一步：在此验证边界上实现 Sublime stateful annotation picker 与 profile application；不得把未验证 catalog 值放入普通设置或日志。
+
 ## 2026-07-15 — VS Code Extension Host lifecycle regression
 
 - 在当前 `f829d69` 后运行 `pnpm --dir editors/vscode test:extension:local`，本机 `/usr/share/code/code` 与隔离 Xvfb profile 通过真实 Extension Host 流程：feature-1 repository import、受控附件预览、CRUD、加密 backup/recovery 和 residue audit。
