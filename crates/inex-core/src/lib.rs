@@ -24,6 +24,7 @@ pub mod search;
 pub mod sodium;
 pub mod tree;
 pub mod umbra_config;
+pub mod umbra_document;
 pub mod umbra_keyslot;
 pub mod vault;
 pub mod vault_config;
