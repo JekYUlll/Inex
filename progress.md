@@ -1,5 +1,10 @@
 # Inex Progress Log
 
+## 2026-07-15 — 主线 Umbra 实施状态校正与全仓回归
+
+- 计划审计确认 Umbra 设计/实现、daemon+VS Code 交互层、Sublime picker/profile/keymap 三个父项的所有实现子项均已完成；将父项校正为完成，避免把真实代码与计划状态割裂。跨编辑器目录、canary/残留及 Outer 隔离的聚合矩阵仍保持未完成，不能由单客户端单元测试替代。
+- 已启动全 workspace Rust 回归；其中 `inex-git` 的 Linux 强杀/恢复矩阵仍在运行，结果返回前不把 Rust 全仓门禁计为通过。VS Code 已通过 strict typecheck、57/57 tests 和 production build；Sublime 已在 ResourceWarning-as-error 下通过 96/96 tests（1 个 pidfd/subreaper 平台条件 skip）。
+
 ## 2026-07-15 — Neovim Outer 受控 buffer 生命周期
 
 - 完成 `InexUnlock`、`InexNew`、`InexOpen` 与 `InexLock` 的最小 Outer 闭环：仅经 `inexd` 的 `vault.unlock`、`file.write`、`document.open/close` 和 `vault.lock` 调用；普通 buffer 显式拒绝 feature-2，保持只读。

@@ -77,7 +77,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
 
 ### Phase 6: Git 合并、迁移与恢复工具
 
-  - [ ] 设计并实现 Umbra 私密标注系统（`docs/prd-umbra-mode.md`）
+  - [x] 设计并实现 Umbra 私密标注系统（`docs/prd-umbra-mode.md`）；冻结独立 `K_umbra`、加密 catalog/profile、feature-2 container、atomic RenderMap mutation 与 Outer 隔离，MVP defer 项保持在规范中
   - [x] 冻结产品交互、私密标签/profile加密边界、Outer隔离、selection原子性及MVP/延期范围
   - [x] 冻结独立K_umbra层级、唯一`umbra-default`密码槽、不可恢复语义与`.inex/config.umbra.inex`边界（`docs/spec/umbra-v1.md`）
   - [x] 实现随机K_umbra、Argon2id KEK 包装/解包、vault/path-bound AEAD、受保护内存清理，以及已解锁会话密码重包装基础（`f96f656`）
@@ -96,7 +96,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
   - [x] 实现 `apply_private_annotation`：以 ETag 与完整 RenderMap/投影复核后，只对纯文本多选区从后向前创建独立 slot 与 marker，并一次性条件保存；过期、混合/私密选区零写入，slot/tag/正文 canary 不进入 Outer 或磁盘可读面（`ee77855`）
   - [x] 实现 complete-private-block 原子解包：完整投影/RenderMap/ETag 一致才可恢复 Markdown 并删除 slot；inside/partial/mixed 选区零写入，恢复正文和 tags 仍不进入磁盘 Outer 面（本轮）
   - [x] 实现 inside-private-slot 原子 metadata edit：保留 slot ID、createdAt 和私密 Markdown，仅在同一 ETag 条件保存中更新 kind/tag IDs/updatedAt/Outer 策略；stale/plain/complete/mixed 选区均拒绝（`aefd789`）
-  - [ ] 扩展daemon session/RPC及VS Code QuickPick/命令/可配置keybindings
+  - [x] 扩展daemon session/RPC及VS Code QuickPick/命令/可配置keybindings；所有私密 catalog/profile/selection 仍只经已解锁会话与 authenticated RenderMap/ETag 边界传递
     - [x] daemon 已声明 `umbraV1` capability，并提供独立 Umbra 状态、初始化、解锁、锁定、feature-2 启用和已解锁投影读取 RPC；普通 `document.open` 不获得 feature-2 plaintext（`f2660b3`）
     - [x] 将 `apply_private_annotation` 接入 daemon 的严格 range/spec RPC：受限嵌套对象/数组解析、base64 projection、完整 RenderMap/ETag 复核、原子返回新投影；RPC 写入 canary 不进入磁盘可读面（`9bd5297`）
     - [x] VS Code sidecar client 已协商/验证 Umbra capability、独立状态/锁定/启用/projection/apply RPC 与严格 RenderMap 响应；异常协议形状不会交给编辑器（`b58bffd`）
@@ -119,7 +119,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
     - [x] VS Code 已实现 `toggleBehavior`（alwaysAsk/useLast/useDefaultProfile/askOnFirstUse）与 `rememberLastSelection`：last spec 仅存于解锁 session 内存、lock 时清零；default profile 仅从已解锁 encrypted catalog 读取（`53ee77b`）
     - [x] CustomEditor 现可保存最多 64 个明确 range，并通过 Add range/Clear ranges 工具栏将其作为一个 selection array 原子交给 daemon；wrap/unwrap 支持多范围，metadata edit 仍只接受一个 slot（`1a2d665`）
     - [x] 接入 CustomEditor webview 选区、QuickPick、多标签及配置化命令/keybindings
-  - [ ] 扩展Sublime stateful picker、profile命令和keymap示例
+  - [x] 扩展Sublime stateful picker、profile命令和keymap示例；维持 experimental 客户端与 host-residue 边界，不扩大平台安全声明
     - [x] Sublime strict RPC client 已支持 `umbra.status` 与 `umbra.config.get`，并在将 catalog 交给 UI 前限制条目数、tag/profile/default 引用（`c5005b1`、`c9b7bc6`）
     - [x] Sublime strict RPC client 已支持 Umbra 独立 keyslot 的 initialize/unlock/enable/lock；其 lock 不触碰 Outer session，异常或不一致状态 fail closed（`5069253`）
     - [x] Sublime 已提供 `Inex: Unlock Umbra Private Mode` 与 `Inex: Lock Umbra Private Mode` 命令；首次初始化经不可恢复警告确认，成功解锁续期同一 Outer idle deadline，Umbra lock 保持 Outer 可用（`cae72cf`）
