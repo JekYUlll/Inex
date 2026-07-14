@@ -599,6 +599,8 @@ pub enum ErrorCode {
     KdfPolicy = -32_010,
     Unsupported = -32_011,
     Busy = -32_012,
+    PublicationReconcileRequired = -32_013,
+    PublicationManualAuditRequired = -32_014,
 }
 
 impl ErrorCode {
@@ -630,6 +632,8 @@ impl ErrorCode {
             Self::KdfPolicy => "KDF_POLICY",
             Self::Unsupported => "UNSUPPORTED",
             Self::Busy => "BUSY",
+            Self::PublicationReconcileRequired => "PUBLICATION_RECONCILE_REQUIRED",
+            Self::PublicationManualAuditRequired => "PUBLICATION_MANUAL_AUDIT_REQUIRED",
         }
     }
 
@@ -655,6 +659,12 @@ impl ErrorCode {
             Self::KdfPolicy => "KDF parameters violate policy",
             Self::Unsupported => "Feature is unsupported",
             Self::Busy => "Vault mutation is busy",
+            Self::PublicationReconcileRequired => {
+                "Repository publication reconciliation is required"
+            }
+            Self::PublicationManualAuditRequired => {
+                "Repository publication marker requires manual audit"
+            }
         }
     }
 }
@@ -1128,6 +1138,16 @@ mod tests {
             (ErrorCode::KdfPolicy, -32_010, "KDF_POLICY"),
             (ErrorCode::Unsupported, -32_011, "UNSUPPORTED"),
             (ErrorCode::Busy, -32_012, "BUSY"),
+            (
+                ErrorCode::PublicationReconcileRequired,
+                -32_013,
+                "PUBLICATION_RECONCILE_REQUIRED",
+            ),
+            (
+                ErrorCode::PublicationManualAuditRequired,
+                -32_014,
+                "PUBLICATION_MANUAL_AUDIT_REQUIRED",
+            ),
         ];
         for (code, number, name) in expected {
             assert_eq!(code.number(), number);

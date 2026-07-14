@@ -30,7 +30,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::path::{AssetPath, LogicalPath};
+use crate::path::{AssetPath, LogicalPath, raw_portable_case_fold_key};
+use crate::publication::{PublicationMarkerError, PublicationMarkerV2};
 
 /// Name of the vault-private directory used for process-local state.
 pub const VAULT_LOCAL_DIRECTORY: &str = ".vault-local";
@@ -50,8 +51,17 @@ pub const PENDING_REBIND_FILE: &str = "pending-rebind-v1";
 /// Prefix used for complete encrypted vaults staged by copy import.
 pub const IMPORT_STAGING_PREFIX: &str = ".inex-import-staging-";
 
-/// Private marker temporarily held open across staged-vault publication.
-pub const IMPORT_PUBLISH_MARKER: &str = "import-publish-marker-v1";
+/// Reserved basename prefix for repository-import publication claims.
+pub const IMPORT_PUBLISH_MARKER_PREFIX: &str = "import-publish-marker-";
+
+/// Legacy private publication marker retained for preview compatibility.
+pub const IMPORT_PUBLISH_MARKER_V1: &str = "import-publish-marker-v1";
+
+/// Canonical cross-process repository-import publication marker.
+pub const IMPORT_PUBLISH_MARKER_V2: &str = "import-publish-marker-v2";
+
+/// Legacy marker name used by the current preview directory publisher.
+pub const IMPORT_PUBLISH_MARKER: &str = IMPORT_PUBLISH_MARKER_V1;
 
 /// Repository-visible Git attributes installed by explicit user request.
 pub const GIT_ATTRIBUTES_FILE: &str = ".gitattributes";
@@ -331,6 +341,14 @@ pub enum AtomicWriteError {
     /// A pending rebind journal could not be reconciled without risking data.
     #[error("pending ciphertext rebind has conflicting filesystem state")]
     RebindRecoveryConflict,
+    /// A canonical repository publication claim must be reconciled before any
+    /// ordinary vault mutation or recovery is allowed.
+    #[error("repository publication reconciliation is required before vault mutation")]
+    RepositoryPublicationReconcileRequired,
+    /// A legacy, malformed, aliased, conflicting, or indeterminate repository
+    /// publication namespace requires manual audit before vault mutation.
+    #[error("repository publication marker state requires manual audit")]
+    RepositoryPublicationManualAuditRequired,
     /// A filesystem or OS-lock operation failed.
     #[error("atomic ciphertext operation failed during {stage}")]
     Io {
@@ -407,6 +425,35 @@ impl ExistingVaultMutationLockError {
     }
 }
 
+/// Read-only classification of the reserved repository-publication namespace.
+///
+/// This classification is only a routing decision. `V2Exact` proves one
+/// canonical marker pathname and byte stream; repository reconciliation must
+/// still bind its identities, domain, child names, private state, and candidate
+/// seal while holding the existing mutation lock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RepositoryPublicationNamespaceState {
+    /// The marker parent is absent or its complete inventory has no reserved
+    /// basename.
+    Absent,
+    /// The sole reserved entry is the exact safe 16-byte legacy marker.
+    LegacyUnverifiable,
+    /// Multiple, aliased, unknown, or unsafe legacy reserved entries exist.
+    ReservedConflict,
+    /// The sole exact v2 pathname has unsafe properties or noncanonical bytes.
+    V2Invalid,
+    /// The sole exact v2 pathname and marker byte stream are canonical.
+    V2Exact,
+}
+
+/// Failure to complete a read-only reserved-publication namespace inventory.
+///
+/// The error intentionally carries no path, marker bytes, identity, or OS
+/// message. Callers must fail closed and direct the user to manual audit.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[error("repository publication marker namespace inspection is indeterminate")]
+pub struct RepositoryPublicationNamespaceInspectionError;
+
 /// Held existing-only publication lock for one already-audited vault root.
 ///
 /// Acquisition opens only the exact pre-existing zero-byte
@@ -424,6 +471,276 @@ pub struct ExistingVaultMutationLock {
 impl fmt::Debug for ExistingVaultMutationLock {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("ExistingVaultMutationLock { .. }")
+    }
+}
+
+enum ReservedMarkerInspection {
+    SafeBytes(Vec<u8>),
+    Unsafe,
+}
+
+/// Inspect the repository-import publication-marker namespace without
+/// creating, recovering, synchronizing, or removing any filesystem entry.
+///
+/// The inventory is bounded and revalidates the vault root, `.vault-local`,
+/// and any held marker after inspection. A missing `.vault-local` is the clean
+/// state used while creating a new vault. Any incomplete inventory or identity
+/// drift is returned as an indeterminate inspection rather than being treated
+/// as an absent marker.
+///
+/// # Errors
+///
+/// Returns a scrubbed indeterminate error when directory safety, local
+/// filesystem support, complete enumeration, held-file binding, or final
+/// identity revalidation cannot be proved.
+pub fn inspect_repository_publication_namespace(
+    vault_root: &Path,
+) -> Result<RepositoryPublicationNamespaceState, RepositoryPublicationNamespaceInspectionError> {
+    inspect_repository_publication_namespace_impl(vault_root)
+        .map_err(|_| RepositoryPublicationNamespaceInspectionError)
+}
+
+fn inspect_repository_publication_namespace_impl(
+    vault_root: &Path,
+) -> io::Result<RepositoryPublicationNamespaceState> {
+    if !vault_root.is_absolute()
+        || !path_is_lexically_normal(vault_root)
+        || !path_ancestors_are_non_link_directories(vault_root)?
+        || !path_is_supported_local_filesystem(vault_root)?
+    {
+        return Err(io::Error::other(
+            "repository publication root cannot be proved safe",
+        ));
+    }
+    let root_identity = filesystem_directory_identity(vault_root)?;
+    verify_directory_has_no_alternate_data_streams(vault_root, &root_identity)?;
+
+    let local = vault_root.join(VAULT_LOCAL_DIRECTORY);
+    let local_metadata = match fs::symlink_metadata(&local) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            revalidate_publication_namespace_root(vault_root, &root_identity)?;
+            if matches!(
+                fs::symlink_metadata(&local),
+                Err(error) if error.kind() == io::ErrorKind::NotFound
+            ) {
+                return Ok(RepositoryPublicationNamespaceState::Absent);
+            }
+            return Err(io::Error::other(
+                "repository publication marker parent changed during inspection",
+            ));
+        }
+        Ok(metadata) => metadata,
+        Err(error) => return Err(error),
+    };
+    if is_link_or_reparse_point(&local_metadata) || !local_metadata.file_type().is_dir() {
+        return Err(io::Error::other(
+            "repository publication marker parent is unsafe",
+        ));
+    }
+    if !path_ancestors_are_non_link_directories(&local)?
+        || !path_is_supported_local_filesystem(&local)?
+        || !paths_share_mount(vault_root, &local)?
+    {
+        return Err(io::Error::other(
+            "repository publication marker parent cannot be proved local",
+        ));
+    }
+    let local_identity = filesystem_directory_identity(&local)?;
+    verify_directory_has_no_alternate_data_streams(&local, &local_identity)?;
+
+    let reserved_prefix = raw_portable_case_fold_key(IMPORT_PUBLISH_MARKER_PREFIX);
+    let mut reserved = Vec::new();
+    let mut entry_count = 0_usize;
+    let mut name_bytes = 0_usize;
+    for entry in fs::read_dir(&local)? {
+        let entry = entry?;
+        entry_count = entry_count
+            .checked_add(1)
+            .filter(|count| *count <= MAX_STAGING_RECOVERY_ENTRIES)
+            .ok_or_else(|| io::Error::other("private namespace entry limit exceeded"))?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| io::Error::other("private namespace name is not portable UTF-8"))?;
+        name_bytes = name_bytes
+            .checked_add(name.len())
+            .filter(|total| *total <= MAX_STAGING_RECOVERY_PATH_BYTES)
+            .ok_or_else(|| io::Error::other("private namespace path limit exceeded"))?;
+        if raw_portable_case_fold_key(&name)
+            .as_str()
+            .starts_with(reserved_prefix.as_str())
+        {
+            reserved.push(name);
+        }
+    }
+    revalidate_publication_namespace_directories(
+        vault_root,
+        &root_identity,
+        &local,
+        &local_identity,
+    )?;
+
+    let state = classify_reserved_publication_entries(&local, &reserved)?;
+    revalidate_publication_namespace_directories(
+        vault_root,
+        &root_identity,
+        &local,
+        &local_identity,
+    )?;
+    Ok(state)
+}
+
+fn classify_reserved_publication_entries(
+    local: &Path,
+    reserved: &[String],
+) -> io::Result<RepositoryPublicationNamespaceState> {
+    Ok(match reserved {
+        [] => RepositoryPublicationNamespaceState::Absent,
+        [name] if name == IMPORT_PUBLISH_MARKER_V1 => {
+            match inspect_reserved_marker(&local.join(name), Some(16))? {
+                ReservedMarkerInspection::SafeBytes(_) => {
+                    RepositoryPublicationNamespaceState::LegacyUnverifiable
+                }
+                ReservedMarkerInspection::Unsafe => {
+                    RepositoryPublicationNamespaceState::ReservedConflict
+                }
+            }
+        }
+        [name] if name == IMPORT_PUBLISH_MARKER_V2 => {
+            match inspect_reserved_marker(&local.join(name), None)? {
+                ReservedMarkerInspection::SafeBytes(bytes) => {
+                    match PublicationMarkerV2::parse(&bytes) {
+                        Ok(_) => RepositoryPublicationNamespaceState::V2Exact,
+                        Err(
+                            PublicationMarkerError::InvalidFormat
+                            | PublicationMarkerError::ResourceLimit,
+                        ) => RepositoryPublicationNamespaceState::V2Invalid,
+                        Err(PublicationMarkerError::Io { .. }) => {
+                            return Err(io::Error::other(
+                                "canonical publication marker read failed",
+                            ));
+                        }
+                    }
+                }
+                ReservedMarkerInspection::Unsafe => RepositoryPublicationNamespaceState::V2Invalid,
+            }
+        }
+        [_] | [_, ..] => RepositoryPublicationNamespaceState::ReservedConflict,
+    })
+}
+
+fn inspect_reserved_marker(
+    path: &Path,
+    exact_size: Option<u64>,
+) -> io::Result<ReservedMarkerInspection> {
+    let path_metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(io::Error::other(
+                "reserved publication marker disappeared during inspection",
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    if is_link_or_reparse_point(&path_metadata) || !path_metadata.file_type().is_file() {
+        return Ok(ReservedMarkerInspection::Unsafe);
+    }
+    if exact_size.is_some_and(|size| path_metadata.len() != size)
+        || path_metadata.len()
+            > u64::try_from(crate::publication::PUBLICATION_MARKER_READ_LIMIT_BYTES)
+                .unwrap_or(u64::MAX)
+    {
+        return Ok(ReservedMarkerInspection::Unsafe);
+    }
+
+    let mut file = platform::open_existing_mutation_lock(path)?;
+    if !platform::open_file_is_single_link(&file)? {
+        return Ok(ReservedMarkerInspection::Unsafe);
+    }
+    if !open_file_matches_path_and_is_single_link(path, &file)? {
+        return Err(io::Error::other(
+            "reserved publication marker path changed during inspection",
+        ));
+    }
+    if let Err(error) = verify_regular_file_has_no_alternate_data_streams(path, &file) {
+        return if error.kind() == io::ErrorKind::InvalidData {
+            Ok(ReservedMarkerInspection::Unsafe)
+        } else {
+            Err(error)
+        };
+    }
+    let held_identity = filesystem_file_identity(&file)?;
+    let held_size = file.metadata()?.len();
+    if held_size != path_metadata.len() {
+        return Err(io::Error::other(
+            "reserved publication marker changed during inspection",
+        ));
+    }
+    let allocation = usize::try_from(held_size)
+        .map_err(|_| io::Error::other("reserved publication marker is too large"))?;
+    let mut bytes = vec![0_u8; allocation];
+    file.read_exact(&mut bytes)?;
+    let mut trailing = [0_u8; 1];
+    if file.read(&mut trailing)? != 0 {
+        return Err(io::Error::other(
+            "reserved publication marker grew during inspection",
+        ));
+    }
+    if filesystem_file_identity(&file)? != held_identity
+        || !open_file_matches_path_and_is_single_link(path, &file)?
+    {
+        return Err(io::Error::other(
+            "reserved publication marker binding changed during inspection",
+        ));
+    }
+    verify_regular_file_has_no_alternate_data_streams(path, &file)?;
+    Ok(ReservedMarkerInspection::SafeBytes(bytes))
+}
+
+fn revalidate_publication_namespace_root(
+    vault_root: &Path,
+    expected_root: &FilesystemDirectoryIdentity,
+) -> io::Result<()> {
+    if filesystem_directory_identity(vault_root)? != *expected_root
+        || !path_is_supported_local_filesystem(vault_root)?
+    {
+        return Err(io::Error::other(
+            "repository publication root identity changed",
+        ));
+    }
+    verify_directory_has_no_alternate_data_streams(vault_root, expected_root)
+}
+
+fn revalidate_publication_namespace_directories(
+    vault_root: &Path,
+    expected_root: &FilesystemDirectoryIdentity,
+    local: &Path,
+    expected_local: &FilesystemDirectoryIdentity,
+) -> io::Result<()> {
+    revalidate_publication_namespace_root(vault_root, expected_root)?;
+    if filesystem_directory_identity(local)? != *expected_local
+        || !path_is_supported_local_filesystem(local)?
+        || !paths_share_mount(vault_root, local)?
+    {
+        return Err(io::Error::other(
+            "repository publication marker parent identity changed",
+        ));
+    }
+    verify_directory_has_no_alternate_data_streams(local, expected_local)
+}
+
+fn require_no_repository_publication_claim(vault_root: &Path) -> Result<(), AtomicWriteError> {
+    match inspect_repository_publication_namespace(vault_root) {
+        Ok(RepositoryPublicationNamespaceState::Absent) => Ok(()),
+        Ok(RepositoryPublicationNamespaceState::V2Exact) => {
+            Err(AtomicWriteError::RepositoryPublicationReconcileRequired)
+        }
+        Ok(
+            RepositoryPublicationNamespaceState::LegacyUnverifiable
+            | RepositoryPublicationNamespaceState::ReservedConflict
+            | RepositoryPublicationNamespaceState::V2Invalid,
+        )
+        | Err(_) => Err(AtomicWriteError::RepositoryPublicationManualAuditRequired),
     }
 }
 
@@ -686,6 +1003,7 @@ impl VaultMutationGuard {
         vault_root: &Path,
         faults: &F,
     ) -> Result<Self, AtomicWriteError> {
+        require_no_repository_publication_claim(vault_root)?;
         let root_identity = filesystem_directory_identity(vault_root)
             .map_err(|source| AtomicWriteError::io(AtomicWriteStage::PrepareLock, source))?;
         let lock = VaultMutationLock::acquire_with_faults(vault_root, faults)?;
@@ -706,6 +1024,7 @@ impl VaultMutationGuard {
         {
             return Err(AtomicWriteError::UnsafeLockPath);
         }
+        require_no_repository_publication_claim(vault_root)?;
         recover_ciphertext_staging_locked(vault_root)?;
         let recovery_changed_repository = recover_pending_rebind_locked(vault_root)?;
         Ok(Self {
@@ -876,10 +1195,12 @@ impl VaultMutationLock {
         let lock_path = lock_directory.join(VAULT_MUTATION_LOCK_FILE);
         reject_unsafe_existing_lock_file(vault_root, &lock_path)?;
 
-        let file = open_lock_file(&lock_path)
+        let (file, lock_created) = open_lock_file(&lock_path)
             .map_err(|source| AtomicWriteError::io(AtomicWriteStage::PrepareLock, source))?;
         reject_unsafe_existing_lock_file(vault_root, &lock_path)?;
-        restrict_file_permissions_best_effort(&file);
+        if lock_created {
+            restrict_file_permissions_best_effort(&file);
+        }
 
         faults
             .check(FaultPoint::AcquireLock)
@@ -4290,13 +4611,13 @@ fn prepare_lock_directory(vault_root: &Path, path: &Path) -> Result<(), AtomicWr
     {
         return Err(AtomicWriteError::UnsafeLockPath);
     }
-    match fs::create_dir(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+    let created = match fs::create_dir(path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
         Err(source) => {
             return Err(AtomicWriteError::io(AtomicWriteStage::PrepareLock, source));
         }
-    }
+    };
 
     let metadata = fs::symlink_metadata(path)
         .map_err(|source| AtomicWriteError::io(AtomicWriteStage::PrepareLock, source))?;
@@ -4310,7 +4631,9 @@ fn prepare_lock_directory(vault_root: &Path, path: &Path) -> Result<(), AtomicWr
     {
         return Err(AtomicWriteError::UnsafeLockPath);
     }
-    restrict_directory_permissions_best_effort(path);
+    if created {
+        restrict_directory_permissions_best_effort(path);
+    }
     Ok(())
 }
 
@@ -4365,11 +4688,19 @@ fn case_alias_exists(path: &Path) -> io::Result<bool> {
     Ok(false)
 }
 
-fn open_lock_file(path: &Path) -> io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true);
-    configure_restrictive_creation(&mut options);
-    options.open(path)
+fn open_lock_file(path: &Path) -> io::Result<(File, bool)> {
+    let mut create = OpenOptions::new();
+    create.read(true).write(true).create_new(true);
+    configure_restrictive_creation(&mut create);
+    match create.open(path) {
+        Ok(file) => Ok((file, true)),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let mut existing = OpenOptions::new();
+            existing.read(true).write(true);
+            existing.open(path).map(|file| (file, false))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn namespace_move(source: &Path, destination: &Path, replace: bool) -> io::Result<()> {
@@ -4819,6 +5150,11 @@ mod platform {
             && handle.nlink() == 1
             && current.dev() == handle.dev()
             && current.ino() == handle.ino())
+    }
+
+    pub(super) fn open_file_is_single_link(file: &File) -> io::Result<bool> {
+        let metadata = file.metadata()?;
+        Ok(metadata.file_type().is_file() && metadata.nlink() == 1)
     }
 
     pub(super) fn open_file_matches_path_and_is_single_link_same_tree(
@@ -5333,6 +5669,14 @@ mod platform {
         )
     }
 
+    pub(super) fn open_file_is_single_link(file: &File) -> io::Result<bool> {
+        let information = handle_information(file)?;
+        Ok(
+            information.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
+                && information.number_of_links == 1,
+        )
+    }
+
     pub(super) fn open_file_matches_path_and_is_single_link_same_tree(
         path: &Path,
         file: &File,
@@ -5787,6 +6131,10 @@ mod platform {
         Ok(false)
     }
 
+    pub(super) fn open_file_is_single_link(_file: &File) -> io::Result<bool> {
+        Ok(false)
+    }
+
     pub(super) fn open_file_matches_path_and_is_single_link_same_tree(
         _path: &Path,
         _file: &File,
@@ -5841,14 +6189,16 @@ mod tests {
     use super::{
         AtomicDirectoryPublishError, AtomicWriteError, AtomicWriteStage, CIPHERTEXT_STAGING_PREFIX,
         CIPHERTEXT_STAGING_SUFFIX, CurrentTarget, ExistingVaultMutationLock,
-        ExistingVaultMutationLockError, FaultInjector, FaultPoint, IMPORT_STAGING_PREFIX,
-        MAX_ATOMIC_TARGET_BYTES, PENDING_REBIND_FILE, ParentSyncStatus, RebindJournal,
+        ExistingVaultMutationLockError, FaultInjector, FaultPoint, IMPORT_PUBLISH_MARKER_V1,
+        IMPORT_PUBLISH_MARKER_V2, IMPORT_STAGING_PREFIX, MAX_ATOMIC_TARGET_BYTES,
+        PENDING_REBIND_FILE, ParentSyncStatus, RebindJournal, RepositoryPublicationNamespaceState,
         VAULT_LOCAL_DIRECTORY, VAULT_MUTATION_LOCK_FILE, VaultMutationGuard, VaultMutationLock,
         WriteCondition, atomic_delete_ciphertext, atomic_move_verified_file_no_replace,
         atomic_publish_directory_no_replace, atomic_publish_directory_no_replace_with_fault,
         atomic_rebind_ciphertext, atomic_replace_verified_file, atomic_write_ciphertext,
-        atomic_write_ciphertext_with_faults, digest_bytes, install_rebind_journal,
-        pending_rebind_path, reconcile_failed_namespace_commit, recover_pending_rebind,
+        atomic_write_ciphertext_with_faults, digest_bytes,
+        inspect_repository_publication_namespace, install_rebind_journal, pending_rebind_path,
+        reconcile_failed_namespace_commit, recover_pending_rebind,
         verify_directory_has_no_alternate_data_streams,
         verify_regular_file_has_no_alternate_data_streams,
     };
@@ -5878,6 +6228,204 @@ mod tests {
             local: super::filesystem_directory_identity(&local)?,
             lock: super::filesystem_file_identity(&lock_file)?,
         })
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    fn write_canonical_publication_marker_v2(root: &Path) -> io::Result<PathBuf> {
+        let local = root.join(VAULT_LOCAL_DIRECTORY);
+        if !local.exists() {
+            fs::create_dir(&local)?;
+        }
+        let marker_path = local.join(IMPORT_PUBLISH_MARKER_V2);
+        fs::write(&marker_path, [])?;
+        let marker_file = fs::File::open(&marker_path)?;
+        let common_parent = super::filesystem_directory_identity(
+            root.parent()
+                .ok_or_else(|| io::Error::other("test vault has no parent"))?,
+        )?;
+        let staging_root = super::filesystem_directory_identity(root)?;
+        let marker_parent = super::filesystem_directory_identity(&local)?;
+        let marker_file_identity = super::filesystem_file_identity(&marker_file)?;
+        let scheme = [
+            super::PublicationIdentityScheme::LinuxDevInodeV1,
+            super::PublicationIdentityScheme::WindowsModernFileId128V1,
+            super::PublicationIdentityScheme::WindowsLegacyFileIndexV1,
+        ]
+        .into_iter()
+        .find(|scheme| {
+            common_parent.publication_identity(*scheme).is_some()
+                && staging_root.publication_identity(*scheme).is_some()
+                && marker_parent.publication_identity(*scheme).is_some()
+                && marker_file_identity.publication_identity(*scheme).is_some()
+        })
+        .ok_or_else(|| io::Error::other("test marker identities have no uniform scheme"))?;
+        let marker = crate::publication::PublicationMarkerV2::new(
+            crate::publication::PublicationMarkerV2Input {
+                scheme,
+                publication_id: [7_u8; 16],
+                common_parent_identity: &common_parent,
+                staging_root_identity: &staging_root,
+                marker_parent_identity: &marker_parent,
+                marker_file_identity: &marker_file_identity,
+                domain: "inex.repository-import.v1",
+                staging_child_name: ".inex-import-staging-00000000000000000000000000000000",
+                destination_child_name: "destination",
+                candidate_seal: &[0x5a; 32],
+            },
+        )
+        .map_err(io::Error::other)?;
+        drop(marker_file);
+        fs::write(&marker_path, marker.to_bytes())?;
+        Ok(marker_path)
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn publication_namespace_classifier_freezes_all_routing_classes() -> io::Result<()> {
+        let absent = TestVault::new()?;
+        assert_eq!(
+            inspect_repository_publication_namespace(absent.root()).map_err(io::Error::other)?,
+            RepositoryPublicationNamespaceState::Absent
+        );
+        assert!(!absent.local().exists());
+
+        let legacy = TestVault::new()?;
+        fs::create_dir(legacy.local())?;
+        fs::write(legacy.local().join(IMPORT_PUBLISH_MARKER_V1), [3_u8; 16])?;
+        assert_eq!(
+            inspect_repository_publication_namespace(legacy.root()).map_err(io::Error::other)?,
+            RepositoryPublicationNamespaceState::LegacyUnverifiable
+        );
+
+        let legacy_unsafe = TestVault::new()?;
+        fs::create_dir(legacy_unsafe.local())?;
+        fs::write(
+            legacy_unsafe.local().join(IMPORT_PUBLISH_MARKER_V1),
+            [3_u8; 15],
+        )?;
+        assert_eq!(
+            inspect_repository_publication_namespace(legacy_unsafe.root())
+                .map_err(io::Error::other)?,
+            RepositoryPublicationNamespaceState::ReservedConflict
+        );
+
+        let malformed = TestVault::new()?;
+        fs::create_dir(malformed.local())?;
+        fs::write(malformed.local().join(IMPORT_PUBLISH_MARKER_V2), b"bad")?;
+        assert_eq!(
+            inspect_repository_publication_namespace(malformed.root()).map_err(io::Error::other)?,
+            RepositoryPublicationNamespaceState::V2Invalid
+        );
+
+        let exact = TestVault::new()?;
+        write_canonical_publication_marker_v2(exact.root())?;
+        assert_eq!(
+            inspect_repository_publication_namespace(exact.root()).map_err(io::Error::other)?,
+            RepositoryPublicationNamespaceState::V2Exact
+        );
+
+        let alias = TestVault::new()?;
+        fs::create_dir(alias.local())?;
+        fs::write(
+            alias.local().join("IMPORT-PUBLISH-MARKER-V2"),
+            b"reserved alias",
+        )?;
+        assert_eq!(
+            inspect_repository_publication_namespace(alias.root()).map_err(io::Error::other)?,
+            RepositoryPublicationNamespaceState::ReservedConflict
+        );
+
+        let multiple = TestVault::new()?;
+        fs::create_dir(multiple.local())?;
+        fs::write(multiple.local().join(IMPORT_PUBLISH_MARKER_V1), [1_u8; 16])?;
+        fs::write(multiple.local().join(IMPORT_PUBLISH_MARKER_V2), b"bad")?;
+        assert_eq!(
+            inspect_repository_publication_namespace(multiple.root()).map_err(io::Error::other)?,
+            RepositoryPublicationNamespaceState::ReservedConflict
+        );
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn publication_barrier_prevents_lock_creation_for_existing_claims() -> io::Result<()> {
+        let exact = TestVault::new()?;
+        write_canonical_publication_marker_v2(exact.root())?;
+        let lock_path = exact.local().join(VAULT_MUTATION_LOCK_FILE);
+        assert!(matches!(
+            VaultMutationGuard::acquire(exact.root()),
+            Err(AtomicWriteError::RepositoryPublicationReconcileRequired)
+        ));
+        assert!(!lock_path.exists());
+
+        let legacy = TestVault::new()?;
+        fs::create_dir(legacy.local())?;
+        fs::write(legacy.local().join(IMPORT_PUBLISH_MARKER_V1), [9_u8; 16])?;
+        let lock_path = legacy.local().join(VAULT_MUTATION_LOCK_FILE);
+        assert!(matches!(
+            VaultMutationGuard::acquire(legacy.root()),
+            Err(AtomicWriteError::RepositoryPublicationManualAuditRequired)
+        ));
+        assert!(!lock_path.exists());
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    struct MarkerBetweenBarrierChecks {
+        marker: PathBuf,
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    impl FaultInjector for MarkerBetweenBarrierChecks {
+        fn check(&self, point: FaultPoint) -> io::Result<()> {
+            if point == FaultPoint::PrepareLock {
+                fs::write(&self.marker, [5_u8; 16])?;
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn publication_barrier_rechecks_under_lock_before_recovery() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        initialize_existing_lock(fixture.root())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(fixture.local(), fs::Permissions::from_mode(0o751))?;
+            fs::set_permissions(
+                fixture.local().join(VAULT_MUTATION_LOCK_FILE),
+                fs::Permissions::from_mode(0o640),
+            )?;
+        }
+        let staging = exact_staging_path(&fixture.local(), 'c');
+        fs::write(&staging, b"encrypted recovery canary")?;
+        let fault = MarkerBetweenBarrierChecks {
+            marker: fixture.local().join(IMPORT_PUBLISH_MARKER_V1),
+        };
+        assert!(matches!(
+            VaultMutationGuard::acquire_with_faults(fixture.root(), &fault),
+            Err(AtomicWriteError::RepositoryPublicationManualAuditRequired)
+        ));
+        assert_eq!(fs::read(&staging)?, b"encrypted recovery canary");
+        assert_eq!(fs::read(fault.marker)?, [5_u8; 16]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                fs::metadata(fixture.local())?.permissions().mode() & 0o777,
+                0o751
+            );
+            assert_eq!(
+                fs::metadata(fixture.local().join(VAULT_MUTATION_LOCK_FILE))?
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o640
+            );
+        }
+        Ok(())
     }
 
     #[cfg(any(target_os = "linux", windows))]

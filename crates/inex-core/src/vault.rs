@@ -177,6 +177,14 @@ pub enum VaultError {
     /// without risking loss.
     #[error("authenticated rename recovery found conflicting repository state")]
     RenameRecoveryConflict,
+    /// A canonical repository-import publication claim must be reconciled
+    /// before this vault can be opened or mutated normally.
+    #[error("repository publication reconciliation is required")]
+    RepositoryPublicationReconcileRequired,
+    /// Reserved repository-publication state is unsafe or unverifiable and
+    /// must be preserved for manual audit.
+    #[error("repository publication marker state requires manual audit")]
+    RepositoryPublicationManualAuditRequired,
     /// A password-slot commit succeeded but re-opening it with the new
     /// password failed. The on-disk metadata is retained for recovery.
     #[error("password-slot metadata committed but post-commit verification failed")]
@@ -1901,6 +1909,12 @@ fn map_atomic_error(error: AtomicWriteError) -> VaultError {
             destination_etag: encode_etag(destination_etag),
         },
         AtomicWriteError::RebindRecoveryConflict => VaultError::RenameRecoveryConflict,
+        AtomicWriteError::RepositoryPublicationReconcileRequired => {
+            VaultError::RepositoryPublicationReconcileRequired
+        }
+        AtomicWriteError::RepositoryPublicationManualAuditRequired => {
+            VaultError::RepositoryPublicationManualAuditRequired
+        }
         AtomicWriteError::Io { stage: _, source } => VaultError::Io {
             operation: VaultIoOperation::Read,
             kind: source.kind(),

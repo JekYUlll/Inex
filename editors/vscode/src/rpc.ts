@@ -304,4 +304,18 @@ const ERROR_CONTRACT = new Map<number, Readonly<{ name: string; message: string 
   [-32010, { name: "KDF_POLICY", message: "KDF parameters violate policy" }],
   [-32011, { name: "UNSUPPORTED", message: "Feature is unsupported" }],
   [-32012, { name: "BUSY", message: "Vault mutation is busy" }],
+  [
+    -32013,
+    {
+      name: "PUBLICATION_RECONCILE_REQUIRED",
+      message: "Repository publication reconciliation is required",
+    },
+  ],
+  [
+    -32014,
+    {
+      name: "PUBLICATION_MANUAL_AUDIT_REQUIRED",
+      message: "Repository publication marker requires manual audit",
+    },
+  ],
 ]);

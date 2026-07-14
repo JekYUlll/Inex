@@ -998,10 +998,16 @@ fn map_vault_error(error: VaultError, context: ErrorContext) -> ErrorObject {
         VaultError::SearchIndexNotReady | VaultError::RenameRecoveryPending { .. } => {
             ErrorCode::Busy
         }
+        VaultError::RepositoryPublicationReconcileRequired => {
+            ErrorCode::PublicationReconcileRequired
+        }
         VaultError::SearchUtf8Invariant | VaultError::AtomicVerificationFailed => {
             ErrorCode::IntegrityFailed
         }
         VaultError::RenameRecoveryConflict => ErrorCode::IntegrityFailed,
+        VaultError::RepositoryPublicationManualAuditRequired => {
+            ErrorCode::PublicationManualAuditRequired
+        }
     };
     ErrorObject::new(code)
 }
@@ -1218,6 +1224,24 @@ mod tests {
         })
         .expect("valid explicit KDF is retained");
         assert_eq!(selected, explicit);
+    }
+
+    #[test]
+    fn publication_barrier_errors_have_distinct_actionable_codes() {
+        let reconcile = map_vault_error(
+            VaultError::RepositoryPublicationReconcileRequired,
+            ErrorContext::Document,
+        );
+        assert_eq!(reconcile.code(), ErrorCode::PublicationReconcileRequired);
+
+        let manual_audit = map_vault_error(
+            VaultError::RepositoryPublicationManualAuditRequired,
+            ErrorContext::Document,
+        );
+        assert_eq!(
+            manual_audit.code(),
+            ErrorCode::PublicationManualAuditRequired
+        );
     }
 
     #[test]

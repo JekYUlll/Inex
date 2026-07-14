@@ -78,3 +78,32 @@ test("request encoder emits one canonical frame and rejects unsafe ids", () => {
   encoded.fill(0);
   assert.throws(() => encodeRequest(Number.MAX_SAFE_INTEGER + 1, "system.ping", {}));
 });
+
+test("publication barrier errors retain their actionable contracts", () => {
+  for (const [code, name, message] of [
+    [
+      -32013,
+      "PUBLICATION_RECONCILE_REQUIRED",
+      "Repository publication reconciliation is required",
+    ],
+    [
+      -32014,
+      "PUBLICATION_MANUAL_AUDIT_REQUIRED",
+      "Repository publication marker requires manual audit",
+    ],
+  ] as const) {
+    assert.throws(
+      () =>
+        responseResult({
+          jsonrpc: "2.0",
+          id: 1,
+          error: { code, message, data: { name } },
+        }),
+      (error: unknown) =>
+        error instanceof RpcRemoteError &&
+        error.code === code &&
+        error.stableName === name &&
+        error.message === message,
+    );
+  }
+});
