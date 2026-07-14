@@ -66,7 +66,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
 
 ### Phase 5.5: Neovim Lua 插件 MVP（最后优先级）
 
-- [ ] 在 CLI/daemon、VS Code Umbra MVP 与核心隔离验证完成后，建立 Lua 插件骨架与安装说明
+- [x] 在 CLI/daemon、VS Code Umbra MVP 与核心隔离验证完成后，建立 Lua 插件骨架与安装说明；`InexStart`/`InexStatus`/`InexStop` 以 strict Content-Length JSON-RPC 启动并认证 `inexd`（本轮）
 - [ ] 复用 `inexd` JSON-RPC：vault 解锁/锁定、树浏览、受控 Markdown buffer、保存与搜索
 - [ ] 实现 Umbra 最小命令：解锁、私密标注、标签/profile 选择与锁定清理；不得绕过 Outer/Umbra 隔离
 - [ ] 使用 headless Neovim 回归验证，并对 swap、shada、undo、LSP 等宿主明文残留执行显式门控

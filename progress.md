@@ -1117,3 +1117,8 @@
 
 - 在同一 standalone checkout 中执行 `smoke_release_artifacts.py`，传入系统 `/usr/bin/code`。脚本对当前 `739b9f0` Linux x64 candidate 的 portable archives、隔离 extensions directory 内 VSIX 安装、installed layout/executable modes 和 bundled CLI/daemon runtime probes 返回 `packageSmoke: passed`。
 - 这是当前精确 artifact 的本地 install/bundled-runtime evidence，补上 structure audit 不运行 executable 的边界；仍不覆盖持久 profile、Extension Host CRUD/recovery、pidfd lifecycle、签名、跨平台和独立可重复构建。
+
+## 2026-07-15 — Neovim final-priority Lua transport skeleton
+
+- 新增 `editors/neovim` runtime plugin。Lua `rpc` 模块只启动 absolute regular `inexd`、使用 bounded Content-Length JSON-RPC framing、绑定 pending request callbacks，并在 stdout/protocol/process failure 时清理；插件提供 `:InexStart`、`:InexStatus`、`:InexStop`，`system.hello` 发送 frozen `client/clientVersion/protocolMajor` 参数。
+- 以本机 Neovim 0.12 headless 和当前 system-GCC `inexd` 做真实 start→hello→status→stop smoke，两次返回 `Inex sidecar is ready`。该切片不处理密码、明文 buffer、Outer/Umbra 或 `.inex` 文件；这些必须通过后续同一 authenticated session/RenderMap API 实现，并先完成 Neovim host residue gate。
