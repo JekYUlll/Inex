@@ -124,6 +124,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
   - [x] 加密 annotation profile 现支持 stable-ID create/edit/remove，所有 tag/Outer 引用复用 catalog 验证；删除 default profile 时清空 encrypted default 引用（`4594d6b`）
   - [x] daemon 已提供 `umbra.profile.create/edit/remove`，所有 profile 文本/tag IDs 使用受限 sensitive 参数读取，生命周期回归覆盖 create→edit→remove（`657f697`）
   - [x] VS Code 已提供 `inex.managePrivateAnnotationProfiles`：create/edit/remove 均经 encrypted catalog RPC；profile label/ID 走可随 lock 清空的敏感 UI，profile draft 不收集或存储实例 cover text（`fe77dc5`、`6450df6`）
+  - [x] 默认 annotation profile 现可经 core→daemon→VS Code 加密事务设置或清除；`useDefaultProfile` 不再依赖无法配置的初始空 default，删除默认 profile 仍在同一 config write 中自动清除引用（`3b9f5c5`）
   - [ ] 跑通多选、wrap/unwrap/edit、跨编辑器目录、canary/残留及Outer隔离矩阵
 
 - [x] 实现 `.gitattributes`、locked-safe `inex merge-driver` 与已解锁 CLI 三方合并

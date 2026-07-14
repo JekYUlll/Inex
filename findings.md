@@ -525,3 +525,4 @@
 - VS Code profile 管理器必须把“复用 annotation picker”限制为 metadata draft：`cover` 仅是 profile 的 mode/prompt 语义，不能在 create/edit profile 时采集一次性公开 cover text。真正将 profile 应用于 slot 时才收集该公开内容；否则会把无归属的 cover 文本留在 UI 流程或错误写入 catalog。
 - `toggleBehavior` 的 `useLast`/`askOnFirstUse` 不能把上次 tag IDs 或 Outer 选择写入 editor-local settings；实现只能保持在当前 authenticated extension session，并在 Umbra lock 时主动丢弃。`useDefaultProfile` 不信任 settings 提供 profile ID，而从已解锁 encrypted config 的 validated defaults 得到 stable ID。
 - `headingSection` 只能以 Markdown ATX heading 识别当前章节，且应以 byte range 返回给既有 RenderMap/daemon 边界；没有前置 heading 时返回 undefined，而不是用整份文档作为便利回退。
+- `useDefaultProfile` 只有在用户可安全设置 encrypted default 时才是完整功能。默认 profile ID 必须由 `K_umbra` catalog transaction 写入/验证，不能由 VS Code window setting 或快捷键参数承担；profile 删除时同一 transaction 清空 default，避免悬空选择。

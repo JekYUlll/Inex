@@ -1,5 +1,11 @@
 # Inex Progress Log
 
+## 2026-07-15 — Encrypted default annotation profile
+
+- 提交 `3b9f5c5`：新增 `UmbraConfigV1::set_default_profile`、Vault wrapper、`umbra.profile.setDefault` RPC 与 VS Code sidecar/client UI。Profile management 可 Set as Default/Clear Default；ID 始终在 encrypted config 中验证、保存，不能由普通 editor setting 注入。
+- core profile test 与 daemon lifecycle 现在验证设置 default、`config.get` 读回以及 remove profile 自动清除 default。core 全量 297/297、daemon 全量 71/71、core/daemon lib Clippy、VS Code check/57 tests/build/fmt/diff-check 均通过。
+- `cargo clippy -p inex-core -p inex-daemon --all-targets -- -D warnings` 仍因 `vault.rs` 两个既有测试函数超过 100 行而失败；本次新增 code 的 `assigning_clones` 已修复，未放宽 lint。该 test-only 基线问题留作质量门修复项。
+
 ## 2026-07-15 — VS Code heading-section annotation target
 
 - 提交 `20fe50d`：`inex.privateAnnotation.noSelectionTarget` 现在支持 `headingSection`。无选区时从当前 ATX 标题开始，至下一个同级或更高标题前结束；光标不属于标题章节时拒绝，避免意外包裹整篇文档。
