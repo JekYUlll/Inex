@@ -1127,3 +1127,8 @@
 
 - Neovim 插件新增 `:InexUnlock`/`:InexLock`/`:InexOpen`。unlock 只发送 `vault.unlock` 给 daemon；open 只接受普通 feature 0/1 Markdown response，创建 unlisted scratch buffer，禁用 swap/undo persistence/modeline、设为 wipe-on-hide 和只读，并在 BufWipeout/lock 时关闭 daemon document handle。feature-2/Umbra response 明确拒绝。
 - headless regression 首次暴露 Lua lexical-scope bug（`HELLO_PARAMS` 在 helper 定义后声明而被解析为 global nil）；移动声明后真实 `inexd` handshake 再次通过。此 slice 不实现保存或可编辑 buffer，且 `inputsecret`/cmdline、shada、LSP、第三方插件仍是未闭合宿主残留边界。
+
+## 2026-07-15 — Neovim reproducible RPC smoke
+
+- 新增 `editors/neovim/tests/headless_smoke.lua`。测试从 `INEX_SIDECAR` 取得绝对 binary，启动 transport、发送 exact frozen `system.hello`、验证 `inexd`/protocol major，并在 3 秒 bounded wait 内 shutdown；README 记录 exact headless invocation。
+- 验证：以当前 system-GCC `inexd` 运行该 smoke 成功。该测试只覆盖 sidecar framing/lifecycle，不证明 password input、vault projection 或 Neovim plaintext-residue 安全。
