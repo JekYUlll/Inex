@@ -268,6 +268,11 @@ export function activate(
         await managePrivateTags(controller);
       });
     }),
+    vscode.commands.registerCommand("inex.reorderPrivateTags", async () => {
+      await runUiAction(async () => {
+        await reorderPrivateTags(controller);
+      });
+    }),
     vscode.commands.registerCommand("inex.applyPrivateAnnotationProfile", async (args?: unknown) => {
       await runUiAction(async () => {
         const profileId = isProfileArguments(args) ? args.profileId : undefined;
@@ -481,11 +486,11 @@ async function managePrivateTags(controller: VaultController): Promise<void> {
       detail: tag.archived ? "Archived" : tag.description,
     })),
   ];
-  const selected = await vscode.window.showQuickPick(items, {
-    title: "Manage Private Tags",
-    placeHolder: "Create a tag or select one to rename/archive",
-    ignoreFocusOut: true,
-  });
+  const selected = await showSensitiveQuickPick(
+    items,
+    { title: "Manage Private Tags", placeHolder: "Create a tag or select one to rename/archive" },
+    controller.onDidLock,
+  );
   if (selected === undefined || !controller.isSessionCurrent(ready.session)) return;
   if (selected.label.startsWith("$(add)")) {
     await createPrivateTag(controller, ready.session, ready.sidecar);
@@ -495,7 +500,7 @@ async function managePrivateTags(controller: VaultController): Promise<void> {
   if (tag === undefined) throw new Error("Selected private tag is unavailable");
   const action = await vscode.window.showQuickPick(
     tag.archived ? ["Rename"] : ["Rename", "Archive"],
-    { title: `Private Tag: ${tag.label}`, ignoreFocusOut: true },
+    { title: "Manage selected private tag", ignoreFocusOut: true },
   );
   if (action === undefined || !controller.isSessionCurrent(ready.session)) return;
   if (action === "Archive") {
@@ -522,6 +527,44 @@ async function managePrivateTags(controller: VaultController): Promise<void> {
   } finally {
     label = undefined;
   }
+}
+
+async function reorderPrivateTags(controller: VaultController): Promise<void> {
+  const ready = await ensureUmbraReady(controller);
+  if (ready === undefined) return;
+  const config = await ready.sidecar.loadUmbraAnnotationConfig();
+  if (config.tags.length < 2) {
+    await vscode.window.showInformationMessage("Create at least two private tags before reordering.");
+    return;
+  }
+  const selected = await showSensitiveQuickPick(
+    config.tags.map((tag) => ({ label: `$(tag) ${tag.label}`, description: tag.id })),
+    { title: "Reorder Private Tags", placeHolder: "Choose a private tag to move" },
+    controller.onDidLock,
+  );
+  if (selected === undefined || !controller.isSessionCurrent(ready.session)) return;
+  const index = config.tags.findIndex((tag) => tag.id === selected.description);
+  if (index < 0) throw new Error("Selected private tag is unavailable");
+  const positions = [
+    { label: "Move to first", index: 0 },
+    { label: "Move earlier", index: Math.max(0, index - 1) },
+    { label: "Move later", index: Math.min(config.tags.length - 1, index + 1) },
+    { label: "Move to last", index: config.tags.length - 1 },
+  ].filter((option, optionIndex, all) =>
+    option.index !== index && all.findIndex((candidate) => candidate.index === option.index) === optionIndex,
+  );
+  const position = await vscode.window.showQuickPick(positions, {
+    title: "Move selected private tag",
+    ignoreFocusOut: true,
+  });
+  if (position === undefined || !controller.isSessionCurrent(ready.session)) return;
+  const ids = config.tags.map((tag) => tag.id);
+  const [moved] = ids.splice(index, 1);
+  if (moved === undefined) throw new Error("Selected private tag is unavailable");
+  ids.splice(position.index, 0, moved);
+  await ready.sidecar.reorderUmbraTags(ids);
+  await ready.sidecar.loadUmbraAnnotationConfig();
+  await vscode.window.showInformationMessage("Private tags reordered.");
 }
 
 async function createPrivateTag(
