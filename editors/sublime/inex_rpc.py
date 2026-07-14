@@ -25,6 +25,8 @@ MAX_PIPE_READ_BYTES = 64 * 1024
 MAX_DOCUMENT_BYTES = 16 * 1024 * 1024
 MAX_DRAFT_BYTES = MAX_DOCUMENT_BYTES + 12 + 4096 + 16
 MAX_UMBRA_MAP_ENTRIES = 100000
+MAX_UMBRA_TAGS = 4096
+MAX_UMBRA_TEXT_BYTES = 4096
 SESSION_TOKEN_TEXT_BYTES = 43
 DOCUMENT_HANDLE_TEXT_BYTES = 22
 REQUEST_TIMEOUT_SECONDS = 120.0
@@ -52,6 +54,14 @@ SESSION_RENEWING_METHODS = frozenset(
         "umbra.lock",
         "umbra.enable",
         "umbra.config.get",
+        "umbra.tag.create",
+        "umbra.tag.rename",
+        "umbra.tag.archive",
+        "umbra.tag.reorder",
+        "umbra.profile.create",
+        "umbra.profile.edit",
+        "umbra.profile.remove",
+        "umbra.profile.setDefault",
     )
 )
 
@@ -613,6 +623,54 @@ class InexRpcClient:
             if not isinstance(default_profile, str) or (default_profile and default_profile not in profile_ids):
                 raise RpcProtocolError("RPC Umbra default profile is invalid")
             return result
+        except RpcProtocolError as error:
+            self._terminate_protocol(error)
+
+    def create_private_tag(self, tag: Dict[str, Any]) -> None:
+        self._umbra_acknowledge("umbra.tag.create", {"tag": _serialize_private_tag(tag)})
+
+    def rename_private_tag(self, tag_id: str, label: str) -> None:
+        self._umbra_acknowledge("umbra.tag.rename", {
+            "tagId": _expect_umbra_id(tag_id, "Umbra tag ID"),
+            "label": _expect_bounded_string(label, "Umbra tag label", MAX_UMBRA_TEXT_BYTES),
+        })
+
+    def archive_private_tag(self, tag_id: str) -> None:
+        self._umbra_acknowledge("umbra.tag.archive", {
+            "tagId": _expect_umbra_id(tag_id, "Umbra tag ID"),
+        })
+
+    def reorder_private_tags(self, tag_ids: List[str]) -> None:
+        if not isinstance(tag_ids, list) or not tag_ids or len(tag_ids) > MAX_UMBRA_TAGS:
+            raise RpcProtocolError("Umbra tag order is invalid")
+        normalized = [_expect_umbra_id(tag_id, "Umbra tag ID") for tag_id in tag_ids]
+        if len(set(normalized)) != len(normalized):
+            raise RpcProtocolError("Umbra tag order is duplicated")
+        self._umbra_acknowledge("umbra.tag.reorder", {"tagIds": normalized})
+
+    def create_private_annotation_profile(self, profile: Dict[str, Any]) -> None:
+        self._umbra_acknowledge("umbra.profile.create", {"profile": _serialize_annotation_profile(profile)})
+
+    def edit_private_annotation_profile(self, profile_id: str, profile: Dict[str, Any]) -> None:
+        stable_id = _expect_umbra_id(profile_id, "Umbra profile ID")
+        normalized = _serialize_annotation_profile(profile)
+        if normalized["id"] != stable_id:
+            raise RpcProtocolError("Umbra profile ID cannot change during edit")
+        self._umbra_acknowledge("umbra.profile.edit", {"profileId": stable_id, "profile": normalized})
+
+    def remove_private_annotation_profile(self, profile_id: str) -> None:
+        self._umbra_acknowledge("umbra.profile.remove", {
+            "profileId": _expect_umbra_id(profile_id, "Umbra profile ID"),
+        })
+
+    def set_default_private_annotation_profile(self, profile_id: str) -> None:
+        if profile_id != "":
+            profile_id = _expect_umbra_id(profile_id, "Umbra profile ID")
+        self._umbra_acknowledge("umbra.profile.setDefault", {"profileId": profile_id})
+
+    def _umbra_acknowledge(self, method: str, params: Dict[str, Any]) -> None:
+        try:
+            self._expect_ok(self._call_raw(method, dict(self._protected_params(), **params)))
         except RpcProtocolError as error:
             self._terminate_protocol(error)
 
@@ -1476,6 +1534,77 @@ def _serialize_private_annotation_spec(value: Any) -> Dict[str, Any]:
     if mode == "cover":
         result["outer"]["coverText"] = cover_text
     return result
+
+
+def _expect_umbra_id(value: Any, name: str) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", value):
+        raise RpcProtocolError("%s is invalid" % name)
+    return value
+
+
+def _serialize_private_tag(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {
+        "id", "label", "description", "aliases", "sortOrder", "defaultSelected"
+    }:
+        raise RpcProtocolError("Umbra tag is invalid")
+    aliases = value.get("aliases")
+    sort_order = value.get("sortOrder")
+    default_selected = value.get("defaultSelected")
+    if (
+        not isinstance(aliases, list)
+        or len(aliases) > MAX_UMBRA_TAGS
+        or isinstance(sort_order, bool)
+        or not isinstance(sort_order, int)
+        or sort_order < -(2**53 - 1)
+        or sort_order > 2**53 - 1
+        or not isinstance(default_selected, bool)
+    ):
+        raise RpcProtocolError("Umbra tag is invalid")
+    description = value.get("description")
+    if not isinstance(description, str) or len(description.encode("utf-8")) > MAX_UMBRA_TEXT_BYTES:
+        raise RpcProtocolError("Umbra tag description is invalid")
+    return {
+        "id": _expect_umbra_id(value.get("id"), "Umbra tag ID"),
+        "label": _expect_bounded_string(value.get("label"), "Umbra tag label", MAX_UMBRA_TEXT_BYTES),
+        "description": description,
+        "aliases": [
+            _expect_bounded_string(alias, "Umbra tag alias", MAX_UMBRA_TEXT_BYTES)
+            for alias in aliases
+        ],
+        "sortOrder": sort_order,
+        "defaultSelected": default_selected,
+    }
+
+
+def _serialize_annotation_profile(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {
+        "id", "label", "kind", "tagIds", "outer", "promptForCover"
+    }:
+        raise RpcProtocolError("Umbra annotation profile is invalid")
+    kind = value.get("kind")
+    outer = value.get("outer")
+    tag_ids = value.get("tagIds")
+    prompt = value.get("promptForCover")
+    if (
+        kind not in ("block", "comment")
+        or outer not in ("drop", "cover", "placeholder")
+        or not isinstance(tag_ids, list)
+        or len(tag_ids) > MAX_UMBRA_TAGS
+        or not isinstance(prompt, bool)
+        or (outer == "cover") != prompt
+    ):
+        raise RpcProtocolError("Umbra annotation profile is invalid")
+    normalized = [_expect_umbra_id(tag_id, "Umbra profile tag ID") for tag_id in tag_ids]
+    if normalized != sorted(set(normalized)):
+        raise RpcProtocolError("Umbra profile tags are not canonical")
+    return {
+        "id": _expect_umbra_id(value.get("id"), "Umbra profile ID"),
+        "label": _expect_bounded_string(value.get("label"), "Umbra profile label", MAX_UMBRA_TEXT_BYTES),
+        "kind": kind,
+        "tagIds": normalized,
+        "outer": outer,
+        "promptForCover": prompt,
+    }
 
 
 def _validate_metadata(value: Any, logical_path: str, allowed_flags: tuple) -> None:

@@ -533,6 +533,38 @@ class RequestAndResponseTests(unittest.TestCase):
             inconsistent.umbra_status()
         self.assertIsInstance(inconsistent._terminal_error, RpcProtocolError)
 
+    def test_umbra_tag_and_profile_mutations_are_canonical_and_authenticated(self):
+        client = InexRpcClient("/unused")
+        client._session = "A" * SESSION_TOKEN_TEXT_BYTES
+        calls = []
+        client._call_raw = lambda method, params: calls.append((method, params)) or {"ok": True}
+        tag = {
+            "id": "relationship", "label": "Relationship", "description": "",
+            "aliases": ["personal"], "sortOrder": 10, "defaultSelected": False,
+        }
+        profile = {
+            "id": "relationship-comment", "label": "Relationship comment",
+            "kind": "comment", "tagIds": ["relationship"], "outer": "drop",
+            "promptForCover": False,
+        }
+        client.create_private_tag(tag)
+        client.rename_private_tag("relationship", "Relations")
+        client.archive_private_tag("relationship")
+        client.reorder_private_tags(["relationship"])
+        client.create_private_annotation_profile(profile)
+        client.edit_private_annotation_profile("relationship-comment", profile)
+        client.set_default_private_annotation_profile("relationship-comment")
+        client.remove_private_annotation_profile("relationship-comment")
+        self.assertEqual([method for method, _params in calls], [
+            "umbra.tag.create", "umbra.tag.rename", "umbra.tag.archive", "umbra.tag.reorder",
+            "umbra.profile.create", "umbra.profile.edit", "umbra.profile.setDefault", "umbra.profile.remove",
+        ])
+        self.assertEqual(calls[0][1]["tag"], tag)
+        self.assertEqual(calls[4][1]["profile"], profile)
+        self.assertEqual(calls[5][1]["profileId"], "relationship-comment")
+        with self.assertRaises(RpcProtocolError):
+            client.create_private_annotation_profile(dict(profile, tagIds=["relationship", "family"]))
+
     def test_umbra_document_conversion_is_etag_bound_and_feature_two_only(self):
         client = InexRpcClient("/unused")
         client._session = "A" * SESSION_TOKEN_TEXT_BYTES
