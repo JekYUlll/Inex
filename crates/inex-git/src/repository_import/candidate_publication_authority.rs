@@ -21,7 +21,9 @@ use std::path::PathBuf;
 use inex_core::atomic::{ExistingPublicationMarkerV2OpenError, FilesystemDirectoryIdentity};
 #[cfg(target_os = "linux")]
 use inex_core::atomic::{
-    HeldPublicationMarkerV2, HeldPublicationMarkerV2Error, IMPORT_STAGING_PREFIX,
+    HeldPublicationMarkerV2, HeldPublicationMarkerV2Error, HeldPublicationMarkerV2UnlinkOutcome,
+    IMPORT_STAGING_PREFIX, PostUnlinkMarkerParentSyncOutcome, SyncedPostUnlinkPublicationMarkerV2,
+    TerminalPublicationMarkerV2Authority, UnsyncedPostUnlinkPublicationMarkerV2,
     open_existing_publication_marker_v2,
 };
 #[cfg(target_os = "linux")]
@@ -320,16 +322,16 @@ impl fmt::Display for PublicationMarkerFailureKind {
 #[cfg(target_os = "linux")]
 impl std::error::Error for PublicationMarkerFailureKind {}
 
-/// A post-synchronization review failure that prevents every forward state.
+/// A complete published-state review failure that prevents a forward state.
 #[cfg(target_os = "linux")]
-pub(super) enum PublicationDurabilityReviewFailure {
+pub(super) enum PublishedCandidateReviewFailure {
     PublishedRole(PublicationMarkerFailureKind),
     FreshAudit(RepositoryImportError),
     SummaryMismatch(CandidateSummaryMismatch),
 }
 
 #[cfg(target_os = "linux")]
-impl fmt::Debug for PublicationDurabilityReviewFailure {
+impl fmt::Debug for PublishedCandidateReviewFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::PublishedRole(kind) => {
@@ -345,23 +347,25 @@ impl fmt::Debug for PublicationDurabilityReviewFailure {
 }
 
 #[cfg(target_os = "linux")]
-impl fmt::Display for PublicationDurabilityReviewFailure {
+impl fmt::Display for PublishedCandidateReviewFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
-            Self::PublishedRole(_) => "published role changed after synchronization",
-            Self::FreshAudit(_) => "published candidate audit failed after synchronization",
-            Self::SummaryMismatch(_) => "published candidate summary changed after synchronization",
+            Self::PublishedRole(_) => "published role changed during complete review",
+            Self::FreshAudit(_) => "published candidate audit failed during complete review",
+            Self::SummaryMismatch(_) => {
+                "published candidate summary changed during complete review"
+            }
         })
     }
 }
 
 #[cfg(target_os = "linux")]
-impl std::error::Error for PublicationDurabilityReviewFailure {}
+impl std::error::Error for PublishedCandidateReviewFailure {}
 
 /// Published state whose held root and common-parent barriers both completed.
 ///
-/// This is the only owner eligible for the future marker-unlink transition.
-/// It exposes no owned marker, extraction API, cleanup, or unlink operation.
+/// This is the only owner eligible for the exact marker-unlink transition. It
+/// exposes no owned marker, extraction API, or cleanup operation.
 #[cfg(target_os = "linux")]
 #[must_use]
 pub(super) struct PublicationDurableWithMarker {
@@ -379,6 +383,13 @@ impl PublicationDurableWithMarker {
     pub(super) const fn audit(&self) -> &FreshMarkerCandidateAudit {
         &self.audit
     }
+
+    /// Consume durable marker authority into one exact unlink attempt.
+    pub(super) fn unlink_marker(self) -> PublicationMarkerUnlinkOutcome {
+        unlink_publication_marker_impl(self, |held_marker, root| {
+            held_marker.unlink_exact_published_marker_at(root)
+        })
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -391,6 +402,366 @@ impl fmt::Debug for PublicationDurableWithMarker {
             .field("held_marker", &"[HELD]")
             .finish()
     }
+}
+
+/// Fixed terminal category from the durable-only marker unlink transition.
+#[cfg(target_os = "linux")]
+pub(super) enum PublicationMarkerUnlinkFailure {
+    PreUnlinkReview(PublishedCandidateReviewFailure),
+    NotRemovedReview(PublishedCandidateReviewFailure),
+    ReplacementRetained,
+    PostStateIndeterminate,
+    ParentSyncReplacementRetained,
+    ParentSyncPostStateIndeterminate,
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for PublicationMarkerUnlinkFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PreUnlinkReview(failure) => formatter
+                .debug_tuple("PreUnlinkReview")
+                .field(failure)
+                .finish(),
+            Self::NotRemovedReview(failure) => formatter
+                .debug_tuple("NotRemovedReview")
+                .field(failure)
+                .finish(),
+            Self::ReplacementRetained => formatter.write_str("ReplacementRetained"),
+            Self::PostStateIndeterminate => formatter.write_str("PostStateIndeterminate"),
+            Self::ParentSyncReplacementRetained => {
+                formatter.write_str("ParentSyncReplacementRetained")
+            }
+            Self::ParentSyncPostStateIndeterminate => {
+                formatter.write_str("ParentSyncPostStateIndeterminate")
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Display for PublicationMarkerUnlinkFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::PreUnlinkReview(_) => "published candidate failed its pre-unlink review",
+            Self::NotRemovedReview(_) => {
+                "published candidate failed review after marker was not removed"
+            }
+            Self::ReplacementRetained => "publication marker replacement was retained",
+            Self::PostStateIndeterminate => "publication marker post-state is indeterminate",
+            Self::ParentSyncReplacementRetained => {
+                "publication marker replacement appeared during parent-sync retry"
+            }
+            Self::ParentSyncPostStateIndeterminate => {
+                "publication marker state became indeterminate during parent-sync retry"
+            }
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::error::Error for PublicationMarkerUnlinkFailure {}
+
+/// Internal terminal authority retained until the scrubbed result is emitted.
+#[cfg(target_os = "linux")]
+enum TerminalPublicationAuthority {
+    Held(HeldPublicationMarkerV2),
+    Core(TerminalPublicationMarkerV2Authority),
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for TerminalPublicationAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Held(_) => "TerminalPublicationAuthority::Held(..)",
+            Self::Core(_) => "TerminalPublicationAuthority::Core(..)",
+        })
+    }
+}
+
+/// Terminal marker-unlink owner with no cleanup or forward transition.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub(super) struct FailedPublicationMarkerUnlink {
+    failure: PublicationMarkerUnlinkFailure,
+    root: PathBuf,
+    audit: FreshMarkerCandidateAudit,
+    authority: TerminalPublicationAuthority,
+}
+
+#[cfg(target_os = "linux")]
+impl FailedPublicationMarkerUnlink {
+    pub(super) const fn failure(&self) -> &PublicationMarkerUnlinkFailure {
+        &self.failure
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for FailedPublicationMarkerUnlink {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FailedPublicationMarkerUnlink")
+            .field("failure", &self.failure)
+            .field("root", &"[REDACTED]")
+            .field("audit", &self.audit)
+            .field("authority", &self.authority)
+            .finish()
+    }
+}
+
+/// Exact marker absence with marker-parent synchronization confirmed.
+///
+/// This state is only pending the later marker-free clean audit. It is not a
+/// success claim and exposes only borrowed root and prior-audit summaries.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub(super) struct CleanAuditPending {
+    root: PathBuf,
+    audit: FreshMarkerCandidateAudit,
+    authority: SyncedPostUnlinkPublicationMarkerV2,
+}
+
+#[cfg(target_os = "linux")]
+impl CleanAuditPending {
+    pub(super) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub(super) const fn audit(&self) -> &FreshMarkerCandidateAudit {
+        &self.audit
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for CleanAuditPending {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CleanAuditPending")
+            .field("root", &"[REDACTED]")
+            .field("audit", &self.audit)
+            .field("authority", &"[HELD]")
+            .finish()
+    }
+}
+
+/// Exact marker absence whose held parent synchronization is unconfirmed.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub(super) struct ParentSyncPending {
+    root: PathBuf,
+    audit: FreshMarkerCandidateAudit,
+    authority: UnsyncedPostUnlinkPublicationMarkerV2,
+}
+
+#[cfg(target_os = "linux")]
+impl ParentSyncPending {
+    /// Consume this owner into one held marker-parent sync retry.
+    pub(super) fn retry_parent_sync(self) -> PublicationParentSyncOutcome {
+        let Self {
+            root,
+            audit,
+            authority,
+        } = self;
+        let outcome = authority.retry_marker_parent_sync_at(&root);
+        map_parent_sync_outcome(root, audit, outcome)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for ParentSyncPending {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ParentSyncPending")
+            .field("root", &"[REDACTED]")
+            .field("audit", &self.audit)
+            .field("authority", &"[HELD]")
+            .finish()
+    }
+}
+
+/// High-level mapping of all five exact core unlink outcomes.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub(super) enum PublicationMarkerUnlinkOutcome {
+    NotRemoved(PublicationDurableWithMarker),
+    CleanAuditPending(CleanAuditPending),
+    ParentSyncPending(ParentSyncPending),
+    Terminal(Box<FailedPublicationMarkerUnlink>),
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for PublicationMarkerUnlinkOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotRemoved(owner) => formatter.debug_tuple("NotRemoved").field(owner).finish(),
+            Self::CleanAuditPending(owner) => formatter
+                .debug_tuple("CleanAuditPending")
+                .field(owner)
+                .finish(),
+            Self::ParentSyncPending(owner) => formatter
+                .debug_tuple("ParentSyncPending")
+                .field(owner)
+                .finish(),
+            Self::Terminal(owner) => formatter.debug_tuple("Terminal").field(owner).finish(),
+        }
+    }
+}
+
+/// Mapping of all four core marker-parent retry outcomes.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub(super) enum PublicationParentSyncOutcome {
+    CleanAuditPending(CleanAuditPending),
+    ParentSyncPending(ParentSyncPending),
+    Terminal(Box<FailedPublicationMarkerUnlink>),
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for PublicationParentSyncOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CleanAuditPending(owner) => formatter
+                .debug_tuple("CleanAuditPending")
+                .field(owner)
+                .finish(),
+            Self::ParentSyncPending(owner) => formatter
+                .debug_tuple("ParentSyncPending")
+                .field(owner)
+                .finish(),
+            Self::Terminal(owner) => formatter.debug_tuple("Terminal").field(owner).finish(),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn unlink_publication_marker_impl<UnlinkDriver>(
+    durable: PublicationDurableWithMarker,
+    unlink_driver: UnlinkDriver,
+) -> PublicationMarkerUnlinkOutcome
+where
+    UnlinkDriver: FnOnce(HeldPublicationMarkerV2, &Path) -> HeldPublicationMarkerV2UnlinkOutcome,
+{
+    let PublicationDurableWithMarker {
+        root,
+        audit,
+        held_marker,
+    } = durable;
+    let reviewed_audit = match review_published_candidate(&root, &held_marker, &audit) {
+        Ok(reviewed_audit) => reviewed_audit,
+        Err(failure) => {
+            return terminal_marker_unlink(
+                root,
+                audit,
+                PublicationMarkerUnlinkFailure::PreUnlinkReview(failure),
+                TerminalPublicationAuthority::Held(held_marker),
+            );
+        }
+    };
+
+    match unlink_driver(held_marker, &root) {
+        HeldPublicationMarkerV2UnlinkOutcome::NotRemoved(held_marker) => {
+            match review_published_candidate(&root, &held_marker, &reviewed_audit) {
+                Ok(post_audit) => {
+                    PublicationMarkerUnlinkOutcome::NotRemoved(PublicationDurableWithMarker {
+                        root,
+                        audit: post_audit,
+                        held_marker,
+                    })
+                }
+                Err(failure) => terminal_marker_unlink(
+                    root,
+                    reviewed_audit,
+                    PublicationMarkerUnlinkFailure::NotRemovedReview(failure),
+                    TerminalPublicationAuthority::Held(held_marker),
+                ),
+            }
+        }
+        HeldPublicationMarkerV2UnlinkOutcome::RemovedAndParentSynced(authority) => {
+            PublicationMarkerUnlinkOutcome::CleanAuditPending(CleanAuditPending {
+                root,
+                audit: reviewed_audit,
+                authority,
+            })
+        }
+        HeldPublicationMarkerV2UnlinkOutcome::RemovedButParentSyncIndeterminate(authority) => {
+            PublicationMarkerUnlinkOutcome::ParentSyncPending(ParentSyncPending {
+                root,
+                audit: reviewed_audit,
+                authority,
+            })
+        }
+        HeldPublicationMarkerV2UnlinkOutcome::ReplacementRetained(authority) => {
+            terminal_marker_unlink(
+                root,
+                reviewed_audit,
+                PublicationMarkerUnlinkFailure::ReplacementRetained,
+                TerminalPublicationAuthority::Core(authority),
+            )
+        }
+        HeldPublicationMarkerV2UnlinkOutcome::PostStateIndeterminate(authority) => {
+            terminal_marker_unlink(
+                root,
+                reviewed_audit,
+                PublicationMarkerUnlinkFailure::PostStateIndeterminate,
+                TerminalPublicationAuthority::Core(authority),
+            )
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn map_parent_sync_outcome(
+    root: PathBuf,
+    audit: FreshMarkerCandidateAudit,
+    outcome: PostUnlinkMarkerParentSyncOutcome,
+) -> PublicationParentSyncOutcome {
+    match outcome {
+        PostUnlinkMarkerParentSyncOutcome::Synced(authority) => {
+            PublicationParentSyncOutcome::CleanAuditPending(CleanAuditPending {
+                root,
+                audit,
+                authority,
+            })
+        }
+        PostUnlinkMarkerParentSyncOutcome::StillIndeterminate(authority) => {
+            PublicationParentSyncOutcome::ParentSyncPending(ParentSyncPending {
+                root,
+                audit,
+                authority,
+            })
+        }
+        PostUnlinkMarkerParentSyncOutcome::ReplacementRetained(authority) => {
+            PublicationParentSyncOutcome::Terminal(Box::new(FailedPublicationMarkerUnlink {
+                failure: PublicationMarkerUnlinkFailure::ParentSyncReplacementRetained,
+                root,
+                audit,
+                authority: TerminalPublicationAuthority::Core(authority),
+            }))
+        }
+        PostUnlinkMarkerParentSyncOutcome::PostStateIndeterminate(authority) => {
+            PublicationParentSyncOutcome::Terminal(Box::new(FailedPublicationMarkerUnlink {
+                failure: PublicationMarkerUnlinkFailure::ParentSyncPostStateIndeterminate,
+                root,
+                audit,
+                authority: TerminalPublicationAuthority::Core(authority),
+            }))
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn terminal_marker_unlink(
+    root: PathBuf,
+    audit: FreshMarkerCandidateAudit,
+    failure: PublicationMarkerUnlinkFailure,
+    authority: TerminalPublicationAuthority,
+) -> PublicationMarkerUnlinkOutcome {
+    PublicationMarkerUnlinkOutcome::Terminal(Box::new(FailedPublicationMarkerUnlink {
+        failure,
+        root,
+        audit,
+        authority,
+    }))
 }
 
 /// The only owner allowed to retry an unconfirmed durability attempt.
@@ -437,7 +808,7 @@ impl fmt::Debug for RetryablePublicationDurability {
 #[must_use]
 pub(super) struct FailedPublicationDurability {
     sync_failure: Option<PublicationMarkerFailureKind>,
-    review_failure: PublicationDurabilityReviewFailure,
+    review_failure: PublishedCandidateReviewFailure,
     root: PathBuf,
     audit: FreshMarkerCandidateAudit,
     held_marker: HeldPublicationMarkerV2,
@@ -449,7 +820,7 @@ impl FailedPublicationDurability {
         self.sync_failure
     }
 
-    pub(super) const fn review_failure(&self) -> &PublicationDurabilityReviewFailure {
+    pub(super) const fn review_failure(&self) -> &PublishedCandidateReviewFailure {
         &self.review_failure
     }
 }
@@ -505,7 +876,7 @@ where
         .err()
         .map(PublicationMarkerFailureKind::from);
 
-    match review_published_candidate_after_sync(&root, &held_marker, &audit) {
+    match review_published_candidate(&root, &held_marker, &audit) {
         Err(review_failure) => {
             PublicationDurabilityOutcome::Terminal(Box::new(FailedPublicationDurability {
                 sync_failure,
@@ -534,23 +905,23 @@ where
 }
 
 #[cfg(target_os = "linux")]
-fn review_published_candidate_after_sync(
+fn review_published_candidate(
     root: &Path,
     held_marker: &HeldPublicationMarkerV2,
     expected: &FreshMarkerCandidateAudit,
-) -> Result<FreshMarkerCandidateAudit, PublicationDurabilityReviewFailure> {
+) -> Result<FreshMarkerCandidateAudit, PublishedCandidateReviewFailure> {
     held_marker
         .require_published_at(root)
         .map_err(PublicationMarkerFailureKind::from)
-        .map_err(PublicationDurabilityReviewFailure::PublishedRole)?;
+        .map_err(PublishedCandidateReviewFailure::PublishedRole)?;
     let audit = audit_fresh_marker_candidate(root, held_marker)
-        .map_err(PublicationDurabilityReviewFailure::FreshAudit)?;
+        .map_err(PublishedCandidateReviewFailure::FreshAudit)?;
     compare_candidate_summaries(&audit, expected)
-        .map_err(PublicationDurabilityReviewFailure::SummaryMismatch)?;
+        .map_err(PublishedCandidateReviewFailure::SummaryMismatch)?;
     held_marker
         .require_published_at(root)
         .map_err(PublicationMarkerFailureKind::from)
-        .map_err(PublicationDurabilityReviewFailure::PublishedRole)?;
+        .map_err(PublishedCandidateReviewFailure::PublishedRole)?;
     Ok(audit)
 }
 
@@ -676,6 +1047,7 @@ fn failed_post_open_claim(
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
+    use std::cell::Cell;
     use std::fs;
     use std::path::PathBuf;
 
@@ -912,6 +1284,13 @@ mod tests {
     fn fresh_published(fixture: &PublishedFixture) -> PublishedWithMarker {
         claim_fresh_existing_candidate(fixture.input())
             .expect("fresh existing claim constructs published owner")
+    }
+
+    fn fresh_durable(fixture: &PublishedFixture) -> PublicationDurableWithMarker {
+        match fresh_published(fixture).synchronize() {
+            PublicationDurabilityOutcome::Durable(owner) => owner,
+            other => panic!("expected fixture durable owner, got {other:?}"),
+        }
     }
 
     fn assert_expected_audit(audit: &FreshMarkerCandidateAudit, expected: &ExpectedAudit) {
@@ -1164,7 +1543,7 @@ mod tests {
                 };
             assert!(matches!(
                 terminal.review_failure(),
-                PublicationDurabilityReviewFailure::PublishedRole(
+                PublishedCandidateReviewFailure::PublishedRole(
                     PublicationMarkerFailureKind::NamespaceConflict
                         | PublicationMarkerFailureKind::AuthorityChanged
                         | PublicationMarkerFailureKind::Io(_)
@@ -1206,7 +1585,7 @@ mod tests {
                 };
             assert!(matches!(
                 terminal.review_failure(),
-                PublicationDurabilityReviewFailure::FreshAudit(_)
+                PublishedCandidateReviewFailure::FreshAudit(_)
             ));
             assert_eq!(terminal.sync_failure().is_some(), sync_fails);
             assert!(!format!("{terminal:?}").contains("secret content sync source"));
@@ -1234,17 +1613,14 @@ mod tests {
         let transition = source
             .split("fn synchronize_published_candidate_impl")
             .nth(1)
-            .and_then(|tail| {
-                tail.split("fn review_published_candidate_after_sync")
-                    .next()
-            })
+            .and_then(|tail| tail.split("fn review_published_candidate").next())
             .expect("durability transition exists");
         let sync = transition.find("sync_driver").expect("sync driver runs");
         let normalize = transition
             .find(".map(PublicationMarkerFailureKind::from)")
             .expect("sync error normalizes");
         let review = transition
-            .find("review_published_candidate_after_sync")
+            .find("review_published_candidate")
             .expect("unified review runs");
         assert!(sync < normalize && normalize < review);
         for forbidden in ["remove_file", "unlink", "into_parts", "drop(held_marker)"] {
@@ -1255,7 +1631,7 @@ mod tests {
         }
 
         let review = source
-            .split("fn review_published_candidate_after_sync")
+            .split("fn review_published_candidate")
             .nth(1)
             .and_then(|tail| tail.split("/// Open and fully audit").next())
             .expect("unified review exists");
@@ -1302,7 +1678,12 @@ mod tests {
             .expect("durable implementation exists");
         assert!(!durable_impl.contains("held_marker("));
         assert!(!durable_impl.contains("into_parts"));
-        assert!(!durable_impl.contains("unlink"));
+        assert_eq!(
+            durable_impl
+                .matches("unlink_exact_published_marker_at")
+                .count(),
+            1
+        );
         let terminal_impl = source
             .split("impl FailedPublicationDurability")
             .nth(1)
@@ -1314,6 +1695,226 @@ mod tests {
         assert!(!terminal_impl.contains("retry"));
         assert!(!terminal_impl.contains("cleanup"));
         assert!(!terminal_impl.contains("unlink"));
+    }
+
+    #[test]
+    fn marker_unlink_real_durable_reaches_only_clean_audit_pending() {
+        let fixture = fixture("unlink-real-clean-pending");
+        let pending = match fresh_durable(&fixture).unlink_marker() {
+            PublicationMarkerUnlinkOutcome::CleanAuditPending(owner) => owner,
+            other => panic!("expected clean-audit-pending owner, got {other:?}"),
+        };
+        assert_eq!(pending.root(), fixture.destination_root);
+        assert_expected_audit(pending.audit(), &fixture.expected);
+        assert!(!fixture.marker_path().exists());
+        fixture.assert_lock_busy();
+        let debug = format!("{pending:?}");
+        assert!(!debug.contains(fixture.destination_root.to_string_lossy().as_ref()));
+        assert!(!debug.to_ascii_lowercase().contains("success"));
+        drop(pending);
+        fixture.assert_lock_available();
+    }
+
+    #[test]
+    fn marker_unlink_pre_review_drift_never_calls_driver() {
+        let fixture = fixture("unlink-pre-review-drift");
+        let durable = fresh_durable(&fixture);
+        fs::write(
+            fixture.destination_root.join(".gitattributes"),
+            b"pre-unlink drift\n",
+        )
+        .expect("published content drifts before unlink");
+        let driver_called = Cell::new(false);
+        let terminal = match unlink_publication_marker_impl(durable, |held_marker, _| {
+            driver_called.set(true);
+            HeldPublicationMarkerV2UnlinkOutcome::NotRemoved(held_marker)
+        }) {
+            PublicationMarkerUnlinkOutcome::Terminal(owner) => owner,
+            other => panic!("expected pre-review terminal owner, got {other:?}"),
+        };
+        assert!(!driver_called.get());
+        assert!(matches!(
+            terminal.failure(),
+            PublicationMarkerUnlinkFailure::PreUnlinkReview(
+                PublishedCandidateReviewFailure::FreshAudit(_)
+            )
+        ));
+        fixture.assert_marker_unchanged();
+        fixture.assert_lock_busy();
+        drop(terminal);
+        fixture.assert_lock_available();
+    }
+
+    #[test]
+    fn marker_unlink_not_removed_returns_durable_then_real_unlink() {
+        let fixture = fixture("unlink-not-removed-retry");
+        let durable =
+            match unlink_publication_marker_impl(fresh_durable(&fixture), |held_marker, _| {
+                HeldPublicationMarkerV2UnlinkOutcome::NotRemoved(held_marker)
+            }) {
+                PublicationMarkerUnlinkOutcome::NotRemoved(owner) => owner,
+                other => panic!("expected durable not-removed owner, got {other:?}"),
+            };
+        fixture.assert_marker_unchanged();
+        fixture.assert_lock_busy();
+
+        let pending = match durable.unlink_marker() {
+            PublicationMarkerUnlinkOutcome::CleanAuditPending(owner) => owner,
+            other => panic!("expected real retry to reach clean audit pending, got {other:?}"),
+        };
+        assert!(!fixture.marker_path().exists());
+        fixture.assert_lock_busy();
+        drop(pending);
+        fixture.assert_lock_available();
+    }
+
+    #[test]
+    fn marker_unlink_not_removed_post_review_drift_is_terminal() {
+        let fixture = fixture("unlink-not-removed-drift");
+        let terminal =
+            match unlink_publication_marker_impl(fresh_durable(&fixture), |held_marker, root| {
+                fs::write(root.join(".gitattributes"), b"not-removed drift\n")
+                    .expect("published content drifts after synthetic not-removed");
+                HeldPublicationMarkerV2UnlinkOutcome::NotRemoved(held_marker)
+            }) {
+                PublicationMarkerUnlinkOutcome::Terminal(owner) => owner,
+                other => panic!("expected not-removed review terminal owner, got {other:?}"),
+            };
+        assert!(matches!(
+            terminal.failure(),
+            PublicationMarkerUnlinkFailure::NotRemovedReview(
+                PublishedCandidateReviewFailure::FreshAudit(_)
+            )
+        ));
+        fixture.assert_marker_unchanged();
+        fixture.assert_lock_busy();
+        drop(terminal);
+        fixture.assert_lock_available();
+    }
+
+    #[test]
+    fn marker_unlink_and_parent_sync_api_surfaces_are_frozen() {
+        let source = include_str!("candidate_publication_authority.rs");
+        let durable_impl = source
+            .split("impl PublicationDurableWithMarker")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("impl fmt::Debug for PublicationDurableWithMarker")
+                    .next()
+            })
+            .expect("durable implementation exists");
+        assert_eq!(
+            durable_impl
+                .matches("unlink_exact_published_marker_at")
+                .count(),
+            1
+        );
+
+        let transition = source
+            .split("fn unlink_publication_marker_impl")
+            .nth(1)
+            .and_then(|tail| tail.split("fn map_parent_sync_outcome").next())
+            .expect("unlink transition exists");
+        let pre_review = transition
+            .find("review_published_candidate")
+            .expect("pre-unlink review exists");
+        let driver = transition
+            .find("unlink_driver(held_marker")
+            .expect("unlink driver exists");
+        assert!(pre_review < driver);
+        for variant in [
+            "HeldPublicationMarkerV2UnlinkOutcome::NotRemoved",
+            "HeldPublicationMarkerV2UnlinkOutcome::RemovedAndParentSynced",
+            "HeldPublicationMarkerV2UnlinkOutcome::RemovedButParentSyncIndeterminate",
+            "HeldPublicationMarkerV2UnlinkOutcome::ReplacementRetained",
+            "HeldPublicationMarkerV2UnlinkOutcome::PostStateIndeterminate",
+        ] {
+            assert!(
+                transition.contains(variant),
+                "missing unlink mapping: {variant}"
+            );
+        }
+        assert!(!transition.contains("unlink_exact_published_marker_at"));
+        assert!(!transition.contains("clean_audit"));
+
+        let parent_mapping = source
+            .split("fn map_parent_sync_outcome")
+            .nth(1)
+            .and_then(|tail| tail.split("fn terminal_marker_unlink").next())
+            .expect("parent-sync mapping exists");
+        for variant in [
+            "PostUnlinkMarkerParentSyncOutcome::Synced",
+            "PostUnlinkMarkerParentSyncOutcome::StillIndeterminate",
+            "PostUnlinkMarkerParentSyncOutcome::ReplacementRetained",
+            "PostUnlinkMarkerParentSyncOutcome::PostStateIndeterminate",
+        ] {
+            assert!(
+                parent_mapping.contains(variant),
+                "missing parent-sync mapping: {variant}"
+            );
+        }
+    }
+
+    #[test]
+    fn marker_unlink_pending_owner_surfaces_are_frozen() {
+        let source = include_str!("candidate_publication_authority.rs");
+        for owner_name in [
+            "CleanAuditPending",
+            "ParentSyncPending",
+            "FailedPublicationMarkerUnlink",
+        ] {
+            let owner = source
+                .split(&format!("pub(super) struct {owner_name}"))
+                .nth(1)
+                .and_then(|tail| tail.split(&format!("impl {owner_name}")).next())
+                .expect("post-unlink owner source exists");
+            assert!(!owner.contains("derive(Clone"));
+            assert!(!owner.contains("derive(Copy"));
+            assert!(
+                owner.find("audit:").expect("audit field")
+                    < owner
+                        .find("authority:")
+                        .expect("authority is the final field")
+            );
+            assert!(!source.contains(&format!("impl Drop for {owner_name}")));
+        }
+        let clean_impl = source
+            .split("impl CleanAuditPending")
+            .nth(1)
+            .and_then(|tail| tail.split("impl fmt::Debug for CleanAuditPending").next())
+            .expect("clean pending implementation exists");
+        for forbidden in ["success", "clean_claim", "unlink", "retry", "authority("] {
+            assert!(
+                !clean_impl.contains(forbidden),
+                "clean pending escalation: {forbidden}"
+            );
+        }
+        let parent_impl = source
+            .split("impl ParentSyncPending")
+            .nth(1)
+            .and_then(|tail| tail.split("impl fmt::Debug for ParentSyncPending").next())
+            .expect("parent pending implementation exists");
+        assert!(parent_impl.contains("pub(super) fn retry_parent_sync(self)"));
+        for forbidden in ["unlink_marker", "clean", "authority(", "into_parts"] {
+            assert!(
+                !parent_impl.contains(forbidden),
+                "parent pending escalation: {forbidden}"
+            );
+        }
+        let terminal_impl = source
+            .split("impl FailedPublicationMarkerUnlink")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("impl fmt::Debug for FailedPublicationMarkerUnlink")
+                    .next()
+            })
+            .expect("unlink terminal implementation exists");
+        for forbidden in ["retry", "cleanup", "unlink", "authority(", "into_parts"] {
+            assert!(
+                !terminal_impl.contains(forbidden),
+                "terminal escalation: {forbidden}"
+            );
+        }
     }
 
     #[test]
