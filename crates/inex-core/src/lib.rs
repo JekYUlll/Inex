@@ -23,6 +23,7 @@ pub mod search;
 #[allow(unsafe_code)]
 pub mod sodium;
 pub mod tree;
+pub mod umbra_config;
 pub mod umbra_keyslot;
 pub mod vault;
 pub mod vault_config;

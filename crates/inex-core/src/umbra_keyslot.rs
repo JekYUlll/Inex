@@ -66,6 +66,19 @@ impl UmbraKey {
     pub const fn memory_health(&self) -> SecureMemoryHealth {
         self.bytes.health()
     }
+
+    /// Derive one domain-separated subkey without exposing `K_umbra`.
+    pub(crate) fn derive_subkey(
+        &self,
+        context: &[u8],
+    ) -> Result<LockedBytes<{ sodium::KEY_BYTES }>, UmbraKeyslotError> {
+        let mut derived = self
+            .bytes
+            .with_read(|key| sodium::blake2b_256_keyed(key, context))??;
+        let protected = LockedBytes::from_slice(&derived)?;
+        derived.zeroize();
+        Ok(protected)
+    }
 }
 
 impl fmt::Debug for UmbraKey {
