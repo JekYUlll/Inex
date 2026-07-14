@@ -22,8 +22,10 @@ use inex_core::search::{
 };
 use inex_core::sodium::{Argon2idParams, MAX_PASSWORD_BYTES};
 use inex_core::tree::{TreeEntryKind, TreeError};
+use inex_core::umbra_keyslot::UmbraKeyslotError;
+use inex_core::umbra_render::OwnedRenderMap;
 use inex_core::vault::{
-    DocumentMetadata, MAX_EDRY_ENVELOPE_BYTES, RenameOutcome, Vault, VaultError,
+    DocumentMetadata, MAX_EDRY_ENVELOPE_BYTES, RenameOutcome, UmbraStatus, Vault, VaultError,
 };
 use inex_core::vault_config::{ConfigError, ConfigWarning, KdfPolicy};
 use serde_json::{Value, json};
@@ -140,6 +142,12 @@ impl<C: MonotonicClock> RpcService<C> {
             Method::VaultUnlock => self.vault_unlock(params),
             Method::VaultLock => self.vault_lock(params),
             Method::VaultStatus => self.vault_status(params),
+            Method::UmbraStatus => self.umbra_status(params),
+            Method::UmbraInitialize => self.umbra_initialize(params),
+            Method::UmbraUnlock => self.umbra_unlock(params),
+            Method::UmbraLock => self.umbra_lock(params),
+            Method::UmbraEnable => self.umbra_enable(params),
+            Method::UmbraDocumentOpen => self.umbra_document_open(params),
             Method::VaultListTree => self.vault_list_tree(params),
             Method::FileStat => self.file_stat(params),
             Method::FileRead => self.file_read(params),
@@ -179,7 +187,7 @@ impl<C: MonotonicClock> RpcService<C> {
             "server": "inexd",
             "serverVersion": env!("CARGO_PKG_VERSION"),
             "protocolMajor": PROTOCOL_MAJOR,
-            "capabilities": ["vault", "files", "documents", "encryptedDrafts", "search", "authenticatedPing", "opaqueAssetsV1"],
+            "capabilities": ["vault", "files", "documents", "encryptedDrafts", "search", "authenticatedPing", "opaqueAssetsV1", "umbraV1"],
         }))
     }
 
@@ -348,6 +356,94 @@ impl<C: MonotonicClock> RpcService<C> {
             "openDocuments": open_documents,
             "openAssets": open_assets,
             "idleTimeoutMs": duration_ms(remaining),
+        }))
+    }
+
+    fn umbra_status(&mut self, params: Params) -> RpcResult {
+        let mut params = ParamObject::new(params);
+        let session = required_session(&mut params)?;
+        params.finish()?;
+        let status = self
+            .sessions
+            .vault(session.as_str())
+            .map_err(map_session_error)?
+            .umbra_status()
+            .map_err(|error| map_vault_error(error, ErrorContext::Authentication))?;
+        Ok(umbra_status_value(status))
+    }
+
+    fn umbra_initialize(&mut self, params: Params) -> RpcResult {
+        let mut params = ParamObject::new(params);
+        let session = required_session(&mut params)?;
+        let password = params.required_sensitive_string("password", 1, MAX_PASSWORD_BYTES)?;
+        params.finish()?;
+        let status = self
+            .sessions
+            .vault_mut(session.as_str())
+            .map_err(map_session_error)?
+            .initialize_umbra(password.as_bytes())
+            .map_err(|error| map_vault_error(error, ErrorContext::Authentication))?;
+        drop(password);
+        Ok(umbra_status_value(status))
+    }
+
+    fn umbra_unlock(&mut self, params: Params) -> RpcResult {
+        let mut params = ParamObject::new(params);
+        let session = required_session(&mut params)?;
+        let password = params.required_sensitive_string("password", 1, MAX_PASSWORD_BYTES)?;
+        params.finish()?;
+        let status = self
+            .sessions
+            .vault_mut(session.as_str())
+            .map_err(map_session_error)?
+            .unlock_umbra(password.as_bytes())
+            .map_err(|error| map_vault_error(error, ErrorContext::Authentication))?;
+        drop(password);
+        Ok(umbra_status_value(status))
+    }
+
+    fn umbra_lock(&mut self, params: Params) -> RpcResult {
+        let mut params = ParamObject::new(params);
+        let session = required_session(&mut params)?;
+        params.finish()?;
+        self.sessions
+            .vault_mut(session.as_str())
+            .map_err(map_session_error)?
+            .lock_umbra();
+        Ok(json!({"ok": true, "unlocked": false}))
+    }
+
+    fn umbra_enable(&mut self, params: Params) -> RpcResult {
+        let mut params = ParamObject::new(params);
+        let session = required_session(&mut params)?;
+        params.finish()?;
+        let durability = self
+            .sessions
+            .vault_mut(session.as_str())
+            .map_err(map_session_error)?
+            .enable_umbra_private_annotations(self.kdf_policy)
+            .map_err(|error| map_vault_error(error, ErrorContext::Authentication))?;
+        Ok(json!({"ok": true, "durability": durability_name(durability)}))
+    }
+
+    fn umbra_document_open(&mut self, params: Params) -> RpcResult {
+        let (session, logical_path) = parse_session_path(params)?;
+        let projection = self
+            .sessions
+            .vault(session.as_str())
+            .map_err(map_session_error)?
+            .render_umbra_projection(&logical_path)
+            .map_err(|error| map_vault_error(error, ErrorContext::Document))?;
+        let (metadata, _) = self
+            .sessions
+            .vault(session.as_str())
+            .map_err(map_session_error)?
+            .read_umbra_outer_document(&logical_path)
+            .map_err(|error| map_vault_error(error, ErrorContext::Document))?;
+        Ok(json!({
+            "contentBase64": encode_base64url(projection.markdown.as_bytes()).as_str(),
+            "etag": metadata.etag,
+            "renderMap": render_map_value(&projection.render_map),
         }))
     }
 
@@ -844,6 +940,28 @@ fn acknowledgement() -> Value {
     json!({"ok": true})
 }
 
+fn umbra_status_value(status: UmbraStatus) -> Value {
+    json!({"initialized": status.initialized, "unlocked": status.unlocked})
+}
+
+fn render_map_value(render_map: &OwnedRenderMap) -> Value {
+    json!({
+        "generationBase64": encode_base64url(&render_map.generation).as_str(),
+        "projectionBytes": render_map.projection_len,
+        "privateSlots": render_map.private_slots.iter().map(|slot| json!({
+            "slotId": slot.slot_id,
+            "startByte": slot.projection_range.start,
+            "endByte": slot.projection_range.end,
+        })).collect::<Vec<_>>(),
+        "outerSegments": render_map.outer_segments.iter().map(|segment| json!({
+            "projectionStartByte": segment.projection_range.start,
+            "projectionEndByte": segment.projection_range.end,
+            "outerStartByte": segment.outer_range.start,
+            "outerEndByte": segment.outer_range.end,
+        })).collect::<Vec<_>>(),
+    })
+}
+
 fn prefix_matches(prefix: Option<&LogicalDir>, logical_path: &str) -> bool {
     let Some(prefix) = prefix else {
         return true;
@@ -988,11 +1106,13 @@ fn map_vault_error(error: VaultError, context: ErrorContext) -> ErrorObject {
         VaultError::UnsupportedFilesystem => ErrorCode::Unsupported,
         VaultError::AlreadyInitialized
         | VaultError::AlreadyExists
-        | VaultError::CaseFoldCollision => ErrorCode::AlreadyExists,
+        | VaultError::CaseFoldCollision
+        | VaultError::UmbraAlreadyInitialized => ErrorCode::AlreadyExists,
         VaultError::NotInitialized
         | VaultError::ParentDirectoryMissing
         | VaultError::DocumentNotFound
-        | VaultError::AssetNotFound => ErrorCode::NotFound,
+        | VaultError::AssetNotFound
+        | VaultError::UmbraNotInitialized => ErrorCode::NotFound,
         VaultError::InvalidEtag => ErrorCode::InvalidParams,
         VaultError::Conflict { .. } => ErrorCode::EtagConflict,
         VaultError::SearchIndexNotReady | VaultError::RenameRecoveryPending { .. } => {
@@ -1001,13 +1121,31 @@ fn map_vault_error(error: VaultError, context: ErrorContext) -> ErrorObject {
         VaultError::RepositoryPublicationReconcileRequired => {
             ErrorCode::PublicationReconcileRequired
         }
-        VaultError::SearchUtf8Invariant | VaultError::AtomicVerificationFailed => {
-            ErrorCode::IntegrityFailed
-        }
-        VaultError::RenameRecoveryConflict => ErrorCode::IntegrityFailed,
+        VaultError::UmbraKeyslot(UmbraKeyslotError::AuthenticationFailed)
+        | VaultError::UmbraLocked => ErrorCode::AuthFailed,
+        VaultError::SearchUtf8Invariant
+        | VaultError::AtomicVerificationFailed
+        | VaultError::UmbraKeyslot(_)
+        | VaultError::UmbraConfig(_)
+        | VaultError::UmbraDocument(_)
+        | VaultError::RenameRecoveryConflict => ErrorCode::IntegrityFailed,
         VaultError::RepositoryPublicationManualAuditRequired => {
             ErrorCode::PublicationManualAuditRequired
         }
+        VaultError::UmbraRender(error) => match error {
+            inex_core::umbra_render::UmbraRenderError::StaleRenderMap => ErrorCode::EtagConflict,
+            inex_core::umbra_render::UmbraRenderError::InvalidTextRange
+            | inex_core::umbra_render::UmbraRenderError::MixedPlainSelection
+            | inex_core::umbra_render::UmbraRenderError::AnnotationSelectionNotPlain => {
+                ErrorCode::InvalidParams
+            }
+            inex_core::umbra_render::UmbraRenderError::InvalidOuterMarker
+            | inex_core::umbra_render::UmbraRenderError::MarkerSlotMismatch
+            | inex_core::umbra_render::UmbraRenderError::MissingPrivatePayload
+            | inex_core::umbra_render::UmbraRenderError::InvalidPrivatePayload => {
+                ErrorCode::IntegrityFailed
+            }
+        },
     };
     ErrorObject::new(code)
 }
@@ -1576,6 +1714,129 @@ mod tests {
         scrub_object(&mut locked);
         session.zeroize();
         handle.zeroize();
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // the independent Outer/Umbra lifecycle is one security scenario
+    fn umbra_rpc_keeps_private_projection_behind_a_second_unlock() {
+        let directory = TestDirectory::new();
+        let outer_password = b"outer handler password";
+        let umbra_password = b"umbra handler password";
+        drop(
+            Vault::create_with_params(
+                directory.path(),
+                outer_password,
+                1_783_699_200_000,
+                Argon2idParams {
+                    ops_limit: 1,
+                    mem_limit_bytes: 8 * 1024,
+                },
+                test_policy(),
+            )
+            .unwrap_or_else(|error| panic!("fixture vault failed: {error}")),
+        );
+        let mut service = RpcService::with_clock_and_policy(SystemClock::new(), test_policy());
+        hello(&mut service);
+        let mut unlocked = response(
+            &mut service,
+            2,
+            "vault.unlock",
+            json!({
+                "vaultPath": directory.path().to_string_lossy(),
+                "password": String::from_utf8_lossy(outer_password),
+            }),
+        );
+        let mut session = Zeroizing::new(
+            unlocked["result"]["session"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+        );
+        scrub_object(&mut unlocked);
+
+        let mut before = response(
+            &mut service,
+            3,
+            "umbra.status",
+            json!({"session": session.as_str()}),
+        );
+        assert_eq!(
+            before["result"],
+            json!({"initialized": false, "unlocked": false})
+        );
+        scrub_object(&mut before);
+        let mut initialized = response(
+            &mut service,
+            4,
+            "umbra.initialize",
+            json!({"session": session.as_str(), "password": String::from_utf8_lossy(umbra_password)}),
+        );
+        assert_eq!(
+            initialized["result"],
+            json!({"initialized": true, "unlocked": true})
+        );
+        assert!(!format!("{initialized:?}").contains("umbra handler password"));
+        scrub_object(&mut initialized);
+        let mut enabled = response(
+            &mut service,
+            5,
+            "umbra.enable",
+            json!({"session": session.as_str()}),
+        );
+        assert_eq!(enabled["result"]["ok"], true);
+        scrub_object(&mut enabled);
+
+        let logical_path = LogicalPath::parse_canonical("private.md")
+            .unwrap_or_else(|error| panic!("logical path failed: {error}"));
+        service
+            .sessions
+            .vault_mut(session.as_str())
+            .unwrap_or_else(|error| panic!("session vault failed: {error}"))
+            .create_umbra_outer_document(
+                &logical_path,
+                &inex_core::umbra_document::UmbraDocumentV1::new(
+                    "private outer text\\n".to_owned(),
+                ),
+                1_783_699_201_000,
+            )
+            .unwrap_or_else(|error| panic!("create Umbra document failed: {error}"));
+        let mut opened = response(
+            &mut service,
+            6,
+            "umbra.document.open",
+            json!({"session": session.as_str(), "logicalPath": "private.md"}),
+        );
+        assert_eq!(
+            opened["result"]["contentBase64"],
+            encode_base64url(b"private outer text\\n").as_str()
+        );
+        assert_eq!(opened["result"]["renderMap"]["projectionBytes"], 20);
+        scrub_object(&mut opened);
+        let mut locked = response(
+            &mut service,
+            7,
+            "umbra.lock",
+            json!({"session": session.as_str()}),
+        );
+        assert_eq!(locked["result"]["ok"], true);
+        scrub_object(&mut locked);
+        let mut denied = response(
+            &mut service,
+            8,
+            "umbra.document.open",
+            json!({"session": session.as_str(), "logicalPath": "private.md"}),
+        );
+        assert_eq!(denied["error"]["code"], ErrorCode::AuthFailed.number());
+        scrub_object(&mut denied);
+        let mut reopened = response(
+            &mut service,
+            9,
+            "umbra.unlock",
+            json!({"session": session.as_str(), "password": String::from_utf8_lossy(umbra_password)}),
+        );
+        assert_eq!(reopened["result"]["unlocked"], true);
+        scrub_object(&mut reopened);
+        session.zeroize();
     }
 
     #[test]
