@@ -1,5 +1,12 @@
 # Inex Progress Log
 
+## 2026-07-15 — VS Code encrypted annotation-profile management
+
+- 提交 `fe77dc5`：sidecar 增加 `umbra.profile.create/edit/remove` typed RPC client，发送前限制 stable ID、标签、tag ID canonicalization、kind/Outer 和 Cover-prompt 语义。
+- 提交 `6450df6`：新增 `Inex: Manage Private Annotation Profiles`。可 create/edit/remove profile；profile label、stable ID 与 profile 列表都使用可被 Umbra lock 主动清空/关闭的 sensitive UI。编辑保持 profile ID，删除不触碰已有私密 slots。
+- Profile editor 复用 kind/tag/Outer picker，但明确产生无实例 cover text 的 draft；只有真正 apply profile 到文档时才会提示公开 cover text。
+- 验证：VS Code `check`、55/55 tests、`build`、`git diff --check` 通过。下一步：补齐 profile/default 的端到端 UI matrix，并继续多选/Outer 隔离及跨客户端验证；Neovim 仍保持最后优先级。
+
 ## 2026-07-15 — Goal update: Neovim last-priority MVP
 
 - 用户将 Neovim Lua 插件纳入正式目标；优先级仍为 CLI/daemon、VS Code、Sublime experimental、Neovim。
