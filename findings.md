@@ -533,3 +533,4 @@
 - Release lifecycle harness 的 process-containment assertions 以 Linux pidfd/subreaper 为硬安全前提；当前环境缺失该能力时必须 fail closed，不能降级为普通 process-group kill 或将未执行的 assertions计入发布证据。Python release tests 从 repo root 运行需显式 `PYTHONPATH=scripts`。
 - Sublime 的 Umbra lock 是 `K_umbra` 生命周期操作，不能复用 vault lock：它必须只丢弃 daemon 的 Umbra session，Outer tree/session 保持可用。客户端必须拒绝 `initialized: false, unlocked: true` 这类逻辑不可能的 status，防止 host UI 在无密钥状态展示私密操作。
 - Sublime 不能把 Umbra 密码写入 input-panel/settings；复用受审计的外部 masked prompt，并把密码变量限制在 worker scope。每次 password/status 回调都要重新验证 Outer client identity 与 generation，避免旧会话在 lock/reunlock 后完成私密初始化或解锁。
+- Sublime 的 repeated Quick Panel 无原生多选，安全实现应只把 encrypted catalog label 保留在 `AnnotationPickerState`，每次点击后再展示，且在 cancel/lock/dispose 调用 `clear()`；不能将标签 label 放进 settings、command args 或持久化状态。

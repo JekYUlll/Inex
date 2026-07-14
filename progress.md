@@ -1021,3 +1021,8 @@
 
 - 提交 `cae72cf`（`feat(sublime): expose Umbra unlock and lock commands`）：新增命令 palette 项。Outer 尚未解锁时拒绝 Umbra 操作；读取 status 后，已有 slot 走独立密码解锁，未初始化时显示冻结的不可恢复警告并经确认后初始化。
 - 每个异步阶段重查 client/generation；密码只在 worker 局部引用，完成后续期 authenticated Outer idle deadline。`Inex: Lock Umbra Private Mode` 只调用 `umbra.lock`，不会执行 vault lock 或 scrub 普通 Outer buffer。验证：Sublime 86/86、1 项 pidfd platform skip、Python compile/JSON/diff-check 通过。
+
+## 2026-07-15 — Sublime 私密标注 stateful picker 基础
+
+- 提交 `5eeb657`（`feat(sublime): add private annotation picker state`）：无 Sublime API 依赖的 picker state 以加密 catalog 的 tag ID/label 构造 repeated-panel items；kind 与 Outer 保持单选，tag 可多选，spec 固定规范排序 tag IDs，并在 cover mode 强制非空公开 cover text。
+- 已选的 archived tag 仍展示，未选 archived tag 不进入默认 picker。`clear()` 主动清空 tags 和 label，给 lock/cancel/dispose 接线使用。验证：state + Python 3.8 syntax 12/12、compile、diff-check 通过；下一步接入 command 后必须在锁定回调清空 live picker。
