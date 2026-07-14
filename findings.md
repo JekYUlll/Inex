@@ -524,3 +524,4 @@
 - Profile RPC 的 nested object 不能复用 annotation 的公开 cover-text spec：profile 仅保存 Outer mode 与 `promptForCover`，不保存任何实际 cover text。所有 profile field（包括 ID、label、selected tag IDs）是 K_umbra catalog 数据，必须经 sensitive 参数层读取且只把 validated values交给 core。
 - VS Code profile 管理器必须把“复用 annotation picker”限制为 metadata draft：`cover` 仅是 profile 的 mode/prompt 语义，不能在 create/edit profile 时采集一次性公开 cover text。真正将 profile 应用于 slot 时才收集该公开内容；否则会把无归属的 cover 文本留在 UI 流程或错误写入 catalog。
 - `toggleBehavior` 的 `useLast`/`askOnFirstUse` 不能把上次 tag IDs 或 Outer 选择写入 editor-local settings；实现只能保持在当前 authenticated extension session，并在 Umbra lock 时主动丢弃。`useDefaultProfile` 不信任 settings 提供 profile ID，而从已解锁 encrypted config 的 validated defaults 得到 stable ID。
+- `headingSection` 只能以 Markdown ATX heading 识别当前章节，且应以 byte range 返回给既有 RenderMap/daemon 边界；没有前置 heading 时返回 undefined，而不是用整份文档作为便利回退。

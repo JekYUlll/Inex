@@ -112,7 +112,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
     - [x] VS Code 贡献式 keybinding 已补 `Ctrl+Alt+H` → `inex.choosePrivateAnnotation`；不处理原始键盘事件（`175d865`）
     - [x] `togglePrivateAnnotation` 现按 active RenderMap 分类：完整 private block 走确认解包，其他选区走 chooser；不以裸 slot ID 判定（本轮）
     - [x] VS Code 空选区可安全扩展到当前 Markdown paragraph（光标所在连续非空行），临时 plaintext snapshot 会立即清零；heading/multicursor 策略仍 deferred（`f34e0dc`）
-    - [x] VS Code 现将 `noSelectionTarget`（paragraph/line/reject）与 `confirmBeforeUnwrap` 作为 window-local 配置贡献；不保存 tag/profile/private content，toggle 与显式 remove 共用确认策略（`3ad47a5`）
+    - [x] VS Code 现将 `noSelectionTarget`（paragraph/line/headingSection/reject）与 `confirmBeforeUnwrap` 作为 window-local 配置贡献；headingSection 精确选择当前 ATX 标题到下一个同级或更高标题前的字节范围；不保存 tag/profile/private content，toggle 与显式 remove 共用确认策略（`3ad47a5`、`20fe50d`）
     - [x] VS Code 已实现 `toggleBehavior`（alwaysAsk/useLast/useDefaultProfile/askOnFirstUse）与 `rememberLastSelection`：last spec 仅存于解锁 session 内存、lock 时清零；default profile 仅从已解锁 encrypted catalog 读取（`53ee77b`）
     - [x] 接入 CustomEditor webview 选区、QuickPick、多标签及配置化命令/keybindings
   - [ ] 扩展Sublime stateful picker、profile命令和keymap示例

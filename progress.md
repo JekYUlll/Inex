@@ -1,5 +1,10 @@
 # Inex Progress Log
 
+## 2026-07-15 — VS Code heading-section annotation target
+
+- 提交 `20fe50d`：`inex.privateAnnotation.noSelectionTarget` 现在支持 `headingSection`。无选区时从当前 ATX 标题开始，至下一个同级或更高标题前结束；光标不属于标题章节时拒绝，避免意外包裹整篇文档。
+- 新增 heading range 与 preference parsing 回归。验证：VS Code check、57/57 tests、build、diff-check 通过。
+
 ## 2026-07-15 — VS Code configurable annotation toggle
 
 - 提交 `53ee77b`：贡献 `toggleBehavior`（alwaysAsk/useLast/useDefaultProfile/askOnFirstUse）和 `rememberLastSelection`。`Ctrl+Alt+/` 现在按配置选择 chooser、当前解锁 session 的 last spec 或 encrypted defaults 指定的 profile。
