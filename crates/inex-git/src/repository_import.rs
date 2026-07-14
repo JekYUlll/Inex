@@ -36,6 +36,12 @@ use thiserror::Error;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+#[allow(
+    dead_code,
+    reason = "the publication writer and fresh auditor consume this frozen encoder in the next slice"
+)]
+mod candidate_seal;
+
 #[cfg(target_os = "linux")]
 use super::raw_index::{RawIndex, RawIndexError, parse_sha1_index};
 use super::{
