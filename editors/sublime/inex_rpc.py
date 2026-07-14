@@ -555,6 +555,22 @@ class InexRpcClient:
                 raise RpcProtocolError("RPC Umbra config is invalid")
             if len(tags) > 4096 or len(profiles) > 4096:
                 raise RpcProtocolError("RPC Umbra config exceeds the client limit")
+            tag_ids = set()
+            for tag in tags:
+                if not isinstance(tag, dict) or not isinstance(tag.get("id"), str) or not tag.get("id"):
+                    raise RpcProtocolError("RPC Umbra tag is invalid")
+                tag_ids.add(tag["id"])
+            profile_ids = set()
+            for profile in profiles:
+                if not isinstance(profile, dict) or not isinstance(profile.get("id"), str) or not profile.get("id"):
+                    raise RpcProtocolError("RPC Umbra profile is invalid")
+                values = profile.get("tagIds")
+                if not isinstance(values, list) or any(not isinstance(value, str) or value not in tag_ids for value in values):
+                    raise RpcProtocolError("RPC Umbra profile tags are invalid")
+                profile_ids.add(profile["id"])
+            default_profile = defaults.get("defaultProfileId")
+            if not isinstance(default_profile, str) or (default_profile and default_profile not in profile_ids):
+                raise RpcProtocolError("RPC Umbra default profile is invalid")
             return result
         except RpcProtocolError as error:
             self._terminate_protocol(error)
