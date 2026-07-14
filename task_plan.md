@@ -124,6 +124,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
     - [x] Sublime picker 可应用 encrypted annotation profile 的 kind/tag/Outer metadata；profile 永不携带实例 cover text，cover 仍在实际 apply 前单独采集（`7b7624e`）
     - [x] Sublime repeated `show_quick_panel` UI 已接入 picker state；Cover 走公开 input panel，cancel/Outer lock/Umbra lock 清空 labels 并关闭 overlay（`fed948e`）；尚待连接 projection command
     - [x] Sublime strict RPC client 已支持 authenticated `umbra.document.open` 与 apply/edit/remove：canonical generation、范围/条目/顺序和 feature-2 response metadata 都在交给 host 前验证；客户端只回传 daemon 返回的完整 projection/ETag/RenderMap（`e93a1a9`、`f788818`、`b027052`，本轮）
+    - [x] Sublime strict RPC client 已支持 `umbra.document.convert` 的 ETag CAS feature-2 升级，返回 metadata 必须精确为 flag 2（`91f7d7a`）
   - [x] 加密 tag catalog 现支持 stable-ID create/rename/archive/reorder：配置验证唯一性、canonical order、profile/default 引用与 Cover profile 语义；Vault 通过 load→mutate→CAS encrypted save 原子提交（`1298641`）
   - [x] daemon 已提供 `umbra.tag.create/rename/archive/reorder`：所有 tag 文本经 zeroizing 参数层读取，生命周期回归验证 create→rename→archive→reorder 后只有 Umbra 已解锁才能读回（`f46d2ff`）
   - [x] VS Code sidecar 已增加对应 typed tag RPC client，并在发出请求前验证 ID/文本/别名/排序资源约束（`ea6d44a`）

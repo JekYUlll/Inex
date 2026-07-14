@@ -1036,3 +1036,8 @@
 
 - 提交 `fed948e`（`feat(sublime): show stateful private annotation picker`）：`_show_annotation_picker` 将 state 映射到重复 `show_quick_panel`，每次 kind/tag/Outer 点击都重开面板；Done 产出 canonical spec，Cover 只在 Done 后经公开 input panel 取得实例文字。
 - live state 由专用内存列表持有；取消、Outer lock 与 Umbra lock 都调用 clear 并隐藏 overlay，避免锁后保留私密 tag label。验证：完整 Sublime 89/89、1 项 pidfd platform skip、compile/diff-check 通过。下一步将 authenticated Umbra projection 与 selection transaction 接入该 callback。
+
+## 2026-07-15 — Sublime Umbra feature-2 conversion client
+
+- 提交 `91f7d7a`（`feat(sublime): convert documents to Umbra containers`）：strict RPC client 新增 `umbra.document.convert`，以当前 document ETag CAS 请求 feature-2 upgrade，并只接受 exact `{etag, metadata, durability}` response 且 metadata flag 为 2。
+- 这使后续 UI 可在 conversion 后重新经 `umbra.document.open` 获取 canonical projection/RenderMap，不能把原 normal buffer 或旧 ETag 当作私密容器状态。验证：RPC 27/27、compile、diff-check 通过。
