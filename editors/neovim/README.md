@@ -22,6 +22,8 @@ Commands currently available:
   Outer session through `vault.unlock`.
 - `:InexOpen path/to/note.md` opens a normal Outer Markdown projection in an
   unnamed, unlisted buffer with swap/undo persistence disabled and wipe-on-hide.
+- `:InexBrowse` shows authenticated vault entries in a nofile scratch buffer;
+  press Enter on a Markdown file to open it. The tree is wiped on lock/stop.
 - `:InexNew path/to/note.md` creates an empty ordinary Markdown document through
   daemon `file.write` and opens it with the same buffer restrictions.
 - `:InexSave` (or normal `:write`) persists the active ordinary document through

@@ -4,8 +4,10 @@ local M = {}
 local configuration = { sidecar_path = "", vault_path = "" }
 local session = nil
 local documents = {}
+local tree_buffers = {}
 local MAX_DOCUMENT_BYTES = 16 * 1024 * 1024
 local MAX_DOCUMENT_BASE64_BYTES = 4 * math.ceil(MAX_DOCUMENT_BYTES / 3)
+local MAX_TREE_ENTRIES = 100000
 local SESSION_RE = "^[A-Za-z0-9_-]+$"
 local ETAG_RE = "^sha256:[a-f0-9]+$"
 local HELLO_PARAMS = { client = "neovim", clientVersion = "0.1.0", protocolMajor = 1 }
@@ -25,6 +27,19 @@ local function wipe_documents()
   end
   for _, buffer in ipairs(buffers) do
     clear_document(buffer)
+    if vim.api.nvim_buf_is_valid(buffer) then
+      vim.api.nvim_buf_delete(buffer, { force = true })
+    end
+  end
+end
+
+local function wipe_tree_buffers()
+  local buffers = {}
+  for buffer, _ in pairs(tree_buffers) do
+    table.insert(buffers, buffer)
+  end
+  for _, buffer in ipairs(buffers) do
+    tree_buffers[buffer] = nil
     if vim.api.nvim_buf_is_valid(buffer) then
       vim.api.nvim_buf_delete(buffer, { force = true })
     end
@@ -59,6 +74,27 @@ local function valid_logical_path(logical_path)
     and logical_path:match("^[^/][^\\]*%.md$")
     and not logical_path:find("//", 1, true)
     and not logical_path:find("..", 1, true)
+end
+
+local function valid_tree_path(logical_path)
+  return type(logical_path) == "string"
+    and #logical_path > 0
+    and #logical_path <= 4096
+    and logical_path:sub(1, 1) ~= "/"
+    and not logical_path:find("\\", 1, true)
+    and not logical_path:find("//", 1, true)
+    and not logical_path:find("..", 1, true)
+    and not logical_path:find("%c")
+end
+
+local function tree_entry_label(kind, logical_path)
+  if kind == "directory" then
+    return "[D] " .. logical_path
+  end
+  if kind == "file" then
+    return "[M] " .. logical_path
+  end
+  return "[A] " .. logical_path
 end
 
 local function encode_base64url(value)
@@ -114,6 +150,7 @@ function M.status()
 end
 
 function M.stop()
+  wipe_tree_buffers()
   wipe_documents()
   session = nil
   rpc.stop()
@@ -149,6 +186,7 @@ function M.unlock(password)
 end
 
 function M.lock()
+  wipe_tree_buffers()
   wipe_documents()
   local active_session = session
   session = nil
@@ -157,6 +195,72 @@ function M.lock()
       vim.notify(error or "Inex Outer vault locked", error and vim.log.levels.ERROR or vim.log.levels.INFO)
     end)
   end
+end
+
+function M.browse()
+  if not session then
+    vim.notify("Unlock an Inex Outer vault before browsing", vim.log.levels.ERROR)
+    return
+  end
+  local active_session = session
+  rpc.request("vault.listTree", { session = active_session }, function(result, error)
+    if error or session ~= active_session or type(result) ~= "table" or type(result.entries) ~= "table" or #result.entries > MAX_TREE_ENTRIES then
+      vim.notify(error or "Inex vault tree response is invalid", vim.log.levels.ERROR)
+      return
+    end
+    local entries, seen = {}, {}
+    for _, entry in ipairs(result.entries) do
+      if type(entry) ~= "table" or type(entry.kind) ~= "string" or type(entry.logicalPath) ~= "string" or (entry.kind ~= "directory" and entry.kind ~= "file" and entry.kind ~= "asset") or not valid_tree_path(entry.logicalPath) then
+        vim.notify("Inex vault tree response is invalid", vim.log.levels.ERROR)
+        return
+      end
+      local identity = entry.kind .. "\0" .. entry.logicalPath
+      if seen[identity] then
+        vim.notify("Inex vault tree has duplicate entries", vim.log.levels.ERROR)
+        return
+      end
+      seen[identity] = true
+      table.insert(entries, { kind = entry.kind, logical_path = entry.logicalPath })
+    end
+    wipe_tree_buffers()
+    local buffer = vim.api.nvim_create_buf(false, true)
+    vim.bo[buffer].buftype = "nofile"
+    vim.bo[buffer].swapfile = false
+    vim.bo[buffer].undofile = false
+    vim.bo[buffer].bufhidden = "wipe"
+    vim.bo[buffer].buflisted = false
+    vim.bo[buffer].modeline = false
+    vim.bo[buffer].modifiable = true
+    vim.api.nvim_buf_set_name(buffer, "inex-tree://vault")
+    local lines = {}
+    for _, entry in ipairs(entries) do
+      table.insert(lines, tree_entry_label(entry.kind, entry.logical_path))
+    end
+    vim.api.nvim_buf_set_lines(buffer, 0, -1, false, lines)
+    vim.bo[buffer].modifiable = false
+    vim.bo[buffer].modified = false
+    tree_buffers[buffer] = entries
+    vim.api.nvim_create_autocmd("BufWipeout", { buffer = buffer, once = true, callback = function()
+      tree_buffers[buffer] = nil
+    end })
+    vim.keymap.set("n", "<CR>", function()
+      local line = vim.api.nvim_win_get_cursor(0)[1]
+      local entry = tree_buffers[buffer] and tree_buffers[buffer][line]
+      if entry and entry.kind == "file" and valid_logical_path(entry.logical_path) then
+        M.open_document(entry.logical_path)
+      elseif entry then
+        vim.notify("This Inex tree entry cannot be opened as a Markdown document", vim.log.levels.INFO)
+      end
+    end, { buffer = buffer, silent = true, desc = "Open selected Inex Markdown document" })
+    local opened, split_error = pcall(vim.cmd, "botright vsplit")
+    if not opened then
+      tree_buffers[buffer] = nil
+      vim.api.nvim_buf_delete(buffer, { force = true })
+      vim.notify(split_error or "Inex tree window could not be opened", vim.log.levels.ERROR)
+      return
+    end
+    vim.api.nvim_set_current_buf(buffer)
+  end)
 end
 
 function M.open_document(logical_path)
@@ -278,6 +382,10 @@ end
 
 function M.is_managed_buffer(buffer)
   return documents[buffer] ~= nil
+end
+
+function M.is_tree_buffer(buffer)
+  return tree_buffers[buffer] ~= nil
 end
 
 return M
