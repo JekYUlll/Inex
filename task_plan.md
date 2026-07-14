@@ -115,7 +115,7 @@ Phase 6 extension — 现有 Markdown Git 仓库与加密附件迁移（Phase 7 
               - [x] 返回不可Clone/Copy且继续持锁的owned `InitialCandidateAuthority`；构造器内部创建全部proof且不接受锁外预制proof（`3205a49`）
               - [x] CLI以不可Clone的`IndependentlyAuditedVault`延长fresh unlock+逐envelope/source审计owner生命周期，并按值接管/尽早清零password；仍在旧v1 seam前显式消费，未错误串联v2（`88e2837`）
               - [x] core以不可Clone/Copy的`HeldPublicationMarkerV2`消费同一existing-only lock与held root，descriptor-relative create/open canonical v2 marker并持有root/local/file authority（`347b4cd`）
-              - [ ] 以v2 consuming publisher整体替换旧v1 publisher，复用同一held lock且禁止串联两套marker/lock
+              - [x] 以v2 consuming publisher整体替换旧v1 publisher，复用同一held lock且禁止串联两套marker/lock（`b34691c`）
       - [ ] 实现held-marker owner、完整live/fresh九段collector、v2 claim创建/发布/reconcile状态机与终态输出
         - [x] held-marker core owner、existing opener、canonical双读、held directory sync与rename revalidation（`347b4cd`）
         - [ ] marker-aware physical/live collector只排除exact held marker identity，并重新形成完整九段candidate evidence
@@ -137,9 +137,10 @@ Phase 6 extension — 现有 Markdown Git 仓库与加密附件迁移（Phase 7 
           - [x] core以单一borrowed原语按held root fd→held common-parent fd建立durability barrier，三轮published-role gate包夹且不信任pathname sync（`0e89e32`）
           - [x] Initial经critical fresh复审与verified no-replace整根move汇入同一PublishedWithMarker；只有exact NotMoved复审后可重试（`5060856`）
           - [x] PublishedWithMarker经held durability+fresh复审进入PublicationDurableWithMarker，只有durable owner可消费exact unlink（`984e52b`）
-          - [ ] marker unlink后的sync retry与marker-free clean audit形成PublishedClean/terminal输出，并整体替换旧v1 publisher
+          - [x] marker unlink后的sync retry与marker-free clean audit形成PublishedClean/terminal输出，并整体替换旧v1 publisher（`b34691c`）
             - [x] 只有PublicationDurableWithMarker可消费exact unlink；五态结果及parent-sync四态映射为pending/retry/terminal且不返回裸core authority（`c3dd202`）
             - [x] 以Synced post-unlink held-root authority执行marker-free clean九段audit并形成PublishedClean或可重试/terminal owner（`0b366e1`）
+        - [ ] 将fresh existing-only exact-v2入口接入CLI早期路由与独立`repository-reconcile`终态输出；不得先重做source Git plan、提示口令或运行KDF
   - [ ] 完成repository import构造/durability/publication每一边界的Linux force-kill、hostile same-UID source/target race、artifact-bound residue与原生Windows矩阵
 - **Status:** in_progress（用户实测驱动的迁移/附件扩展；原Markdown-only实现仍保持已验证基线）
 
