@@ -66,6 +66,12 @@ mod candidate_git;
 )]
 mod candidate_control;
 
+#[allow(
+    dead_code,
+    reason = "the authenticated vault/config authority is consumed by the unified candidate assembler in the next slice"
+)]
+mod candidate_vault_authority;
+
 #[cfg(target_os = "linux")]
 use super::raw_index::{RawIndex, parse_sha1_index};
 use super::raw_index::{RawIndexError, TargetRawIndexSummary, validate_target_sha1_index_paths};
