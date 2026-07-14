@@ -166,6 +166,20 @@ pub struct PublicationMarkerV2Input<'a> {
     pub candidate_seal: &'a [u8],
 }
 
+#[derive(Clone, Copy)]
+#[cfg(target_os = "linux")]
+pub(crate) struct PublicationMarkerV2PreflightInput<'a> {
+    pub(crate) scheme: PublicationIdentityScheme,
+    pub(crate) publication_id: [u8; PUBLICATION_ID_BYTES],
+    pub(crate) common_parent_identity: &'a FilesystemDirectoryIdentity,
+    pub(crate) staging_root_identity: &'a FilesystemDirectoryIdentity,
+    pub(crate) marker_parent_identity: &'a FilesystemDirectoryIdentity,
+    pub(crate) domain: &'a str,
+    pub(crate) staging_child_name: &'a str,
+    pub(crate) destination_child_name: &'a str,
+    pub(crate) candidate_seal: &'a [u8],
+}
+
 impl fmt::Debug for PublicationMarkerV2Input<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -220,6 +234,37 @@ impl PartialEq for PublicationMarkerV2 {
 impl Eq for PublicationMarkerV2 {}
 
 impl PublicationMarkerV2 {
+    /// Validate every caller-controlled creation field before a marker file
+    /// exists.
+    ///
+    /// The marker-file identity is necessarily unavailable until the exact
+    /// create-new operation succeeds. This crate-private preflight lets the
+    /// held filesystem primitive reject all other malformed inputs without
+    /// leaving an empty reserved marker behind. The completed marker still
+    /// passes through [`Self::new`] after the file identity is captured.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn validate_creation_fields(
+        input: PublicationMarkerV2PreflightInput<'_>,
+    ) -> Result<(), PublicationMarkerError> {
+        if [
+            input.common_parent_identity,
+            input.staging_root_identity,
+            input.marker_parent_identity,
+        ]
+        .into_iter()
+        .any(|identity| identity.publication_identity(input.scheme).is_none())
+        {
+            return Err(PublicationMarkerError::InvalidFormat);
+        }
+        validate_creation_value_fields(
+            input.publication_id,
+            input.domain.as_bytes(),
+            input.staging_child_name.as_bytes(),
+            input.destination_child_name.as_bytes(),
+            input.candidate_seal,
+        )
+    }
+
     /// Validate observed values and construct one marker.
     ///
     /// This generic layer accepts any valid domain and opaque seal. A caller
@@ -527,29 +572,21 @@ impl PublicationMarkerV2 {
         destination_child_name: &[u8],
         candidate_seal: &[u8],
     ) -> Result<Self, PublicationMarkerError> {
-        if publication_id.iter().all(|byte| *byte == 0) {
-            return Err(PublicationMarkerError::InvalidFormat);
-        }
         if identities.iter().any(|identity| identity.scheme != scheme) {
             return Err(PublicationMarkerError::InvalidFormat);
         }
         validate_identities(scheme, &identities)?;
-        validate_field_lengths(
-            domain.len(),
-            staging_child_name.len(),
-            destination_child_name.len(),
-            candidate_seal.len(),
+        validate_creation_value_fields(
+            publication_id,
+            domain,
+            staging_child_name,
+            destination_child_name,
+            candidate_seal,
         )?;
 
         let domain = validate_domain(domain)?.to_owned();
         let staging_child_name = validate_child_name(staging_child_name)?.to_owned();
         let destination_child_name = validate_child_name(destination_child_name)?.to_owned();
-        if staging_child_name == destination_child_name
-            || raw_portable_case_fold_key(&staging_child_name)
-                == raw_portable_case_fold_key(&destination_child_name)
-        {
-            return Err(PublicationMarkerError::InvalidFormat);
-        }
         let domain_length = checked_u16_length(domain.len())?;
         let staging_child_name_length = checked_u16_length(staging_child_name.len())?;
         let destination_child_name_length = checked_u16_length(destination_child_name.len())?;
@@ -569,6 +606,34 @@ impl PublicationMarkerV2 {
             candidate_seal_length,
         })
     }
+}
+
+fn validate_creation_value_fields(
+    publication_id: [u8; PUBLICATION_ID_BYTES],
+    domain: &[u8],
+    staging_child_name: &[u8],
+    destination_child_name: &[u8],
+    candidate_seal: &[u8],
+) -> Result<(), PublicationMarkerError> {
+    if publication_id.iter().all(|byte| *byte == 0) {
+        return Err(PublicationMarkerError::InvalidFormat);
+    }
+    validate_field_lengths(
+        domain.len(),
+        staging_child_name.len(),
+        destination_child_name.len(),
+        candidate_seal.len(),
+    )?;
+    validate_domain(domain)?;
+    let staging_child_name = validate_child_name(staging_child_name)?;
+    let destination_child_name = validate_child_name(destination_child_name)?;
+    if staging_child_name == destination_child_name
+        || raw_portable_case_fold_key(staging_child_name)
+            == raw_portable_case_fold_key(destination_child_name)
+    {
+        return Err(PublicationMarkerError::InvalidFormat);
+    }
+    Ok(())
 }
 
 impl fmt::Debug for PublicationMarkerV2 {

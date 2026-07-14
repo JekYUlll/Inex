@@ -24,6 +24,8 @@
 use std::fmt;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Read, Write};
+#[cfg(target_os = "linux")]
+use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -32,6 +34,8 @@ use uuid::Uuid;
 
 use crate::path::{AssetPath, LogicalPath, raw_portable_case_fold_key};
 use crate::publication::{PublicationMarkerError, PublicationMarkerV2};
+#[cfg(target_os = "linux")]
+use crate::publication::{PublicationMarkerV2Input, PublicationMarkerV2PreflightInput};
 
 /// Name of the vault-private directory used for process-local state.
 pub const VAULT_LOCAL_DIRECTORY: &str = ".vault-local";
@@ -474,6 +478,100 @@ impl fmt::Debug for ExistingVaultMutationLock {
     }
 }
 
+/// Caller-controlled fields for one Linux held publication-marker creation.
+///
+/// The staging-root, marker-parent, and marker-file identities are derived
+/// from handles already held by the primitive. The common-parent identity is
+/// retained because it belongs to the caller's sibling-publication contract.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+pub struct HeldPublicationMarkerV2CreateInput<'a> {
+    /// One canonical identity scheme shared by every marker role.
+    pub scheme: PublicationIdentityScheme,
+    /// Nonzero CSPRNG publication identifier.
+    pub publication_id: [u8; 16],
+    /// Previously audited common-parent directory identity.
+    pub common_parent_identity: &'a FilesystemDirectoryIdentity,
+    /// Exact current staging-root direct-child name.
+    pub staging_child_name: &'a str,
+    /// Exact future destination direct-child name.
+    pub destination_child_name: &'a str,
+    /// Exact repository-specific marker domain.
+    pub domain: &'a str,
+    /// Nonempty opaque candidate seal.
+    pub candidate_seal: &'a [u8],
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for HeldPublicationMarkerV2CreateInput<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HeldPublicationMarkerV2CreateInput")
+            .field("scheme", &self.scheme)
+            .field("publication_id", &"[REDACTED]")
+            .field("common_parent_identity", &"[REDACTED]")
+            .field("staging_child_name", &"[REDACTED]")
+            .field("destination_child_name", &"[REDACTED]")
+            .field("domain", &"[REDACTED]")
+            .field("candidate_seal", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Failure to create, open, or revalidate one held publication marker.
+///
+/// No variant carries a path, marker body, publication identifier, candidate
+/// seal, or filesystem identity. Once create-new has succeeded, failures do
+/// not remove the reserved entry: an incomplete claim remains visible and
+/// must be reconciled or audited by a later process.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Error)]
+pub enum HeldPublicationMarkerV2Error {
+    /// Caller fields or the staging-root child name are invalid.
+    #[error("held publication marker input is invalid")]
+    InvalidInput,
+    /// The complete held reserved-prefix inventory is not the expected state.
+    #[error("held publication marker namespace conflicts with the requested state")]
+    NamespaceConflict,
+    /// A held root, directory, lock, file, or canonical body changed.
+    #[error("held publication marker authority changed")]
+    AuthorityChanged,
+    /// A scrubbed filesystem operation failed.
+    #[error("held publication marker filesystem operation failed")]
+    Io(#[source] io::Error),
+}
+
+/// Linear Linux authority for one canonical publication-marker v2 claim.
+///
+/// The value owns the exact marker/root/private-directory handles and the
+/// same existing-only mutation lock that preceded marker creation or opening.
+/// It is intentionally neither `Clone` nor `Copy`, exposes no raw handle, and
+/// drops the mutation lock last.
+///
+/// ```compile_fail
+/// use inex_core::atomic::HeldPublicationMarkerV2;
+///
+/// fn requires_clone<T: Clone>() {}
+/// requires_clone::<HeldPublicationMarkerV2>();
+/// ```
+#[cfg(target_os = "linux")]
+pub struct HeldPublicationMarkerV2 {
+    marker: PublicationMarkerV2,
+    marker_file_identity: FilesystemFileIdentity,
+    common_parent: SecureSourceDirectory,
+    root: SecureSourceDirectory,
+    marker_parent: SecureSourceDirectory,
+    marker_file: SecureSourceFile,
+    mutation_lock: ExistingVaultMutationLock,
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for HeldPublicationMarkerV2 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("HeldPublicationMarkerV2 { .. }")
+    }
+}
+
 enum ReservedMarkerInspection {
     SafeBytes(Vec<u8>),
     Unsafe,
@@ -841,6 +939,50 @@ impl ExistingVaultMutationLock {
     #[must_use]
     pub const fn lock_identity(&self) -> &FilesystemFileIdentity {
         &self.lock_identity
+    }
+
+    /// Consume this lock and one already-held staging root to create the exact
+    /// canonical publication-marker v2 claim.
+    ///
+    /// Linux performs one descriptor-relative `openat2` create-new beneath
+    /// the held `.vault-local`, writes and synchronizes the canonical body,
+    /// performs bounded exact re-reads, synchronizes the held private/root
+    /// directory handles, and returns an owner that keeps this same lock.
+    /// No path-based create or directory sync participates in the authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns a scrubbed input, namespace, authority, or I/O error. If the
+    /// create-new operation itself succeeded, no later error deletes or
+    /// replaces the reserved marker.
+    #[cfg(target_os = "linux")]
+    pub fn create_held_publication_marker_v2(
+        self,
+        staging_root: &Path,
+        held_root: SecureSourceDirectory,
+        input: HeldPublicationMarkerV2CreateInput<'_>,
+    ) -> Result<HeldPublicationMarkerV2, HeldPublicationMarkerV2Error> {
+        HeldPublicationMarkerV2::create(staging_root, held_root, self, input)
+    }
+
+    /// Consume this lock and one already-held root to open the sole exact
+    /// canonical publication-marker v2 claim without modifying it.
+    ///
+    /// The complete reserved-prefix inventory must contain only the exact v2
+    /// basename. The returned owner binds the canonical body to the held
+    /// common/root/private/file identities and retains this same lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns a scrubbed namespace, authority, or I/O error for a missing,
+    /// aliased, malformed, rebound, hard-linked, or otherwise unsafe claim.
+    #[cfg(target_os = "linux")]
+    pub fn open_held_publication_marker_v2(
+        self,
+        current_root: &Path,
+        held_root: SecureSourceDirectory,
+    ) -> Result<HeldPublicationMarkerV2, HeldPublicationMarkerV2Error> {
+        HeldPublicationMarkerV2::open_existing(current_root, held_root, self)
     }
 }
 
@@ -3822,6 +3964,617 @@ impl Read for SecureSourceFile {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HeldReservedPublicationInventory {
+    Absent,
+    ExactV2,
+    Conflict,
+}
+
+#[cfg(target_os = "linux")]
+impl HeldPublicationMarkerV2 {
+    fn create(
+        staging_root_path: &Path,
+        held_root: SecureSourceDirectory,
+        mutation_lock: ExistingVaultMutationLock,
+        input: HeldPublicationMarkerV2CreateInput<'_>,
+    ) -> Result<Self, HeldPublicationMarkerV2Error> {
+        let (common_parent, root, marker_parent, current_child_name) =
+            prepare_held_publication_directories(staging_root_path, held_root, &mutation_lock)?;
+        if current_child_name != input.staging_child_name
+            || common_parent.identity() != input.common_parent_identity
+        {
+            return Err(HeldPublicationMarkerV2Error::InvalidInput);
+        }
+        PublicationMarkerV2::validate_creation_fields(PublicationMarkerV2PreflightInput {
+            scheme: input.scheme,
+            publication_id: input.publication_id,
+            common_parent_identity: input.common_parent_identity,
+            staging_root_identity: root.identity(),
+            marker_parent_identity: marker_parent.identity(),
+            domain: input.domain,
+            staging_child_name: input.staging_child_name,
+            destination_child_name: input.destination_child_name,
+            candidate_seal: input.candidate_seal,
+        })
+        .map_err(|_| HeldPublicationMarkerV2Error::InvalidInput)?;
+        require_held_reserved_inventory(&marker_parent, HeldReservedPublicationInventory::Absent)?;
+        revalidate_pre_marker_authority(
+            staging_root_path,
+            &common_parent,
+            &root,
+            &marker_parent,
+            &mutation_lock,
+        )?;
+
+        let mut marker_file = create_secure_publication_marker(&marker_parent)
+            .map_err(HeldPublicationMarkerV2Error::Io)?;
+        let marker_file_identity = marker_file
+            .identity()
+            .map_err(HeldPublicationMarkerV2Error::Io)?;
+        if marker_file_identity.projections.comparison_volume()
+            != marker_parent.identity().comparison_volume()
+        {
+            return Err(HeldPublicationMarkerV2Error::AuthorityChanged);
+        }
+        let marker = PublicationMarkerV2::new(PublicationMarkerV2Input {
+            scheme: input.scheme,
+            publication_id: input.publication_id,
+            common_parent_identity: input.common_parent_identity,
+            staging_root_identity: root.identity(),
+            marker_parent_identity: marker_parent.identity(),
+            marker_file_identity: &marker_file_identity,
+            domain: input.domain,
+            staging_child_name: input.staging_child_name,
+            destination_child_name: input.destination_child_name,
+            candidate_seal: input.candidate_seal,
+        })
+        .map_err(|_| HeldPublicationMarkerV2Error::AuthorityChanged)?;
+        let canonical = marker.to_bytes();
+
+        marker_file
+            .file
+            .write_all(&canonical)
+            .map_err(HeldPublicationMarkerV2Error::Io)?;
+        marker_file
+            .file
+            .flush()
+            .map_err(HeldPublicationMarkerV2Error::Io)?;
+        marker_file
+            .file
+            .sync_all()
+            .map_err(HeldPublicationMarkerV2Error::Io)?;
+        let observed =
+            read_canonical_held_publication_marker(&mut marker_file, &marker_file_identity)?;
+        if observed != marker
+            || marker_file
+                .observed_len()
+                .map_err(HeldPublicationMarkerV2Error::Io)?
+                != u64::try_from(canonical.len()).unwrap_or(u64::MAX)
+        {
+            return Err(HeldPublicationMarkerV2Error::AuthorityChanged);
+        }
+
+        marker_parent
+            .verify_binding()
+            .map_err(HeldPublicationMarkerV2Error::Io)?;
+        platform::sync_directory_handle(&marker_parent.file)
+            .map_err(HeldPublicationMarkerV2Error::Io)?;
+        marker_parent
+            .verify_binding()
+            .map_err(HeldPublicationMarkerV2Error::Io)?;
+        root.verify_binding()
+            .map_err(HeldPublicationMarkerV2Error::Io)?;
+        platform::sync_directory_handle(&root.file).map_err(HeldPublicationMarkerV2Error::Io)?;
+        root.verify_binding()
+            .map_err(HeldPublicationMarkerV2Error::Io)?;
+
+        let held = Self {
+            marker,
+            marker_file_identity,
+            common_parent,
+            root,
+            marker_parent,
+            marker_file,
+            mutation_lock,
+        };
+        held.revalidate_at(staging_root_path)?;
+        Ok(held)
+    }
+
+    fn open_existing(
+        current_root_path: &Path,
+        held_root: SecureSourceDirectory,
+        mutation_lock: ExistingVaultMutationLock,
+    ) -> Result<Self, HeldPublicationMarkerV2Error> {
+        let (common_parent, root, marker_parent, _) =
+            prepare_held_publication_directories(current_root_path, held_root, &mutation_lock)?;
+        require_held_reserved_inventory(&marker_parent, HeldReservedPublicationInventory::ExactV2)?;
+        revalidate_pre_marker_authority(
+            current_root_path,
+            &common_parent,
+            &root,
+            &marker_parent,
+            &mutation_lock,
+        )?;
+
+        let mut marker_file = match marker_parent
+            .open_child(std::ffi::OsStr::new(IMPORT_PUBLISH_MARKER_V2))
+            .map_err(HeldPublicationMarkerV2Error::Io)?
+        {
+            SecureSourceChild::File(file) => file,
+            SecureSourceChild::Directory(_) | SecureSourceChild::Other => {
+                return Err(HeldPublicationMarkerV2Error::AuthorityChanged);
+            }
+        };
+        let marker_file_identity = marker_file
+            .identity()
+            .map_err(HeldPublicationMarkerV2Error::Io)?;
+        if marker_file_identity.projections.comparison_volume()
+            != marker_parent.identity().comparison_volume()
+        {
+            return Err(HeldPublicationMarkerV2Error::AuthorityChanged);
+        }
+        let marker =
+            read_canonical_held_publication_marker(&mut marker_file, &marker_file_identity)?;
+        let held = Self {
+            marker,
+            marker_file_identity,
+            common_parent,
+            root,
+            marker_parent,
+            marker_file,
+            mutation_lock,
+        };
+        held.revalidate_at(current_root_path)?;
+        Ok(held)
+    }
+
+    /// Revalidate the same held lock, directories, marker identity, canonical
+    /// body, and complete reserved-prefix inventory at `current_root`.
+    ///
+    /// `current_root` may use either the marker's staging child name or its
+    /// destination child name, allowing the owner to remain valid across one
+    /// caller-managed whole-root move. This method performs no write, sync,
+    /// cleanup, move, or recovery action.
+    ///
+    /// # Errors
+    ///
+    /// Returns a scrubbed error if any held or current binding, marker role,
+    /// body byte, hard-link count, stream state, or reserved alias differs.
+    pub fn revalidate_at(&self, current_root: &Path) -> Result<(), HeldPublicationMarkerV2Error> {
+        self.mutation_lock
+            .revalidate(current_root)
+            .map_err(|_| HeldPublicationMarkerV2Error::AuthorityChanged)?;
+        if self.root.identity() != self.mutation_lock.root_identity()
+            || self.marker_parent.identity() != self.mutation_lock.local_identity()
+            || self
+                .marker_file
+                .identity()
+                .map_err(HeldPublicationMarkerV2Error::Io)?
+                != self.marker_file_identity
+        {
+            return Err(HeldPublicationMarkerV2Error::AuthorityChanged);
+        }
+        revalidate_current_publication_root(
+            current_root,
+            &self.common_parent,
+            &self.root,
+            &self.marker,
+        )?;
+        platform::verify_directory_handle_has_no_alternate_data_streams(&self.root.file)
+            .map_err(HeldPublicationMarkerV2Error::Io)?;
+        self.marker_parent
+            .verify_no_alternate_data_streams()
+            .map_err(HeldPublicationMarkerV2Error::Io)?;
+        self.marker_file
+            .verify_no_alternate_data_streams()
+            .map_err(HeldPublicationMarkerV2Error::Io)?;
+        require_held_reserved_inventory(
+            &self.marker_parent,
+            HeldReservedPublicationInventory::ExactV2,
+        )?;
+
+        let mut observed_file = match self
+            .marker_parent
+            .open_child(std::ffi::OsStr::new(IMPORT_PUBLISH_MARKER_V2))
+            .map_err(HeldPublicationMarkerV2Error::Io)?
+        {
+            SecureSourceChild::File(file) => file,
+            SecureSourceChild::Directory(_) | SecureSourceChild::Other => {
+                return Err(HeldPublicationMarkerV2Error::AuthorityChanged);
+            }
+        };
+        if observed_file
+            .identity()
+            .map_err(HeldPublicationMarkerV2Error::Io)?
+            != self.marker_file_identity
+        {
+            return Err(HeldPublicationMarkerV2Error::AuthorityChanged);
+        }
+        let observed =
+            read_canonical_held_publication_marker(&mut observed_file, &self.marker_file_identity)?;
+        if observed != self.marker
+            || !self
+                .marker
+                .common_parent_matches(self.common_parent.identity())
+            || !self.marker.staging_root_matches(self.root.identity())
+            || !self
+                .marker
+                .marker_parent_matches(self.marker_parent.identity())
+            || !self.marker.marker_file_matches(&self.marker_file_identity)
+        {
+            return Err(HeldPublicationMarkerV2Error::AuthorityChanged);
+        }
+
+        require_held_reserved_inventory(
+            &self.marker_parent,
+            HeldReservedPublicationInventory::ExactV2,
+        )?;
+        revalidate_current_publication_root(
+            current_root,
+            &self.common_parent,
+            &self.root,
+            &self.marker,
+        )?;
+        self.marker_parent
+            .verify_binding()
+            .map_err(HeldPublicationMarkerV2Error::Io)?;
+        self.marker_file
+            .verify_binding()
+            .map_err(HeldPublicationMarkerV2Error::Io)?;
+        self.mutation_lock
+            .revalidate(current_root)
+            .map_err(|_| HeldPublicationMarkerV2Error::AuthorityChanged)
+    }
+
+    /// Borrow the validated canonical marker value without exposing its file.
+    #[must_use]
+    pub const fn marker(&self) -> &PublicationMarkerV2 {
+        &self.marker
+    }
+
+    /// Borrow the exact held marker-file identity for marker-aware audits.
+    #[must_use]
+    pub const fn marker_file_identity(&self) -> &FilesystemFileIdentity {
+        &self.marker_file_identity
+    }
+
+    /// Borrow the exact root identity retained by the held mutation lock.
+    #[must_use]
+    pub const fn root_identity(&self) -> &FilesystemDirectoryIdentity {
+        self.mutation_lock.root_identity()
+    }
+
+    /// Borrow the exact `.vault-local` identity retained by the held lock.
+    #[must_use]
+    pub const fn marker_parent_identity(&self) -> &FilesystemDirectoryIdentity {
+        self.mutation_lock.local_identity()
+    }
+
+    /// Borrow the exact held root descriptor authority for marker-aware
+    /// physical collectors.
+    ///
+    /// [`SecureSourceDirectory`] preserves descriptor-relative opening and
+    /// binding checks without exposing its raw file descriptor.
+    #[must_use]
+    pub const fn held_root(&self) -> &SecureSourceDirectory {
+        &self.root
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_held_publication_directories(
+    current_root: &Path,
+    held_root: SecureSourceDirectory,
+    mutation_lock: &ExistingVaultMutationLock,
+) -> Result<
+    (
+        SecureSourceDirectory,
+        SecureSourceDirectory,
+        SecureSourceDirectory,
+        String,
+    ),
+    HeldPublicationMarkerV2Error,
+> {
+    if !current_root.is_absolute() || !path_is_lexically_normal(current_root) {
+        return Err(HeldPublicationMarkerV2Error::InvalidInput);
+    }
+    let common_parent_path = current_root
+        .parent()
+        .ok_or(HeldPublicationMarkerV2Error::InvalidInput)?;
+    let current_child_name = current_root
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or(HeldPublicationMarkerV2Error::InvalidInput)?
+        .to_owned();
+    mutation_lock
+        .revalidate(current_root)
+        .map_err(|_| HeldPublicationMarkerV2Error::AuthorityChanged)?;
+    held_root
+        .verify_no_alternate_data_streams()
+        .map_err(HeldPublicationMarkerV2Error::Io)?;
+    if held_root.identity() != mutation_lock.root_identity()
+        || !path_is_supported_local_filesystem(common_parent_path)
+            .map_err(HeldPublicationMarkerV2Error::Io)?
+        || !paths_share_mount(common_parent_path, current_root)
+            .map_err(HeldPublicationMarkerV2Error::Io)?
+    {
+        return Err(HeldPublicationMarkerV2Error::AuthorityChanged);
+    }
+
+    let common_parent =
+        open_secure_source_root(common_parent_path).map_err(HeldPublicationMarkerV2Error::Io)?;
+    common_parent
+        .verify_no_alternate_data_streams()
+        .map_err(HeldPublicationMarkerV2Error::Io)?;
+    let observed_root = match common_parent
+        .open_child(std::ffi::OsStr::new(&current_child_name))
+        .map_err(HeldPublicationMarkerV2Error::Io)?
+    {
+        SecureSourceChild::Directory(directory) => directory,
+        SecureSourceChild::File(_) | SecureSourceChild::Other => {
+            return Err(HeldPublicationMarkerV2Error::AuthorityChanged);
+        }
+    };
+    if observed_root.identity() != held_root.identity() {
+        return Err(HeldPublicationMarkerV2Error::AuthorityChanged);
+    }
+    observed_root
+        .verify_no_alternate_data_streams()
+        .map_err(HeldPublicationMarkerV2Error::Io)?;
+
+    let marker_parent = match held_root
+        .open_child(std::ffi::OsStr::new(VAULT_LOCAL_DIRECTORY))
+        .map_err(HeldPublicationMarkerV2Error::Io)?
+    {
+        SecureSourceChild::Directory(directory) => directory,
+        SecureSourceChild::File(_) | SecureSourceChild::Other => {
+            return Err(HeldPublicationMarkerV2Error::AuthorityChanged);
+        }
+    };
+    if marker_parent.identity() != mutation_lock.local_identity() {
+        return Err(HeldPublicationMarkerV2Error::AuthorityChanged);
+    }
+    marker_parent
+        .verify_no_alternate_data_streams()
+        .map_err(HeldPublicationMarkerV2Error::Io)?;
+    mutation_lock
+        .revalidate(current_root)
+        .map_err(|_| HeldPublicationMarkerV2Error::AuthorityChanged)?;
+    Ok((common_parent, held_root, marker_parent, current_child_name))
+}
+
+#[cfg(target_os = "linux")]
+fn revalidate_pre_marker_authority(
+    current_root: &Path,
+    common_parent: &SecureSourceDirectory,
+    root: &SecureSourceDirectory,
+    marker_parent: &SecureSourceDirectory,
+    mutation_lock: &ExistingVaultMutationLock,
+) -> Result<(), HeldPublicationMarkerV2Error> {
+    mutation_lock
+        .revalidate(current_root)
+        .map_err(|_| HeldPublicationMarkerV2Error::AuthorityChanged)?;
+    common_parent
+        .verify_no_alternate_data_streams()
+        .map_err(HeldPublicationMarkerV2Error::Io)?;
+    root.verify_no_alternate_data_streams()
+        .map_err(HeldPublicationMarkerV2Error::Io)?;
+    marker_parent
+        .verify_no_alternate_data_streams()
+        .map_err(HeldPublicationMarkerV2Error::Io)?;
+    if root.identity() != mutation_lock.root_identity()
+        || marker_parent.identity() != mutation_lock.local_identity()
+    {
+        return Err(HeldPublicationMarkerV2Error::AuthorityChanged);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn revalidate_current_publication_root(
+    current_root: &Path,
+    common_parent: &SecureSourceDirectory,
+    held_root: &SecureSourceDirectory,
+    marker: &PublicationMarkerV2,
+) -> Result<(), HeldPublicationMarkerV2Error> {
+    if !current_root.is_absolute() || !path_is_lexically_normal(current_root) {
+        return Err(HeldPublicationMarkerV2Error::AuthorityChanged);
+    }
+    let current_parent = current_root
+        .parent()
+        .ok_or(HeldPublicationMarkerV2Error::AuthorityChanged)?;
+    let current_name = current_root
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or(HeldPublicationMarkerV2Error::AuthorityChanged)?;
+    if current_name != marker.staging_child_name()
+        && current_name != marker.destination_child_name()
+    {
+        return Err(HeldPublicationMarkerV2Error::AuthorityChanged);
+    }
+    common_parent
+        .verify_no_alternate_data_streams()
+        .map_err(HeldPublicationMarkerV2Error::Io)?;
+    if filesystem_directory_identity(current_parent).map_err(HeldPublicationMarkerV2Error::Io)?
+        != *common_parent.identity()
+        || !marker.common_parent_matches(common_parent.identity())
+    {
+        return Err(HeldPublicationMarkerV2Error::AuthorityChanged);
+    }
+    let observed_root = match common_parent
+        .open_child(std::ffi::OsStr::new(current_name))
+        .map_err(HeldPublicationMarkerV2Error::Io)?
+    {
+        SecureSourceChild::Directory(directory) => directory,
+        SecureSourceChild::File(_) | SecureSourceChild::Other => {
+            return Err(HeldPublicationMarkerV2Error::AuthorityChanged);
+        }
+    };
+    observed_root
+        .verify_no_alternate_data_streams()
+        .map_err(HeldPublicationMarkerV2Error::Io)?;
+    if observed_root.identity() != held_root.identity()
+        || !marker.staging_root_matches(held_root.identity())
+    {
+        return Err(HeldPublicationMarkerV2Error::AuthorityChanged);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn held_reserved_publication_inventory(
+    marker_parent: &SecureSourceDirectory,
+) -> io::Result<HeldReservedPublicationInventory> {
+    marker_parent.verify_binding()?;
+    let reserved_prefix = raw_portable_case_fold_key(IMPORT_PUBLISH_MARKER_PREFIX);
+    let mut reserved_count = 0_usize;
+    let mut exact_v2 = false;
+    let mut entry_count = 0_usize;
+    let mut name_bytes = 0_usize;
+    for entry in marker_parent.read_dir()? {
+        let name = entry?
+            .file_name()
+            .into_string()
+            .map_err(|_| io::Error::other("private namespace name is not portable UTF-8"))?;
+        entry_count = entry_count
+            .checked_add(1)
+            .filter(|count| *count <= MAX_STAGING_RECOVERY_ENTRIES)
+            .ok_or_else(|| io::Error::other("private namespace entry limit exceeded"))?;
+        name_bytes = name_bytes
+            .checked_add(name.len())
+            .filter(|total| *total <= MAX_STAGING_RECOVERY_PATH_BYTES)
+            .ok_or_else(|| io::Error::other("private namespace path limit exceeded"))?;
+        if raw_portable_case_fold_key(&name)
+            .as_str()
+            .starts_with(reserved_prefix.as_str())
+        {
+            reserved_count = reserved_count
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("reserved namespace count overflow"))?;
+            exact_v2 |= name == IMPORT_PUBLISH_MARKER_V2;
+        }
+    }
+    marker_parent.verify_binding()?;
+    Ok(match (reserved_count, exact_v2) {
+        (0, false) => HeldReservedPublicationInventory::Absent,
+        (1, true) => HeldReservedPublicationInventory::ExactV2,
+        _ => HeldReservedPublicationInventory::Conflict,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn require_held_reserved_inventory(
+    marker_parent: &SecureSourceDirectory,
+    expected: HeldReservedPublicationInventory,
+) -> Result<(), HeldPublicationMarkerV2Error> {
+    if held_reserved_publication_inventory(marker_parent)
+        .map_err(HeldPublicationMarkerV2Error::Io)?
+        == expected
+    {
+        Ok(())
+    } else {
+        Err(HeldPublicationMarkerV2Error::NamespaceConflict)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn create_secure_publication_marker(
+    marker_parent: &SecureSourceDirectory,
+) -> io::Result<SecureSourceFile> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    marker_parent.verify_binding()?;
+    let file = platform::create_publication_marker_child(
+        &marker_parent.file,
+        std::ffi::OsStr::new(IMPORT_PUBLISH_MARKER_V2),
+    )?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file()
+        || metadata.nlink() != 1
+        || metadata.len() != 0
+        || metadata.mode() & 0o777 != 0o600
+    {
+        return Err(io::Error::other(
+            "created publication marker is not an exact private regular file",
+        ));
+    }
+    let marker_file = SecureSourceFile {
+        file,
+        parent: marker_parent.file.try_clone()?,
+        name: std::ffi::OsString::from(IMPORT_PUBLISH_MARKER_V2),
+    };
+    marker_file.verify_no_alternate_data_streams()?;
+    marker_parent.verify_binding()?;
+    Ok(marker_file)
+}
+
+#[cfg(target_os = "linux")]
+fn read_canonical_held_publication_marker(
+    marker_file: &mut SecureSourceFile,
+    expected_identity: &FilesystemFileIdentity,
+) -> Result<PublicationMarkerV2, HeldPublicationMarkerV2Error> {
+    verify_secure_publication_marker_metadata(marker_file)
+        .map_err(HeldPublicationMarkerV2Error::Io)?;
+    marker_file
+        .verify_no_alternate_data_streams()
+        .map_err(HeldPublicationMarkerV2Error::Io)?;
+    let initial_length = marker_file
+        .observed_len()
+        .map_err(HeldPublicationMarkerV2Error::Io)?;
+    if marker_file
+        .identity()
+        .map_err(HeldPublicationMarkerV2Error::Io)?
+        != *expected_identity
+        || initial_length
+            > u64::try_from(crate::publication::PUBLICATION_MARKER_READ_LIMIT_BYTES)
+                .unwrap_or(u64::MAX)
+    {
+        return Err(HeldPublicationMarkerV2Error::AuthorityChanged);
+    }
+    marker_file
+        .file
+        .seek(SeekFrom::Start(0))
+        .map_err(HeldPublicationMarkerV2Error::Io)?;
+    let marker = PublicationMarkerV2::read_bounded(marker_file)
+        .map_err(|_| HeldPublicationMarkerV2Error::AuthorityChanged)?;
+    marker_file
+        .verify_no_alternate_data_streams()
+        .map_err(HeldPublicationMarkerV2Error::Io)?;
+    verify_secure_publication_marker_metadata(marker_file)
+        .map_err(HeldPublicationMarkerV2Error::Io)?;
+    if marker_file
+        .identity()
+        .map_err(HeldPublicationMarkerV2Error::Io)?
+        != *expected_identity
+        || marker_file
+            .observed_len()
+            .map_err(HeldPublicationMarkerV2Error::Io)?
+            != initial_length
+        || initial_length != u64::try_from(marker.to_bytes().len()).unwrap_or(u64::MAX)
+    {
+        return Err(HeldPublicationMarkerV2Error::AuthorityChanged);
+    }
+    Ok(marker)
+}
+
+#[cfg(target_os = "linux")]
+fn verify_secure_publication_marker_metadata(marker_file: &SecureSourceFile) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = marker_file.file.metadata()?;
+    if metadata.file_type().is_file() && metadata.nlink() == 1 && metadata.mode() & 0o777 == 0o600 {
+        Ok(())
+    } else {
+        Err(io::Error::other(
+            "held publication marker metadata is not canonical",
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn linux_directory_identity_from_file(file: &File) -> io::Result<FilesystemDirectoryIdentity> {
     use std::os::unix::fs::MetadataExt as _;
 
@@ -4968,6 +5721,9 @@ mod platform {
     const AT_FDCWD: i32 = -100;
     const RENAME_NOREPLACE: u32 = 1;
     const O_DIRECTORY: i32 = 0o200_000;
+    const O_RDWR: i32 = 0o2;
+    const O_CREAT: i32 = 0o100;
+    const O_EXCL: i32 = 0o200;
     const O_NOFOLLOW: i32 = 0o400_000;
     const O_CLOEXEC: i32 = 0o2_000_000;
     const O_NONBLOCK: i32 = 0o4_000;
@@ -5098,6 +5854,51 @@ mod platform {
         // SAFETY: `name` and `how` are live for the syscall, the size matches
         // the kernel open_how v0 layout, and a nonnegative descriptor is
         // transferred exactly once into `File`.
+        let descriptor = unsafe {
+            syscall(
+                SYS_OPENAT2,
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                &raw const how,
+                std::mem::size_of::<OpenHow>(),
+            )
+        };
+        if descriptor < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let descriptor = i32::try_from(descriptor)
+            .map_err(|_| io::Error::other("openat2 descriptor overflow"))?;
+        // SAFETY: the successful syscall returned one newly owned descriptor.
+        Ok(unsafe { File::from_raw_fd(descriptor) })
+    }
+
+    pub(super) fn create_publication_marker_child(
+        parent: &File,
+        name: &std::ffi::OsStr,
+    ) -> io::Result<File> {
+        let name = CString::new(name.as_bytes()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "publication marker child name contains NUL",
+            )
+        })?;
+        if name.as_bytes().contains(&b'/') || matches!(name.as_bytes(), b"." | b"..") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "publication marker must be one direct child",
+            ));
+        }
+        let how = OpenHow {
+            flags: u64::try_from(O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC).unwrap_or(0),
+            mode: 0o600,
+            resolve: RESOLVE_NO_XDEV
+                | RESOLVE_NO_MAGICLINKS
+                | RESOLVE_NO_SYMLINKS
+                | RESOLVE_BENEATH,
+        };
+        // SAFETY: `name` and `how` remain live for the syscall, `parent` is
+        // one held directory descriptor, and a successful create-new
+        // descriptor is transferred exactly once into `File`.
         let descriptor = unsafe {
             syscall(
                 SYS_OPENAT2,
@@ -5260,6 +6061,16 @@ mod platform {
 
     pub(super) fn sync_directory(path: &Path) -> io::Result<()> {
         File::open(path)?.sync_all()
+    }
+
+    pub(super) fn sync_directory_handle(directory: &File) -> io::Result<()> {
+        if !directory.metadata()?.file_type().is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "directory synchronization requires a held directory",
+            ));
+        }
+        directory.sync_all()
     }
 
     pub(super) fn namespace_move(
@@ -6234,6 +7045,8 @@ mod tests {
     use std::fs;
     use std::io;
     #[cfg(target_os = "linux")]
+    use std::io::Write as _;
+    #[cfg(target_os = "linux")]
     use std::os::unix::ffi::OsStrExt as _;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Barrier};
@@ -6353,6 +7166,385 @@ mod tests {
         drop(marker_file);
         fs::write(&marker_path, marker.to_bytes())?;
         Ok(marker_path)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn held_marker_test_input<'a>(
+        root: &'a Path,
+        common_parent_identity: &'a super::FilesystemDirectoryIdentity,
+        destination_child_name: &'a str,
+    ) -> io::Result<super::HeldPublicationMarkerV2CreateInput<'a>> {
+        let staging_child_name = root
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .ok_or_else(|| io::Error::other("test staging root has no portable child name"))?;
+        Ok(super::HeldPublicationMarkerV2CreateInput {
+            scheme: super::PublicationIdentityScheme::LinuxDevInodeV1,
+            publication_id: [0x37; 16],
+            common_parent_identity,
+            staging_child_name,
+            destination_child_name,
+            domain: "inex.repository-import.v1",
+            candidate_seal: &[0xa5; 32],
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn held_root_and_existing_lock(
+        root: &Path,
+    ) -> io::Result<(super::SecureSourceDirectory, ExistingVaultMutationLock)> {
+        let identities = initialize_existing_lock(root)?;
+        let held_root = super::open_secure_source_root(root)?;
+        let mutation_lock = ExistingVaultMutationLock::acquire(
+            root,
+            &identities.root,
+            &identities.local,
+            &identities.lock,
+        )
+        .map_err(io::Error::other)?;
+        Ok((held_root, mutation_lock))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn held_publication_marker_create_open_and_lock_lifetime_are_exact() -> io::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = TestVault::new()?;
+        let common_parent = super::filesystem_directory_identity(
+            fixture
+                .root()
+                .parent()
+                .ok_or_else(|| io::Error::other("test root has no parent"))?,
+        )?;
+        let (held_root, mutation_lock) = held_root_and_existing_lock(fixture.root())?;
+        let destination = format!("published-{}", uuid::Uuid::new_v4().simple());
+        let input = held_marker_test_input(fixture.root(), &common_parent, &destination)?;
+        let marker_path = fixture.local().join(IMPORT_PUBLISH_MARKER_V2);
+        let held = mutation_lock
+            .create_held_publication_marker_v2(fixture.root(), held_root, input)
+            .map_err(io::Error::other)?;
+
+        held.revalidate_at(fixture.root())
+            .map_err(io::Error::other)?;
+        assert_eq!(held.marker().to_bytes(), fs::read(&marker_path)?);
+        assert!(
+            held.marker()
+                .marker_file_matches(held.marker_file_identity())
+        );
+        assert_eq!(
+            held.root_identity(),
+            &super::filesystem_directory_identity(fixture.root())?
+        );
+        assert_eq!(
+            held.marker_parent_identity(),
+            &super::filesystem_directory_identity(&fixture.local())?
+        );
+        assert_eq!(
+            fs::metadata(&marker_path)?.permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(format!("{held:?}"), "HeldPublicationMarkerV2 { .. }");
+        assert!(!format!("{input:?}").contains("repository-import"));
+
+        let current_identities = ExistingLockIdentities {
+            root: super::filesystem_directory_identity(fixture.root())?,
+            local: super::filesystem_directory_identity(&fixture.local())?,
+            lock: {
+                let file = fs::File::open(fixture.local().join(VAULT_MUTATION_LOCK_FILE))?;
+                super::filesystem_file_identity(&file)?
+            },
+        };
+        assert!(matches!(
+            ExistingVaultMutationLock::acquire(
+                fixture.root(),
+                &current_identities.root,
+                &current_identities.local,
+                &current_identities.lock,
+            ),
+            Err(ExistingVaultMutationLockError::Busy)
+        ));
+        let expected_wire = held.marker().to_bytes();
+        drop(held);
+
+        let held_root = super::open_secure_source_root(fixture.root())?;
+        let lock = ExistingVaultMutationLock::acquire(
+            fixture.root(),
+            &current_identities.root,
+            &current_identities.local,
+            &current_identities.lock,
+        )
+        .map_err(io::Error::other)?;
+        let reopened = lock
+            .open_held_publication_marker_v2(fixture.root(), held_root)
+            .map_err(io::Error::other)?;
+        reopened
+            .revalidate_at(fixture.root())
+            .map_err(io::Error::other)?;
+        assert_eq!(reopened.marker().to_bytes(), expected_wire);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn held_publication_marker_rejects_invalid_input_and_reserved_alias_before_create()
+    -> io::Result<()> {
+        let invalid = TestVault::new()?;
+        let common_parent = super::filesystem_directory_identity(
+            invalid
+                .root()
+                .parent()
+                .ok_or_else(|| io::Error::other("test root has no parent"))?,
+        )?;
+        let (held_root, lock) = held_root_and_existing_lock(invalid.root())?;
+        let mut input = held_marker_test_input(invalid.root(), &common_parent, "destination")?;
+        input.publication_id = [0; 16];
+        assert!(matches!(
+            lock.create_held_publication_marker_v2(invalid.root(), held_root, input),
+            Err(super::HeldPublicationMarkerV2Error::InvalidInput)
+        ));
+        assert!(!invalid.local().join(IMPORT_PUBLISH_MARKER_V2).exists());
+
+        let aliased = TestVault::new()?;
+        let identities = initialize_existing_lock(aliased.root())?;
+        let alias = aliased.local().join("IMPORT-PUBLISH-MARKER-V2");
+        fs::write(&alias, b"foreign-reserved-canary")?;
+        let held_root = super::open_secure_source_root(aliased.root())?;
+        let lock = ExistingVaultMutationLock::acquire(
+            aliased.root(),
+            &identities.root,
+            &identities.local,
+            &identities.lock,
+        )
+        .map_err(io::Error::other)?;
+        let common_parent = super::filesystem_directory_identity(
+            aliased
+                .root()
+                .parent()
+                .ok_or_else(|| io::Error::other("test root has no parent"))?,
+        )?;
+        let input = held_marker_test_input(aliased.root(), &common_parent, "destination")?;
+        assert!(matches!(
+            lock.create_held_publication_marker_v2(aliased.root(), held_root, input),
+            Err(super::HeldPublicationMarkerV2Error::NamespaceConflict)
+        ));
+        assert_eq!(fs::read(alias)?, b"foreign-reserved-canary");
+        assert!(!aliased.local().join(IMPORT_PUBLISH_MARKER_V2).exists());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn held_publication_marker_create_preserves_preexisting_exact_v1_and_extra_claims()
+    -> io::Result<()> {
+        let exact = TestVault::new()?;
+        let identities = initialize_existing_lock(exact.root())?;
+        let exact_path = write_canonical_publication_marker_v2(exact.root())?;
+        let exact_before = fs::read(&exact_path)?;
+        let held_root = super::open_secure_source_root(exact.root())?;
+        let lock = ExistingVaultMutationLock::acquire(
+            exact.root(),
+            &identities.root,
+            &identities.local,
+            &identities.lock,
+        )
+        .map_err(io::Error::other)?;
+        let common_parent = super::filesystem_directory_identity(
+            exact
+                .root()
+                .parent()
+                .ok_or_else(|| io::Error::other("test root has no parent"))?,
+        )?;
+        let input = held_marker_test_input(exact.root(), &common_parent, "destination")?;
+        assert!(matches!(
+            lock.create_held_publication_marker_v2(exact.root(), held_root, input),
+            Err(super::HeldPublicationMarkerV2Error::NamespaceConflict)
+        ));
+        assert_eq!(fs::read(&exact_path)?, exact_before);
+
+        let legacy = TestVault::new()?;
+        let identities = initialize_existing_lock(legacy.root())?;
+        let legacy_path = legacy.local().join(IMPORT_PUBLISH_MARKER_V1);
+        fs::write(&legacy_path, [0x42; 16])?;
+        let held_root = super::open_secure_source_root(legacy.root())?;
+        let lock = ExistingVaultMutationLock::acquire(
+            legacy.root(),
+            &identities.root,
+            &identities.local,
+            &identities.lock,
+        )
+        .map_err(io::Error::other)?;
+        let common_parent = super::filesystem_directory_identity(
+            legacy
+                .root()
+                .parent()
+                .ok_or_else(|| io::Error::other("test root has no parent"))?,
+        )?;
+        let input = held_marker_test_input(legacy.root(), &common_parent, "destination")?;
+        assert!(matches!(
+            lock.create_held_publication_marker_v2(legacy.root(), held_root, input),
+            Err(super::HeldPublicationMarkerV2Error::NamespaceConflict)
+        ));
+        assert_eq!(fs::read(&legacy_path)?, [0x42; 16]);
+        assert!(!legacy.local().join(IMPORT_PUBLISH_MARKER_V2).exists());
+
+        let multiple = TestVault::new()?;
+        let identities = initialize_existing_lock(multiple.root())?;
+        let exact_path = write_canonical_publication_marker_v2(multiple.root())?;
+        let exact_before = fs::read(&exact_path)?;
+        let extra_path = multiple.local().join("import-publish-marker-foreign");
+        fs::write(&extra_path, b"foreign-reserved-canary")?;
+        let held_root = super::open_secure_source_root(multiple.root())?;
+        let lock = ExistingVaultMutationLock::acquire(
+            multiple.root(),
+            &identities.root,
+            &identities.local,
+            &identities.lock,
+        )
+        .map_err(io::Error::other)?;
+        let common_parent = super::filesystem_directory_identity(
+            multiple
+                .root()
+                .parent()
+                .ok_or_else(|| io::Error::other("test root has no parent"))?,
+        )?;
+        let input = held_marker_test_input(multiple.root(), &common_parent, "destination")?;
+        assert!(matches!(
+            lock.create_held_publication_marker_v2(multiple.root(), held_root, input),
+            Err(super::HeldPublicationMarkerV2Error::NamespaceConflict)
+        ));
+        assert_eq!(fs::read(exact_path)?, exact_before);
+        assert_eq!(fs::read(extra_path)?, b"foreign-reserved-canary");
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn held_publication_marker_revalidation_rejects_body_and_link_drift() -> io::Result<()> {
+        let tampered = TestVault::new()?;
+        let common_parent = super::filesystem_directory_identity(
+            tampered
+                .root()
+                .parent()
+                .ok_or_else(|| io::Error::other("test root has no parent"))?,
+        )?;
+        let (held_root, lock) = held_root_and_existing_lock(tampered.root())?;
+        let input = held_marker_test_input(tampered.root(), &common_parent, "destination")?;
+        let held = lock
+            .create_held_publication_marker_v2(tampered.root(), held_root, input)
+            .map_err(io::Error::other)?;
+        fs::write(
+            tampered.local().join(IMPORT_PUBLISH_MARKER_V2),
+            b"not-canonical",
+        )?;
+        assert!(held.revalidate_at(tampered.root()).is_err());
+        drop(held);
+
+        let linked = TestVault::new()?;
+        let common_parent = super::filesystem_directory_identity(
+            linked
+                .root()
+                .parent()
+                .ok_or_else(|| io::Error::other("test root has no parent"))?,
+        )?;
+        let (held_root, lock) = held_root_and_existing_lock(linked.root())?;
+        let input = held_marker_test_input(linked.root(), &common_parent, "destination")?;
+        let held = lock
+            .create_held_publication_marker_v2(linked.root(), held_root, input)
+            .map_err(io::Error::other)?;
+        let marker_path = linked.local().join(IMPORT_PUBLISH_MARKER_V2);
+        fs::hard_link(&marker_path, linked.local().join("marker-hardlink"))?;
+        assert!(held.revalidate_at(linked.root()).is_err());
+        assert!(marker_path.exists());
+
+        let grown = TestVault::new()?;
+        let common_parent = super::filesystem_directory_identity(
+            grown
+                .root()
+                .parent()
+                .ok_or_else(|| io::Error::other("test root has no parent"))?,
+        )?;
+        let (held_root, lock) = held_root_and_existing_lock(grown.root())?;
+        let input = held_marker_test_input(grown.root(), &common_parent, "destination")?;
+        let held = lock
+            .create_held_publication_marker_v2(grown.root(), held_root, input)
+            .map_err(io::Error::other)?;
+        let marker_path = grown.local().join(IMPORT_PUBLISH_MARKER_V2);
+        let mut append = fs::OpenOptions::new().append(true).open(&marker_path)?;
+        append.write_all(b"trailing")?;
+        append.sync_all()?;
+        drop(append);
+        assert!(held.revalidate_at(grown.root()).is_err());
+        drop(held);
+
+        let replaced = TestVault::new()?;
+        let common_parent = super::filesystem_directory_identity(
+            replaced
+                .root()
+                .parent()
+                .ok_or_else(|| io::Error::other("test root has no parent"))?,
+        )?;
+        let (held_root, lock) = held_root_and_existing_lock(replaced.root())?;
+        let input = held_marker_test_input(replaced.root(), &common_parent, "destination")?;
+        let held = lock
+            .create_held_publication_marker_v2(replaced.root(), held_root, input)
+            .map_err(io::Error::other)?;
+        let marker_path = replaced.local().join(IMPORT_PUBLISH_MARKER_V2);
+        let retired_path = replaced.local().join("retired-marker-canary");
+        let canonical = held.marker().to_bytes();
+        fs::rename(&marker_path, &retired_path)?;
+        fs::write(&marker_path, &canonical)?;
+        assert!(held.revalidate_at(replaced.root()).is_err());
+        assert_eq!(fs::read(&marker_path)?, canonical);
+        assert!(retired_path.exists());
+        drop(held);
+
+        let extra = TestVault::new()?;
+        let common_parent = super::filesystem_directory_identity(
+            extra
+                .root()
+                .parent()
+                .ok_or_else(|| io::Error::other("test root has no parent"))?,
+        )?;
+        let (held_root, lock) = held_root_and_existing_lock(extra.root())?;
+        let input = held_marker_test_input(extra.root(), &common_parent, "destination")?;
+        let held = lock
+            .create_held_publication_marker_v2(extra.root(), held_root, input)
+            .map_err(io::Error::other)?;
+        let extra_path = extra.local().join("import-publish-marker-foreign");
+        fs::write(&extra_path, b"foreign-reserved-canary")?;
+        assert!(matches!(
+            held.revalidate_at(extra.root()),
+            Err(super::HeldPublicationMarkerV2Error::NamespaceConflict)
+        ));
+        assert_eq!(fs::read(extra_path)?, b"foreign-reserved-canary");
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn held_publication_marker_revalidates_after_external_whole_root_rename() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        let common_parent_path = fixture
+            .root()
+            .parent()
+            .ok_or_else(|| io::Error::other("test root has no parent"))?;
+        let common_parent = super::filesystem_directory_identity(common_parent_path)?;
+        let destination_name = format!("inex-held-marker-dest-{}", uuid::Uuid::new_v4().simple());
+        let destination = common_parent_path.join(&destination_name);
+        let (held_root, lock) = held_root_and_existing_lock(fixture.root())?;
+        let input = held_marker_test_input(fixture.root(), &common_parent, &destination_name)?;
+        let held = lock
+            .create_held_publication_marker_v2(fixture.root(), held_root, input)
+            .map_err(io::Error::other)?;
+
+        fs::rename(fixture.root(), &destination)?;
+        assert!(held.revalidate_at(fixture.root()).is_err());
+        held.revalidate_at(&destination).map_err(io::Error::other)?;
+        fs::rename(&destination, fixture.root())?;
+        held.revalidate_at(fixture.root())
+            .map_err(io::Error::other)?;
+        Ok(())
     }
 
     #[cfg(any(target_os = "linux", windows))]
