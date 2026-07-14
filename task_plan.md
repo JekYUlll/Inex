@@ -104,7 +104,7 @@ Phase 6 extension — 现有 Markdown Git 仓库与加密附件迁移（Phase 7 
         - [x] 从target构造/只读audit移除`ls-files`、`ls-tree`与`--batch-all-objects`，改为raw index直连、canonical tree/commit和exact loose-object inventory下的16 KiB逐对象双哈希证明（`80af987`）
         - [x] 让target raw-index直接对section-1借用路径验证v2/v3/v4与IEOT，只保留OID摘要；legacy canonical tree逐棵计算OID/大小/SHA-256后立即释放body（`604624e`）
         - [x] 为section-1提供稳定record ID与无第二份owned path的exact streaming revalidation；首版NO-GO后改为held-file ADS、borrowed parent/child匹配与仅root持完整路径，修复复审GO（`75f754e`）
-        - [ ] 重构初始section-1采集本身，消除`Vec<NamespaceSeal>`、`BTreeSet<CaseFoldKey>`与最终records同时拥有路径字节的峰值，并以唯一路径清单上的借用比较完成portable collision验证
+        - [x] 重构初始section-1采集本身，消除`Vec<NamespaceSeal>`、`BTreeSet<CaseFoldKey>`与最终records同时拥有路径字节的峰值，并以唯一路径清单上的借用比较完成portable collision验证（`3aa0a0c`、`865937d`）
         - [ ] 实现不依赖`TargetRepository`的fresh assembler，并以借用路径、raw-index visitor和逐棵tree摘要后释放闭合全进程同时不超过256 MiB canonical-path bytes及不缓存全部tree body的硬边界
       - [ ] 实现held-marker owner、完整live/fresh九段collector、v2 claim创建/发布/reconcile状态机与终态输出
   - [ ] 完成repository import构造/durability/publication每一边界的Linux force-kill、hostile same-UID source/target race、artifact-bound residue与原生Windows矩阵
