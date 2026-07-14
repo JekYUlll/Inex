@@ -942,3 +942,8 @@
 
 - 提交 `c8b6f10`（`feat(vscode): reorder encrypted private tags`）：新增 `Inex: Reorder Private Tags`，选择当前 tag 后可移动到 first/previous/next/last。UI 从 daemon 刚读回的完整 catalog 产生 exact ID permutation，再调用 `umbra.tag.reorder` 并 reload。
 - 修正管理器原本的普通 QuickPick：任何展示私密 tag label/description 的选择器均改用 sensitive QuickPick，在 Umbra 锁定时清空 items 并关闭；后续位置动作不显示 tag label。验证：VS Code check、55/55 tests、build、diff-check 通过。
+
+## 2026-07-15 — 加密 annotation profile 核心管理
+
+- 提交 `4594d6b`（`feat(umbra): manage encrypted annotation profiles`）：`UmbraConfigV1`/Vault 新增 create/edit/remove profile。edit 必须以同一 stable profile ID 回写，create/edit 都重新验证 encrypted tag references、kind/Outer/Cover prompt 语义；remove 会在同一 config 事务中清掉 matching default profile ID。
+- 核心 profile mutation 与 catalog/canary 回归、严格 core Clippy、fmt/diff-check 通过。下一步为 daemon RPC，编辑器仍不能直接改 `.inex/config.umbra.inex`。

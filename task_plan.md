@@ -120,6 +120,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
   - [x] VS Code sidecar 已增加对应 typed tag RPC client，并在发出请求前验证 ID/文本/别名/排序资源约束（`ea6d44a`）
   - [x] VS Code 已提供 `inex.managePrivateTags` 的 create/rename/archive：复用统一 Umbra 初始化/解锁会话，取消输入立即清理敏感 label/ID，每次 mutation 后从 daemon reload catalog（`a94ce38`）
   - [x] VS Code 已提供 `inex.reorderPrivateTags`：从刚读回的完整 catalog 生成 exact permutation，再提交 RPC；私密 label 用 sensitive QuickPick 并随 lock 清空（`c8b6f10`）；profile 管理仍 pending
+  - [x] 加密 annotation profile 现支持 stable-ID create/edit/remove，所有 tag/Outer 引用复用 catalog 验证；删除 default profile 时清空 encrypted default 引用（`4594d6b`）
   - [ ] 跑通多选、wrap/unwrap/edit、跨编辑器目录、canary/残留及Outer隔离矩阵
 
 - [x] 实现 `.gitattributes`、locked-safe `inex merge-driver` 与已解锁 CLI 三方合并
