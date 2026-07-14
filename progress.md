@@ -1,5 +1,10 @@
 # Inex Progress Log
 
+## 2026-07-15 — Neovim 受控目录创建
+
+- 新增 `InexMkdir`：目录 path 经过与 tree 一致的有界、相对、无控制字符/反斜杠/alias 验证后，才调用 daemon `file.mkdir`；结果必须为 exact `{ok:true}`，不作隐式父目录创建或本地文件系统写入。
+- lifecycle 回归在 Unicode document 保存/search 后创建 `notes`，刷新 tree 并验证 `[D] notes`；同一测试仍验证 lock wipe。transport smoke 与 `git diff --check` 通过。
+
 ## 2026-07-15 — Neovim masked 内存搜索
 
 - 新增 `InexSearch`：交互搜索词来自 `inputsecret()`，不使用普通 `input()`；最多 4 KiB 的 query 仅作为当前 RPC 参数传给 daemon `search.query`，回调后立即丢弃 Lua 变量。
