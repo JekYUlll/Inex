@@ -216,6 +216,68 @@ impl UmbraConfigV1 {
         self.tag_catalog
             .sort_by(|left, right| (left.sort_order, &left.id).cmp(&(right.sort_order, &right.id)));
     }
+
+    /// Add a reusable encrypted private-annotation profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-config error for duplicate IDs or invalid tag/cover
+    /// references.
+    pub fn create_profile(&mut self, profile: AnnotationProfile) -> Result<(), UmbraConfigError> {
+        if self
+            .annotation_profiles
+            .iter()
+            .any(|existing| existing.id == profile.id)
+        {
+            return Err(UmbraConfigError::InvalidConfig);
+        }
+        self.annotation_profiles.push(profile);
+        self.annotation_profiles
+            .sort_by(|left, right| left.id.cmp(&right.id));
+        self.validate()
+    }
+
+    /// Replace one profile while preserving its stable ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-config error for an absent or mismatched profile ID.
+    pub fn edit_profile(
+        &mut self,
+        profile_id: &str,
+        profile: AnnotationProfile,
+    ) -> Result<(), UmbraConfigError> {
+        if profile.id != profile_id {
+            return Err(UmbraConfigError::InvalidConfig);
+        }
+        let Some(existing) = self
+            .annotation_profiles
+            .iter_mut()
+            .find(|existing| existing.id == profile_id)
+        else {
+            return Err(UmbraConfigError::InvalidConfig);
+        };
+        *existing = profile;
+        self.validate()
+    }
+
+    /// Remove a profile and clear it if it was the encrypted default.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-config error for an absent profile.
+    pub fn remove_profile(&mut self, profile_id: &str) -> Result<(), UmbraConfigError> {
+        let before = self.annotation_profiles.len();
+        self.annotation_profiles
+            .retain(|profile| profile.id != profile_id);
+        if self.annotation_profiles.len() == before {
+            return Err(UmbraConfigError::InvalidConfig);
+        }
+        if self.defaults.default_profile_id == profile_id {
+            self.defaults.default_profile_id.clear();
+        }
+        self.validate()
+    }
 }
 
 /// Canonical public envelope around encrypted config bytes.
@@ -485,5 +547,48 @@ mod tests {
 
         config.defaults.tag_ids = vec!["missing".to_owned()];
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn annotation_profiles_keep_stable_ids_and_clear_deleted_default() {
+        let mut config = UmbraConfigV1::empty();
+        config
+            .create_tag(PrivateTagDefinition {
+                id: "relationship".to_owned(),
+                label: "Relationship".to_owned(),
+                description: String::new(),
+                aliases: Vec::new(),
+                sort_order: 0,
+                default_selected: false,
+                archived: false,
+            })
+            .expect("create tag");
+        let profile = AnnotationProfile {
+            id: "relationship-comment".to_owned(),
+            label: "Relationship comment".to_owned(),
+            kind: PrivateAnnotationKind::Comment,
+            tag_ids: vec!["relationship".to_owned()],
+            outer: OuterMode::Drop,
+            prompt_for_cover: false,
+        };
+        config
+            .create_profile(profile.clone())
+            .expect("create profile");
+        config.defaults.default_profile_id = profile.id.clone();
+        config.validate().expect("default profile is valid");
+        let mut edited = profile.clone();
+        edited.label = "Relations".to_owned();
+        edited.outer = OuterMode::Cover;
+        edited.prompt_for_cover = true;
+        config
+            .edit_profile("relationship-comment", edited)
+            .expect("edit stable profile");
+        assert_eq!(config.annotation_profiles[0].id, "relationship-comment");
+        assert_eq!(config.annotation_profiles[0].label, "Relations");
+        config
+            .remove_profile("relationship-comment")
+            .expect("remove profile");
+        assert!(config.defaults.default_profile_id.is_empty());
+        assert!(config.annotation_profiles.is_empty());
     }
 }

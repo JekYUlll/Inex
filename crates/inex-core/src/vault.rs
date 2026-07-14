@@ -32,8 +32,8 @@ use crate::search::{
 use crate::sodium::Argon2idParams;
 use crate::tree::{self, TreeEntryKind, TreeError, VaultTree, VaultTreeProfile};
 use crate::umbra_config::{
-    EncryptedUmbraConfigV1, PrivateTagDefinition, UMBRA_CONFIG_PATH, UmbraConfigError,
-    UmbraConfigV1,
+    AnnotationProfile, EncryptedUmbraConfigV1, PrivateTagDefinition, UMBRA_CONFIG_PATH,
+    UmbraConfigError, UmbraConfigV1,
 };
 use crate::umbra_document::{
     OuterSlotStrategy, PrivateAnnotationSpec, PrivateSlotPayloadV1, UmbraDocumentError,
@@ -840,6 +840,47 @@ impl Vault {
     pub fn reorder_private_tags(&mut self, tag_ids: &[String]) -> Result<(), VaultError> {
         let mut config = self.load_umbra_config()?;
         config.reorder_tags(tag_ids)?;
+        self.save_umbra_config(&config)
+    }
+
+    /// Create one encrypted annotation profile in the shared Umbra catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless all profile references are valid under the
+    /// current live Umbra session.
+    pub fn create_annotation_profile(
+        &mut self,
+        profile: AnnotationProfile,
+    ) -> Result<(), VaultError> {
+        let mut config = self.load_umbra_config()?;
+        config.create_profile(profile)?;
+        self.save_umbra_config(&config)
+    }
+
+    /// Edit one encrypted annotation profile without changing its stable ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an absent/mismatched profile or invalid references.
+    pub fn edit_annotation_profile(
+        &mut self,
+        profile_id: &str,
+        profile: AnnotationProfile,
+    ) -> Result<(), VaultError> {
+        let mut config = self.load_umbra_config()?;
+        config.edit_profile(profile_id, profile)?;
+        self.save_umbra_config(&config)
+    }
+
+    /// Remove one encrypted annotation profile and clear a matching default.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an absent profile.
+    pub fn remove_annotation_profile(&mut self, profile_id: &str) -> Result<(), VaultError> {
+        let mut config = self.load_umbra_config()?;
+        config.remove_profile(profile_id)?;
         self.save_umbra_config(&config)
     }
 
