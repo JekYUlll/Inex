@@ -91,6 +91,12 @@ inex.unlock_umbra(vim.env.INEX_TEST_UMBRA_PASSWORD, true)
 assert(vim.wait(5000, inex.is_umbra_unlocked, 10), "Inex Umbra re-unlock timed out")
 inex.enable_umbra()
 assert(vim.wait(5000, inex.is_umbra_enabled, 10), "Inex Umbra enable timed out")
+local catalog_loaded = false
+inex.load_umbra_annotation_config(function(config)
+  assert(type(config.tags) == "table" and type(config.profiles) == "table" and type(config.defaults) == "table", "Umbra catalog shape is invalid")
+  catalog_loaded = true
+end)
+assert(vim.wait(5000, function() return catalog_loaded end, 10), "Inex Umbra catalog load timed out")
 buffer = vim.api.nvim_get_current_buf()
 inex.convert_current_document_to_umbra()
 assert(vim.wait(5000, function()

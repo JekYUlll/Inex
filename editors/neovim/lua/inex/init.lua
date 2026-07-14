@@ -191,6 +191,41 @@ local function valid_annotation_spec(value)
     and (value.outer.mode == "drop" or value.outer.mode == "placeholder")
 end
 
+local function valid_umbra_config(value)
+  if not has_exact_keys(value, { tags = true, profiles = true, defaults = true, count = 3 })
+    or type(value.tags) ~= "table" or type(value.profiles) ~= "table" or type(value.defaults) ~= "table"
+    or #value.tags > 4096 or #value.profiles > 4096 then
+    return false
+  end
+  local tags, profiles = {}, {}
+  for _, tag in ipairs(value.tags) do
+    if not has_exact_keys(tag, { id = true, label = true, description = true, aliases = true, sortOrder = true, defaultSelected = true, archived = true, count = 7 })
+      or not valid_tag_id(tag.id) or tags[tag.id] or type(tag.label) ~= "string" or #tag.label == 0 or #tag.label > 4096
+      or type(tag.description) ~= "string" or #tag.description > 16384 or type(tag.aliases) ~= "table" or #tag.aliases > 256
+      or type(tag.sortOrder) ~= "number" or tag.sortOrder % 1 ~= 0 or type(tag.defaultSelected) ~= "boolean" or type(tag.archived) ~= "boolean" then return false end
+    tags[tag.id] = true
+  end
+  local function canonical_tag_ids(ids)
+    if type(ids) ~= "table" or #ids > 4096 then return false end
+    local previous = nil
+    for _, id in ipairs(ids) do if not tags[id] or (previous and previous >= id) then return false end; previous = id end
+    return true
+  end
+  for _, profile in ipairs(value.profiles) do
+    if not has_exact_keys(profile, { id = true, label = true, kind = true, tagIds = true, outer = true, promptForCover = true, count = 6 })
+      or not valid_tag_id(profile.id) or profiles[profile.id] or type(profile.label) ~= "string" or #profile.label == 0 or #profile.label > 4096
+      or (profile.kind ~= "block" and profile.kind ~= "comment") or not canonical_tag_ids(profile.tagIds)
+      or (profile.outer ~= "drop" and profile.outer ~= "cover" and profile.outer ~= "placeholder") or type(profile.promptForCover) ~= "boolean"
+      or ((profile.outer == "cover") ~= profile.promptForCover) then return false end
+    profiles[profile.id] = true
+  end
+  local defaults = value.defaults
+  return has_exact_keys(defaults, { kind = true, tagIds = true, outer = true, defaultProfileId = true, count = 4 })
+    and (defaults.kind == "block" or defaults.kind == "comment") and canonical_tag_ids(defaults.tagIds)
+    and (defaults.outer == "drop" or defaults.outer == "cover" or defaults.outer == "placeholder")
+    and type(defaults.defaultProfileId) == "string" and (defaults.defaultProfileId == "" or profiles[defaults.defaultProfileId] == true)
+end
+
 -- Validate every private projection boundary before displaying it. The map is
 -- deliberately not retained by this read-only MVP, so lock needs to wipe only
 -- the buffer that contains the daemon-rendered projection.
@@ -434,6 +469,21 @@ function M.enable_umbra()
     end
     umbra_enabled = true
     vim.notify("Inex Umbra private annotations enabled", vim.log.levels.INFO)
+  end)
+end
+
+function M.load_umbra_annotation_config(callback)
+  if not session or not umbra_unlocked then
+    vim.notify("Unlock Inex Umbra before loading private annotations", vim.log.levels.ERROR)
+    return
+  end
+  local active_session = session
+  rpc.request("umbra.config.get", { session = active_session }, function(result, error)
+    if error or session ~= active_session or not umbra_unlocked or not valid_umbra_config(result) then
+      vim.notify(error or "Inex Umbra catalog response is invalid", vim.log.levels.ERROR)
+      return
+    end
+    callback(result)
   end)
 end
 
