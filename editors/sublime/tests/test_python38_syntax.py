@@ -13,6 +13,7 @@ class Python38SyntaxTests(unittest.TestCase):
         for name in (
             "Inex.py",
             "inex_core.py",
+            "inex_annotation.py",
             "inex_markdown.py",
             "inex_password.py",
             "inex_rpc.py",
