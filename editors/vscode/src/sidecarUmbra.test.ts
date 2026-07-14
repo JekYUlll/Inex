@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { RpcProtocolError, type JsonObject } from "./rpc.ts";
-import { parseUmbraAnnotationResult, parseUmbraProjection } from "./sidecar.ts";
+import {
+  parseUmbraAnnotationConfig,
+  parseUmbraAnnotationResult,
+  parseUmbraProjection,
+} from "./sidecar.ts";
 
 const ETAG = `sha256:${"a".repeat(64)}`;
 const METADATA = {
@@ -72,4 +76,48 @@ test("Umbra annotation parser requires fresh projection, metadata, and durabilit
   assert.equal(parsed.metadata.logicalPath, "private.md");
   parsed.content.fill(0);
   parsed.renderMap.generation.fill(0);
+});
+
+test("Umbra config parser accepts only encrypted-catalog identifiers and references", () => {
+  const parsed = parseUmbraAnnotationConfig({
+    tags: [
+      {
+        id: "comment-content",
+        label: "Comment",
+        description: "General private annotation",
+        aliases: ["comment"],
+        sortOrder: 10,
+        defaultSelected: true,
+        archived: false,
+      },
+    ],
+    profiles: [
+      {
+        id: "private-comment",
+        label: "Private comment",
+        kind: "comment",
+        tagIds: ["comment-content"],
+        outer: "drop",
+        promptForCover: false,
+      },
+    ],
+    defaults: {
+      kind: "comment",
+      tagIds: ["comment-content"],
+      outer: "drop",
+      defaultProfileId: "private-comment",
+    },
+  });
+  assert.equal(parsed.tags[0]?.id, "comment-content");
+  assert.equal(parsed.profiles[0]?.label, "Private comment");
+
+  assert.throws(
+    () =>
+      parseUmbraAnnotationConfig({
+        tags: [],
+        profiles: [],
+        defaults: { kind: "comment", tagIds: ["missing"], outer: "drop", defaultProfileId: "" },
+      }),
+    RpcProtocolError,
+  );
 });

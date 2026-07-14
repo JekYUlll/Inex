@@ -28,6 +28,9 @@ const MAX_OUTSTANDING_FRAME_BYTES = MAX_FRAME_BYTES + 64 * 1024;
 const MAX_CLIENT_IDLE_TIMEOUT_MS = 60 * 60 * 1_000;
 const MAX_DOCUMENT_BYTES = 16 * 1024 * 1024;
 const MAX_ASSET_BYTES = 64 * 1024 * 1024;
+const MAX_UMBRA_TAGS = 1_024;
+const MAX_UMBRA_PROFILES = 1_024;
+const MAX_UMBRA_TEXT_BYTES = 4 * 1024;
 export const MAX_ASSET_CHUNK_BYTES = 1024 * 1024;
 const MAX_DRAFT_ENVELOPE_BYTES = MAX_DOCUMENT_BYTES + 12 + 4096 + 16;
 const PROTOCOL_MAJOR = 1;
@@ -87,6 +90,36 @@ export interface PrivateAnnotationSpec {
   readonly kind: PrivateAnnotationKind;
   readonly tagIds: readonly string[];
   readonly outer: { readonly mode: OuterMode; readonly coverText?: string };
+}
+
+export interface UmbraTagDefinition {
+  readonly id: string;
+  readonly label: string;
+  readonly description: string;
+  readonly aliases: readonly string[];
+  readonly sortOrder: number;
+  readonly defaultSelected: boolean;
+  readonly archived: boolean;
+}
+
+export interface UmbraAnnotationProfile {
+  readonly id: string;
+  readonly label: string;
+  readonly kind: PrivateAnnotationKind;
+  readonly tagIds: readonly string[];
+  readonly outer: OuterMode;
+  readonly promptForCover: boolean;
+}
+
+export interface UmbraAnnotationConfig {
+  readonly tags: readonly UmbraTagDefinition[];
+  readonly profiles: readonly UmbraAnnotationProfile[];
+  readonly defaults: {
+    readonly kind: PrivateAnnotationKind;
+    readonly tagIds: readonly string[];
+    readonly outer: OuterMode;
+    readonly defaultProfileId: string;
+  };
 }
 
 export interface UmbraAnnotationResult extends UmbraProjection {
@@ -375,6 +408,13 @@ export class InexSidecar {
       throw new RpcProtocolError("RPC Umbra lock result is invalid");
     }
     expectAcknowledgement(result);
+  }
+
+  public async loadUmbraAnnotationConfig(): Promise<UmbraAnnotationConfig> {
+    this.requireUmbraV1();
+    return parseUmbraAnnotationConfig(
+      await this.callRaw("umbra.config.get", this.protectedParams()),
+    );
   }
 
   public async enableUmbra(): Promise<"synced" | "notSynced"> {
@@ -1074,6 +1114,146 @@ function parseUmbraStatus(value: JsonValue): UmbraStatus {
     throw new RpcProtocolError("RPC Umbra status is invalid");
   }
   return { initialized: result.initialized, unlocked: result.unlocked };
+}
+
+/** @internal Exported for exact encrypted Umbra config protocol-shape tests. */
+export function parseUmbraAnnotationConfig(value: JsonValue): UmbraAnnotationConfig {
+  const result = expectObject(value);
+  expectExactKeys(result, ["defaults", "profiles", "tags"], "Umbra config");
+  const tags = expectArray(result.tags, "Umbra tags");
+  const profiles = expectArray(result.profiles, "Umbra profiles");
+  if (tags.length > MAX_UMBRA_TAGS || profiles.length > MAX_UMBRA_PROFILES) {
+    throw new RpcProtocolError("RPC Umbra config exceeds v1 limits");
+  }
+  const parsedTags = tags.map(parseUmbraTag);
+  const seenTags = new Set<string>();
+  for (const tag of parsedTags) {
+    if (seenTags.has(tag.id)) {
+      throw new RpcProtocolError("RPC Umbra tag IDs are duplicated");
+    }
+    seenTags.add(tag.id);
+  }
+  const parsedProfiles = profiles.map((profile) => parseUmbraProfile(profile, seenTags));
+  const seenProfiles = new Set<string>();
+  for (const profile of parsedProfiles) {
+    if (seenProfiles.has(profile.id)) {
+      throw new RpcProtocolError("RPC Umbra profile IDs are duplicated");
+    }
+    seenProfiles.add(profile.id);
+  }
+  const defaults = expectObject(result.defaults);
+  expectExactKeys(defaults, ["defaultProfileId", "kind", "outer", "tagIds"], "Umbra defaults");
+  const defaultProfileId = expectUmbraId(defaults.defaultProfileId, "Umbra default profile ID", true);
+  if (defaultProfileId !== "" && !seenProfiles.has(defaultProfileId)) {
+    throw new RpcProtocolError("RPC Umbra default profile is unavailable");
+  }
+  return {
+    tags: parsedTags,
+    profiles: parsedProfiles,
+    defaults: {
+      kind: expectAnnotationKind(defaults.kind, "Umbra default kind"),
+      tagIds: parseUmbraTagIds(defaults.tagIds, seenTags, "Umbra default tags"),
+      outer: expectOuterMode(defaults.outer, "Umbra default outer mode"),
+      defaultProfileId,
+    },
+  };
+}
+
+function parseUmbraTag(value: JsonValue): UmbraTagDefinition {
+  const tag = expectObject(value);
+  expectExactKeys(
+    tag,
+    ["aliases", "archived", "defaultSelected", "description", "id", "label", "sortOrder"],
+    "Umbra tag",
+  );
+  if (typeof tag.defaultSelected !== "boolean" || typeof tag.archived !== "boolean") {
+    throw new RpcProtocolError("RPC Umbra tag flags are invalid");
+  }
+  const aliases = expectArray(tag.aliases, "Umbra tag aliases");
+  if (aliases.length > MAX_UMBRA_TAGS) {
+    throw new RpcProtocolError("RPC Umbra tag aliases exceed v1 limits");
+  }
+  return {
+    id: expectUmbraId(tag.id, "Umbra tag ID"),
+    label: expectBoundedString(tag.label, "Umbra tag label", MAX_UMBRA_TEXT_BYTES),
+    description: expectBoundedString(tag.description, "Umbra tag description", MAX_UMBRA_TEXT_BYTES),
+    aliases: aliases.map((alias) => expectBoundedString(alias, "Umbra tag alias", MAX_UMBRA_TEXT_BYTES)),
+    sortOrder: expectSafeInteger(tag.sortOrder, "Umbra tag sort order"),
+    defaultSelected: tag.defaultSelected,
+    archived: tag.archived,
+  };
+}
+
+function parseUmbraProfile(
+  value: JsonValue,
+  availableTagIds: ReadonlySet<string>,
+): UmbraAnnotationProfile {
+  const profile = expectObject(value);
+  expectExactKeys(
+    profile,
+    ["id", "kind", "label", "outer", "promptForCover", "tagIds"],
+    "Umbra profile",
+  );
+  if (typeof profile.promptForCover !== "boolean") {
+    throw new RpcProtocolError("RPC Umbra profile cover flag is invalid");
+  }
+  return {
+    id: expectUmbraId(profile.id, "Umbra profile ID"),
+    label: expectBoundedString(profile.label, "Umbra profile label", MAX_UMBRA_TEXT_BYTES),
+    kind: expectAnnotationKind(profile.kind, "Umbra profile kind"),
+    tagIds: parseUmbraTagIds(profile.tagIds, availableTagIds, "Umbra profile tags"),
+    outer: expectOuterMode(profile.outer, "Umbra profile outer mode"),
+    promptForCover: profile.promptForCover,
+  };
+}
+
+function parseUmbraTagIds(
+  value: JsonValue | undefined,
+  availableTagIds: ReadonlySet<string>,
+  field: string,
+): readonly string[] {
+  const tags = expectArray(value, field);
+  if (tags.length > MAX_UMBRA_TAGS) {
+    throw new RpcProtocolError(`RPC ${field} exceeds v1 limits`);
+  }
+  const ids = tags.map((tag) => expectUmbraId(tag, field));
+  if (
+    ids.some((id, index) => (index > 0 && ids[index - 1]! >= id) || !availableTagIds.has(id))
+  ) {
+    throw new RpcProtocolError(`RPC ${field} are not canonical or available`);
+  }
+  return ids;
+}
+
+function expectUmbraId(
+  value: JsonValue | undefined,
+  field: string,
+  allowEmpty = false,
+): string {
+  const id = expectString(value, field);
+  if ((allowEmpty && id === "") || /^[a-z0-9][a-z0-9._-]{0,63}$/.test(id)) {
+    return id;
+  }
+  throw new RpcProtocolError(`RPC ${field} is invalid`);
+}
+
+function expectAnnotationKind(
+  value: JsonValue | undefined,
+  field: string,
+): PrivateAnnotationKind {
+  const kind = expectString(value, field);
+  if (kind === "block" || kind === "comment") {
+    return kind;
+  }
+  throw new RpcProtocolError(`RPC ${field} is invalid`);
+}
+
+function expectOuterMode(value: JsonValue | undefined, field: string): OuterMode {
+  const outer = expectString(value, field);
+  if (outer === "drop" || outer === "cover" || outer === "placeholder") {
+    return outer;
+  }
+  throw new RpcProtocolError(`RPC ${field} is invalid`);
 }
 
 /** @internal Exported for exact Umbra protocol-shape regression tests. */
