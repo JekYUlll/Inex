@@ -110,6 +110,20 @@ class ModelTests(unittest.TestCase):
         with self.assertRaisesRegex(ModelError, "normal handle"):
             ManagedDocument(15, "today.md", "normal", ETAG, bytearray(), render_map)
 
+    def test_only_clean_normal_document_can_transition_to_umbra(self):
+        document = ManagedDocument(16, "today.md", "normal-handle", ETAG, bytearray(b"outer"))
+        projection = bytearray(b"Umbra projection")
+        render_map = {"generationBase64": "g", "projectionBytes": len(projection)}
+        self.assertEqual(document.transition_to_umbra_projection(projection, NEW_ETAG, render_map), "normal-handle")
+        self.assertTrue(document.is_umbra)
+        self.assertEqual(document.handle, "")
+        dirty = ManagedDocument(17, "dirty.md", "h", ETAG, bytearray(b"outer"))
+        dirty.replace(bytearray(b"changed"))
+        rejected = bytearray(b"projection")
+        with self.assertRaisesRegex(ModelError, "clean normal"):
+            dirty.transition_to_umbra_projection(rejected, NEW_ETAG, render_map)
+        self.assertEqual(rejected, bytearray(len(rejected)))
+
     def test_registry_bypass_is_one_shot(self):
         registry = DocumentRegistry()
         document = ManagedDocument(10, "today.md", "h", ETAG, bytearray())

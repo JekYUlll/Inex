@@ -495,6 +495,26 @@ class ManagedDocument:
         self.draft_version = self.version
         self.requires_overwrite_confirmation = False
 
+    def transition_to_umbra_projection(
+        self, content: bytearray, etag: str, render_map: Dict[str, Any]
+    ) -> str:
+        if self.is_umbra or self.closed or self.read_only or self.dirty:
+            wipe(content)
+            raise ModelError("Only a clean normal document can enter Umbra")
+        old_handle = self.handle
+        if not old_handle:
+            wipe(content)
+            raise ModelError("Normal document handle is invalid")
+        self.handle = ""
+        self.umbra_render_map = {"pending": True}
+        try:
+            self.replace_umbra_projection(content, etag, render_map)
+        except Exception:
+            self.handle = old_handle
+            self.umbra_render_map = None
+            raise
+        return old_handle
+
     def mark_drafted(self, version: int) -> None:
         if version <= self.version:
             self.draft_version = max(self.draft_version, version)
