@@ -90,7 +90,8 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
   - [ ] 实现core私密slot、TagId、catalog/profile和RenderMap选择事务，并证明canary不进入磁盘Outer面
     - [x] Vault 已提供 live-session-only 的 private slot insert/read/replace/remove；slot payload 与标签的磁盘 canary 不进入 Outer projection（`3d6d6ef`）
   - [x] 实现 canonical Umbra projection、RenderMap generation、严格私密块范围分类，以及 marker/slot 一一对应的 ETag 原子变更；普通保存拒绝 dangling/duplicate/missing marker（`9d05c11`）
-    - [x] 实现 `apply_private_annotation`：以 ETag 与完整 RenderMap/投影复核后，只对纯文本多选区从后向前创建独立 slot 与 marker，并一次性条件保存；过期、混合/私密选区零写入，slot/tag/正文 canary 不进入 Outer 或磁盘可读面（`ee77855`）
+  - [x] 实现 `apply_private_annotation`：以 ETag 与完整 RenderMap/投影复核后，只对纯文本多选区从后向前创建独立 slot 与 marker，并一次性条件保存；过期、混合/私密选区零写入，slot/tag/正文 canary 不进入 Outer 或磁盘可读面（`ee77855`）
+  - [x] 实现 complete-private-block 原子解包：完整投影/RenderMap/ETag 一致才可恢复 Markdown 并删除 slot；inside/partial/mixed 选区零写入，恢复正文和 tags 仍不进入磁盘 Outer 面（本轮）
   - [ ] 扩展daemon session/RPC及VS Code QuickPick/命令/可配置keybindings
     - [x] daemon 已声明 `umbraV1` capability，并提供独立 Umbra 状态、初始化、解锁、锁定、feature-2 启用和已解锁投影读取 RPC；普通 `document.open` 不获得 feature-2 plaintext（`f2660b3`）
     - [x] 将 `apply_private_annotation` 接入 daemon 的严格 range/spec RPC：受限嵌套对象/数组解析、base64 projection、完整 RenderMap/ETag 复核、原子返回新投影；RPC 写入 canary 不进入磁盘可读面（`9bd5297`）

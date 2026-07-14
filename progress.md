@@ -31,6 +31,11 @@
 - `QuickPick.canSelectMany` 实现 kind/Outer 单选与 tag 多选，所有标签和 profile 数据仅从已解锁 daemon catalog 取得；Cover 文本单独提示为明确公开数据。选择完成后 CustomEditor 将完整当前 projection、RenderMap 和已验证 UTF-8 selection 交给 `umbra.annotation.apply`，并仅采用 daemon 返回的新投影。
 - package 贡献默认 `Ctrl+Alt+/` 与 `Ctrl+Alt+Shift+/`，不处理原始按键事件。Outer projection 编辑/draft recovery、toggle unwrap/edit、profile shortcut 与管理命令仍待下一切片，当前保持 fail-closed。
 
+## 2026-07-15 — Atomic private annotation unwrap core
+
+- Vault 新增 `remove_private_annotations`：要求 caller 提供当前 ETag、完整 projection、完整 RenderMap 和选区；仅 `CompletePrivateBlocks` 分类可以继续。所有 payload 先经 `K_umbra` 认证，再在单一 feature-2 CAS 中以原 Markdown 替换 markers、删除 slots 并重新渲染。
+- 回归验证 partial private range 被拒绝且不写入；完整 block 解包恢复仅 Umbra projection，密文文件不出现正文或 tag canary。`cargo test -p inex-core --lib` 294/294、严格 Clippy、fmt/diff-check 通过。下一步接 daemon `umbra.annotation.remove` 和 VS Code 确认 UI。
+
 ## 2026-07-15 — Vault feature-2 启用事务
 
 - 提交 `538168d`：`Vault::enable_umbra_private_annotations` 只接受 live Umbra session；它调用已认证 core metadata upgrader，并以 vault.json etag CAS 提交，随后重新 parse 确认 exact committed metadata 才更新内存 config。锁定 session 的调用被拒绝。
