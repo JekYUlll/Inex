@@ -1,5 +1,10 @@
 # Inex Progress Log
 
+## 2026-07-15 — Outer 容器严格解码边界
+
+- 提交 `4973257`：`UmbraDocumentV1` 现可在不解密 private slots 的情况下严格解析 Outer container，拒绝未知版本、非法 slot ID、非 canonical ciphertext 与错误算法；round-trip 回归与私密 canary/Outer 策略篡改回归均通过。
+- 该切片刻意未改动 legacy `Vault::read/save_document`：现有 EDRY header 仍只承诺普通 Markdown，feature-2 与专用 Umbra read/write API 需一起落地，避免把 container JSON 误当编辑正文。
+
 ## 2026-07-15 — 加密 private slot 与 Outer 容器基础
 
 - 提交 `f20d2b6`：新增 `UmbraDocumentV1`、公开 `OuterSlotEntry` 与加密 `PrivateSlotPayloadV1`。私密 kind、tag IDs、Markdown 与 timestamps 仅序列化到 K_umbra slot ciphertext；Outer 容器仅有 marker/Outer strategy/cover 与 nonce/ciphertext。
