@@ -2,7 +2,7 @@
 
 ## Goal
 
-按照 `.agent/init_plan.md` 的架构与安全边界，优先交付“现有 Markdown Git 仓库 → 全新 Inex 密文仓库”的可安装迁移闭环：从干净且固定的 source HEAD 只读导入当前 tracked snapshot，完整加密 Markdown 与图片/附件，在同一隐藏 sibling staging root 内建立并审计全新密文 Git 根提交，再以一次 verified no-replace 整根发布暴露目标；使相对图片可在 VS Code 受控内存界面中读取，且原明文 Git 历史保持在源仓库、绝不进入目标 object database。随后交付 Umbra 私密标注系统：私密slot、标签、profile和元数据均经K_umbra加密，Outer投影、索引、设置与日志不泄漏它们。持续维护可安装编辑器体验、验证与发布准备，使磁盘仓库始终只保存密文而不产生临时明文 Markdown/附件。
+按照 `.agent/init_plan.md` 的架构与安全边界，优先交付“现有 Markdown Git 仓库 → 全新 Inex 密文仓库”的可安装迁移闭环：从干净且固定的 source HEAD 只读导入当前 tracked snapshot，完整加密 Markdown 与图片/附件，在同一隐藏 sibling staging root 内建立并审计全新密文 Git 根提交，再以一次 verified no-replace 整根发布暴露目标；使相对图片可在 VS Code 受控内存界面中读取，且原明文 Git 历史保持在源仓库、绝不进入目标 object database。随后交付 Umbra 私密标注系统：私密slot、标签、profile和元数据均经K_umbra加密，Outer投影、索引、设置与日志不泄漏它们。交付优先级固定为 CLI/daemon、VS Code、Sublime experimental、最后 Neovim；所有客户端复用同一 RPC 与安全边界。持续维护可安装编辑器体验、验证与发布准备，使磁盘仓库始终只保存密文而不产生临时明文 Markdown/附件。
 
 ## Current Phase
 
@@ -13,7 +13,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
 - 真实 Git 仓库只保存 `vault.json`、目录元数据、`*.md.enc` Markdown 密文及版本化附件密文，不创建临时明文 Markdown/附件文件。
 - 口令经 Argon2id 派生 KEK；随机 256-bit master key 被 KEK 包裹；文件使用派生子密钥与 XChaCha20-Poly1305 AEAD。
 - 支持创建/解锁/锁定 vault、文件读写、树浏览、内存搜索、换密码、从现有 Markdown Git 工作树安全迁移当前快照、加密附件与密文 Git 合并。
-- `inexd` 提供语言无关的本地 JSON-RPC 接口；VS Code 为主客户端，Sublime 为命令式轻量客户端。
+- `inexd` 提供语言无关的本地 JSON-RPC 接口；CLI/daemon 与 VS Code 是主交付，Sublime 和 Neovim 是后续轻量客户端。
 - VS Code 通过真实 `*.md.enc` 上的 CustomEditorProvider 提供目录树、编辑、受控链接/引用、扩展内安全搜索与加密 draft backup。
 - Sublime 以 experimental 模式支持 Quick Panel、scratch buffer、自管 dirty/加密 draft 与安全设置 hard gate，不承诺原生虚拟文件系统体验。
 - 核心测试覆盖错误口令、格式/AAD 篡改、Unicode 往返、换密码不重写正文、路径约束、会话与 RPC；CI 至少覆盖 Linux/Windows 构建与打包路径。
@@ -63,6 +63,14 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
 - [x] 实现搜索、跳转与 plugin-host/应用退出失败安全降级
 - [x] 添加 61 项 Python 测试与独立 data-dir Build 4200 canary/CRUD/宿主崩溃边界矩阵；记录 Safe Mode 不加载第三方包的限制
 - **Status:** complete（experimental；宿主崩溃后需重启 Sublime 的平台边界不宣称已消除）
+
+### Phase 5.5: Neovim 轻量客户端（最后优先级）
+
+- [ ] 在 CLI/daemon、VS Code Umbra MVP 与核心隔离验证完成后，建立 Lua 插件骨架与安装说明
+- [ ] 复用 `inexd` JSON-RPC：vault 解锁/锁定、树浏览、受控 Markdown buffer、保存与搜索
+- [ ] 实现 Umbra 最小命令：解锁、私密标注、标签/profile 选择与锁定清理；不得绕过 Outer/Umbra 隔离
+- [ ] 使用 headless Neovim 回归验证，并对 swap、shada、undo、LSP 等宿主明文残留执行显式门控
+- **Status:** pending（不阻塞当前 CLI/daemon 与 VS Code Umbra MVP）
 
 ### Phase 6: Git 合并、迁移与恢复工具
 

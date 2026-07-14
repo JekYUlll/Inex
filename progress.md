@@ -1,5 +1,11 @@
 # Inex Progress Log
 
+## 2026-07-15 — 目标补充：Neovim 最后优先级客户端
+
+- 用户要求增加 Neovim 插件，但明确优先级为 CLI/daemon 与 VS Code 之后。已列为 Phase 5.5：复用 `inexd` JSON-RPC 和同一 Outer/Umbra 安全边界，不新增独立加密实现，也不阻塞当前 Umbra MVP。
+- Neovim MVP 范围是受控 buffer、保存、树/搜索与私密标注命令；swap、shada、undo、LSP 等宿主明文残留风险必须经 headless 验证和文档门控，未验证前不得宣称安全。
+- 后端 Goal API 仍拒绝在未完成 Goal 存在时创建替代目标；已将用户的新优先级写入持久计划，继续以 `task_plan.md` 作为阶段执行真源，不伪造完成状态。
+
 ## Session: 2026-07-10
 
 ### Phase 1: 需求、格式与工程基线冻结
