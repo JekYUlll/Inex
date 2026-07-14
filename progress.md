@@ -1051,3 +1051,8 @@
 
 - 提交 `bdf365b`（`feat(sublime): transition clean documents into Umbra`）：仅 clean、open、normal managed document 可 transition 到 Umbra；方法先从 model 取出 normal handle，再以 authenticated projection 安装 Umbra identity，调用方随后才可关闭旧 normal handle。
 - dirty、locked、closed 或已 Umbra document 一律拒绝并 wipe incoming projection，避免用户未保存的普通修改被 conversion 覆盖。验证：model 20/20、diff-check 通过；下一步是 UI worker 的 convert→open→transition→close-handle sequencing。
+
+## 2026-07-15 — Sublime active document Umbra conversion
+
+- 提交 `4a30a99`（`feat(sublime): enter active documents into Umbra mode`）：`Inex: Enter Umbra Mode for Active Document` 要求 clean normal managed buffer 与已解锁 Umbra，按 convert ETag CAS → authenticated projection open → main-thread client/model identity recheck → model transition → close old normal handle 顺序执行。
+- conversion 已成功但 projection/transition 任一步失败时立即执行 vault lock/scrub；不会继续暴露可保存的旧 normal buffer。成功时使用 daemon projection 替换 scratch view、清空 undo stack，并保留 Outer session。验证：完整 Sublime 92/92、1 项 pidfd platform skip、compile/JSON/diff-check 通过。

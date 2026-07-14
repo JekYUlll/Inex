@@ -539,3 +539,4 @@
 - 进入 Umbra container 不是客户端 buffer 标记：普通 document 必须先用 current ciphertext ETag 调用 `umbra.document.convert`，然后放弃 normal document identity并重新读取 canonical Umbra projection。转换 response 的 feature flag 不是可选提示，必须精确为 2。
 - Umbra projection 不能伪装为 `document.open` handle：普通 close RPC 只对 daemon-issued normal handles 有效。Sublime model 必须以空 handle + authenticated RenderMap 表达 Umbra document，并在 mutation 成功时整体替换 projection identity。
 - normal→Umbra transition 的安全顺序是 daemon CAS convert、daemon authenticated projection open、main-thread identity recheck、model transition、再关闭旧 normal handle。任何 dirty/locked/stale model 都要在 transition 前拒绝，且传入 projection 必须 wipe。
+- 当 `umbra.document.convert` 已成功后，普通 document buffer 已不能安全继续作为 normal document 保存。若随后 projection open、UI identity recheck 或 transition 失败，Sublime 必须锁定并 scrub 全部 managed buffer，而不能仅恢复 view 可编辑性。
