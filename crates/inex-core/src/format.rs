@@ -9,7 +9,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::features::{OPAQUE_ASSETS_V1, is_supported_required_feature};
+use crate::features::{
+    OPAQUE_ASSETS_V1, UMBRA_PRIVATE_ANNOTATIONS_V1, is_supported_required_feature,
+};
 use crate::path::{AssetPath, LogicalPath};
 
 /// Four-byte EDRY file signature.
@@ -270,7 +272,9 @@ impl EdryHeader {
                         reason: error.to_string(),
                     }
                 })?;
-                if !self.required_features.is_empty() {
+                if !self.required_features.is_empty()
+                    && self.required_features.as_slice() != [UMBRA_PRIVATE_ANNOTATIONS_V1]
+                {
                     return Err(FormatError::PlaintextProfileMismatch);
                 }
             }

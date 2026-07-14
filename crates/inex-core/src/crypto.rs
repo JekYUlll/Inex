@@ -13,7 +13,7 @@ use thiserror::Error;
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::features::OPAQUE_ASSETS_V1;
+use crate::features::{OPAQUE_ASSETS_V1, UMBRA_PRIVATE_ANNOTATIONS_V1};
 use crate::format::{
     self, CipherSuite, ContentFlags, EdryHeader, FileKeyDerivation, FormatError, PlaintextKind,
 };
@@ -597,6 +597,53 @@ pub fn encrypt_document(
     encrypt_with_header(master_key, header, plaintext)
 }
 
+/// Encrypt a canonical Umbra Outer container under the normal EDRY key.
+///
+/// # Errors
+///
+/// Returns an error unless authenticated metadata declares exactly feature 2,
+/// or if the usual UTF-8 document encryption checks fail.
+#[allow(clippy::too_many_arguments)]
+pub fn encrypt_umbra_outer_document(
+    master_key: &VaultMasterKey,
+    config: &VaultConfig,
+    logical_path: &LogicalPath,
+    identity: Option<FileIdentity>,
+    plaintext: &[u8],
+    modified_at_ms: i64,
+    content_flags: ContentFlags,
+    kind: EnvelopeKind,
+) -> Result<EncryptedDocument, CryptoError> {
+    require_umbra_private_annotations(config, master_key)?;
+    if plaintext.len() > format::MAX_PLAINTEXT_LEN {
+        return Err(CryptoError::PlaintextTooLarge);
+    }
+    std::str::from_utf8(plaintext).map_err(|_| CryptoError::InvalidMarkdownUtf8)?;
+    let identity = identity.unwrap_or(FileIdentity {
+        file_id: random_uuid_v4()?,
+        created_at_ms: modified_at_ms,
+    });
+    let header = EdryHeader {
+        vault_id: config.vault_id,
+        file_id: identity.file_id,
+        logical_path: logical_path.as_str().to_owned(),
+        key_epoch: config.key_epoch,
+        key_derivation: FileKeyDerivation::Blake2b256V1,
+        cipher: CipherSuite::XChaCha20Poly1305Ietf,
+        nonce: sodium::random_array()?,
+        plaintext_kind: PlaintextKind::Utf8Markdown,
+        created_at_ms: identity.created_at_ms,
+        modified_at_ms,
+        content_flags,
+        required_features: vec![UMBRA_PRIVATE_ANNOTATIONS_V1],
+        base_etag: match kind {
+            EnvelopeKind::Committed => None,
+            EnvelopeKind::Draft { base_etag } => base_etag,
+        },
+    };
+    encrypt_with_header(master_key, header, plaintext)
+}
+
 /// Authenticate and decrypt an EDRY document in an expected logical context.
 ///
 /// # Errors
@@ -756,6 +803,17 @@ fn require_opaque_assets(
     verify_metadata_mac(config, master_key)?;
     if config.required_features.as_slice() != [OPAQUE_ASSETS_V1] {
         return Err(CryptoError::OpaqueAssetsNotEnabled);
+    }
+    Ok(())
+}
+
+fn require_umbra_private_annotations(
+    config: &VaultConfig,
+    master_key: &VaultMasterKey,
+) -> Result<(), CryptoError> {
+    verify_metadata_mac(config, master_key)?;
+    if config.required_features.as_slice() != [UMBRA_PRIVATE_ANNOTATIONS_V1] {
+        return Err(CryptoError::DocumentContextMismatch);
     }
     Ok(())
 }
@@ -1199,6 +1257,29 @@ mod tests {
             test_policy(),
         )
         .expect("asset-capable test vault creation succeeds")
+    }
+
+    #[test]
+    fn umbra_outer_container_is_feature_bound_in_edry_header() {
+        let mut created = created();
+        created.config.required_features = vec![UMBRA_PRIVATE_ANNOTATIONS_V1];
+        refresh_metadata_mac(&mut created.config, &created.master_key).expect("refresh metadata");
+        let logical_path = path();
+        let encrypted = encrypt_umbra_outer_document(
+            &created.master_key,
+            &created.config,
+            &logical_path,
+            None,
+            br#"{\"format\":\"inex-umbra-document\",\"version\":1,\"outerMarkdown\":\"public\",\"slots\":{}}"#,
+            1_783_699_200_000,
+            ContentFlags::NONE,
+            EnvelopeKind::Committed,
+        )
+        .expect("encrypt Umbra outer document");
+        assert_eq!(
+            encrypted.header.required_features,
+            vec![UMBRA_PRIVATE_ANNOTATIONS_V1]
+        );
     }
 
     fn path() -> LogicalPath {

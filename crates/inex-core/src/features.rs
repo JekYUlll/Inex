@@ -8,5 +8,5 @@ pub const UMBRA_PRIVATE_ANNOTATIONS_V1: u32 = 2;
 /// Return whether this core understands one required feature identifier.
 #[must_use]
 pub const fn is_supported_required_feature(feature: u32) -> bool {
-    matches!(feature, OPAQUE_ASSETS_V1)
+    matches!(feature, OPAQUE_ASSETS_V1 | UMBRA_PRIVATE_ANNOTATIONS_V1)
 }
