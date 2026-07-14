@@ -50,8 +50,12 @@ Commands currently available:
   `:InexApplyPrivateAnnotation startByte endByte` and
   `:InexRemovePrivateAnnotation startByte endByte` with the safe default
   `comment`/no-tags/`drop` spec. Byte-range commands are an interim testing
-  surface: visual selection, tag/profile picker, edit command, and configured
-  keybindings remain the next Neovim MVP slice.
+  surface. `:InexTogglePrivateAnnotation` consumes one non-empty visual range:
+  ordinary projection text receives the same default annotation, a range that
+  exactly equals a RenderMap private block requests confirmation then removes
+  it, and partial private overlap is rejected. It deliberately installs no
+  hard-coded mapping; users may map the command normally. Tag/profile picker
+  and edit command remain the next Neovim MVP slice.
 - `:InexStop` terminates the local RPC process and drops pending callbacks.
 
 `InexOpen`, `InexNew`, and `InexMkdir` take Inex logical paths (for example,

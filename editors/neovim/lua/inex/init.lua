@@ -590,6 +590,89 @@ function M.remove_private_annotation(selections)
   mutate_private_annotation("umbra.annotation.remove", selections, nil)
 end
 
+local function visual_selection_range(buffer, selection_mode)
+  local start_mark = vim.api.nvim_buf_get_mark(buffer, "<")
+  local end_mark = vim.api.nvim_buf_get_mark(buffer, ">")
+  -- nvim_buf_get_mark returns a 1-based row and a 0-based byte column.
+  local start_row, start_column = start_mark[1] - 1, start_mark[2]
+  local end_row, end_column = end_mark[1] - 1, end_mark[2]
+  if start_row < 0 or end_row < 0 or start_row > end_row or (start_row == end_row and start_column > end_column) then
+    return nil, "mark order"
+  end
+  local start_offset = vim.api.nvim_buf_get_offset(buffer, start_row) + start_column
+  if selection_mode == "V" then
+    local line_count = vim.api.nvim_buf_line_count(buffer)
+    local end_offset
+    if end_row + 1 < line_count then
+      end_offset = vim.api.nvim_buf_get_offset(buffer, end_row + 1)
+    else
+      local final_line = vim.api.nvim_buf_get_lines(buffer, end_row, end_row + 1, false)[1]
+      end_offset = vim.api.nvim_buf_get_offset(buffer, end_row) + #final_line
+    end
+    if not valid_range(vim.api.nvim_buf_get_offset(buffer, start_row), end_offset) then
+      return nil, "line range"
+    end
+    return { startByte = vim.api.nvim_buf_get_offset(buffer, start_row), endByte = end_offset }
+  end
+  local last_line = vim.api.nvim_buf_get_lines(buffer, end_row, end_row + 1, false)[1]
+  if type(last_line) ~= "string" or end_column < 0 or end_column >= #last_line then
+    return nil, "end column"
+  end
+  local next_column = vim.fn.byteidx(last_line, vim.fn.charidx(last_line, end_column) + 1)
+  if next_column < 0 then
+    next_column = #last_line
+  end
+  local end_offset = vim.api.nvim_buf_get_offset(buffer, end_row) + next_column
+  if not valid_range(start_offset, end_offset) then
+    return nil, "byte range"
+  end
+  return { startByte = start_offset, endByte = end_offset }
+end
+
+local function private_selection_class(document, selection)
+  local complete = false
+  for _, slot in ipairs(document.render_map.privateSlots) do
+    if selection.startByte == slot.startByte and selection.endByte == slot.endByte then
+      complete = true
+    elseif selection.startByte < slot.endByte and slot.startByte < selection.endByte then
+      return "partial"
+    end
+  end
+  return complete and "complete" or "plain"
+end
+
+function M.toggle_private_annotation(selection_mode)
+  if not session or not umbra_unlocked then
+    vim.notify("Unlock Inex Umbra before changing a private annotation", vim.log.levels.ERROR)
+    return
+  end
+  local buffer = vim.api.nvim_get_current_buf()
+  local document = private_buffers[buffer]
+  local selection, selection_error
+  if document then
+    selection, selection_error = visual_selection_range(buffer, selection_mode or vim.fn.visualmode())
+  else
+    selection_error = "buffer"
+  end
+  if not selection then
+    vim.notify("Select one non-empty Inex Umbra range before toggling a private annotation: " .. selection_error, vim.log.levels.ERROR)
+    return
+  end
+  local class = private_selection_class(document, selection)
+  if class == "partial" then
+    vim.notify("Selection partially crosses an Inex private block", vim.log.levels.ERROR)
+    return
+  end
+  if class == "complete" then
+    if vim.fn.confirm("Remove this private annotation and restore it to Umbra Markdown?", "&Remove\n&Cancel", 2) ~= 1 then
+      return
+    end
+    M.remove_private_annotation({ selection })
+    return
+  end
+  M.apply_private_annotation({ selection }, { kind = "comment", tagIds = {}, outer = { mode = "drop" } })
+end
+
 function M.open_umbra_document(logical_path)
   if not session or not umbra_unlocked then
     vim.notify("Unlock Inex Umbra before opening a private projection", vim.log.levels.ERROR)

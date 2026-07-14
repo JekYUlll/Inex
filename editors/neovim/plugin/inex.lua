@@ -45,6 +45,10 @@ vim.api.nvim_create_user_command("InexConvertUmbra", function()
   inex.convert_current_document_to_umbra()
 end, { desc = "Convert the current saved Inex document to Umbra" })
 
+vim.api.nvim_create_user_command("InexTogglePrivateAnnotation", function()
+  inex.toggle_private_annotation()
+end, { range = false, desc = "Toggle the visual Inex private annotation" })
+
 vim.api.nvim_create_user_command("InexApplyPrivateAnnotation", function(arguments)
   if #arguments.fargs ~= 2 then
     vim.notify("InexApplyPrivateAnnotation requires startByte and endByte", vim.log.levels.ERROR)
