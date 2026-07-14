@@ -1031,3 +1031,8 @@
 
 - 提交 `7b7624e`（`feat(sublime): apply encrypted annotation profiles`）：picker state 接受 daemon 已验证的完整 profile，原子替换 kind/tag IDs/Outer mode；严格校验 profile key set、stable ID/label、catalog tag references 和 `cover ↔ promptForCover` 语义。
 - Profile 只提供 metadata，不能提供公开实例 cover text；当 outer=cover 时仍由 `spec()` 强制单独输入。验证：picker 3/3、compile、diff-check 通过。
+
+## 2026-07-15 — Sublime repeated private annotation Quick Panel
+
+- 提交 `fed948e`（`feat(sublime): show stateful private annotation picker`）：`_show_annotation_picker` 将 state 映射到重复 `show_quick_panel`，每次 kind/tag/Outer 点击都重开面板；Done 产出 canonical spec，Cover 只在 Done 后经公开 input panel 取得实例文字。
+- live state 由专用内存列表持有；取消、Outer lock 与 Umbra lock 都调用 clear 并隐藏 overlay，避免锁后保留私密 tag label。验证：完整 Sublime 89/89、1 项 pidfd platform skip、compile/diff-check 通过。下一步将 authenticated Umbra projection 与 selection transaction 接入该 callback。

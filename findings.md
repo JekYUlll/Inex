@@ -535,3 +535,4 @@
 - Sublime 不能把 Umbra 密码写入 input-panel/settings；复用受审计的外部 masked prompt，并把密码变量限制在 worker scope。每次 password/status 回调都要重新验证 Outer client identity 与 generation，避免旧会话在 lock/reunlock 后完成私密初始化或解锁。
 - Sublime 的 repeated Quick Panel 无原生多选，安全实现应只把 encrypted catalog label 保留在 `AnnotationPickerState`，每次点击后再展示，且在 cancel/lock/dispose 调用 `clear()`；不能将标签 label 放进 settings、command args 或持久化状态。
 - Annotation profile 与 instance annotation spec 不能共用 cover payload：profile 的 `cover` 只表达 `promptForCover` 语义。Sublime 在 profile apply 后仍必须在真正 daemon mutation 之前请求一次公开 cover text，避免把无归属文字写入加密 profile catalog。
+- Sublime standard Quick Panel 没有可保存的 multi-select handle；stateful picker 必须在每次选择后重开，并在 lock 时同时 clear in-memory state 和 `hide_overlay`。仅 clear state 而让旧 overlay 保留会使锁后仍可见私密标签。
