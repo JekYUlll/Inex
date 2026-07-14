@@ -548,3 +548,4 @@
 - Sublime profile shortcut 的 `profile_id` 可来自用户 keymap，但不是可信配置来源：每次调用仍必须在 live Umbra session 中读取 encrypted catalog、查找 exact profile 并由 picker state 验证 tag/Outer 语义。`cover` 是一次性公开实例字段，不可由 profile 携带；其验证失败/取消时必须释放已捕获的 private projection。
 - Sublime tag/profile 管理必须经 daemon mutation RPC；client 要在请求前限制 ID、文本、排序和 canonical tag sequence，并把任何 malformed acknowledgement 当作 terminal protocol violation。这样 UI 后续只拥有 transient catalog data，永远不直接操作 `.inex/config.umbra.inex`。
 - 加密 catalog 的 AEAD 认证不足以保证安全可用：客户端还必须完整验证 tag/profile/default schema 与所有 cross-reference，特别是 default/profile 的 canonical tag order 和 cover/prompt pairing。否则一个已认证但语义矛盾的 sync 冲突可能把 private labels 送进 UI 后才失败，或者生成不可持久化的 annotation spec。
+- Sublime tag management 只能以 transient repeated panel 表现 encrypted label；每次 mutation 成功后必须丢弃旧 config 并重新经 daemon `config.get` 读取，而不是在 host 端修改 cache。lock 时调用 `hide_overlay`，并以 Umbra generation 阻止旧 panel/worker 完成后继续写入。

@@ -1092,3 +1092,8 @@
 
 - `umbra.config.get` 不再只验证 ID 存在：client 现在在私密 label 接触 host UI 前验证 tag 全字段、description/alias 限额、sort order、唯一 stable IDs、profile tag 引用/cover prompt、default kind/tag/profile 引用与 canonical tag ID order。异常响应按 terminal protocol violation 处理。
 - 新增合法 catalog、重复 tag、悬空 profile tag、重复 default tag 和悬空 default profile 回归。验证：Sublime 96/96（1 项 pidfd platform skip）、Python compile、diff-check 通过。
+
+## 2026-07-15 — Sublime private tag management UI
+
+- 新增 `Inex: Manage Private Tags` repeated Quick Panel：create 依次采集 label/stable ID，rename 与 archive 选择 encrypted catalog tag，reorder 以 first/previous/next/last 生成完整 ID permutation。每个操作调用 strict daemon RPC，成功后重新 load catalog；插件不合成或写入 config ciphertext。
+- UI 只在 live Umbra generation 中呈现；Umbra lock 的既有 `hide_overlay` 关闭面板，旧 generation 回调不会继续 mutation。验证：Sublime 96/96（1 项 pidfd platform skip）、Python compile、commands JSON、diff-check 通过。
