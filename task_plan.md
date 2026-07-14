@@ -94,6 +94,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
     - [x] daemon 已声明 `umbraV1` capability，并提供独立 Umbra 状态、初始化、解锁、锁定、feature-2 启用和已解锁投影读取 RPC；普通 `document.open` 不获得 feature-2 plaintext（`f2660b3`）
     - [x] 将 `apply_private_annotation` 接入 daemon 的严格 range/spec RPC：受限嵌套对象/数组解析、base64 projection、完整 RenderMap/ETag 复核、原子返回新投影；RPC 写入 canary 不进入磁盘可读面（`9bd5297`）
     - [x] VS Code sidecar client 已协商/验证 Umbra capability、独立状态/锁定/启用/projection/apply RPC 与严格 RenderMap 响应；异常协议形状不会交给编辑器（`b58bffd`）
+    - [x] CustomEditor webview 已将完整内容和 UTF-8 byte 选区回传到受会话保护的 document；无效范围、锁定和 dispose 会拒绝/清理选区（`058fb61`）
     - [ ] 接入 CustomEditor webview 选区、QuickPick、多标签及配置化命令/keybindings
   - [ ] 扩展Sublime stateful picker、profile命令和keymap示例
   - [ ] 跑通多选、wrap/unwrap/edit、跨编辑器目录、canary/残留及Outer隔离矩阵

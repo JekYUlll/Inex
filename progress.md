@@ -802,3 +802,8 @@
 
 - 提交 `b58bffd`（`feat(vscode): add typed Umbra sidecar client`）：扩展侧新增 capability-gated Umbra status/init/unlock/lock/enable/open/apply API、严格 `RenderMap`/range/spec 序列化和响应解析。投影字节长度必须匹配 RenderMap，固定 32-byte generation、严格字段集、canonical ETag、逻辑路径和 durability 均在进入 UI 前验证。
 - 新增 2 项 parser 回归；`pnpm --dir editors/vscode check` 与测试 47/47 通过。下一步为 CustomEditor 保留并上报 webview 选区、实现多选 QuickPick 及普通/快速标注命令；该 UI 尚未宣称可用。
+
+## 2026-07-15 — VS Code Webview 选区桥接
+
+- 提交 `058fb61`（`feat(vscode): capture verified webview selections`）：textarea 选区以 UTF-8 byte offsets 连同完整编辑内容发送；host 先同步内容，再验证范围并关联当前 document/session。锁定、dispose 会主动丢弃缓存选区，协议错误会恢复 host 内容而非保留 client 坐标。
+- `pnpm --dir editors/vscode check` 和 47/47 测试通过。下一步将当前 CustomEditor document/选区暴露给命令，并实现 stateful multi-select QuickPick；此提交尚未将 Umbra projection 替换进普通 feature-2 打开路径。
