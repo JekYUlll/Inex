@@ -40,7 +40,10 @@ use inex_core::vault::Vault;
 use thiserror::Error;
 
 #[cfg(target_os = "linux")]
-use super::candidate_fresh_audit::{FreshMarkerCandidateAudit, audit_fresh_marker_candidate};
+use super::candidate_fresh_audit::{
+    CandidateSummaryMismatch, FreshMarkerCandidateAudit, audit_fresh_marker_candidate,
+    compare_candidate_summaries,
+};
 #[cfg(target_os = "linux")]
 use super::candidate_seal::DOMAIN;
 use super::candidate_seal::{CandidateSealContext, CandidateSealError};
@@ -326,19 +329,6 @@ impl fmt::Debug for StagingAuditedClaim {
     }
 }
 
-/// One fixed candidate-summary field that changed across publication checks.
-#[cfg(target_os = "linux")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum InitialCandidateSummaryMismatch {
-    Context,
-    ContentSeal,
-    RootCommit,
-    WorktreeCount,
-    MarkdownCount,
-    AssetCount,
-    GitObjectCount,
-}
-
 /// Scrubbed terminal reason retained beside the exact publication authority.
 ///
 /// In particular, the generic move's original `io::Error` is never retained:
@@ -350,7 +340,7 @@ pub(super) enum InitialCandidatePublishFailure {
     CriticalSourceMismatch,
     CriticalDestinationObservation(HeldPublicationMarkerV2Error),
     CriticalFreshAudit(RepositoryImportError),
-    CriticalSummaryMismatch(InitialCandidateSummaryMismatch),
+    CriticalSummaryMismatch(CandidateSummaryMismatch),
     DestinationExists,
     IndeterminateMove,
     InvalidMovePaths,
@@ -358,10 +348,10 @@ pub(super) enum InitialCandidatePublishFailure {
     PublishedCleanupFailed,
     RetryDestinationObservation(HeldPublicationMarkerV2Error),
     RetryFreshAudit(RepositoryImportError),
-    RetrySummaryMismatch(InitialCandidateSummaryMismatch),
+    RetrySummaryMismatch(CandidateSummaryMismatch),
     PublishedRole(HeldPublicationMarkerV2Error),
     PublishedFreshAudit(RepositoryImportError),
-    PublishedSummaryMismatch(InitialCandidateSummaryMismatch),
+    PublishedSummaryMismatch(CandidateSummaryMismatch),
 }
 
 #[cfg(target_os = "linux")]
@@ -791,30 +781,6 @@ fn reconcile_published_initial_candidate(
 }
 
 #[cfg(target_os = "linux")]
-fn compare_candidate_summaries(
-    current: &FreshMarkerCandidateAudit,
-    expected: &FreshMarkerCandidateAudit,
-) -> Result<(), InitialCandidateSummaryMismatch> {
-    if current.context() != expected.context() {
-        Err(InitialCandidateSummaryMismatch::Context)
-    } else if current.content_seal() != expected.content_seal() {
-        Err(InitialCandidateSummaryMismatch::ContentSeal)
-    } else if current.root_commit_oid() != expected.root_commit_oid() {
-        Err(InitialCandidateSummaryMismatch::RootCommit)
-    } else if current.worktree_files() != expected.worktree_files() {
-        Err(InitialCandidateSummaryMismatch::WorktreeCount)
-    } else if current.encrypted_markdown() != expected.encrypted_markdown() {
-        Err(InitialCandidateSummaryMismatch::MarkdownCount)
-    } else if current.encrypted_assets() != expected.encrypted_assets() {
-        Err(InitialCandidateSummaryMismatch::AssetCount)
-    } else if current.git_objects() != expected.git_objects() {
-        Err(InitialCandidateSummaryMismatch::GitObjectCount)
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(target_os = "linux")]
 fn terminal_initial_publication(
     claim: StagingAuditedClaim,
     failure: InitialCandidatePublishFailure,
@@ -1178,6 +1144,9 @@ mod tests {
     use inex_core::vault::Vault;
     use inex_core::vault_config::KdfPolicy;
 
+    use super::super::candidate_fresh_audit::{
+        CandidateSummaryMismatch, compare_candidate_summaries,
+    };
     use super::super::candidate_manifest::{
         MarkerFreePhysicalManifest, collect_marker_free_physical_manifest,
     };
@@ -1187,10 +1156,9 @@ mod tests {
         InitialCandidateAuthority, InitialCandidateAuthorityError, InitialCandidateClaimError,
         InitialCandidateClaimInput, InitialCandidateClaimPreflightError, InitialCandidateInputs,
         InitialCandidatePostMarkerFailure, InitialCandidatePublishFailure,
-        InitialCandidatePublishOutcome, InitialCandidateSummaryMismatch,
-        acquire_initial_candidate_authority, acquire_initial_candidate_authority_impl,
-        claim_initial_candidate, claim_initial_candidate_impl, publish_initial_candidate,
-        publish_initial_candidate_impl,
+        InitialCandidatePublishOutcome, acquire_initial_candidate_authority,
+        acquire_initial_candidate_authority_impl, claim_initial_candidate,
+        claim_initial_candidate_impl, publish_initial_candidate, publish_initial_candidate_impl,
     };
 
     const PASSWORD: &[u8] = b"initial candidate authority test password";
@@ -2268,7 +2236,7 @@ mod tests {
         assert!(matches!(
             terminal.failure(),
             InitialCandidatePublishFailure::CriticalSummaryMismatch(
-                InitialCandidateSummaryMismatch::Context
+                CandidateSummaryMismatch::Context
             )
         ));
         assert!(staging.is_dir());
@@ -2308,37 +2276,37 @@ mod tests {
                     5,
                     6,
                 ),
-                InitialCandidateSummaryMismatch::Context,
+                CandidateSummaryMismatch::Context,
             ),
             (
                 synthetic([0x12; 32], [0x22; 20], 3, 4, 5, 6),
-                InitialCandidateSummaryMismatch::ContentSeal,
+                CandidateSummaryMismatch::ContentSeal,
             ),
             (
                 synthetic([0x11; 32], [0x23; 20], 3, 4, 5, 6),
-                InitialCandidateSummaryMismatch::RootCommit,
+                CandidateSummaryMismatch::RootCommit,
             ),
             (
                 synthetic([0x11; 32], [0x22; 20], 7, 4, 5, 6),
-                InitialCandidateSummaryMismatch::WorktreeCount,
+                CandidateSummaryMismatch::WorktreeCount,
             ),
             (
                 synthetic([0x11; 32], [0x22; 20], 3, 7, 5, 6),
-                InitialCandidateSummaryMismatch::MarkdownCount,
+                CandidateSummaryMismatch::MarkdownCount,
             ),
             (
                 synthetic([0x11; 32], [0x22; 20], 3, 4, 7, 6),
-                InitialCandidateSummaryMismatch::AssetCount,
+                CandidateSummaryMismatch::AssetCount,
             ),
             (
                 synthetic([0x11; 32], [0x22; 20], 3, 4, 5, 7),
-                InitialCandidateSummaryMismatch::GitObjectCount,
+                CandidateSummaryMismatch::GitObjectCount,
             ),
         ];
         for (current, expected_mismatch) in cases {
             let expected = synthetic([0x11; 32], [0x22; 20], 3, 4, 5, 6);
             assert_eq!(
-                super::compare_candidate_summaries(&current, &expected),
+                compare_candidate_summaries(&current, &expected),
                 Err(expected_mismatch)
             );
         }
@@ -2379,10 +2347,10 @@ mod tests {
         assert!(first_absence < audit && audit < compare && compare < second_absence);
         assert_ne!(first_absence, second_absence);
 
-        let comparison = source
+        let comparison = include_str!("candidate_fresh_audit.rs")
             .split("fn compare_candidate_summaries")
             .nth(1)
-            .and_then(|tail| tail.split("fn terminal_initial_publication").next())
+            .and_then(|tail| tail.split("/// Audit one complete fresh target").next())
             .expect("summary comparison exists");
         for field in [
             "context()",

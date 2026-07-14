@@ -41,6 +41,18 @@ pub(super) struct FreshMarkerCandidateAudit {
     root_commit_oid: [u8; 20],
 }
 
+/// One fixed candidate-summary field that changed across held-state reviews.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CandidateSummaryMismatch {
+    Context,
+    ContentSeal,
+    RootCommit,
+    WorktreeCount,
+    MarkdownCount,
+    AssetCount,
+    GitObjectCount,
+}
+
 impl FreshMarkerCandidateAudit {
     #[cfg(test)]
     pub(super) const fn test_only_synthetic(
@@ -104,6 +116,30 @@ impl fmt::Debug for FreshMarkerCandidateAudit {
             .field("git_objects", &self.git_objects)
             .field("root_commit_oid", &"[REDACTED]")
             .finish()
+    }
+}
+
+/// Compare every fixed field produced by two complete nine-section audits.
+pub(super) fn compare_candidate_summaries(
+    current: &FreshMarkerCandidateAudit,
+    expected: &FreshMarkerCandidateAudit,
+) -> Result<(), CandidateSummaryMismatch> {
+    if current.context() != expected.context() {
+        Err(CandidateSummaryMismatch::Context)
+    } else if current.content_seal() != expected.content_seal() {
+        Err(CandidateSummaryMismatch::ContentSeal)
+    } else if current.root_commit_oid() != expected.root_commit_oid() {
+        Err(CandidateSummaryMismatch::RootCommit)
+    } else if current.worktree_files() != expected.worktree_files() {
+        Err(CandidateSummaryMismatch::WorktreeCount)
+    } else if current.encrypted_markdown() != expected.encrypted_markdown() {
+        Err(CandidateSummaryMismatch::MarkdownCount)
+    } else if current.encrypted_assets() != expected.encrypted_assets() {
+        Err(CandidateSummaryMismatch::AssetCount)
+    } else if current.git_objects() != expected.git_objects() {
+        Err(CandidateSummaryMismatch::GitObjectCount)
+    } else {
+        Ok(())
     }
 }
 

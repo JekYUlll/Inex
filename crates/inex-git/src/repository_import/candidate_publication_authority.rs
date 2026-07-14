@@ -12,6 +12,8 @@
 //! transition, so a rejected claim cannot be relabelled as published.
 
 use std::fmt;
+#[cfg(target_os = "linux")]
+use std::io;
 use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
@@ -28,7 +30,10 @@ use inex_core::path::raw_portable_case_fold_key;
 #[cfg(target_os = "linux")]
 use super::RepositoryImportError;
 #[cfg(target_os = "linux")]
-use super::candidate_fresh_audit::{FreshMarkerCandidateAudit, audit_fresh_marker_candidate};
+use super::candidate_fresh_audit::{
+    CandidateSummaryMismatch, FreshMarkerCandidateAudit, audit_fresh_marker_candidate,
+    compare_candidate_summaries,
+};
 #[cfg(target_os = "linux")]
 use super::candidate_initial_authority::VerifiedInitialMove;
 #[cfg(target_os = "linux")]
@@ -254,6 +259,13 @@ impl PublishedWithMarker {
     pub(super) const fn held_marker(&self) -> &HeldPublicationMarkerV2 {
         &self.held_marker
     }
+
+    /// Consume this published claim into an explicit durability attempt.
+    pub(super) fn synchronize(self) -> PublicationDurabilityOutcome {
+        synchronize_published_candidate_impl(self, |root, held_marker| {
+            held_marker.synchronize_published_root_and_common_parent_at(root)
+        })
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -266,6 +278,280 @@ impl fmt::Debug for PublishedWithMarker {
             .field("held_marker", &"[HELD]")
             .finish()
     }
+}
+
+/// Fixed, source-free form of one held-marker failure.
+///
+/// Raw `io::Error` values are reduced to their stable class immediately when
+/// they cross from core into repository publication state.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PublicationMarkerFailureKind {
+    InvalidInput,
+    NamespaceConflict,
+    AuthorityChanged,
+    Io(io::ErrorKind),
+}
+
+#[cfg(target_os = "linux")]
+impl From<HeldPublicationMarkerV2Error> for PublicationMarkerFailureKind {
+    fn from(error: HeldPublicationMarkerV2Error) -> Self {
+        match error {
+            HeldPublicationMarkerV2Error::InvalidInput => Self::InvalidInput,
+            HeldPublicationMarkerV2Error::NamespaceConflict => Self::NamespaceConflict,
+            HeldPublicationMarkerV2Error::AuthorityChanged => Self::AuthorityChanged,
+            HeldPublicationMarkerV2Error::Io(source) => Self::Io(source.kind()),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Display for PublicationMarkerFailureKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidInput => "publication marker input is invalid",
+            Self::NamespaceConflict => "publication marker namespace conflicts",
+            Self::AuthorityChanged => "publication marker authority changed",
+            Self::Io(_) => "publication marker I/O failed",
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::error::Error for PublicationMarkerFailureKind {}
+
+/// A post-synchronization review failure that prevents every forward state.
+#[cfg(target_os = "linux")]
+pub(super) enum PublicationDurabilityReviewFailure {
+    PublishedRole(PublicationMarkerFailureKind),
+    FreshAudit(RepositoryImportError),
+    SummaryMismatch(CandidateSummaryMismatch),
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for PublicationDurabilityReviewFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PublishedRole(kind) => {
+                formatter.debug_tuple("PublishedRole").field(kind).finish()
+            }
+            Self::FreshAudit(_) => formatter.write_str("FreshAudit(..)"),
+            Self::SummaryMismatch(field) => formatter
+                .debug_tuple("SummaryMismatch")
+                .field(field)
+                .finish(),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Display for PublicationDurabilityReviewFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::PublishedRole(_) => "published role changed after synchronization",
+            Self::FreshAudit(_) => "published candidate audit failed after synchronization",
+            Self::SummaryMismatch(_) => "published candidate summary changed after synchronization",
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::error::Error for PublicationDurabilityReviewFailure {}
+
+/// Published state whose held root and common-parent barriers both completed.
+///
+/// This is the only owner eligible for the future marker-unlink transition.
+/// It exposes no owned marker, extraction API, cleanup, or unlink operation.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub(super) struct PublicationDurableWithMarker {
+    root: PathBuf,
+    audit: FreshMarkerCandidateAudit,
+    held_marker: HeldPublicationMarkerV2,
+}
+
+#[cfg(target_os = "linux")]
+impl PublicationDurableWithMarker {
+    pub(super) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub(super) const fn audit(&self) -> &FreshMarkerCandidateAudit {
+        &self.audit
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for PublicationDurableWithMarker {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PublicationDurableWithMarker")
+            .field("root", &"[REDACTED]")
+            .field("audit", &self.audit)
+            .field("held_marker", &"[HELD]")
+            .finish()
+    }
+}
+
+/// The only owner allowed to retry an unconfirmed durability attempt.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub(super) struct RetryablePublicationDurability {
+    sync_failure: PublicationMarkerFailureKind,
+    root: PathBuf,
+    audit: FreshMarkerCandidateAudit,
+    held_marker: HeldPublicationMarkerV2,
+}
+
+#[cfg(target_os = "linux")]
+impl RetryablePublicationDurability {
+    pub(super) const fn failure(&self) -> PublicationMarkerFailureKind {
+        self.sync_failure
+    }
+
+    pub(super) fn retry(self) -> PublicationDurabilityOutcome {
+        PublishedWithMarker {
+            root: self.root,
+            audit: self.audit,
+            held_marker: self.held_marker,
+        }
+        .synchronize()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for RetryablePublicationDurability {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RetryablePublicationDurability")
+            .field("sync_failure", &self.sync_failure)
+            .field("root", &"[REDACTED]")
+            .field("audit", &self.audit)
+            .field("held_marker", &"[HELD]")
+            .finish()
+    }
+}
+
+/// Terminal owner when the unified review fails after a durability attempt.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub(super) struct FailedPublicationDurability {
+    sync_failure: Option<PublicationMarkerFailureKind>,
+    review_failure: PublicationDurabilityReviewFailure,
+    root: PathBuf,
+    audit: FreshMarkerCandidateAudit,
+    held_marker: HeldPublicationMarkerV2,
+}
+
+#[cfg(target_os = "linux")]
+impl FailedPublicationDurability {
+    pub(super) const fn sync_failure(&self) -> Option<PublicationMarkerFailureKind> {
+        self.sync_failure
+    }
+
+    pub(super) const fn review_failure(&self) -> &PublicationDurabilityReviewFailure {
+        &self.review_failure
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for FailedPublicationDurability {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FailedPublicationDurability")
+            .field("sync_failure", &self.sync_failure)
+            .field("review_failure", &self.review_failure)
+            .field("root", &"[REDACTED]")
+            .field("audit", &self.audit)
+            .field("held_marker", &"[HELD]")
+            .finish()
+    }
+}
+
+/// Consuming result of one held-root and held-common-parent durability attempt.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub(super) enum PublicationDurabilityOutcome {
+    Durable(PublicationDurableWithMarker),
+    Retryable(RetryablePublicationDurability),
+    Terminal(Box<FailedPublicationDurability>),
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for PublicationDurabilityOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Durable(owner) => formatter.debug_tuple("Durable").field(owner).finish(),
+            Self::Retryable(owner) => formatter.debug_tuple("Retryable").field(owner).finish(),
+            Self::Terminal(owner) => formatter.debug_tuple("Terminal").field(owner).finish(),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn synchronize_published_candidate_impl<SyncDriver>(
+    published: PublishedWithMarker,
+    sync_driver: SyncDriver,
+) -> PublicationDurabilityOutcome
+where
+    SyncDriver: FnOnce(&Path, &HeldPublicationMarkerV2) -> Result<(), HeldPublicationMarkerV2Error>,
+{
+    let PublishedWithMarker {
+        root,
+        audit,
+        held_marker,
+    } = published;
+    let sync_failure = sync_driver(&root, &held_marker)
+        .err()
+        .map(PublicationMarkerFailureKind::from);
+
+    match review_published_candidate_after_sync(&root, &held_marker, &audit) {
+        Err(review_failure) => {
+            PublicationDurabilityOutcome::Terminal(Box::new(FailedPublicationDurability {
+                sync_failure,
+                review_failure,
+                root,
+                audit,
+                held_marker,
+            }))
+        }
+        Ok(reviewed_audit) => match sync_failure {
+            Some(sync_failure) => {
+                PublicationDurabilityOutcome::Retryable(RetryablePublicationDurability {
+                    sync_failure,
+                    root,
+                    audit: reviewed_audit,
+                    held_marker,
+                })
+            }
+            None => PublicationDurabilityOutcome::Durable(PublicationDurableWithMarker {
+                root,
+                audit: reviewed_audit,
+                held_marker,
+            }),
+        },
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn review_published_candidate_after_sync(
+    root: &Path,
+    held_marker: &HeldPublicationMarkerV2,
+    expected: &FreshMarkerCandidateAudit,
+) -> Result<FreshMarkerCandidateAudit, PublicationDurabilityReviewFailure> {
+    held_marker
+        .require_published_at(root)
+        .map_err(PublicationMarkerFailureKind::from)
+        .map_err(PublicationDurabilityReviewFailure::PublishedRole)?;
+    let audit = audit_fresh_marker_candidate(root, held_marker)
+        .map_err(PublicationDurabilityReviewFailure::FreshAudit)?;
+    compare_candidate_summaries(&audit, expected)
+        .map_err(PublicationDurabilityReviewFailure::SummaryMismatch)?;
+    held_marker
+        .require_published_at(root)
+        .map_err(PublicationMarkerFailureKind::from)
+        .map_err(PublicationDurabilityReviewFailure::PublishedRole)?;
+    Ok(audit)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -396,7 +682,7 @@ mod tests {
     use inex_core::atomic::{
         ExistingVaultMutationLock, ExistingVaultMutationLockError, FilesystemFileIdentity,
         IMPORT_PUBLISH_MARKER_V2, PublicationIdentityScheme, VAULT_LOCAL_DIRECTORY,
-        filesystem_directory_identity,
+        filesystem_directory_identity, filesystem_file_identity,
     };
     use inex_core::crypto::VaultContentProfile;
     use inex_core::sodium::Argon2idParams;
@@ -404,7 +690,8 @@ mod tests {
     use inex_core::vault_config::KdfPolicy;
 
     use super::super::candidate_initial_authority::{
-        InitialCandidateClaimInput, acquire_initial_candidate_authority, claim_initial_candidate,
+        InitialCandidateClaimInput, InitialCandidatePublishOutcome, StagingAuditedClaim,
+        acquire_initial_candidate_authority, claim_initial_candidate, publish_initial_candidate,
     };
     use super::super::candidate_manifest::collect_marker_free_physical_manifest;
     use super::super::candidate_seal::CandidateSealContext;
@@ -433,6 +720,8 @@ mod tests {
         ),
         staging_child_name: String,
         expected: ExpectedAudit,
+        marker_bytes: Vec<u8>,
+        marker_identity: FilesystemFileIdentity,
     }
 
     impl PublishedFixture {
@@ -448,6 +737,19 @@ mod tests {
             self.destination_root
                 .join(VAULT_LOCAL_DIRECTORY)
                 .join(IMPORT_PUBLISH_MARKER_V2)
+        }
+
+        fn assert_marker_unchanged(&self) {
+            let marker_path = self.marker_path();
+            assert_eq!(
+                fs::read(&marker_path).expect("held marker bytes read"),
+                self.marker_bytes
+            );
+            let marker_file = fs::File::open(&marker_path).expect("held marker opens");
+            assert_eq!(
+                filesystem_file_identity(&marker_file).expect("held marker identity captures"),
+                self.marker_identity
+            );
         }
 
         fn assert_lock_busy(&self) {
@@ -492,7 +794,7 @@ mod tests {
         }
     }
 
-    fn fixture(label: &str) -> PublishedFixture {
+    fn claimed_fixture(label: &str) -> (PublishedFixture, StagingAuditedClaim) {
         let token = uuid::Uuid::new_v4().simple().to_string();
         let parent = std::env::temp_dir().join(format!(
             "inex-fresh-existing-authority-{label}-{}-{token}",
@@ -568,25 +870,63 @@ mod tests {
                 claim.audit().git_objects(),
             ),
         };
-        fs::rename(&staging_root, &destination_root)
-            .expect("fixture performs whole-root publication rename");
-        claim
-            .held_marker()
-            .require_published_at(&destination_root)
-            .expect("fixture claim validates in destination role");
-        drop(claim);
+        let marker_path = staging_root
+            .join(VAULT_LOCAL_DIRECTORY)
+            .join(IMPORT_PUBLISH_MARKER_V2);
+        let marker_bytes = fs::read(&marker_path).expect("canonical marker bytes capture");
+        let marker_file = fs::File::open(&marker_path).expect("canonical marker opens");
+        let marker_identity =
+            filesystem_file_identity(&marker_file).expect("canonical marker identity captures");
+        drop(marker_file);
         drop(target);
         drop(vault);
 
-        PublishedFixture {
-            parent,
-            destination_root,
-            destination_child_name,
-            common_parent_identity,
-            baseline,
-            staging_child_name,
-            expected,
-        }
+        (
+            PublishedFixture {
+                parent,
+                destination_root,
+                destination_child_name,
+                common_parent_identity,
+                baseline,
+                staging_child_name,
+                expected,
+                marker_bytes,
+                marker_identity,
+            },
+            claim,
+        )
+    }
+
+    fn fixture(label: &str) -> PublishedFixture {
+        let (fixture, claim) = claimed_fixture(label);
+        fs::rename(claim.root(), &fixture.destination_root)
+            .expect("fixture performs whole-root publication rename");
+        claim
+            .held_marker()
+            .require_published_at(&fixture.destination_root)
+            .expect("fixture claim validates in destination role");
+        drop(claim);
+        fixture
+    }
+
+    fn fresh_published(fixture: &PublishedFixture) -> PublishedWithMarker {
+        claim_fresh_existing_candidate(fixture.input())
+            .expect("fresh existing claim constructs published owner")
+    }
+
+    fn assert_expected_audit(audit: &FreshMarkerCandidateAudit, expected: &ExpectedAudit) {
+        assert_eq!(audit.context(), expected.context);
+        assert_eq!(audit.content_seal(), expected.content_seal);
+        assert_eq!(audit.root_commit_oid(), expected.root_commit_oid);
+        assert_eq!(
+            (
+                audit.worktree_files(),
+                audit.encrypted_markdown(),
+                audit.encrypted_assets(),
+                audit.git_objects(),
+            ),
+            expected.counts
+        );
     }
 
     #[test]
@@ -691,6 +1031,289 @@ mod tests {
         fs::remove_dir(&staging).expect("foreign staging canary cleans up");
         drop(failed);
         fixture.assert_lock_available();
+    }
+
+    #[test]
+    fn durability_real_fresh_and_initial_states_reach_only_durable_owner() {
+        let fresh_fixture = fixture("durability-real-fresh");
+        let durable = match fresh_published(&fresh_fixture).synchronize() {
+            PublicationDurabilityOutcome::Durable(owner) => owner,
+            other => panic!("expected fresh durable owner, got {other:?}"),
+        };
+        assert_eq!(durable.root(), fresh_fixture.destination_root);
+        assert_expected_audit(durable.audit(), &fresh_fixture.expected);
+        assert!(fresh_fixture.marker_path().is_file());
+        fresh_fixture.assert_marker_unchanged();
+        fresh_fixture.assert_lock_busy();
+        let debug = format!("{durable:?}");
+        assert!(!debug.contains(fresh_fixture.destination_root.to_string_lossy().as_ref()));
+        drop(durable);
+        fresh_fixture.assert_lock_available();
+
+        let (initial_fixture, claim) = claimed_fixture("durability-real-initial");
+        let published = match publish_initial_candidate(claim) {
+            InitialCandidatePublishOutcome::Published(owner) => owner,
+            other => panic!("expected initial published owner, got {other:?}"),
+        };
+        let durable = match published.synchronize() {
+            PublicationDurabilityOutcome::Durable(owner) => owner,
+            other => panic!("expected initial durable owner, got {other:?}"),
+        };
+        assert_eq!(durable.root(), initial_fixture.destination_root);
+        assert_expected_audit(durable.audit(), &initial_fixture.expected);
+        assert!(initial_fixture.marker_path().is_file());
+        initial_fixture.assert_marker_unchanged();
+        initial_fixture.assert_lock_busy();
+        drop(durable);
+        initial_fixture.assert_lock_available();
+    }
+
+    #[test]
+    fn durability_sync_errors_before_and_after_effect_are_retryable_and_scrubbed() {
+        for normalized in [
+            PublicationMarkerFailureKind::InvalidInput,
+            PublicationMarkerFailureKind::NamespaceConflict,
+            PublicationMarkerFailureKind::AuthorityChanged,
+            PublicationMarkerFailureKind::Io(io::ErrorKind::PermissionDenied),
+        ] {
+            assert!(std::error::Error::source(&normalized).is_none());
+        }
+
+        let before_fixture = fixture("durability-retry-before");
+        let retry =
+            match synchronize_published_candidate_impl(fresh_published(&before_fixture), |_, _| {
+                Err(HeldPublicationMarkerV2Error::Io(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "secret before-sync source",
+                )))
+            }) {
+                PublicationDurabilityOutcome::Retryable(owner) => owner,
+                other => panic!("expected before-effect retry owner, got {other:?}"),
+            };
+        assert_eq!(
+            retry.failure(),
+            PublicationMarkerFailureKind::Io(io::ErrorKind::PermissionDenied)
+        );
+        assert!(!format!("{retry:?}").contains("secret before-sync source"));
+        assert!(before_fixture.marker_path().is_file());
+        before_fixture.assert_marker_unchanged();
+        before_fixture.assert_lock_busy();
+        let normalized_failure = retry.failure();
+        assert!(std::error::Error::source(&normalized_failure).is_none());
+        let durable = match retry.retry() {
+            PublicationDurabilityOutcome::Durable(owner) => owner,
+            other => panic!("expected before-effect retry to become durable, got {other:?}"),
+        };
+        before_fixture.assert_lock_busy();
+        drop(durable);
+        before_fixture.assert_lock_available();
+
+        let after_fixture = fixture("durability-retry-after");
+        let retry = match synchronize_published_candidate_impl(
+            fresh_published(&after_fixture),
+            |root, held_marker| {
+                held_marker
+                    .synchronize_published_root_and_common_parent_at(root)
+                    .expect("simulated effect completes");
+                Err(HeldPublicationMarkerV2Error::Io(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "secret after-sync source",
+                )))
+            },
+        ) {
+            PublicationDurabilityOutcome::Retryable(owner) => owner,
+            other => panic!("expected after-effect retry owner, got {other:?}"),
+        };
+        assert_eq!(
+            retry.failure(),
+            PublicationMarkerFailureKind::Io(io::ErrorKind::Interrupted)
+        );
+        assert!(!format!("{retry:?}").contains("secret after-sync source"));
+        assert!(after_fixture.marker_path().is_file());
+        after_fixture.assert_marker_unchanged();
+        after_fixture.assert_lock_busy();
+        let durable = match retry.retry() {
+            PublicationDurabilityOutcome::Durable(owner) => owner,
+            other => panic!("expected after-effect retry to become durable, got {other:?}"),
+        };
+        drop(durable);
+        after_fixture.assert_lock_available();
+    }
+
+    #[test]
+    fn durability_ok_or_error_with_staging_drift_is_terminal() {
+        for (label, sync_fails) in [
+            ("durability-staging-ok", false),
+            ("durability-staging-error", true),
+        ] {
+            let fixture = fixture(label);
+            let staging = fixture.parent.join(&fixture.staging_child_name);
+            let terminal =
+                match synchronize_published_candidate_impl(fresh_published(&fixture), |_, _| {
+                    fs::create_dir(&staging).expect("foreign staging name reappears");
+                    if sync_fails {
+                        Err(HeldPublicationMarkerV2Error::Io(io::Error::other(
+                            "secret staging sync source",
+                        )))
+                    } else {
+                        Ok(())
+                    }
+                }) {
+                    PublicationDurabilityOutcome::Terminal(owner) => owner,
+                    other => panic!("expected staging-drift terminal owner, got {other:?}"),
+                };
+            assert!(matches!(
+                terminal.review_failure(),
+                PublicationDurabilityReviewFailure::PublishedRole(
+                    PublicationMarkerFailureKind::NamespaceConflict
+                        | PublicationMarkerFailureKind::AuthorityChanged
+                        | PublicationMarkerFailureKind::Io(_)
+                )
+            ));
+            assert_eq!(terminal.sync_failure().is_some(), sync_fails);
+            assert!(!format!("{terminal:?}").contains("secret staging sync source"));
+            assert!(fixture.marker_path().is_file());
+            fixture.assert_marker_unchanged();
+            fixture.assert_lock_busy();
+            fs::remove_dir(&staging).expect("foreign staging canary removes");
+            drop(terminal);
+            fixture.assert_lock_available();
+        }
+    }
+
+    #[test]
+    fn durability_ok_or_error_with_content_drift_is_terminal() {
+        for (label, sync_fails) in [
+            ("durability-content-ok", false),
+            ("durability-content-error", true),
+        ] {
+            let fixture = fixture(label);
+            let terminal =
+                match synchronize_published_candidate_impl(fresh_published(&fixture), |root, _| {
+                    fs::write(root.join(".gitattributes"), b"post-sync content drift\n")
+                        .expect("published candidate content drifts");
+                    if sync_fails {
+                        Err(HeldPublicationMarkerV2Error::Io(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "secret content sync source",
+                        )))
+                    } else {
+                        Ok(())
+                    }
+                }) {
+                    PublicationDurabilityOutcome::Terminal(owner) => owner,
+                    other => panic!("expected content-drift terminal owner, got {other:?}"),
+                };
+            assert!(matches!(
+                terminal.review_failure(),
+                PublicationDurabilityReviewFailure::FreshAudit(_)
+            ));
+            assert_eq!(terminal.sync_failure().is_some(), sync_fails);
+            assert!(!format!("{terminal:?}").contains("secret content sync source"));
+            assert!(fixture.marker_path().is_file());
+            fixture.assert_marker_unchanged();
+            fixture.assert_lock_busy();
+            drop(terminal);
+            fixture.assert_lock_available();
+        }
+    }
+
+    #[test]
+    fn durability_api_surface_and_review_order_are_frozen() {
+        let source = include_str!("candidate_publication_authority.rs");
+        let production = source
+            .split("pub(super) fn synchronize(self)")
+            .nth(1)
+            .and_then(|tail| tail.split("impl fmt::Debug for PublishedWithMarker").next())
+            .expect("production synchronize entry point exists");
+        assert!(production.contains("synchronize_published_root_and_common_parent_at(root)"));
+        assert!(!production.contains("sync_directory"));
+        assert!(!production.contains("remove"));
+        assert!(!production.contains("unlink"));
+
+        let transition = source
+            .split("fn synchronize_published_candidate_impl")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("fn review_published_candidate_after_sync")
+                    .next()
+            })
+            .expect("durability transition exists");
+        let sync = transition.find("sync_driver").expect("sync driver runs");
+        let normalize = transition
+            .find(".map(PublicationMarkerFailureKind::from)")
+            .expect("sync error normalizes");
+        let review = transition
+            .find("review_published_candidate_after_sync")
+            .expect("unified review runs");
+        assert!(sync < normalize && normalize < review);
+        for forbidden in ["remove_file", "unlink", "into_parts", "drop(held_marker)"] {
+            assert!(
+                !transition.contains(forbidden),
+                "forbidden transition API: {forbidden}"
+            );
+        }
+
+        let review = source
+            .split("fn review_published_candidate_after_sync")
+            .nth(1)
+            .and_then(|tail| tail.split("/// Open and fully audit").next())
+            .expect("unified review exists");
+        let first_role = review
+            .find("require_published_at")
+            .expect("first role check exists");
+        let audit = review
+            .find("audit_fresh_marker_candidate")
+            .expect("fresh audit exists");
+        let compare = review
+            .find("compare_candidate_summaries")
+            .expect("shared comparison exists");
+        let second_role = review
+            .rfind("require_published_at")
+            .expect("second role check exists");
+        assert!(first_role < audit && audit < compare && compare < second_role);
+        assert_ne!(first_role, second_role);
+
+        for owner_name in [
+            "PublicationDurableWithMarker",
+            "RetryablePublicationDurability",
+            "FailedPublicationDurability",
+        ] {
+            let owner = source
+                .split(&format!("pub(super) struct {owner_name}"))
+                .nth(1)
+                .and_then(|tail| tail.split(&format!("impl {owner_name}")).next())
+                .expect("durability owner source exists");
+            assert!(!owner.contains("derive(Clone"));
+            assert!(!owner.contains("derive(Copy"));
+            assert!(
+                owner.find("audit:").expect("audit field")
+                    < owner.find("held_marker:").expect("marker field")
+            );
+            assert!(!source.contains(&format!("impl Drop for {owner_name}")));
+        }
+        let durable_impl = source
+            .split("impl PublicationDurableWithMarker")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("impl fmt::Debug for PublicationDurableWithMarker")
+                    .next()
+            })
+            .expect("durable implementation exists");
+        assert!(!durable_impl.contains("held_marker("));
+        assert!(!durable_impl.contains("into_parts"));
+        assert!(!durable_impl.contains("unlink"));
+        let terminal_impl = source
+            .split("impl FailedPublicationDurability")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("impl fmt::Debug for FailedPublicationDurability")
+                    .next()
+            })
+            .expect("terminal implementation exists");
+        assert!(!terminal_impl.contains("retry"));
+        assert!(!terminal_impl.contains("cleanup"));
+        assert!(!terminal_impl.contains("unlink"));
     }
 
     #[test]
