@@ -1,5 +1,10 @@
 # Inex Progress Log
 
+## 2026-07-15 — VS Code Extension Host lifecycle regression
+
+- 在当前 `f829d69` 后运行 `pnpm --dir editors/vscode test:extension:local`，本机 `/usr/share/code/code` 与隔离 Xvfb profile 通过真实 Extension Host 流程：feature-1 repository import、受控附件预览、CRUD、加密 backup/recovery 和 residue audit。
+- 该自动矩阵确认多范围 host 改动未回归既有加密生命周期；它不替代多范围 Add range 工具栏的人工 UI 路径，也不替代 persistent-profile/跨平台发布门禁。
+
 ## 2026-07-15 — VS Code multi-range private annotation
 
 - 提交 `1a2d665`：CustomEditor 从单一 selection 改为有上限的 validated range list。用户可在 webview 工具栏依次 Add range，再调用 annotation command；所有 ranges 伴随同一 projection/RenderMap/ETag 交给 daemon，失败仍由核心原子回滚。
