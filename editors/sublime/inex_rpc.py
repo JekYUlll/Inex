@@ -665,7 +665,7 @@ class InexRpcClient:
             )
             content = decode_base64url(result.get("contentBase64"), MAX_DOCUMENT_BYTES)
             etag = _expect_etag(result.get("etag"))
-            _validate_metadata(result.get("metadata"), logical_path, (2,))
+            _validate_metadata(result.get("metadata"), logical_path, (0, 1))
             render_map = _parse_umbra_render_map(result.get("renderMap"), len(content))
             return content, etag, render_map
         except RpcProtocolError as error:
@@ -687,7 +687,7 @@ class InexRpcClient:
                 "Umbra document convert result",
             )
             next_etag = _expect_etag(result.get("etag"))
-            _validate_metadata(result.get("metadata"), logical_path, (2,))
+            _validate_metadata(result.get("metadata"), logical_path, (0, 1))
             return next_etag, _expect_durability(result.get("durability"), "Umbra document convert")
         except RpcProtocolError as error:
             self._terminate_protocol(error)
@@ -774,7 +774,7 @@ class InexRpcClient:
             )
             next_content = decode_base64url(result.get("contentBase64"), MAX_DOCUMENT_BYTES)
             next_etag = _expect_etag(result.get("etag"))
-            _validate_metadata(result.get("metadata"), logical_path, (2,))
+            _validate_metadata(result.get("metadata"), logical_path, (0, 1))
             durability = _expect_durability(result.get("durability"), "Umbra annotation")
             next_map = _parse_umbra_render_map(result.get("renderMap"), len(next_content))
             return next_content, next_etag, next_map, durability

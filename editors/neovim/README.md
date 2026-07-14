@@ -38,6 +38,12 @@ Commands currently available:
 - `:InexUmbraStatus`, `:InexUnlockUmbra`, and `:InexLockUmbra` manage the
   independent Umbra keyslot. First initialization displays the unrecoverable
   password warning; Umbra lock leaves the Outer session available.
+- `:InexEnableUmbra` enables private annotations only after Umbra is unlocked.
+  `:InexConvertUmbra` converts the current saved normal document, then opens a
+  daemon-rendered `inex-umbra://` projection. `:InexOpenUmbra path/to/note.md`
+  opens an existing feature-2 document. These projections are read-only in this
+  milestone, are nofile/unlisted/no-swap/no-undo buffers, and are wiped when
+  either Umbra or Outer is locked.
 - `:InexStop` terminates the local RPC process and drops pending callbacks.
 
 `InexOpen`, `InexNew`, and `InexMkdir` take Inex logical paths (for example,
@@ -46,10 +52,10 @@ an existing parent directory; directory browsing/creation is a later MVP
 command. These commands intentionally do not offer ordinary filesystem
 completion.
 
-The current MVP intentionally rejects feature-2/Umbra documents. These commands
-only manage the independent key lifecycle; Umbra documents and annotation UI
-follow only through the same authenticated session
-and RenderMap boundaries already used by the CLI and VS Code clients. Neovim's
+The current MVP renders feature-2/Umbra documents only through an authenticated
+daemon projection and validates the accompanying RenderMap before display. It
+does not yet edit/save Umbra projections or expose annotation/tag/profile UI;
+those remain behind the CLI/VS Code milestones. Neovim's
 cmdline, undo, shada, LSP, plugins, terminal, and OS memory remain separate
 residue boundaries; do not enable other plugins on an Inex buffer until the
 explicit Neovim host-residue gate is implemented. Do not point the plugin at a

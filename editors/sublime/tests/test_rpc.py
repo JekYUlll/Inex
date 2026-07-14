@@ -420,7 +420,7 @@ class RequestAndResponseTests(unittest.TestCase):
             "logicalPath": "today.md",
             "createdAt": 1,
             "modifiedAt": 2,
-            "flags": 2,
+            "flags": 0,
         }
         content = bytearray(b"public\n")
         render_map = {
@@ -597,13 +597,13 @@ class RequestAndResponseTests(unittest.TestCase):
                 rejected.load_umbra_annotation_config()
             self.assertIsInstance(rejected._terminal_error, RpcProtocolError)
 
-    def test_umbra_document_conversion_is_etag_bound_and_feature_two_only(self):
+    def test_umbra_document_conversion_is_etag_bound(self):
         client = InexRpcClient("/unused")
         client._session = "A" * SESSION_TOKEN_TEXT_BYTES
         etag = "sha256:" + "1" * 64
         metadata = {
             "fileId": "00000000-0000-4000-8000-000000000000",
-            "logicalPath": "today.md", "createdAt": 1, "modifiedAt": 2, "flags": 2,
+            "logicalPath": "today.md", "createdAt": 1, "modifiedAt": 2, "flags": 0,
         }
         calls = []
         client._call_raw = lambda method, params: calls.append((method, params)) or {
@@ -616,7 +616,7 @@ class RequestAndResponseTests(unittest.TestCase):
 
         invalid = InexRpcClient("/unused")
         invalid._session = "A" * SESSION_TOKEN_TEXT_BYTES
-        invalid._call_raw = lambda method, params: {"etag": etag, "metadata": dict(metadata, flags=0), "durability": "synced"}
+        invalid._call_raw = lambda method, params: {"etag": etag, "metadata": dict(metadata, flags=2), "durability": "synced"}
         with self.assertRaises(RpcProtocolError):
             invalid.convert_document_to_umbra("today.md", etag)
         self.assertIsInstance(invalid._terminal_error, RpcProtocolError)

@@ -4,15 +4,18 @@ local M = {}
 local configuration = { sidecar_path = "", vault_path = "" }
 local session = nil
 local umbra_unlocked = false
+local umbra_enabled = false
 local documents = {}
 local tree_buffers = {}
 local search_buffers = {}
+local private_buffers = {}
 local MAX_DOCUMENT_BYTES = 16 * 1024 * 1024
 local MAX_DOCUMENT_BASE64_BYTES = 4 * math.ceil(MAX_DOCUMENT_BYTES / 3)
 local MAX_TREE_ENTRIES = 100000
 local SESSION_RE = "^[A-Za-z0-9_-]+$"
 local ETAG_RE = "^sha256:[a-f0-9]+$"
 local HELLO_PARAMS = { client = "neovim", clientVersion = "0.1.0", protocolMajor = 1 }
+local decode_base64url
 
 local function clear_document(buffer)
   local document = documents[buffer]
@@ -55,6 +58,19 @@ local function wipe_search_buffers()
   end
   for _, buffer in ipairs(buffers) do
     search_buffers[buffer] = nil
+    if vim.api.nvim_buf_is_valid(buffer) then
+      vim.api.nvim_buf_delete(buffer, { force = true })
+    end
+  end
+end
+
+local function wipe_private_buffers()
+  local buffers = {}
+  for buffer, _ in pairs(private_buffers) do
+    table.insert(buffers, buffer)
+  end
+  for _, buffer in ipairs(buffers) do
+    private_buffers[buffer] = nil
     if vim.api.nvim_buf_is_valid(buffer) then
       vim.api.nvim_buf_delete(buffer, { force = true })
     end
@@ -123,6 +139,60 @@ local function valid_umbra_status(value)
     and (value.initialized or not value.unlocked)
 end
 
+local function valid_metadata(value, logical_path)
+  return has_exact_keys(value, { fileId = true, logicalPath = true, createdAt = true, modifiedAt = true, flags = true, count = 5 })
+    and value.logicalPath == logical_path
+    and (value.flags == 0 or value.flags == 1)
+    and type(value.fileId) == "string" and value.fileId:match("^[0-9a-f][0-9a-f-]+$")
+    and type(value.createdAt) == "number" and type(value.modifiedAt) == "number"
+    and value.createdAt % 1 == 0 and value.modifiedAt % 1 == 0
+    and value.createdAt >= 0 and value.modifiedAt >= 0
+end
+
+local function valid_range(start_byte, end_byte)
+  return type(start_byte) == "number" and type(end_byte) == "number"
+    and start_byte % 1 == 0 and end_byte % 1 == 0
+    and start_byte >= 0 and end_byte > start_byte and end_byte <= MAX_DOCUMENT_BYTES
+end
+
+-- Validate every private projection boundary before displaying it. The map is
+-- deliberately not retained by this read-only MVP, so lock needs to wipe only
+-- the buffer that contains the daemon-rendered projection.
+local function valid_render_map(value, projection_bytes)
+  if not has_exact_keys(value, { generationBase64 = true, projectionBytes = true, privateSlots = true, outerSegments = true, count = 4 })
+    or type(value.generationBase64) ~= "string" or type(value.projectionBytes) ~= "number"
+    or value.projectionBytes % 1 ~= 0 or value.projectionBytes ~= projection_bytes
+    or value.projectionBytes < 0 or value.projectionBytes > MAX_DOCUMENT_BYTES
+    or type(value.privateSlots) ~= "table" or type(value.outerSegments) ~= "table" then
+    return false
+  end
+  local generation = decode_base64url(value.generationBase64)
+  if not generation or #generation ~= 32 then
+    return false
+  end
+  generation = ""
+  if #value.privateSlots > 4096 or #value.outerSegments > 4096 then
+    return false
+  end
+  for _, slot in ipairs(value.privateSlots) do
+    if not has_exact_keys(slot, { slotId = true, startByte = true, endByte = true, count = 3 })
+      or type(slot.slotId) ~= "string" or #slot.slotId == 0 or #slot.slotId > 256
+      or not valid_range(slot.startByte, slot.endByte) then
+      return false
+    end
+  end
+  for _, segment in ipairs(value.outerSegments) do
+    if not has_exact_keys(segment, { projectionStartByte = true, projectionEndByte = true, outerStartByte = true, outerEndByte = true, count = 4 })
+      or not valid_range(segment.projectionStartByte, segment.projectionEndByte)
+      or type(segment.outerStartByte) ~= "number" or type(segment.outerEndByte) ~= "number"
+      or segment.outerStartByte % 1 ~= 0 or segment.outerEndByte % 1 ~= 0
+      or segment.outerStartByte < 0 or segment.outerEndByte < segment.outerStartByte or segment.outerEndByte > MAX_DOCUMENT_BYTES then
+      return false
+    end
+  end
+  return true
+end
+
 local function tree_entry_label(kind, logical_path)
   if kind == "directory" then
     return "[D] " .. logical_path
@@ -144,7 +214,7 @@ local function encode_base64url(value)
   return encoded:gsub("%+", "-"):gsub("/", "_"):gsub("=+$", "")
 end
 
-local function decode_base64url(value)
+decode_base64url = function(value)
   if type(value) ~= "string" or #value > MAX_DOCUMENT_BASE64_BYTES or not value:match("^[A-Za-z0-9_-]*$") or #value % 4 == 1 then
     return nil
   end
@@ -186,10 +256,12 @@ function M.status()
 end
 
 function M.stop()
+  wipe_private_buffers()
   wipe_search_buffers()
   wipe_tree_buffers()
   wipe_documents()
   umbra_unlocked = false
+  umbra_enabled = false
   session = nil
   rpc.stop()
 end
@@ -224,10 +296,12 @@ function M.unlock(password)
 end
 
 function M.lock()
+  wipe_private_buffers()
   wipe_search_buffers()
   wipe_tree_buffers()
   wipe_documents()
   umbra_unlocked = false
+  umbra_enabled = false
   local active_session = session
   session = nil
   if active_session and rpc.started() then
@@ -293,16 +367,133 @@ end
 function M.lock_umbra()
   if not session then
     umbra_unlocked = false
+    umbra_enabled = false
     return
   end
   local active_session = session
+  wipe_private_buffers()
   umbra_unlocked = false
+  umbra_enabled = false
   rpc.request("umbra.lock", { session = active_session }, function(result, error)
     if error or session ~= active_session or not has_exact_keys(result, { ok = true, unlocked = true, count = 2 }) or result.ok ~= true or result.unlocked ~= false then
       vim.notify(error or "Inex Umbra lock failed", vim.log.levels.ERROR)
       return
     end
     vim.notify("Inex Umbra locked", vim.log.levels.INFO)
+  end)
+end
+
+function M.enable_umbra()
+  if not session or not umbra_unlocked then
+    vim.notify("Unlock Inex Umbra before enabling private annotations", vim.log.levels.ERROR)
+    return
+  end
+  local active_session = session
+  rpc.request("umbra.enable", { session = active_session }, function(result, error)
+    if error or session ~= active_session or not umbra_unlocked
+      or not has_exact_keys(result, { ok = true, durability = true, count = 2 })
+      or result.ok ~= true or (result.durability ~= "synced" and result.durability ~= "notSynced") then
+      vim.notify(error or "Inex Umbra enable failed", vim.log.levels.ERROR)
+      return
+    end
+    umbra_enabled = true
+    vim.notify("Inex Umbra private annotations enabled", vim.log.levels.INFO)
+  end)
+end
+
+local function show_umbra_projection(logical_path, result)
+  if not has_exact_keys(result, { contentBase64 = true, etag = true, metadata = true, renderMap = true, count = 4 })
+    or type(result.etag) ~= "string" or not result.etag:match(ETAG_RE)
+    or not valid_metadata(result.metadata, logical_path) then
+    return nil
+  end
+  local content = decode_base64url(result.contentBase64)
+  if not content or not valid_render_map(result.renderMap, #content) then
+    content = ""
+    return nil
+  end
+  local buffer = vim.api.nvim_create_buf(false, true)
+  vim.bo[buffer].buftype = "nofile"
+  vim.bo[buffer].swapfile = false
+  vim.bo[buffer].undofile = false
+  vim.bo[buffer].bufhidden = "wipe"
+  vim.bo[buffer].buflisted = false
+  vim.bo[buffer].modeline = false
+  vim.bo[buffer].modifiable = true
+  vim.api.nvim_buf_set_name(buffer, "inex-umbra://" .. logical_path)
+  vim.api.nvim_buf_set_lines(buffer, 0, -1, false, vim.split(content, "\n", { plain = true }))
+  content = ""
+  vim.bo[buffer].modifiable = false
+  vim.bo[buffer].modified = false
+  private_buffers[buffer] = true
+  vim.api.nvim_create_autocmd("BufWipeout", { buffer = buffer, once = true, callback = function()
+    private_buffers[buffer] = nil
+  end })
+  local opened, split_error = pcall(vim.cmd, "botright vsplit")
+  if not opened then
+    private_buffers[buffer] = nil
+    vim.api.nvim_buf_delete(buffer, { force = true })
+    vim.notify(split_error or "Inex Umbra projection window could not be opened", vim.log.levels.ERROR)
+    return nil
+  end
+  vim.api.nvim_set_current_buf(buffer)
+  return buffer
+end
+
+function M.open_umbra_document(logical_path)
+  if not session or not umbra_unlocked then
+    vim.notify("Unlock Inex Umbra before opening a private projection", vim.log.levels.ERROR)
+    return
+  end
+  if not valid_logical_path(logical_path) then
+    vim.notify("Inex logical Markdown path is invalid", vim.log.levels.ERROR)
+    return
+  end
+  local active_session = session
+  rpc.request("umbra.document.open", { session = active_session, logicalPath = logical_path }, function(result, error)
+    if error or session ~= active_session or not umbra_unlocked or not show_umbra_projection(logical_path, result) then
+      vim.notify(error or "Inex Umbra projection is invalid", vim.log.levels.ERROR)
+    end
+  end)
+end
+
+function M.convert_current_document_to_umbra()
+  if not session or not umbra_unlocked or not umbra_enabled then
+    vim.notify("Unlock and enable Inex Umbra before converting a document", vim.log.levels.ERROR)
+    return
+  end
+  local buffer = vim.api.nvim_get_current_buf()
+  local document = documents[buffer]
+  if not document or vim.bo[buffer].modified or document.saving then
+    vim.notify("Save an ordinary Inex document before converting it to Umbra", vim.log.levels.ERROR)
+    return
+  end
+  local active_session = session
+  rpc.request("umbra.document.convert", { session = active_session, logicalPath = document.logical_path, ifMatch = document.etag }, function(result, error)
+    if error or session ~= active_session or not umbra_unlocked or not umbra_enabled
+      or type(result) ~= "table" or type(result.etag) ~= "string" or not result.etag:match(ETAG_RE)
+      or not valid_metadata(result.metadata, document.logical_path)
+      or (result.durability ~= "synced" and result.durability ~= "notSynced") then
+      vim.notify(error or "Inex Umbra conversion failed", vim.log.levels.ERROR)
+      return
+    end
+    rpc.request("umbra.document.open", { session = active_session, logicalPath = document.logical_path }, function(projection, open_error)
+      if open_error or session ~= active_session or not umbra_unlocked or documents[buffer] ~= document then
+        vim.notify(open_error or "Inex Umbra conversion projection failed; locking vault", vim.log.levels.ERROR)
+        M.lock()
+        return
+      end
+      local private_buffer = show_umbra_projection(document.logical_path, projection)
+      if not private_buffer then
+        vim.notify("Inex Umbra conversion projection is invalid; locking vault", vim.log.levels.ERROR)
+        M.lock()
+        return
+      end
+      clear_document(buffer)
+      if vim.api.nvim_buf_is_valid(buffer) then
+        vim.api.nvim_buf_delete(buffer, { force = true })
+      end
+    end)
   end)
 end
 
@@ -591,6 +782,10 @@ function M.is_umbra_unlocked()
   return umbra_unlocked
 end
 
+function M.is_umbra_enabled()
+  return umbra_enabled
+end
+
 function M.is_managed_buffer(buffer)
   return documents[buffer] ~= nil
 end
@@ -601,6 +796,10 @@ end
 
 function M.is_search_buffer(buffer)
   return search_buffers[buffer] ~= nil
+end
+
+function M.is_umbra_buffer(buffer)
+  return private_buffers[buffer] ~= nil
 end
 
 return M

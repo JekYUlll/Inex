@@ -33,6 +33,18 @@ vim.api.nvim_create_user_command("InexLockUmbra", function()
   inex.lock_umbra()
 end, { desc = "Lock Inex Umbra while keeping the Outer vault unlocked" })
 
+vim.api.nvim_create_user_command("InexEnableUmbra", function()
+  inex.enable_umbra()
+end, { desc = "Enable Umbra private annotations for this vault" })
+
+vim.api.nvim_create_user_command("InexOpenUmbra", function(arguments)
+  inex.open_umbra_document(arguments.args)
+end, { nargs = 1, desc = "Open a read-only Inex Umbra projection" })
+
+vim.api.nvim_create_user_command("InexConvertUmbra", function()
+  inex.convert_current_document_to_umbra()
+end, { desc = "Convert the current saved Inex document to Umbra" })
+
 vim.api.nvim_create_user_command("InexOpen", function(arguments)
   inex.open_document(arguments.args)
 end, { nargs = 1, desc = "Open an Inex Markdown document" })
