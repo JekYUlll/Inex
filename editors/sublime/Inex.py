@@ -40,6 +40,7 @@ try:
         validate_logical_path,
     )
     from .inex_password import PasswordPromptError, prompt_password
+    from .inex_annotation import AnnotationPickerError, AnnotationPickerState
     from .inex_markdown import markdown_headings, markdown_links
     from .inex_rpc import (
         InexRpcClient,
@@ -73,6 +74,7 @@ except ImportError:  # Direct package development outside Sublime's loader.
         validate_logical_path,
     )
     from inex_password import PasswordPromptError, prompt_password
+    from inex_annotation import AnnotationPickerError, AnnotationPickerState
     from inex_markdown import markdown_headings, markdown_links
     from inex_rpc import (
         InexRpcClient,
@@ -93,6 +95,7 @@ LOCKED_TEXT = "[Inex locked — unlock the vault to reopen this document]\n"
 BLOCKED_TEXT = "[Inex blocked an unsafe plaintext save]\n"
 
 _registry = DocumentRegistry()
+_annotation_pickers: List[AnnotationPickerState] = []
 _runtime_lock = threading.Lock()
 _client: Optional[InexRpcClient] = None
 _vault_id: Optional[str] = None
@@ -392,6 +395,7 @@ def _lock_views_and_drop_models(reason: str) -> Tuple[Optional[InexRpcClient], L
         _activity_ping_inflight = False
         _idle_deadline = None
         _idle_timer_serial += 1
+    _clear_annotation_pickers()
     scrub_failed = False
     try:
         _handoffs.clear()
@@ -1715,9 +1719,82 @@ def _lock_umbra(window: sublime.Window) -> None:
     def done() -> None:
         current, _vault_now, current_generation = _runtime_snapshot()
         if current is client and current_generation == generation:
+            _clear_annotation_pickers()
+            try:
+                window.run_command("hide_overlay")
+            except Exception:
+                pass
             window.status_message("Inex Umbra locked; Outer vault remains unlocked")
 
     sublime.set_timeout_async(worker, 0)
+
+
+def _clear_annotation_pickers() -> None:
+    global _annotation_pickers
+    for state in _annotation_pickers:
+        try:
+            state.clear()
+        except Exception:
+            pass
+    _annotation_pickers = []
+
+
+def _show_annotation_picker(
+    window: sublime.Window,
+    state: AnnotationPickerState,
+    on_apply: Callable[[Dict[str, Any]], None],
+) -> None:
+    """Show the MVP repeated Quick Panel without persisting private labels."""
+    _annotation_pickers.append(state)
+
+    def discard() -> None:
+        if state in _annotation_pickers:
+            _annotation_pickers.remove(state)
+        state.clear()
+
+    def submit() -> None:
+        if state.outer != "cover":
+            try:
+                on_apply(state.spec())
+            finally:
+                discard()
+            return
+
+        def cover_done(cover_text: str) -> None:
+            try:
+                on_apply(state.spec(cover_text))
+            except Exception as error:
+                _show_error(error)
+            finally:
+                discard()
+
+        window.show_input_panel("Public cover text", "", cover_done, None, discard)
+
+    def present() -> None:
+        if state not in _annotation_pickers:
+            return
+        items = state.items()
+        choices = [item["label"] for item in items]
+
+        def selected(index: int) -> None:
+            if index < 0 or index >= len(items):
+                discard()
+                return
+            try:
+                action = state.select(items[index]["id"])
+                if action == "cancel":
+                    discard()
+                elif action == "done":
+                    submit()
+                else:
+                    present()
+            except Exception as error:
+                discard()
+                _show_error(error)
+
+        window.show_quick_panel(choices, selected, placeholder="Configure private annotation")
+
+    present()
 
 
 def _search(window: sublime.Window, query: str) -> None:
