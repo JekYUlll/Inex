@@ -797,3 +797,8 @@
 - 提交 `9bd5297`（`feat(daemon): apply Umbra annotations over RPC`）：新增 `umbra.annotation.apply`；请求包含 ETag、base64 projection、完整 RenderMap、多选 byte ranges、kind/tag IDs/Outer strategy 和 mergeAdjacent。新增受限 object-array/sensitive-string-array 参数提取器，所有未消费或无效嵌套 JSON 在 drop 时递归清理。
 - handler 在交给 `Vault::apply_private_annotation` 前只做 schema/resource 验证；核心仍负责 projection/RenderMap/ETag 三重一致性、private boundary 分类和单次条件保存。成功后返回刚提交的 ETag、metadata、投影与 RenderMap；stale map 映射 ETag conflict、非法范围映射 invalid params、损坏容器映射 integrity failure。
 - 服务级 RPC 用真实返回的 projection/RenderMap 包裹选区，并验证 disk 上没有正文或 tag canary。`cargo test -p inex-daemon --lib` 71/71、严格 Clippy、fmt、diff-check 全通过。下一优先级进入 VS Code 选择器/命令与可配置 keybindings。
+
+## 2026-07-15 — VS Code Umbra Sidecar Client
+
+- 提交 `b58bffd`（`feat(vscode): add typed Umbra sidecar client`）：扩展侧新增 capability-gated Umbra status/init/unlock/lock/enable/open/apply API、严格 `RenderMap`/range/spec 序列化和响应解析。投影字节长度必须匹配 RenderMap，固定 32-byte generation、严格字段集、canonical ETag、逻辑路径和 durability 均在进入 UI 前验证。
+- 新增 2 项 parser 回归；`pnpm --dir editors/vscode check` 与测试 47/47 通过。下一步为 CustomEditor 保留并上报 webview 选区、实现多选 QuickPick 及普通/快速标注命令；该 UI 尚未宣称可用。
