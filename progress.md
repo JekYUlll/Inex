@@ -1,5 +1,11 @@
 # Inex Progress Log
 
+## 2026-07-15 — Neovim Outer 受控编辑与保存
+
+- Neovim ordinary Outer buffer 改为 `acwrite`：`InexSave` 与普通 `:write` 都由 buffer-local `BufWriteCmd` 拦截，只向 `inexd` 发送带 current ETag 的 `file.write`，绝不把 `inex://` 内容写至宿主文件路径。
+- Lua 端补齐严格 canonical unpadded Base64URL encoder/decoder；decoder 先限制 URL alphabet/大小、按需补位给 Neovim decoder，再重新编码比对 canonical wire text。这样空文档可如 daemon 协议定义那样保存为空 payload，单字节/Unicode 内容仍可安全读写。
+- `outer_lifecycle.lua` 已验证：创建空文档、编辑 Unicode Markdown、正常 `:write`、CAS 加密保存、lock wipe、re-unlock/open 后逐行一致。现有 transport `system.hello` smoke 亦通过。
+
 ## 2026-07-15 — 可追踪全仓主线回归
 
 - 以单一可追踪 session 重跑 `cargo test --workspace --locked` 并获得 exit 0：365 passed、12 ignored，耗时 225.49s；包含 core 的 Umbra/Outer 隔离、daemon/CLI、repository-import、v5 publication/recovery 以及代表性 native force-kill 边界。12 个 ignored 项是明确要求分片并行运行的完整 native force-kill matrix child/full-shard tests，不被计作已执行证据。
