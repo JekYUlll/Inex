@@ -140,7 +140,7 @@ Phase 6 extension — 现有 Markdown Git 仓库与加密附件迁移（Phase 7 
           - [x] marker unlink后的sync retry与marker-free clean audit形成PublishedClean/terminal输出，并整体替换旧v1 publisher（`b34691c`）
             - [x] 只有PublicationDurableWithMarker可消费exact unlink；五态结果及parent-sync四态映射为pending/retry/terminal且不返回裸core authority（`c3dd202`）
             - [x] 以Synced post-unlink held-root authority执行marker-free clean九段audit并形成PublishedClean或可重试/terminal owner（`0b366e1`）
-        - [ ] 将fresh existing-only exact-v2入口接入CLI早期路由与独立`repository-reconcile`终态输出；不得先重做source Git plan、提示口令或运行KDF
+        - [x] 将fresh existing-only exact-v2入口接入CLI早期路由与独立`repository-reconcile`终态输出；不得先重做source Git plan、提示口令或运行KDF（`d9dc345`）
   - [ ] 完成repository import构造/durability/publication每一边界的Linux force-kill、hostile same-UID source/target race、artifact-bound residue与原生Windows矩阵
 - **Status:** in_progress（用户实测驱动的迁移/附件扩展；原Markdown-only实现仍保持已验证基线）
 
@@ -262,6 +262,9 @@ Phase 6 extension — 现有 Markdown Git 仓库与加密附件迁移（Phase 7 
 
 | Error | Attempt | Resolution |
 |-------|---------|------------|
+| CLI path-first接线后两次production源码契约测试因函数切片边界与临时test wrapper误截断而失败 | 2 | 删除test-only wrapper，让fixture直接走真实`dispatch`；分别以`execute_reconcile`/`build_staging_vault`固定函数边界，产品断言保持不变 |
+| strict Clippy发现large enum、冻结表长度、boxed fixture类型及Windows非Linux常量dead-code | 4 | 只box大型linear owner/plan，对纯冻结表使用窄理由，fixture显式解box并cfg Linux资源常量；Linux与Windows GNU/MSVC门禁复绿 |
+| 独立审查发现canonicalize身份换绑、预存bind alias及non-v2同分类目录替换 | 3 | 增加前后identity采样、held directory-only source identity walk与终态parent/root/namespace复验；真实canary测试证明零mutation，hostile same-UID ABA仍保留为GA门禁 |
 | `create_goal` 拒绝新的迁移objective，因为线程已有paused但unfinished的长期Goal | 5 | 不伪造complete/blocked；把可执行细化Goal写入根`task_plan.md`并继续Git开发，待产品侧恢复/替换后端Goal |
 | 完整core回归中的既有OS-lock竞争测试偶发得到一条成功和一条pre-lock fail-closed错误，而非预期Conflict | 2 | 在竞争前先建立并释放稳定lock namespace，让测试只测同一既有lock上的串行语义；精确50轮及完整254/254通过（`70fc0b2`） |
 | raw index parser首版拒绝“有IEOT但无EOIE”的真实Git 2.43 index | 1 | 以真实Git生成的v4 index和Git格式契约确认IEOT可独立存在；放宽该组合但保持唯一extension、分区与block独立解码校验，定向测试和Windows GNU检查通过 |
