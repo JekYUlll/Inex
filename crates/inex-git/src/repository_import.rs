@@ -72,6 +72,12 @@ mod candidate_control;
 )]
 mod candidate_vault_authority;
 
+#[allow(
+    dead_code,
+    reason = "the marker writer consumes the held initial candidate authority in the next slice"
+)]
+mod candidate_initial_authority;
+
 #[cfg(target_os = "linux")]
 use super::raw_index::{RawIndex, parse_sha1_index};
 use super::raw_index::{RawIndexError, TargetRawIndexSummary, validate_target_sha1_index_paths};
