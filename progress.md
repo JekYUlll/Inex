@@ -1056,3 +1056,8 @@
 
 - 提交 `4a30a99`（`feat(sublime): enter active documents into Umbra mode`）：`Inex: Enter Umbra Mode for Active Document` 要求 clean normal managed buffer 与已解锁 Umbra，按 convert ETag CAS → authenticated projection open → main-thread client/model identity recheck → model transition → close old normal handle 顺序执行。
 - conversion 已成功但 projection/transition 任一步失败时立即执行 vault lock/scrub；不会继续暴露可保存的旧 normal buffer。成功时使用 daemon projection 替换 scratch view、清空 undo stack，并保留 Outer session。验证：完整 Sublime 92/92、1 项 pidfd platform skip、compile/JSON/diff-check 通过。
+
+## 2026-07-15 — Sublime private annotation apply command
+
+- 提交 `950c692`（`feat(sublime): apply private annotations from projections`）：`Inex: Choose Private Annotation` 仅接受 clean active Umbra projection 的一个或多个显式 selection，使用 UTF-8 byte offsets，加载已解锁 encrypted catalog，再以完整 current projection/ETag/RenderMap 调用 daemon apply。
+- apply response 仅在 Outer client、Outer generation、独立 Umbra generation、document identity、ETag/RenderMap 均未变化时安装；Umbra lock 期间完成的旧 callback 无法回写私密 projection。成功后清空 undo stack并采用 daemon projection，不推导 slot/marker。验证：完整 Sublime 92/92、1 项 pidfd platform skip、compile/JSON/diff-check 通过。

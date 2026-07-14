@@ -123,6 +123,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
     - [x] Sublime stateful picker 基础已实现：kind/Outer 单选、tag 多选、归档已选 tag 可见、Cover 约束与 clear-on-cancel/lock state（`5eeb657`）；尚待连接 projection command
     - [x] Sublime picker 可应用 encrypted annotation profile 的 kind/tag/Outer metadata；profile 永不携带实例 cover text，cover 仍在实际 apply 前单独采集（`7b7624e`）
     - [x] Sublime repeated `show_quick_panel` UI 已接入 picker state；Cover 走公开 input panel，cancel/Outer lock/Umbra lock 清空 labels 并关闭 overlay（`fed948e`）；尚待连接 projection command
+    - [x] Sublime `Inex: Choose Private Annotation` 已从 canonical Umbra projection 多选生成 UTF-8 ranges，经过 picker 后调用 authenticated apply 并替换返回 projection（`950c692`）
     - [x] Sublime strict RPC client 已支持 authenticated `umbra.document.open` 与 apply/edit/remove：canonical generation、范围/条目/顺序和 feature-2 response metadata 都在交给 host 前验证；客户端只回传 daemon 返回的完整 projection/ETag/RenderMap（`e93a1a9`、`f788818`、`b027052`，本轮）
     - [x] Sublime strict RPC client 已支持 `umbra.document.convert` 的 ETag CAS feature-2 升级，返回 metadata 必须精确为 flag 2（`91f7d7a`）
     - [x] Sublime `ManagedDocument` 现区分无 normal handle 的 authenticated Umbra projection，投影替换原子更新 ETag/RenderMap，close 清除 projection state（`d5036fc`）

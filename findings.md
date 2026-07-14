@@ -540,3 +540,4 @@
 - Umbra projection 不能伪装为 `document.open` handle：普通 close RPC 只对 daemon-issued normal handles 有效。Sublime model 必须以空 handle + authenticated RenderMap 表达 Umbra document，并在 mutation 成功时整体替换 projection identity。
 - normal→Umbra transition 的安全顺序是 daemon CAS convert、daemon authenticated projection open、main-thread identity recheck、model transition、再关闭旧 normal handle。任何 dirty/locked/stale model 都要在 transition 前拒绝，且传入 projection 必须 wipe。
 - 当 `umbra.document.convert` 已成功后，普通 document buffer 已不能安全继续作为 normal document 保存。若随后 projection open、UI identity recheck 或 transition 失败，Sublime 必须锁定并 scrub 全部 managed buffer，而不能仅恢复 view 可编辑性。
+- Sublime selection points 是 host character offsets，annotation RPC 却要求 canonical UTF-8 byte ranges；必须从当前 view 前缀编码计算每个 selection 的 start/end，而不使用 Python character index。apply completion 必须同时检查 Outer 与 Umbra generation，否则 Umbra lock 后异步响应可重新安装私密文本。
