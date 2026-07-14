@@ -38,6 +38,7 @@
     "onCommand:inex.togglePrivateAnnotation",
     "onCommand:inex.choosePrivateAnnotation",
     "onCommand:inex.editPrivateAnnotation",
+    "onCommand:inex.managePrivateTags",
     "onCommand:inex.removePrivateAnnotation",
     "onCommand:inex.applyPrivateAnnotationProfile"
   ],
@@ -86,6 +87,11 @@
       {
         "command": "inex.editPrivateAnnotation",
         "title": "Inex: Edit Private Annotation",
+        "enablement": "inex.vaultUnlocked"
+      },
+      {
+        "command": "inex.managePrivateTags",
+        "title": "Inex: Manage Private Tags",
         "enablement": "inex.vaultUnlocked"
       },
       {

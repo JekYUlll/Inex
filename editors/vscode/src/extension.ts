@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 
-import { VaultController } from "./controller.ts";
+import { VaultController, type VaultSession } from "./controller.ts";
 import { InexCrudActions } from "./crud.ts";
 import { InexCustomEditorProvider } from "./customEditor.ts";
 import { offerToOpenImportedVault } from "./importCompletion.ts";
@@ -263,6 +263,11 @@ export function activate(
         );
       });
     }),
+    vscode.commands.registerCommand("inex.managePrivateTags", async () => {
+      await runUiAction(async () => {
+        await managePrivateTags(controller);
+      });
+    }),
     vscode.commands.registerCommand("inex.applyPrivateAnnotationProfile", async (args?: unknown) => {
       await runUiAction(async () => {
         const profileId = isProfileArguments(args) ? args.profileId : undefined;
@@ -369,52 +374,9 @@ async function applyChosenPrivateAnnotation(
   preferences: PrivateAnnotationPreferences = privateAnnotationPreferences(),
   initialSpec?: PrivateAnnotationSpec,
 ): Promise<void> {
-  if (!(await ensureVaultUnlocked(controller))) {
-    return;
-  }
-  const session = controller.acquireSession();
-  const sidecar = session.sidecar;
-  const status = await sidecar.umbraStatus();
-  if (!controller.isSessionCurrent(session)) {
-    throw new Error("Inex vault session changed before Umbra unlock");
-  }
-  if (!status.unlocked) {
-    if (!status.initialized) {
-      const warning = await vscode.window.showWarningMessage(
-        "Umbra passwords cannot be recovered. Forgetting it permanently loses Umbra private content. Continue?",
-        { modal: true },
-        "Initialize Umbra",
-      );
-      if (warning !== "Initialize Umbra") return;
-    }
-    let password = await showSensitiveInputBox(
-      {
-        ignoreFocusOut: true,
-        password: true,
-        prompt: status.initialized ? "Umbra password" : "New Umbra password",
-        title: status.initialized ? "Unlock Umbra" : "Initialize Umbra",
-        validateInput: (value) => {
-          const bytes = Buffer.byteLength(value, "utf8");
-          return bytes >= 1 && bytes <= 1024 ? undefined : "Password must be 1–1024 UTF-8 bytes";
-        },
-      },
-      controller.onDidLock,
-    );
-    if (password === undefined) return;
-    try {
-      if (status.initialized) {
-        await sidecar.unlockUmbra(password);
-      } else {
-        await sidecar.initializeUmbra(password);
-      }
-      await sidecar.enableUmbra();
-    } finally {
-      password = undefined;
-    }
-  }
-  if (!controller.isSessionCurrent(session)) {
-    throw new Error("Inex vault session changed during Umbra unlock");
-  }
+  const ready = await ensureUmbraReady(controller);
+  if (ready === undefined) return;
+  const { session, sidecar } = ready;
   await editor.convertActiveDocumentToUmbra();
   const config = await sidecar.loadUmbraAnnotationConfig();
   const profile = profileId === undefined
@@ -455,6 +417,155 @@ async function applyChosenPrivateAnnotation(
   } else {
     await editor.editPrivateAnnotationAtActive(spec);
   }
+}
+
+async function ensureUmbraReady(
+  controller: VaultController,
+): Promise<{ readonly session: VaultSession; readonly sidecar: VaultSession["sidecar"] } | undefined> {
+  if (!(await ensureVaultUnlocked(controller))) return undefined;
+  const session = controller.acquireSession();
+  const sidecar = session.sidecar;
+  const status = await sidecar.umbraStatus();
+  if (!controller.isSessionCurrent(session)) {
+    throw new Error("Inex vault session changed before Umbra unlock");
+  }
+  if (!status.unlocked) {
+    if (!status.initialized) {
+      const warning = await vscode.window.showWarningMessage(
+        "Umbra passwords cannot be recovered. Forgetting it permanently loses Umbra private content. Continue?",
+        { modal: true },
+        "Initialize Umbra",
+      );
+      if (warning !== "Initialize Umbra") return undefined;
+    }
+    let password = await showSensitiveInputBox(
+      {
+        ignoreFocusOut: true,
+        password: true,
+        prompt: status.initialized ? "Umbra password" : "New Umbra password",
+        title: status.initialized ? "Unlock Umbra" : "Initialize Umbra",
+        validateInput: (value) => {
+          const bytes = Buffer.byteLength(value, "utf8");
+          return bytes >= 1 && bytes <= 1024 ? undefined : "Password must be 1–1024 UTF-8 bytes";
+        },
+      },
+      controller.onDidLock,
+    );
+    if (password === undefined) return undefined;
+    try {
+      if (status.initialized) {
+        await sidecar.unlockUmbra(password);
+      } else {
+        await sidecar.initializeUmbra(password);
+      }
+      await sidecar.enableUmbra();
+    } finally {
+      password = undefined;
+    }
+  }
+  if (!controller.isSessionCurrent(session)) {
+    throw new Error("Inex vault session changed during Umbra unlock");
+  }
+  return { session, sidecar };
+}
+
+async function managePrivateTags(controller: VaultController): Promise<void> {
+  const ready = await ensureUmbraReady(controller);
+  if (ready === undefined) return;
+  const config = await ready.sidecar.loadUmbraAnnotationConfig();
+  const items: vscode.QuickPickItem[] = [
+    { label: "$(add) Create Private Tag", description: "Add an encrypted catalog entry" },
+    ...config.tags.map((tag) => ({
+      label: `$(tag) ${tag.label}`,
+      description: tag.id,
+      detail: tag.archived ? "Archived" : tag.description,
+    })),
+  ];
+  const selected = await vscode.window.showQuickPick(items, {
+    title: "Manage Private Tags",
+    placeHolder: "Create a tag or select one to rename/archive",
+    ignoreFocusOut: true,
+  });
+  if (selected === undefined || !controller.isSessionCurrent(ready.session)) return;
+  if (selected.label.startsWith("$(add)")) {
+    await createPrivateTag(controller, ready.session, ready.sidecar);
+    return;
+  }
+  const tag = config.tags.find((candidate) => candidate.id === selected.description);
+  if (tag === undefined) throw new Error("Selected private tag is unavailable");
+  const action = await vscode.window.showQuickPick(
+    tag.archived ? ["Rename"] : ["Rename", "Archive"],
+    { title: `Private Tag: ${tag.label}`, ignoreFocusOut: true },
+  );
+  if (action === undefined || !controller.isSessionCurrent(ready.session)) return;
+  if (action === "Archive") {
+    await ready.sidecar.archiveUmbraTag(tag.id);
+    await ready.sidecar.loadUmbraAnnotationConfig();
+    await vscode.window.showInformationMessage("Private tag archived.");
+    return;
+  }
+  let label = await showSensitiveInputBox(
+    {
+      title: "Rename Private Tag",
+      prompt: "Private display label",
+      value: tag.label,
+      ignoreFocusOut: true,
+      validateInput: validatePrivateTagText,
+    },
+    controller.onDidLock,
+  );
+  if (label === undefined) return;
+  try {
+    await ready.sidecar.renameUmbraTag(tag.id, label);
+    await ready.sidecar.loadUmbraAnnotationConfig();
+    await vscode.window.showInformationMessage("Private tag renamed.");
+  } finally {
+    label = undefined;
+  }
+}
+
+async function createPrivateTag(
+  controller: VaultController,
+  session: VaultSession,
+  sidecar: VaultSession["sidecar"],
+): Promise<void> {
+  let label = await showSensitiveInputBox(
+    { title: "Create Private Tag", prompt: "Private display label", ignoreFocusOut: true, validateInput: validatePrivateTagText },
+    controller.onDidLock,
+  );
+  let id: string | undefined;
+  try {
+    if (label === undefined || !controller.isSessionCurrent(session)) return;
+    id = await showSensitiveInputBox(
+      { title: "Create Private Tag", prompt: "Stable machine-readable ID", ignoreFocusOut: true, validateInput: validatePrivateTagId },
+      controller.onDidLock,
+    );
+    if (id === undefined || !controller.isSessionCurrent(session)) return;
+    await sidecar.createUmbraTag({
+      id,
+      label,
+      description: "",
+      aliases: [],
+      sortOrder: 0,
+      defaultSelected: false,
+    });
+    await sidecar.loadUmbraAnnotationConfig();
+    await vscode.window.showInformationMessage("Private tag created.");
+  } finally {
+    id = undefined;
+    label = undefined;
+  }
+}
+
+function validatePrivateTagText(value: string): string | undefined {
+  const bytes = Buffer.byteLength(value, "utf8");
+  return bytes >= 1 && bytes <= 4096 ? undefined : "Text must be 1–4096 UTF-8 bytes";
+}
+
+function validatePrivateTagId(value: string): string | undefined {
+  return /^[a-z0-9][a-z0-9._-]{0,63}$/.test(value)
+    ? undefined
+    : "ID must match [a-z0-9][a-z0-9._-]{0,63}";
 }
 
 function privateAnnotationPreferences(): PrivateAnnotationPreferences {
