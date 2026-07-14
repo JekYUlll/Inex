@@ -62,6 +62,7 @@ const MAX_TARGET_ENTRIES: usize = 100_003;
 const MAX_CONTROL_ENTRIES: usize = 1_000_000;
 const MAX_TREE_DEPTH: usize = 128;
 const MAX_RETAINED_PATH_BYTES: usize = 256 * 1024 * 1024;
+#[cfg(target_os = "linux")]
 const MAX_GIT_OUTPUT: usize = 64 * 1024 * 1024;
 const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 const MAX_GIT_STDERR_BYTES: usize = 64 * 1024;
@@ -474,6 +475,24 @@ struct ObjectDescriptor {
     size: u64,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct TargetObjectExpectation {
+    object_type: &'static str,
+    size: u64,
+    sha256: [u8; 32],
+}
+
+impl fmt::Debug for TargetObjectExpectation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TargetObjectExpectation")
+            .field("object_type", &self.object_type)
+            .field("size", &self.size)
+            .field("sha256", &"[REDACTED]")
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CanonicalTreeEntry {
     name: String,
@@ -516,6 +535,10 @@ impl fmt::Debug for BoundControlFile {
 
 struct TargetRawIndexEvidence {
     raw_index: RawIndex,
+    control: TargetIndexControlEvidence,
+}
+
+struct TargetIndexControlEvidence {
     identity: FilesystemFileIdentity,
     size: u64,
     sha256: [u8; 32],
@@ -527,8 +550,7 @@ impl fmt::Debug for TargetRawIndexEvidence {
             .debug_struct("TargetRawIndexEvidence")
             .field("version", &self.raw_index.version)
             .field("entry_count", &self.raw_index.entries.len())
-            .field("identity", &"[REDACTED]")
-            .field("sha256", &"[REDACTED]")
+            .field("control", &"[REDACTED]")
             .finish_non_exhaustive()
     }
 }
@@ -697,9 +719,11 @@ fn target_raw_index_evidence_from_held(
     let digest = sha256(&held.bytes);
     Ok(TargetRawIndexEvidence {
         raw_index,
-        identity: held.identity,
-        size,
-        sha256: digest,
+        control: TargetIndexControlEvidence {
+            identity: held.identity,
+            size,
+            sha256: digest,
+        },
     })
 }
 
@@ -732,7 +756,7 @@ fn capture_target_raw_index(root: &Path) -> Result<TargetRawIndexEvidence, Repos
 }
 
 fn require_target_index_control_binding(
-    evidence: &TargetRawIndexEvidence,
+    evidence: &TargetIndexControlEvidence,
     git_control: &[NamespaceSeal],
 ) -> Result<(), RepositoryImportError> {
     let mut matches = git_control
@@ -1433,6 +1457,29 @@ fn inventory_namespace(
     inventory_namespace_with_file_limit(root, policy, None)
 }
 
+fn inventory_target_git_control(
+    target_root: &Path,
+) -> Result<Vec<NamespaceSeal>, RepositoryImportError> {
+    inventory_target_namespace(&target_root.join(".git"), NamespacePolicy::TargetGit)
+}
+
+fn inventory_target_private_control(
+    private_root: &Path,
+) -> Result<Vec<NamespaceSeal>, RepositoryImportError> {
+    inventory_target_namespace(private_root, NamespacePolicy::TargetPrivate)
+}
+
+fn inventory_target_namespace(
+    root: &Path,
+    policy: NamespacePolicy,
+) -> Result<Vec<NamespaceSeal>, RepositoryImportError> {
+    inventory_namespace_with_file_limit(
+        root,
+        policy,
+        Some(u64::try_from(MAX_TARGET_FILE_BYTES).unwrap_or(u64::MAX)),
+    )
+}
+
 #[cfg(target_os = "linux")]
 fn inventory_namespace_with_file_limit(
     root: &Path,
@@ -1532,14 +1579,6 @@ fn inventory_secure_namespace_directory(
     directory
         .verify_binding()
         .map_err(|_| namespace_error(policy))
-}
-
-#[cfg(not(target_os = "linux"))]
-fn inventory_namespace(
-    root: &Path,
-    policy: NamespacePolicy,
-) -> Result<Vec<NamespaceSeal>, RepositoryImportError> {
-    inventory_namespace_with_file_limit(root, policy, None)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -2346,10 +2385,11 @@ pub fn initialize_and_audit_target(
         });
     }
     let expected_trees = construct_canonical_target_trees(&target_blob_manifest(&tracked)?)?;
-    let expected_root_tree_oid = &expected_trees
+    let expected_root_tree_oid = expected_trees
         .get("")
         .ok_or(RepositoryImportError::TargetAuditFailed)?
-        .oid;
+        .oid
+        .clone();
     runner.run(
         RepositoryGitOperation::ConstructTarget,
         &os_args(["update-index", "-z", "--index-info"]),
@@ -2366,10 +2406,9 @@ pub fn initialize_and_audit_target(
     )?)?
     .to_owned();
     require_sha1_oid(&root_tree_oid)?;
-    if &root_tree_oid != expected_root_tree_oid {
+    if root_tree_oid != expected_root_tree_oid {
         return Err(RepositoryImportError::TargetAuditFailed);
     }
-    drop(expected_trees);
     let date = format!("{import_time_utc_seconds} +0000");
     let identity = GitIdentityEnvironment {
         author_name: "Inex Repository Import",
@@ -2409,21 +2448,25 @@ pub fn initialize_and_audit_target(
     )?;
     configure_target(&runner, "core.logAllRefUpdates", "true")?;
 
-    let object_ids = target_object_inventory(&runner)?;
-    let mut batch = runner.target_object_batch()?;
-    batch.verify(&root_commit_oid, "commit", commit_bytes.as_slice())?;
-    let tree_oids = validate_expected_target_objects(
-        &runner,
-        &mut batch,
+    let object_expectations = expected_target_object_expectations(
         &tracked,
-        &root_tree_oid,
+        &expected_trees,
         &root_commit_oid,
-        commit_bytes.len() as u64,
-        &object_ids,
+        commit_bytes.as_slice(),
     )?;
+    let object_ids = target_object_descriptors(&object_expectations);
+    let tree_oids = canonical_target_tree_oids(&expected_trees);
+    let initial_git_control = inventory_target_git_control(&root)?;
+    require_exact_loose_target_objects(&initial_git_control, &object_expectations)?;
+    validate_target_git_control(&initial_git_control, &object_ids)?;
+    let mut batch = runner.target_object_batch()?;
+    prove_expected_target_objects(&mut batch, &object_expectations)?;
     batch.finish()?;
-    let git_control = inventory_namespace(&root.join(".git"), NamespacePolicy::TargetGit)?;
-    let private_control = inventory_namespace(&local, NamespacePolicy::TargetPrivate)?;
+    let git_control = inventory_target_git_control(&root)?;
+    if git_control != initial_git_control {
+        return Err(RepositoryImportError::TargetAuditFailed);
+    }
+    let private_control = inventory_target_private_control(&local)?;
     validate_target_git_control(&git_control, &object_ids)?;
     validate_target_private_control(&private_control)?;
     let target = TargetRepository {
@@ -2815,6 +2858,17 @@ fn audit_target(
     expected: &TargetRepository,
     publication_marker: bool,
 ) -> Result<(), RepositoryImportError> {
+    let executable =
+        discover_git_executable().map_err(|_| RepositoryImportError::GitExecutableUnavailable)?;
+    audit_target_with_executable(root, expected, publication_marker, executable)
+}
+
+fn audit_target_with_executable(
+    root: &Path,
+    expected: &TargetRepository,
+    publication_marker: bool,
+    executable: PathBuf,
+) -> Result<(), RepositoryImportError> {
     let root = canonical_normal_directory(root, RepositoryImportError::TargetAuditFailed)?;
     if filesystem_directory_identity(&root).ok().as_ref() != Some(&expected.root_identity) {
         return Err(RepositoryImportError::TargetAuditFailed);
@@ -2825,20 +2879,23 @@ fn audit_target(
         .map(|entry| entry.relative_path.clone())
         .collect::<Vec<_>>();
     prove_target_worktree_allowlist(&root, &paths, true)?;
-    let executable =
-        discover_git_executable().map_err(|_| RepositoryImportError::GitExecutableUnavailable)?;
     let runner = GitRunner::target(executable, root.clone())?;
-    let raw_index = prove_target_semantics(&runner, expected)?;
-    let git_control = inventory_namespace(&root.join(".git"), NamespacePolicy::TargetGit)?;
+    let TargetRawIndexEvidence { raw_index, control } = capture_target_raw_index(&runner.root)?;
+    let initial_git_control = inventory_target_git_control(&root)?;
+    validate_target_git_control(&initial_git_control, &expected.object_ids)?;
+    if initial_git_control != expected.git_control {
+        return Err(RepositoryImportError::TargetAuditFailed);
+    }
+    require_target_index_control_binding(&control, &initial_git_control)?;
+    drop(initial_git_control);
+    prove_target_semantics(&runner, expected, raw_index, &expected.git_control)?;
+    let git_control = inventory_target_git_control(&root)?;
     validate_target_git_control(&git_control, &expected.object_ids)?;
     if git_control != expected.git_control {
         return Err(RepositoryImportError::TargetAuditFailed);
     }
-    require_target_index_control_binding(&raw_index, &git_control)?;
-    let private = inventory_namespace(
-        &root.join(VAULT_LOCAL_DIRECTORY),
-        NamespacePolicy::TargetPrivate,
-    )?;
+    require_target_index_control_binding(&control, &git_control)?;
+    let private = inventory_target_private_control(&root.join(VAULT_LOCAL_DIRECTORY))?;
     if publication_marker {
         require_private_manifest_with_marker(&private, &expected.private_control)?;
     } else if private != expected.private_control {
@@ -2880,7 +2937,9 @@ fn revalidate_target_worktree(
 fn prove_target_semantics(
     runner: &GitRunner,
     expected: &TargetRepository,
-) -> Result<TargetRawIndexEvidence, RepositoryImportError> {
+    raw_index: RawIndex,
+    git_control: &[NamespaceSeal],
+) -> Result<(), RepositoryImportError> {
     let object_format = runner.run(
         RepositoryGitOperation::AuditTarget,
         &os_args(["rev-parse", "--show-object-format"]),
@@ -2924,85 +2983,38 @@ fn prove_target_semantics(
     }
     validate_target_config(runner)?;
 
-    let raw_index = capture_target_raw_index(&runner.root)?;
-    let raw_index_map = raw_target_index_semantic_map(&raw_index.raw_index)?;
-
-    let mut batch = runner.target_object_batch()?;
-    batch.verify(
-        &expected.root_commit_oid,
-        "commit",
-        expected.commit_bytes.as_slice(),
-    )?;
-    let index = runner.run(
-        RepositoryGitOperation::AuditTarget,
-        &os_args(["ls-files", "-s", "-z", "--full-name"]),
-        None,
-        MAX_GIT_OUTPUT,
-        None,
-    )?;
-    let index_map = parse_target_index(&index)?;
-    let tree = runner.run(
-        RepositoryGitOperation::AuditTarget,
-        &[
-            OsString::from("ls-tree"),
-            OsString::from("-r"),
-            OsString::from("-z"),
-            OsString::from("--full-tree"),
-            OsString::from(&expected.root_commit_oid),
-        ],
-        None,
-        MAX_GIT_OUTPUT,
-        None,
-    )?;
-    let tree_map = parse_target_tree(&tree)?;
-    let expected_map = expected
-        .tracked
-        .iter()
-        .map(|entry| {
-            (
-                slash_path(&entry.relative_path).unwrap_or_default(),
-                entry.blob_oid.clone(),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    require_exact_target_index_maps(&raw_index_map, &index_map, &expected_map)?;
-    if tree_map != expected_map {
-        return Err(RepositoryImportError::TargetAuditFailed);
-    }
+    require_exact_target_raw_index(&raw_index, &expected.tracked)?;
+    drop(raw_index);
     for entry in &expected.tracked {
         let body = inspect_target_tracked_entry(&runner.root, &entry.relative_path, Some(entry))?;
         if typed_git_object_oid("blob", body.bytes.as_slice())? != entry.blob_oid {
             return Err(RepositoryImportError::TargetAuditFailed);
         }
-        batch.verify(&entry.blob_oid, "blob", body.bytes.as_slice())?;
     }
-    let objects = target_object_inventory(runner)?;
-    if objects != expected.object_ids {
+
+    let expected_blobs = target_blob_manifest(&expected.tracked)?;
+    let expected_trees = construct_canonical_target_trees(&expected_blobs)?;
+    let tree_oids = canonical_target_tree_oids(&expected_trees);
+    if tree_oids != expected.tree_oids
+        || !matches!(tree_oids.get(""), Some(oid) if oid == &expected.root_tree_oid)
+    {
         return Err(RepositoryImportError::TargetAuditFailed);
     }
-    if !matches!(
-        objects.get(&expected.root_commit_oid),
-        Some(descriptor)
-            if descriptor.object_type == "commit"
-                && descriptor.size
-                    == u64::try_from(expected.commit_bytes.len()).unwrap_or(u64::MAX)
-    ) {
-        return Err(RepositoryImportError::TargetAuditFailed);
-    }
-    let tree_oids = validate_expected_target_objects(
-        runner,
-        &mut batch,
+
+    let object_expectations = expected_target_object_expectations(
         &expected.tracked,
-        &expected.root_tree_oid,
+        &expected_trees,
         &expected.root_commit_oid,
-        expected.commit_bytes.len() as u64,
-        &objects,
+        expected.commit_bytes.as_slice(),
     )?;
-    if tree_oids != expected.tree_oids {
+    if target_object_descriptors(&object_expectations) != expected.object_ids {
         return Err(RepositoryImportError::TargetAuditFailed);
     }
+    require_exact_loose_target_objects(git_control, &object_expectations)?;
+    let mut batch = runner.target_object_batch()?;
+    prove_expected_target_objects(&mut batch, &object_expectations)?;
     batch.finish()?;
-    Ok(raw_index)
+    Ok(())
 }
 
 fn configure_target(
@@ -3102,189 +3114,21 @@ fn require_single_config(
     }
 }
 
-fn parse_target_index(output: &[u8]) -> Result<BTreeMap<String, String>, RepositoryImportError> {
-    let mut result = BTreeMap::new();
-    for record in nul_records(output)? {
-        if result.len() >= MAX_TARGET_ENTRIES {
-            return Err(RepositoryImportError::ResourceLimit);
-        }
-        let tab = record
-            .iter()
-            .position(|byte| *byte == b'\t')
-            .ok_or(RepositoryImportError::TargetAuditFailed)?;
-        let metadata = std::str::from_utf8(&record[..tab])
-            .map_err(|_| RepositoryImportError::TargetAuditFailed)?;
-        let path = std::str::from_utf8(&record[tab + 1..])
-            .map_err(|_| RepositoryImportError::TargetAuditFailed)?;
-        let fields = metadata.split_ascii_whitespace().collect::<Vec<_>>();
-        if fields.len() != 3 || fields[0] != "100644" || fields[2] != "0" {
-            return Err(RepositoryImportError::TargetAuditFailed);
-        }
-        require_sha1_oid(fields[1]).map_err(|_| RepositoryImportError::TargetAuditFailed)?;
-        if result
-            .insert(path.to_owned(), fields[1].to_owned())
-            .is_some()
-        {
-            return Err(RepositoryImportError::TargetAuditFailed);
-        }
-    }
-    Ok(result)
-}
-
-fn raw_target_index_semantic_map(
+fn require_exact_target_raw_index(
     raw_index: &RawIndex,
-) -> Result<BTreeMap<String, String>, RepositoryImportError> {
-    let mut result = BTreeMap::new();
-    for entry in &raw_index.entries {
-        let path = std::str::from_utf8(&entry.path)
-            .map_err(|_| RepositoryImportError::TargetAuditFailed)?;
-        let mut oid = String::with_capacity(40);
-        for byte in entry.oid {
-            oid.push(char::from(LOWER_HEX[usize::from(byte >> 4)]));
-            oid.push(char::from(LOWER_HEX[usize::from(byte & 0x0f)]));
-        }
-        if result.insert(path.to_owned(), oid).is_some() {
-            return Err(RepositoryImportError::TargetAuditFailed);
-        }
-    }
-    Ok(result)
-}
-
-fn require_exact_target_index_maps(
-    raw: &BTreeMap<String, String>,
-    git: &BTreeMap<String, String>,
-    expected: &BTreeMap<String, String>,
-) -> Result<(), RepositoryImportError> {
-    if raw == git && git == expected {
-        Ok(())
-    } else {
-        Err(RepositoryImportError::TargetAuditFailed)
-    }
-}
-
-fn parse_target_tree(output: &[u8]) -> Result<BTreeMap<String, String>, RepositoryImportError> {
-    let mut result = BTreeMap::new();
-    for record in nul_records(output)? {
-        let tab = record
-            .iter()
-            .position(|byte| *byte == b'\t')
-            .ok_or(RepositoryImportError::TargetAuditFailed)?;
-        let metadata = std::str::from_utf8(&record[..tab])
-            .map_err(|_| RepositoryImportError::TargetAuditFailed)?;
-        let path = std::str::from_utf8(&record[tab + 1..])
-            .map_err(|_| RepositoryImportError::TargetAuditFailed)?;
-        let fields = metadata.split_ascii_whitespace().collect::<Vec<_>>();
-        if fields.len() != 3 || fields[0] != "100644" || fields[1] != "blob" {
-            return Err(RepositoryImportError::TargetAuditFailed);
-        }
-        require_sha1_oid(fields[2]).map_err(|_| RepositoryImportError::TargetAuditFailed)?;
-        if result
-            .insert(path.to_owned(), fields[2].to_owned())
-            .is_some()
-        {
-            return Err(RepositoryImportError::TargetAuditFailed);
-        }
-    }
-    Ok(result)
-}
-
-fn target_object_inventory(
-    runner: &GitRunner,
-) -> Result<BTreeMap<String, ObjectDescriptor>, RepositoryImportError> {
-    let output = runner.run(
-        RepositoryGitOperation::AuditTarget,
-        &[
-            OsString::from("cat-file"),
-            OsString::from("--batch-all-objects"),
-            OsString::from("--batch-check=%(objectname) %(objecttype) %(objectsize)"),
-        ],
-        None,
-        MAX_GIT_OUTPUT,
-        None,
-    )?;
-    let text =
-        std::str::from_utf8(&output).map_err(|_| RepositoryImportError::TargetAuditFailed)?;
-    let mut result = BTreeMap::new();
-    for line in text.lines() {
-        let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
-        if fields.len() != 3 {
-            return Err(RepositoryImportError::TargetAuditFailed);
-        }
-        require_sha1_oid(fields[0]).map_err(|_| RepositoryImportError::TargetAuditFailed)?;
-        if !matches!(fields[1], "blob" | "tree" | "commit") {
-            return Err(RepositoryImportError::TargetAuditFailed);
-        }
-        let size = fields[2]
-            .parse::<u64>()
-            .map_err(|_| RepositoryImportError::TargetAuditFailed)?;
-        if result
-            .insert(
-                fields[0].to_owned(),
-                ObjectDescriptor {
-                    object_type: fields[1].to_owned(),
-                    size,
-                },
-            )
-            .is_some()
-        {
-            return Err(RepositoryImportError::TargetAuditFailed);
-        }
-    }
-    Ok(result)
-}
-
-fn validate_expected_target_objects(
-    runner: &GitRunner,
-    batch: &mut TargetObjectBatch<'_>,
     tracked: &[TargetTrackedEntry],
-    root_tree_oid: &str,
-    root_commit_oid: &str,
-    root_commit_size: u64,
-    objects: &BTreeMap<String, ObjectDescriptor>,
-) -> Result<BTreeMap<String, String>, RepositoryImportError> {
-    let output = runner.run(
-        RepositoryGitOperation::AuditTarget,
-        &[
-            OsString::from("ls-tree"),
-            OsString::from("-r"),
-            OsString::from("-t"),
-            OsString::from("-z"),
-            OsString::from("--full-tree"),
-            OsString::from(root_commit_oid),
-        ],
-        None,
-        MAX_GIT_OUTPUT,
-        None,
-    )?;
-    let expected_blobs = target_blob_manifest(tracked)?;
-    let expected_trees = construct_canonical_target_trees(&expected_blobs)?;
-    let (observed_blobs, observed_trees) = parse_recursive_target_tree(&output, root_tree_oid)?;
-    if observed_blobs
-        != expected_blobs
-            .iter()
-            .map(|(path, (oid, _))| (path.clone(), oid.clone()))
-            .collect::<BTreeMap<_, _>>()
-    {
+) -> Result<(), RepositoryImportError> {
+    if raw_index.entries.len() != tracked.len() {
         return Err(RepositoryImportError::TargetAuditFailed);
     }
-
-    let expected_tree_oids = expected_trees
-        .iter()
-        .map(|(path, object)| (path.clone(), object.oid.clone()))
-        .collect::<BTreeMap<_, _>>();
-    if observed_trees != expected_tree_oids {
-        return Err(RepositoryImportError::TargetAuditFailed);
+    for (raw, expected) in raw_index.entries.iter().zip(tracked) {
+        let expected_path =
+            slash_path(&expected.relative_path).ok_or(RepositoryImportError::TargetAuditFailed)?;
+        if raw.path != expected_path.as_bytes() || raw.oid != decode_sha1_oid(&expected.blob_oid)? {
+            return Err(RepositoryImportError::TargetAuditFailed);
+        }
     }
-
-    validate_target_object_inventory(
-        &expected_blobs,
-        &expected_trees,
-        root_commit_oid,
-        root_commit_size,
-        objects,
-    )?;
-    prove_expected_target_trees(batch, &expected_trees, objects)?;
-    Ok(expected_tree_oids)
+    Ok(())
 }
 
 fn target_blob_manifest(
@@ -3306,88 +3150,150 @@ fn target_blob_manifest(
     }
 }
 
-fn parse_recursive_target_tree(
-    output: &[u8],
-    root_tree_oid: &str,
-) -> Result<(TargetOidByPath, TargetOidByPath), RepositoryImportError> {
-    let mut observed_blobs = BTreeMap::new();
-    let mut observed_trees = BTreeMap::from([(String::new(), root_tree_oid.to_owned())]);
-    for record in nul_records(output)? {
-        let tab = record
-            .iter()
-            .position(|byte| *byte == b'\t')
-            .ok_or(RepositoryImportError::TargetAuditFailed)?;
-        let fields = std::str::from_utf8(&record[..tab])
-            .map_err(|_| RepositoryImportError::TargetAuditFailed)?
-            .split_ascii_whitespace()
-            .collect::<Vec<_>>();
-        let path = std::str::from_utf8(&record[tab + 1..])
-            .map_err(|_| RepositoryImportError::TargetAuditFailed)?;
-        if fields.len() != 3 {
-            return Err(RepositoryImportError::TargetAuditFailed);
-        }
-        require_sha1_oid(fields[2]).map_err(|_| RepositoryImportError::TargetAuditFailed)?;
-        let destination = match (fields[0], fields[1]) {
-            ("100644", "blob") => &mut observed_blobs,
-            ("040000", "tree") => &mut observed_trees,
-            _ => return Err(RepositoryImportError::TargetAuditFailed),
-        };
-        if destination
-            .insert(path.to_owned(), fields[2].to_owned())
-            .is_some()
-        {
-            return Err(RepositoryImportError::TargetAuditFailed);
-        }
-    }
-    Ok((observed_blobs, observed_trees))
+fn canonical_target_tree_oids(expected_trees: &CanonicalTreesByPath) -> TargetOidByPath {
+    expected_trees
+        .iter()
+        .map(|(path, object)| (path.clone(), object.oid.clone()))
+        .collect()
 }
 
-fn validate_target_object_inventory(
-    expected_blobs: &BTreeMap<String, (String, u64)>,
-    expected_trees: &CanonicalTreesByPath,
+fn insert_target_object_expectation(
+    objects: &mut BTreeMap<String, TargetObjectExpectation>,
+    oid: &str,
+    expectation: TargetObjectExpectation,
+) -> Result<(), RepositoryImportError> {
+    require_sha1_oid(oid).map_err(|_| RepositoryImportError::TargetAuditFailed)?;
+    match objects.get(oid) {
+        Some(existing) if existing == &expectation => Ok(()),
+        Some(_) => Err(RepositoryImportError::TargetAuditFailed),
+        None => {
+            objects.insert(oid.to_owned(), expectation);
+            Ok(())
+        }
+    }
+}
+
+fn expected_target_object_expectations(
+    tracked: &[TargetTrackedEntry],
+    trees: &CanonicalTreesByPath,
     root_commit_oid: &str,
-    root_commit_size: u64,
-    objects: &BTreeMap<String, ObjectDescriptor>,
-) -> Result<(), RepositoryImportError> {
-    let mut expected_ids = BTreeSet::from([root_commit_oid.to_owned()]);
-    expected_ids.extend(expected_blobs.values().map(|(oid, _)| oid.clone()));
-    expected_ids.extend(expected_trees.values().map(|object| object.oid.clone()));
-    if objects.keys().cloned().collect::<BTreeSet<_>>() != expected_ids {
-        return Err(RepositoryImportError::TargetAuditFailed);
+    commit_bytes: &[u8],
+) -> Result<BTreeMap<String, TargetObjectExpectation>, RepositoryImportError> {
+    let mut objects = BTreeMap::new();
+    for entry in tracked {
+        insert_target_object_expectation(
+            &mut objects,
+            &entry.blob_oid,
+            TargetObjectExpectation {
+                object_type: "blob",
+                size: entry.size,
+                sha256: entry.sha256,
+            },
+        )?;
     }
-    for (oid, size) in expected_blobs.values() {
-        if !matches!(objects.get(oid), Some(descriptor) if descriptor.object_type == "blob" && descriptor.size == *size)
-        {
+    for tree in trees.values() {
+        if typed_git_object_oid("tree", tree.body.as_slice())? != tree.oid {
             return Err(RepositoryImportError::TargetAuditFailed);
         }
+        insert_target_object_expectation(
+            &mut objects,
+            &tree.oid,
+            TargetObjectExpectation {
+                object_type: "tree",
+                size: u64::try_from(tree.body.len())
+                    .map_err(|_| RepositoryImportError::ResourceLimit)?,
+                sha256: sha256(tree.body.as_slice()),
+            },
+        )?;
     }
-    if !matches!(objects.get(root_commit_oid), Some(descriptor) if descriptor.object_type == "commit" && descriptor.size == root_commit_size)
-    {
+    if typed_git_object_oid("commit", commit_bytes)? != root_commit_oid {
         return Err(RepositoryImportError::TargetAuditFailed);
     }
-    Ok(())
+    insert_target_object_expectation(
+        &mut objects,
+        root_commit_oid,
+        TargetObjectExpectation {
+            object_type: "commit",
+            size: u64::try_from(commit_bytes.len())
+                .map_err(|_| RepositoryImportError::ResourceLimit)?,
+            sha256: sha256(commit_bytes),
+        },
+    )?;
+    Ok(objects)
 }
 
-fn prove_expected_target_trees(
-    batch: &mut TargetObjectBatch<'_>,
-    expected_trees: &CanonicalTreesByPath,
-    objects: &BTreeMap<String, ObjectDescriptor>,
-) -> Result<(), RepositoryImportError> {
-    let mut directories = expected_trees.keys().collect::<Vec<_>>();
-    directories.sort_by(|left, right| {
-        target_tree_depth(right)
-            .cmp(&target_tree_depth(left))
-            .then_with(|| left.cmp(right))
-    });
-    for directory in directories {
-        let object = expected_trees
-            .get(directory)
-            .ok_or(RepositoryImportError::TargetAuditFailed)?;
-        if !matches!(objects.get(&object.oid), Some(descriptor) if descriptor.object_type == "tree" && descriptor.size == object.body.len() as u64)
+fn target_object_descriptors(
+    objects: &BTreeMap<String, TargetObjectExpectation>,
+) -> BTreeMap<String, ObjectDescriptor> {
+    objects
+        .iter()
+        .map(|(oid, expectation)| {
+            (
+                oid.clone(),
+                ObjectDescriptor {
+                    object_type: expectation.object_type.to_owned(),
+                    size: expectation.size,
+                },
+            )
+        })
+        .collect()
+}
+
+fn exact_loose_target_object_ids(
+    git_control: &[NamespaceSeal],
+) -> Result<BTreeSet<String>, RepositoryImportError> {
+    let mut objects = BTreeSet::new();
+    for entry in git_control {
+        let NamespaceKind::File(_) = &entry.kind else {
+            continue;
+        };
+        let Some(relative) = entry.relative_path.strip_prefix("objects/") else {
+            continue;
+        };
+        let Some((prefix, suffix)) = relative.split_once('/') else {
+            return Err(RepositoryImportError::TargetAuditFailed);
+        };
+        if prefix.len() != 2
+            || suffix.len() != 38
+            || suffix.contains('/')
+            || !prefix
+                .bytes()
+                .chain(suffix.bytes())
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         {
             return Err(RepositoryImportError::TargetAuditFailed);
         }
-        batch.verify(&object.oid, "tree", object.body.as_slice())?;
+        let oid = format!("{prefix}{suffix}");
+        if !objects.insert(oid) {
+            return Err(RepositoryImportError::TargetAuditFailed);
+        }
+    }
+    Ok(objects)
+}
+
+fn require_exact_loose_target_objects(
+    git_control: &[NamespaceSeal],
+    expected: &BTreeMap<String, TargetObjectExpectation>,
+) -> Result<(), RepositoryImportError> {
+    let observed = exact_loose_target_object_ids(git_control)?;
+    if observed.len() == expected.len()
+        && observed
+            .iter()
+            .zip(expected.keys())
+            .all(|(observed, expected)| observed == expected)
+    {
+        Ok(())
+    } else {
+        Err(RepositoryImportError::TargetAuditFailed)
+    }
+}
+
+fn prove_expected_target_objects(
+    batch: &mut TargetObjectBatch<'_>,
+    expected: &BTreeMap<String, TargetObjectExpectation>,
+) -> Result<(), RepositoryImportError> {
+    for (oid, expectation) in expected {
+        batch.prove(oid, *expectation)?;
     }
     Ok(())
 }
@@ -4102,17 +4008,17 @@ struct TargetObjectBatch<'a> {
 
 impl TargetObjectBatch<'_> {
     #[allow(clippy::too_many_lines)] // One bounded request/response and forced-shutdown transaction.
-    fn verify(
+    fn prove(
         &mut self,
         oid: &str,
-        object_type: &str,
-        expected: &[u8],
+        expected: TargetObjectExpectation,
     ) -> Result<(), RepositoryImportError> {
         require_sha1_oid(oid).map_err(|_| RepositoryImportError::TargetAuditFailed)?;
-        if !matches!(object_type, "blob" | "tree" | "commit") {
+        if !matches!(expected.object_type, "blob" | "tree" | "commit") {
             return Err(RepositoryImportError::TargetAuditFailed);
         }
-        validate_target_object_stream_length(expected.len() as u64)?;
+        validate_target_object_stream_length(expected.size)?;
+        let raw_oid = decode_sha1_oid(oid)?;
         self.runner.verify_runtime_bindings()?;
         let stdin = self
             .stdin
@@ -4143,7 +4049,7 @@ impl TargetObjectBatch<'_> {
         let stdin_slot = &mut self.stdin;
         let communication = std::thread::scope(|scope| {
             let reader = scope.spawn(|| {
-                let result = read_batch_object_exact(stdout, oid, object_type, expected);
+                let result = read_batch_object_proof(stdout, oid, &raw_oid, expected);
                 if result.is_err() {
                     failed.store(true, Ordering::Release);
                 }
@@ -4438,23 +4344,48 @@ enum BatchReadError {
     Io(io::Error),
 }
 
-fn read_batch_object_exact(
+fn read_batch_object_proof(
     reader: &mut impl Read,
     expected_oid: &str,
-    expected_type: &str,
-    expected_body: &[u8],
+    expected_raw_oid: &[u8; 20],
+    expected: TargetObjectExpectation,
 ) -> Result<(), BatchReadError> {
-    validate_target_object_stream_length(expected_body.len() as u64)
+    let body_length = validate_target_object_stream_length(expected.size)
         .map_err(|_| BatchReadError::Mismatch)?;
-    let canonical_header = format!("{expected_oid} {expected_type} {}\n", expected_body.len());
+    let canonical_header = format!(
+        "{expected_oid} {} {}\n",
+        expected.object_type, expected.size
+    );
     let mut buffer = Zeroizing::new([0_u8; TARGET_OBJECT_STREAM_CHUNK_BYTES]);
     read_exact_match(reader, canonical_header.as_bytes(), &mut buffer)?;
-    read_exact_match(reader, expected_body, &mut buffer)?;
+
+    let typed_header = format!("{} {}\0", expected.object_type, expected.size);
+    let mut typed_sha1 = Sha1::new();
+    typed_sha1.update(typed_header.as_bytes());
+    let mut raw_sha256 = Sha256::new();
+    let mut remaining = body_length;
+    while remaining > 0 {
+        let maximum = remaining.min(buffer.len());
+        let read = reader
+            .read(&mut buffer[..maximum])
+            .map_err(BatchReadError::Io)?;
+        if read == 0 {
+            return Err(BatchReadError::Mismatch);
+        }
+        typed_sha1.update(&buffer[..read]);
+        raw_sha256.update(&buffer[..read]);
+        remaining -= read;
+    }
     let mut separator = Zeroizing::new([0_u8; 1]);
     let read = reader
         .read(separator.as_mut_slice())
         .map_err(BatchReadError::Io)?;
-    if read == 1 && separator[0] == b'\n' {
+    if read != 1 || separator[0] != b'\n' {
+        return Err(BatchReadError::Mismatch);
+    }
+    let observed_oid: [u8; 20] = typed_sha1.finalize().into();
+    let observed_sha256: [u8; 32] = raw_sha256.finalize().into();
+    if &observed_oid == expected_raw_oid && observed_sha256 == expected.sha256 {
         Ok(())
     } else {
         Err(BatchReadError::Mismatch)
@@ -4685,6 +4616,12 @@ mod tests {
             .status()
             .expect("test Git starts");
         assert!(status.success(), "test Git command failed: {arguments:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn shell_single_quote(path: &Path) -> String {
+        let text = path.to_str().expect("test executable path is valid UTF-8");
+        format!("'{}'", text.replace('\'', "'\"'\"'"))
     }
 
     #[cfg(target_os = "linux")]
@@ -5066,9 +5003,9 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "one real-index fixture keeps binding, map drift, identity drift, and redaction coupled"
+        reason = "one real-index fixture keeps semantic, identity, and redaction drift coupled"
     )]
-    fn target_raw_index_binding_maps_and_drift_fail_closed_without_disclosure() {
+    fn target_raw_index_binding_and_drift_fail_closed_without_disclosure() {
         let target = TestDirectory::new("target-raw-index");
         fs::create_dir(target.path().join(VAULT_LOCAL_DIRECTORY))
             .expect("private directory creates");
@@ -5089,49 +5026,25 @@ mod tests {
         )
         .expect("target initializes and audits");
         force_index_version(target.path(), 2);
-        repository.git_control =
-            inventory_namespace(&target.path().join(".git"), NamespacePolicy::TargetGit)
-                .expect("rewritten index control inventories");
+        repository.git_control = inventory_target_git_control(target.path())
+            .expect("rewritten index control inventories");
 
         let evidence = capture_target_raw_index(target.path()).expect("raw target index captures");
-        require_target_index_control_binding(&evidence, &repository.git_control)
+        require_target_index_control_binding(&evidence.control, &repository.git_control)
             .expect("raw read binds current Git control index");
-        let raw = raw_target_index_semantic_map(&evidence.raw_index)
-            .expect("raw target semantics project");
-        let expected = repository
-            .tracked
-            .iter()
-            .map(|entry| {
-                (
-                    slash_path(&entry.relative_path).expect("tracked path is canonical"),
-                    entry.blob_oid.clone(),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        require_exact_target_index_maps(&raw, &raw, &expected)
-            .expect("equal raw Git and expected maps bind");
+        require_exact_target_raw_index(&evidence.raw_index, &repository.tracked)
+            .expect("equal raw and expected entries bind");
 
-        let first_path = raw
-            .keys()
-            .next()
-            .expect("target has managed entries")
-            .clone();
-        let mut raw_drift = raw.clone();
-        raw_drift.remove(&first_path);
+        let mut raw_drift = evidence.raw_index.clone();
+        raw_drift.entries.pop().expect("target has managed entries");
         assert!(matches!(
-            require_exact_target_index_maps(&raw_drift, &raw, &expected),
+            require_exact_target_raw_index(&raw_drift, &repository.tracked),
             Err(RepositoryImportError::TargetAuditFailed)
         ));
-        let mut git_drift = raw.clone();
-        git_drift.remove(&first_path);
+        let mut expected_drift = repository.tracked.clone();
+        expected_drift.pop().expect("target has managed entries");
         assert!(matches!(
-            require_exact_target_index_maps(&raw, &git_drift, &expected),
-            Err(RepositoryImportError::TargetAuditFailed)
-        ));
-        let mut expected_drift = expected.clone();
-        expected_drift.remove(&first_path);
-        assert!(matches!(
-            require_exact_target_index_maps(&raw, &raw, &expected_drift),
+            require_exact_target_raw_index(&evidence.raw_index, &expected_drift),
             Err(RepositoryImportError::TargetAuditFailed)
         ));
 
@@ -5143,7 +5056,7 @@ mod tests {
         let mut size_drift = repository.git_control.clone();
         size_drift[index_position].size = size_drift[index_position].size.saturating_add(1);
         assert!(matches!(
-            require_target_index_control_binding(&evidence, &size_drift),
+            require_target_index_control_binding(&evidence.control, &size_drift),
             Err(RepositoryImportError::TargetAuditFailed)
         ));
         let mut digest_drift = repository.git_control.clone();
@@ -5152,7 +5065,7 @@ mod tests {
             .as_mut()
             .expect("index has digest")[0] ^= 1;
         assert!(matches!(
-            require_target_index_control_binding(&evidence, &digest_drift),
+            require_target_index_control_binding(&evidence.control, &digest_drift),
             Err(RepositoryImportError::TargetAuditFailed)
         ));
         let foreign_identity = repository
@@ -5166,13 +5079,13 @@ mod tests {
         let mut identity_drift = repository.git_control.clone();
         identity_drift[index_position].kind = NamespaceKind::File(foreign_identity);
         assert!(matches!(
-            require_target_index_control_binding(&evidence, &identity_drift),
+            require_target_index_control_binding(&evidence.control, &identity_drift),
             Err(RepositoryImportError::TargetAuditFailed)
         ));
         let mut duplicate = repository.git_control.clone();
         duplicate.push(duplicate[index_position].clone());
         assert!(matches!(
-            require_target_index_control_binding(&evidence, &duplicate),
+            require_target_index_control_binding(&evidence.control, &duplicate),
             Err(RepositoryImportError::TargetAuditFailed)
         ));
 
@@ -5187,71 +5100,217 @@ mod tests {
             bytes[12 + 40..12 + 60].copy_from_slice(&replacement_oid);
         });
         repository.git_control =
-            inventory_namespace(&target.path().join(".git"), NamespacePolicy::TargetGit)
-                .expect("drifted index control inventories");
+            inventory_target_git_control(target.path()).expect("drifted index control inventories");
         let error = audit_repository_import_target(target.path(), &repository)
-            .expect_err("raw/Git map drift rejects the target");
+            .expect_err("raw/Git semantic drift rejects the target");
         assert!(matches!(&error, RepositoryImportError::TargetAuditFailed));
         let diagnostic = format!("{error:?} {error}");
         assert!(!diagnostic.contains(".git/index"));
         assert!(!diagnostic.contains(&repository.tracked[1].blob_oid));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
+    fn target_audit_uses_raw_index_direct_trees_and_streaming_objects_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let target = TestDirectory::new("target-direct-audit");
+        fs::create_dir(target.path().join(VAULT_LOCAL_DIRECTORY))
+            .expect("private directory creates");
+        fs::write(
+            target
+                .path()
+                .join(VAULT_LOCAL_DIRECTORY)
+                .join(VAULT_MUTATION_LOCK_FILE),
+            [],
+        )
+        .expect("mutation lock creates");
+        fs::write(target.path().join("vault.json"), b"authenticated metadata")
+            .expect("vault metadata writes");
+        fs::write(target.path().join("note.md.enc"), b"opaque envelope")
+            .expect("document envelope writes");
+        let repository = initialize_and_audit_target(
+            target.path(),
+            &[PathBuf::from("vault.json"), PathBuf::from("note.md.enc")],
+            1_784_044_800,
+        )
+        .expect("target initializes and audits");
+
+        let real_git = discover_git_executable().expect("real Git resolves");
+        let spy_directory = TestDirectory::new("target-audit-spy");
+        let spy = spy_directory.path().join("git-spy");
+        let script = format!(
+            "#!/bin/sh\nfor arg in \"$@\"; do\n  printf '%s\\n' \"$arg\" >> \"$0.log\"\n  case \"$arg\" in\n    ls-files|ls-tree|--batch-all-objects) exit 97 ;;\n  esac\ndone\nprintf '%s\\n' -- >> \"$0.log\"\nexec {} \"$@\"\n",
+            shell_single_quote(&real_git)
+        );
+        fs::write(&spy, script).expect("Git spy writes");
+        let mut permissions = fs::metadata(&spy)
+            .expect("Git spy metadata reads")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&spy, permissions).expect("Git spy becomes executable");
+
+        audit_target_with_executable(target.path(), &repository, false, spy.clone())
+            .expect("direct target audit succeeds through strict Git spy");
+        let log = fs::read_to_string(spy.with_extension("log")).expect("Git spy log reads");
+        let arguments = log.lines().collect::<Vec<_>>();
+        assert!(arguments.contains(&"cat-file"));
+        assert!(arguments.contains(&"--batch"));
+        assert!(
+            !arguments.iter().any(|argument| matches!(
+                *argument,
+                "ls-files" | "ls-tree" | "--batch-all-objects"
+            ))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn target_audit_rejects_extra_unreachable_loose_object_without_bulk_inventory() {
+        let target = TestDirectory::new("target-extra-object");
+        fs::create_dir(target.path().join(VAULT_LOCAL_DIRECTORY))
+            .expect("private directory creates");
+        fs::write(
+            target
+                .path()
+                .join(VAULT_LOCAL_DIRECTORY)
+                .join(VAULT_MUTATION_LOCK_FILE),
+            [],
+        )
+        .expect("mutation lock creates");
+        fs::write(target.path().join("vault.json"), b"authenticated metadata")
+            .expect("vault metadata writes");
+        let repository = initialize_and_audit_target(
+            target.path(),
+            &[PathBuf::from("vault.json")],
+            1_784_044_800,
+        )
+        .expect("target initializes and audits");
+
+        let executable = discover_git_executable().expect("real Git resolves");
+        let runner = GitRunner::target(executable, target.path().to_path_buf())
+            .expect("target runner binds");
+        let output = runner
+            .run(
+                RepositoryGitOperation::ConstructTarget,
+                &os_args(["hash-object", "-w", "--stdin", "--no-filters"]),
+                Some(b"unreachable object"),
+                128,
+                None,
+            )
+            .expect("extra object writes");
+        let extra_oid = one_line(&output)
+            .expect("extra object oid is one line")
+            .to_owned();
+        assert!(!repository.object_ids.contains_key(&extra_oid));
+        drop(runner);
+
+        let error = audit_repository_import_target(target.path(), &repository)
+            .expect_err("extra unreachable loose object rejects exact audit");
+        assert!(matches!(&error, RepositoryImportError::TargetAuditFailed));
+        let diagnostic = format!("{error:?} {error}");
+        assert!(!diagnostic.contains(&extra_oid));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one stream fixture keeps every canonical framing and digest failure adjacent"
+    )]
     fn batch_object_reader_requires_exact_header_body_separator_and_bounds() {
-        let oid = "0123456789abcdef0123456789abcdef01234567";
+        let oid = "b6fc4c620b67d95f953a5c1c1230aaab5db5a1b0";
+        let raw_oid = decode_sha1_oid(oid).expect("blob oid decodes");
+        let expectation = TargetObjectExpectation {
+            object_type: "blob",
+            size: 5,
+            sha256: sha256(b"hello"),
+        };
         let exact = format!("{oid} blob 5\nhello\n");
-        read_batch_object_exact(
+        read_batch_object_proof(
             &mut io::Cursor::new(exact.as_bytes()),
             oid,
-            "blob",
-            b"hello",
+            &raw_oid,
+            expectation,
         )
         .expect("exact batch response passes");
 
         let short = format!("{oid} blob 5\nhell");
         assert!(matches!(
-            read_batch_object_exact(
+            read_batch_object_proof(
                 &mut io::Cursor::new(short.as_bytes()),
                 oid,
-                "blob",
-                b"hello"
+                &raw_oid,
+                expectation,
             ),
             Err(BatchReadError::Mismatch)
         ));
         let same_length_tamper = format!("{oid} blob 5\njello\n");
         assert!(matches!(
-            read_batch_object_exact(
+            read_batch_object_proof(
                 &mut io::Cursor::new(same_length_tamper.as_bytes()),
                 oid,
-                "blob",
-                b"hello"
+                &raw_oid,
+                expectation,
             ),
             Err(BatchReadError::Mismatch)
         ));
         let extra = format!("{oid} blob 5\nhello!\n");
         assert!(matches!(
-            read_batch_object_exact(
+            read_batch_object_proof(
                 &mut io::Cursor::new(extra.as_bytes()),
                 oid,
-                "blob",
-                b"hello"
+                &raw_oid,
+                expectation,
             ),
             Err(BatchReadError::Mismatch)
         ));
         let noncanonical = format!("{oid}\tblob 05\nhello\n");
         assert!(matches!(
-            read_batch_object_exact(
+            read_batch_object_proof(
                 &mut io::Cursor::new(noncanonical.as_bytes()),
                 oid,
-                "blob",
-                b"hello"
+                &raw_oid,
+                expectation,
             ),
             Err(BatchReadError::Mismatch)
         ));
+        let wrong_digest = TargetObjectExpectation {
+            sha256: sha256(b"jello"),
+            ..expectation
+        };
+        assert!(matches!(
+            read_batch_object_proof(
+                &mut io::Cursor::new(exact.as_bytes()),
+                oid,
+                &raw_oid,
+                wrong_digest,
+            ),
+            Err(BatchReadError::Mismatch)
+        ));
+        let foreign_raw_oid = decode_sha1_oid("0123456789abcdef0123456789abcdef01234567")
+            .expect("foreign oid decodes");
+        assert!(matches!(
+            read_batch_object_proof(
+                &mut io::Cursor::new(exact.as_bytes()),
+                oid,
+                &foreign_raw_oid,
+                expectation,
+            ),
+            Err(BatchReadError::Mismatch)
+        ));
+        let oversized_expectation = TargetObjectExpectation {
+            object_type: "blob",
+            size: MAX_TARGET_OBJECT_BYTES as u64 + 1,
+            sha256: sha256(b""),
+        };
         let oversized = format!("{oid} blob {}\n", MAX_TARGET_OBJECT_BYTES as u64 + 1);
         assert!(matches!(
-            read_batch_object_exact(&mut io::Cursor::new(oversized.as_bytes()), oid, "blob", b""),
+            read_batch_object_proof(
+                &mut io::Cursor::new(oversized.as_bytes()),
+                oid,
+                &raw_oid,
+                oversized_expectation,
+            ),
             Err(BatchReadError::Mismatch)
         ));
         assert!(matches!(
@@ -5284,6 +5343,34 @@ mod tests {
             body.windows(b"40000 foo\0".len())
                 .any(|part| part == b"40000 foo\0")
         );
+    }
+
+    #[test]
+    fn target_object_expectations_deduplicate_only_identical_proofs() {
+        let oid = "b6fc4c620b67d95f953a5c1c1230aaab5db5a1b0";
+        let expectation = TargetObjectExpectation {
+            object_type: "blob",
+            size: 5,
+            sha256: sha256(b"hello"),
+        };
+        let mut objects = BTreeMap::new();
+        insert_target_object_expectation(&mut objects, oid, expectation)
+            .expect("first proof inserts");
+        insert_target_object_expectation(&mut objects, oid, expectation)
+            .expect("identical duplicate deduplicates");
+        assert_eq!(objects.len(), 1);
+
+        let conflict = TargetObjectExpectation {
+            sha256: sha256(b"jello"),
+            ..expectation
+        };
+        assert!(matches!(
+            insert_target_object_expectation(&mut objects, oid, conflict),
+            Err(RepositoryImportError::TargetAuditFailed)
+        ));
+        let debug = format!("{expectation:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("2cf24dba"));
     }
 
     #[test]
@@ -5368,6 +5455,21 @@ mod tests {
             repository.tree_oids.get("left"),
             repository.tree_oids.get("right/deep")
         );
+        let duplicate_blob_oids = repository
+            .tracked
+            .iter()
+            .filter(|entry| entry.relative_path.ends_with("dup.bin.asset.enc"))
+            .map(|entry| entry.blob_oid.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(duplicate_blob_oids.len(), 1);
+        let mut unique_object_oids = repository
+            .tracked
+            .iter()
+            .map(|entry| entry.blob_oid.clone())
+            .collect::<BTreeSet<_>>();
+        unique_object_oids.extend(repository.tree_oids.values().cloned());
+        unique_object_oids.insert(repository.root_commit_oid.clone());
+        assert_eq!(repository.object_ids.len(), unique_object_oids.len());
         audit_repository_import_target(target.path(), &repository)
             .expect("nested duplicate tree proof repeats");
 
@@ -5413,7 +5515,14 @@ mod tests {
             .target_object_batch_with_timeout(Duration::from_millis(50))
             .expect("blocking batch starts");
         assert!(matches!(
-            batch.verify("0123456789abcdef0123456789abcdef01234567", "blob", b""),
+            batch.prove(
+                "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+                TargetObjectExpectation {
+                    object_type: "blob",
+                    size: 0,
+                    sha256: sha256(b""),
+                },
+            ),
             Err(RepositoryImportError::GitCommandFailed {
                 operation: RepositoryGitOperation::AuditTarget
             })
@@ -5444,7 +5553,14 @@ mod tests {
             .target_object_batch_with_timeout(Duration::from_secs(2))
             .expect("noisy batch starts");
         assert!(matches!(
-            batch.verify("e69de29bb2d1d6434b8b29ae775ad8c2e48c5391", "blob", b""),
+            batch.prove(
+                "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+                TargetObjectExpectation {
+                    object_type: "blob",
+                    size: 0,
+                    sha256: sha256(b""),
+                },
+            ),
             Err(RepositoryImportError::ResourceLimit)
         ));
         assert!(started.elapsed() < Duration::from_secs(5));
