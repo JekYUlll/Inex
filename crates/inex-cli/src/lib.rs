@@ -412,6 +412,16 @@ fn print_repository_import_dry_run_success() {
 fn command_repository_import_create(
     plan: &repository_import::RepositoryImportPlan,
 ) -> Result<ExitCode, AppError> {
+    if !inex_git::initial_repository_publication_supported() {
+        print_repository_import_terminal(repository_import::RepositoryImportTerminal::NotCreated);
+        io::stdout()
+            .flush()
+            .map_err(|error| AppError::io(IoOperation::WriteOutput, &error))?;
+        return Err(repository_import::RepositoryImportError::Publication(
+            inex_git::RepositoryCandidatePublicationFailureKind::UnsupportedPlatform,
+        )
+        .into());
+    }
     if let Err(error) = io::stdout().flush() {
         print_repository_import_terminal(repository_import::RepositoryImportTerminal::NotCreated);
         return Err(AppError::io(IoOperation::WriteOutput, &error));
@@ -457,12 +467,17 @@ fn command_repository_import_create(
     let report = match report {
         Ok(report) => report,
         Err(failure) => {
-            let (error, terminal) = failure.into_parts();
-            print_repository_import_terminal(terminal);
-            return Err(error.into());
+            print_repository_import_terminal(failure.terminal());
+            if let Err(error) = io::stdout().flush() {
+                return Err(AppError::io(IoOperation::WriteOutput, &error));
+            }
+            return Err(failure.into_error().into());
         }
     };
     print_repository_import_success(&report);
+    io::stdout()
+        .flush()
+        .map_err(|error| AppError::io(IoOperation::WriteOutput, &error))?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -470,9 +485,9 @@ fn print_repository_import_success(report: &repository_import::RepositoryImportR
     print_warnings(&report.warnings);
     println!(
         "committed-encrypted-markdown: {}",
-        report.committed_markdown
+        report.committed_markdown()
     );
-    println!("committed-encrypted-assets: {}", report.committed_assets);
+    println!("committed-encrypted-assets: {}", report.committed_assets());
     println!("candidate-vault-audit: passed");
     println!("candidate-git-object-audit: passed");
     println!("candidate-plaintext-file-objects: 0");
@@ -481,7 +496,7 @@ fn print_repository_import_success(report: &repository_import::RepositoryImportR
     println!("candidate-root: published");
     println!("vault-publication: published");
     println!("git-repository: initialized");
-    println!("git-root-commit: {}", report.git_root_commit);
+    println!("git-root-commit: {}", report.git_root_commit());
     println!("git-root-parent-count: 0");
     println!("git-tracked-source-plaintext-files: 0");
     println!("recovery-required: none");

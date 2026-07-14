@@ -52,6 +52,11 @@ mod candidate_bundle_v5;
 mod raw_index;
 mod repository_import;
 
+pub use repository_import::candidate_transaction::{
+    PublishedRepositoryCandidate, RepositoryCandidatePublicationFailure,
+    RepositoryCandidatePublicationFailureKind, initial_repository_publication_supported,
+    publish_initial_repository_candidate,
+};
 pub use repository_import::{
     RepositoryImportError, SourceSnapshot, SourceSnapshotEntry, TargetRepository,
     audit_repository_import_target, audit_repository_import_target_for_publication,

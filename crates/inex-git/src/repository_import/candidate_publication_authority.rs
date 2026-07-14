@@ -630,8 +630,9 @@ impl fmt::Debug for FailedCleanAudit {
 
 /// Complete marker-free published candidate with clean authority retained.
 ///
-/// This value is not wired to any CLI success path in this slice and exposes
-/// no raw authority, marker reconstruction, unlink, or synchronization API.
+/// This private value is consumed only by the high-level transaction driver
+/// and exposes no raw authority, marker reconstruction, unlink, or
+/// synchronization API.
 #[cfg(target_os = "linux")]
 #[must_use]
 pub(super) struct PublishedClean {

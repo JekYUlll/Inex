@@ -12,8 +12,7 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 
 use inex_core::atomic::{
-    AtomicDirectoryPublishError, FilesystemDirectoryIdentity, IMPORT_STAGING_PREFIX,
-    ParentSyncStatus, atomic_publish_directory_no_replace_checked, filesystem_directory_identity,
+    FilesystemDirectoryIdentity, IMPORT_STAGING_PREFIX, filesystem_directory_identity,
     path_is_supported_local_filesystem,
 };
 use inex_core::crypto::VaultContentProfile;
@@ -70,12 +69,7 @@ pub(crate) enum RepositoryImportError {
     VaultPopulationFailed,
     VaultAuditFailed,
     GitCandidateFailed,
-    PublishDestinationExists,
-    PublishIndeterminate,
-    PublishedCleanupFailed,
-    PublishFailed,
-    PublishedAuditFailed,
-    PublishedDurabilityNotConfirmed,
+    Publication(inex_git::RepositoryCandidatePublicationFailureKind),
     Io {
         operation: RepositoryImportIoOperation,
         kind: io::ErrorKind,
@@ -148,24 +142,7 @@ impl fmt::Display for RepositoryImportError {
             Self::GitCandidateFailed => formatter.write_str(
                 "fresh encrypted Git candidate construction or audit failed; destination remains absent",
             ),
-            Self::PublishDestinationExists => formatter.write_str(
-                "destination appeared before publication and was not replaced",
-            ),
-            Self::PublishIndeterminate => formatter.write_str(
-                "whole-root publication outcome is indeterminate; no replacement fallback was attempted",
-            ),
-            Self::PublishedCleanupFailed => formatter.write_str(
-                "complete repository was published, but publication-marker cleanup failed",
-            ),
-            Self::PublishFailed => formatter.write_str(
-                "whole-root atomic publication failed; encrypted staging is retained",
-            ),
-            Self::PublishedAuditFailed => formatter.write_str(
-                "repository was published but its final independent audit failed",
-            ),
-            Self::PublishedDurabilityNotConfirmed => formatter.write_str(
-                "complete repository was published, but destination-parent durability was not confirmed",
-            ),
+            Self::Publication(kind) => kind.fmt(formatter),
             Self::Io { operation, kind } => {
                 write!(formatter, "I/O failed while {operation}: {kind:?}")
             }
@@ -291,18 +268,30 @@ impl RepositoryImportPlan {
 }
 
 pub(crate) struct RepositoryImportReport {
-    pub(crate) committed_markdown: usize,
-    pub(crate) committed_assets: usize,
-    pub(crate) git_root_commit: String,
     pub(crate) warnings: Vec<ConfigWarning>,
+    publication: inex_git::PublishedRepositoryCandidate,
+}
+
+impl RepositoryImportReport {
+    pub(crate) const fn committed_markdown(&self) -> u32 {
+        self.publication.encrypted_markdown()
+    }
+
+    pub(crate) const fn committed_assets(&self) -> u32 {
+        self.publication.encrypted_assets()
+    }
+
+    pub(crate) fn git_root_commit(&self) -> String {
+        self.publication.root_commit_oid()
+    }
 }
 
 /// One freshly unlocked vault whose complete logical inventory and every
 /// planned plaintext envelope have been independently audited against source.
 ///
-/// The type is deliberately private and non-cloneable. A future initial
-/// candidate-authority call must borrow `vault` from this owner before the
-/// legacy-publication conversion consumes it.
+/// The type is deliberately private and non-cloneable. The v2 initial
+/// publication call borrows `vault` from this owner while constructing its
+/// held-lock authority; no legacy publisher is layered afterward.
 struct IndependentlyAuditedVault {
     vault: Vault,
     warnings: Vec<ConfigWarning>,
@@ -315,18 +304,6 @@ impl fmt::Debug for IndependentlyAuditedVault {
             .field("vault", &"[REDACTED]")
             .field("warnings", &self.warnings.len())
             .finish_non_exhaustive()
-    }
-}
-
-impl IndependentlyAuditedVault {
-    /// End the audited-vault lifetime at the explicit legacy-publication seam.
-    ///
-    /// The future v2 authority path must borrow `self.vault` before this point
-    /// and replace, rather than wrap, the legacy v1 publisher.
-    fn into_warnings_before_legacy_publication(self) -> Vec<ConfigWarning> {
-        let Self { vault, warnings } = self;
-        drop(vault);
-        warnings
     }
 }
 
@@ -374,11 +351,21 @@ impl RepositoryImportTerminal {
 pub(crate) struct RepositoryImportExecutionError {
     error: RepositoryImportError,
     terminal: RepositoryImportTerminal,
+    publication: Option<inex_git::RepositoryCandidatePublicationFailure>,
 }
 
 impl RepositoryImportExecutionError {
-    pub(crate) fn into_parts(self) -> (RepositoryImportError, RepositoryImportTerminal) {
-        (self.error, self.terminal)
+    pub(crate) const fn terminal(&self) -> RepositoryImportTerminal {
+        self.terminal
+    }
+
+    pub(crate) fn into_error(self) -> RepositoryImportError {
+        let Self {
+            error,
+            terminal: _,
+            publication: _publication,
+        } = self;
+        error
     }
 }
 
@@ -490,7 +477,13 @@ pub(crate) fn execute(
     creation_params: Argon2idParams,
 ) -> Result<RepositoryImportReport, RepositoryImportExecutionError> {
     let mut terminal = RepositoryImportTerminal::NotCreated;
+    let mut publication_failure = None;
     let result = (|| -> Result<RepositoryImportReport, RepositoryImportError> {
+        if !inex_git::initial_repository_publication_supported() {
+            return Err(RepositoryImportError::Publication(
+                inex_git::RepositoryCandidatePublicationFailureKind::UnsupportedPlatform,
+            ));
+        }
         plan.revalidate_source()?;
         plan.destination.revalidate(&plan.source)?;
         let staging = StagingRoot::create(&plan.destination)?;
@@ -525,49 +518,46 @@ pub(crate) fn execute(
         plan.destination.revalidate(&plan.source)?;
         staging.revalidate(&plan.destination)?;
 
-        // Future initial candidate authority is acquired here while the same
-        // freshly unlocked, fully audited `audited_vault.vault` is still
-        // owned. The legacy v1 publisher must never be layered after v2.
-        let warnings = audited_vault.into_warnings_before_legacy_publication();
-
-        let publication = match atomic_publish_directory_no_replace_checked(
+        let IndependentlyAuditedVault { vault, warnings } = audited_vault;
+        let destination_child_name = plan
+            .destination
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(RepositoryImportError::InvalidDestination)?;
+        let expected_profile = if plan.asset_files == 0 {
+            VaultContentProfile::DocumentsOnly
+        } else {
+            VaultContentProfile::OpaqueAssetsV1
+        };
+        let publication = match inex_git::publish_initial_repository_candidate(
             staging.path(),
-            &plan.destination.path,
-            |current| {
-                inex_git::audit_repository_import_target_for_publication(current, &target)
-                    .map_err(|_| io::Error::other("repository import candidate audit failed"))
-            },
+            &target,
+            &vault,
+            expected_profile,
+            &plan.destination.parent_identity,
+            destination_child_name,
         ) {
             Ok(publication) => publication,
-            Err(error) => {
-                terminal = match error {
-                    AtomicDirectoryPublishError::Indeterminate => {
-                        RepositoryImportTerminal::PublicationIndeterminate
-                    }
-                    AtomicDirectoryPublishError::PublishedCleanupFailed => {
-                        RepositoryImportTerminal::PublishedNeedsReconcile
-                    }
-                    _ => RepositoryImportTerminal::StagingAudited,
-                };
-                return Err(map_publish_error(&error));
+            Err(failure) => {
+                let kind = failure.kind();
+                terminal = publication_terminal(kind);
+                publication_failure = Some(failure);
+                return Err(RepositoryImportError::Publication(kind));
             }
         };
-        terminal = RepositoryImportTerminal::PublishedNeedsReconcile;
-
-        inex_git::audit_repository_import_target(&plan.destination.path, &target)
-            .map_err(|_| RepositoryImportError::PublishedAuditFailed)?;
-        if publication.parent_sync != ParentSyncStatus::Synced {
-            return Err(RepositoryImportError::PublishedDurabilityNotConfirmed);
-        }
+        drop(vault);
 
         Ok(RepositoryImportReport {
-            committed_markdown: plan.markdown_files,
-            committed_assets: plan.asset_files,
-            git_root_commit: target.root_commit_oid().to_owned(),
             warnings,
+            publication,
         })
     })();
-    result.map_err(|error| RepositoryImportExecutionError { error, terminal })
+    result.map_err(|error| RepositoryImportExecutionError {
+        error,
+        terminal,
+        publication: publication_failure,
+    })
 }
 
 fn build_staging_vault(
@@ -1031,18 +1021,26 @@ fn ensure_disjoint(source: &Path, destination: &Path) -> Result<(), RepositoryIm
     }
 }
 
-fn map_publish_error(error: &AtomicDirectoryPublishError) -> RepositoryImportError {
-    match error {
-        AtomicDirectoryPublishError::DestinationExists => {
-            RepositoryImportError::PublishDestinationExists
-        }
-        AtomicDirectoryPublishError::Indeterminate => RepositoryImportError::PublishIndeterminate,
-        AtomicDirectoryPublishError::PublishedCleanupFailed => {
-            RepositoryImportError::PublishedCleanupFailed
-        }
-        AtomicDirectoryPublishError::InvalidPaths
-        | AtomicDirectoryPublishError::NotMoved
-        | AtomicDirectoryPublishError::Io { .. } => RepositoryImportError::PublishFailed,
+const fn publication_terminal(
+    kind: inex_git::RepositoryCandidatePublicationFailureKind,
+) -> RepositoryImportTerminal {
+    use inex_git::RepositoryCandidatePublicationFailureKind as Kind;
+
+    match kind {
+        Kind::PublicationIndeterminate => RepositoryImportTerminal::PublicationIndeterminate,
+        Kind::PublicationDurabilityIndeterminate
+        | Kind::PublicationDurabilityRejected
+        | Kind::PublicationMarkerRetained
+        | Kind::PublicationMarkerReplaced
+        | Kind::PublicationMarkerPostStateIndeterminate
+        | Kind::PostUnlinkIndeterminate
+        | Kind::CleanAuditRejected => RepositoryImportTerminal::PublishedNeedsReconcile,
+        Kind::UnsupportedPlatform
+        | Kind::InitialAuthorityRejected
+        | Kind::InitialClaimRejected
+        | Kind::InitialPublicationNotMoved
+        | Kind::DestinationExists
+        | Kind::InitialPublicationRejected => RepositoryImportTerminal::StagingAudited,
     }
 }
 
@@ -1143,7 +1141,7 @@ mod tests {
     }
 
     #[test]
-    fn production_source_freezes_audited_owner_and_legacy_publication_seams() {
+    fn production_source_freezes_audited_owner_and_v2_publication_seam() {
         let source = include_str!("repository_import.rs");
         let production = source
             .split_once("\n#[cfg(test)]")
@@ -1170,8 +1168,8 @@ mod tests {
         let fresh_audit = position("unlock_and_independently_audit_staging_vault(");
         let password_drop = position("drop(password);");
         let terminal_audited = position("terminal = RepositoryImportTerminal::StagingAudited;");
-        let owner_consumed = position("into_warnings_before_legacy_publication()");
-        let legacy_publish = position("atomic_publish_directory_no_replace_checked(");
+        let owner_opened = position("let IndependentlyAuditedVault { vault, warnings }");
+        let v2_publish = position("inex_git::publish_initial_repository_candidate(");
         assert!(
             build < git
                 && git < git_audit
@@ -1179,18 +1177,44 @@ mod tests {
                 && git_durable < fresh_audit
                 && fresh_audit < password_drop
                 && password_drop < terminal_audited
-                && terminal_audited < owner_consumed
-                && owner_consumed < legacy_publish
+                && terminal_audited < owner_opened
+                && owner_opened < v2_publish
         );
         assert!(production.contains("password: Zeroizing<Vec<u8>>"));
         assert_eq!(production.matches("Vault::unlock(").count(), 1);
         assert!(production.contains("\nstruct IndependentlyAuditedVault {"));
         assert!(!production.contains("acquire_initial_candidate_authority"));
         assert!(!production.contains("IMPORT_PUBLISH_MARKER_V2"));
+        assert!(!production.contains("atomic_publish_directory_no_replace_checked"));
+        assert!(!production.contains("into_warnings_before_legacy_publication"));
 
         let cli = include_str!("lib.rs");
         assert!(cli.contains("repository_import::execute(plan, password, created_at_ms"));
         assert!(!cli.contains("repository_import::execute(plan, password.as_slice()"));
+        let command = cli
+            .split("fn command_repository_import_create(")
+            .nth(1)
+            .and_then(|tail| tail.split("fn print_repository_import_success(").next())
+            .expect("repository-import command exists");
+        let failure_output = command
+            .rfind("print_repository_import_terminal(failure.terminal())")
+            .expect("failure terminal output exists");
+        let failure_flush = command[failure_output..]
+            .find("io::stdout().flush()")
+            .map(|offset| offset + failure_output)
+            .expect("failure output flush exists");
+        let failure_drop = command
+            .find("failure.into_error()")
+            .expect("failure owner is consumed");
+        assert!(failure_output < failure_flush && failure_flush < failure_drop);
+        let success_output = command
+            .find("print_repository_import_success(&report)")
+            .expect("success output exists");
+        let success_flush = command[success_output..]
+            .find("io::stdout()")
+            .map(|offset| offset + success_output)
+            .expect("success output flush exists");
+        assert!(success_output < success_flush);
     }
 
     #[cfg(target_os = "linux")]
@@ -1346,10 +1370,102 @@ mod tests {
             assert!(!debug.contains(&staging.path().to_string_lossy().into_owned()));
             assert!(!debug.contains("WeakKdf"));
 
-            let warnings = audited.into_warnings_before_legacy_publication();
+            let IndependentlyAuditedVault { vault, warnings } = audited;
             assert_eq!(warnings.len(), 1);
             inex_git::audit_repository_import_target(staging.path(), &target)
-                .unwrap_or_else(|error| panic!("legacy target audit changed: {error}"));
+                .unwrap_or_else(|error| panic!("target audit changed: {error}"));
+            drop(vault);
+        }
+
+        #[test]
+        fn v2_published_owner_retains_the_mutation_lock_until_acknowledgement() {
+            use inex_core::atomic::{
+                ExistingVaultMutationLock, ExistingVaultMutationLockError,
+                IMPORT_PUBLISH_MARKER_V1, IMPORT_PUBLISH_MARKER_V2, VAULT_LOCAL_DIRECTORY,
+                VAULT_MUTATION_LOCK_FILE, filesystem_directory_identity, filesystem_file_identity,
+            };
+
+            let (_temporary, plan) = fixture("v2-owner-lock");
+            let (staging, target) = build_git_candidate(&plan);
+            let audited = unlock_and_independently_audit_staging_vault(&plan, &staging, PASSWORD)
+                .unwrap_or_else(|error| panic!("fresh audit failed: {error}"));
+            let IndependentlyAuditedVault { vault, warnings } = audited;
+            assert_eq!(warnings.len(), 1);
+            let destination_name = plan
+                .destination
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_else(|| panic!("destination name is not UTF-8"));
+            let expected_profile = if plan.asset_files == 0 {
+                VaultContentProfile::DocumentsOnly
+            } else {
+                VaultContentProfile::OpaqueAssetsV1
+            };
+            let root_identity = filesystem_directory_identity(staging.path())
+                .unwrap_or_else(|error| panic!("staging root identity failed: {error}"));
+            let local = staging.path().join(VAULT_LOCAL_DIRECTORY);
+            let local_identity = filesystem_directory_identity(&local)
+                .unwrap_or_else(|error| panic!("staging local identity failed: {error}"));
+            let lock_file = fs::File::open(local.join(VAULT_MUTATION_LOCK_FILE))
+                .unwrap_or_else(|error| panic!("staging lock open failed: {error}"));
+            let lock_identity = filesystem_file_identity(&lock_file)
+                .unwrap_or_else(|error| panic!("staging lock identity failed: {error}"));
+            drop(lock_file);
+            let published = inex_git::publish_initial_repository_candidate(
+                staging.path(),
+                &target,
+                &vault,
+                expected_profile,
+                &plan.destination.parent_identity,
+                destination_name,
+            )
+            .unwrap_or_else(|error| panic!("v2 publication failed: {error:?}"));
+            drop(vault);
+
+            assert_eq!(
+                published.encrypted_markdown(),
+                u32::try_from(plan.markdown_files)
+                    .unwrap_or_else(|_| panic!("Markdown count exceeds u32"))
+            );
+            assert_eq!(
+                published.encrypted_assets(),
+                u32::try_from(plan.asset_files)
+                    .unwrap_or_else(|_| panic!("asset count exceeds u32"))
+            );
+            assert_eq!(published.root_commit_oid(), target.root_commit_oid());
+            let debug = format!("{published:?}");
+            assert!(debug.contains("root_commit_oid: \"[REDACTED]\""));
+            assert!(!debug.contains(target.root_commit_oid()));
+            assert!(!debug.contains(&plan.destination.path.to_string_lossy().into_owned()));
+            for marker in [IMPORT_PUBLISH_MARKER_V1, IMPORT_PUBLISH_MARKER_V2] {
+                assert!(
+                    !plan
+                        .destination
+                        .path
+                        .join(VAULT_LOCAL_DIRECTORY)
+                        .join(marker)
+                        .exists()
+                );
+            }
+            assert!(matches!(
+                ExistingVaultMutationLock::acquire(
+                    &plan.destination.path,
+                    &root_identity,
+                    &local_identity,
+                    &lock_identity,
+                ),
+                Err(ExistingVaultMutationLockError::Busy)
+            ));
+            drop(published);
+            let guard = ExistingVaultMutationLock::acquire(
+                &plan.destination.path,
+                &root_identity,
+                &local_identity,
+                &lock_identity,
+            )
+            .unwrap_or_else(|error| panic!("lock was not released after owner drop: {error}"));
+            drop(guard);
         }
 
         #[derive(Clone, Copy, Debug)]

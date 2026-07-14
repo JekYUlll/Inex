@@ -90,6 +90,8 @@ mod candidate_fresh_audit;
 )]
 mod candidate_publication_authority;
 
+pub(crate) mod candidate_transaction;
+
 #[cfg(target_os = "linux")]
 use super::raw_index::{RawIndex, parse_sha1_index};
 use super::raw_index::{RawIndexError, TargetRawIndexSummary, validate_target_sha1_index_paths};

@@ -10,6 +10,9 @@ use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use inex_core::atomic::{
+    IMPORT_PUBLISH_MARKER_V1, IMPORT_PUBLISH_MARKER_V2, VAULT_LOCAL_DIRECTORY,
+};
 use inex_core::path::{AssetPath, LogicalPath};
 use inex_core::vault::Vault;
 use inex_core::vault_config::KdfPolicy;
@@ -255,8 +258,22 @@ fn imports_current_snapshot_into_one_parentless_ciphertext_commit() {
     let stdout = String::from_utf8(imported.stdout)
         .unwrap_or_else(|error| panic!("import stdout UTF-8 failed: {error}"));
     assert!(stdout.contains("result: repository import complete"));
+    assert!(stdout.contains("committed-encrypted-markdown: 2"));
+    assert!(stdout.contains("committed-encrypted-assets: 3"));
     assert!(stdout.contains("git-root-parent-count: 0"));
     assert!(stdout.contains("candidate-plaintext-file-objects: 0"));
+    assert!(
+        !destination
+            .join(VAULT_LOCAL_DIRECTORY)
+            .join(IMPORT_PUBLISH_MARKER_V1)
+            .exists()
+    );
+    assert!(
+        !destination
+            .join(VAULT_LOCAL_DIRECTORY)
+            .join(IMPORT_PUBLISH_MARKER_V2)
+            .exists()
+    );
     assert!(destination.join("journal.md.enc").is_file());
     assert!(
         destination
@@ -310,6 +327,7 @@ fn imports_current_snapshot_into_one_parentless_ciphertext_commit() {
         String::from_utf8(git(&destination, &["rev-list", "--parents", "-n", "1", "HEAD"]).stdout)
             .unwrap_or_else(|error| panic!("target commit UTF-8 failed: {error}"));
     assert_eq!(target_commit.split_whitespace().count(), 1);
+    assert!(stdout.contains(&format!("git-root-commit: {}", target_commit.trim())));
     assert_eq!(
         git(&destination, &["rev-list", "--all", "--count"]).stdout,
         b"1\n"
