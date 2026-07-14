@@ -482,3 +482,5 @@
 - Initial整根move后的terminal owner必须把root切换为实际destination再做post-move复审；否则marker/lock虽仍安全持有，但诊断状态会错误指向已消失的staging名。generic move的parent sync无论报告`Synced`还是`NotSynced`都不形成durability，后继仍必须经过held root fd与held common-parent fd的独立同步transition。
 - Publication durability的最小充分组合是先调用core内建role包夹的held root/common-parent同步，再无条件执行一次`role→fresh九段audit→七字段compare→role`；同步前重复昂贵fresh audit不增加既定cooperative-lock威胁模型下的授权强度。`Ok+review`才是Durable，`Err+review`才可重试，任何review失败都必须terminal。
 - Durability owner不能保留`HeldPublicationMarkerV2Error::Io`中的原始`io::Error`：即使Debug/Display脱敏，枚举解构或`Error::source()`仍可能泄漏路径。当前transition在错误进入状态前就归一化为fixed variant或`io::ErrorKind`，并用单一shared comparator防止Initial与durability七字段顺序漂移。
+- 高层不能直接返回core的`HeldPublicationMarkerV2UnlinkOutcome`：否则root与expected audit会和authority分离，且调用方可能把“marker已删除”误当成“候选已clean”。正确映射必须把RemovedAndParentSynced命名为`CleanAuditPending`、unsynced限制为parent-sync retry、replacement/indeterminate封入terminal，并持续保留同一lock。
+- Core的`NotRemoved`只证明exact marker仍在，不自动证明候选正文未漂移；高层必须在unlink前做完整published review，并在`NotRemoved`后再次review，只有两次role/fresh/七字段/role均通过才重新授予Durable unlink能力。marker一旦absent，任何状态都禁止再次unlink或重建marker。

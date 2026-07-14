@@ -138,6 +138,8 @@ Phase 6 extension — 现有 Markdown Git 仓库与加密附件迁移（Phase 7 
           - [x] Initial经critical fresh复审与verified no-replace整根move汇入同一PublishedWithMarker；只有exact NotMoved复审后可重试（`5060856`）
           - [x] PublishedWithMarker经held durability+fresh复审进入PublicationDurableWithMarker，只有durable owner可消费exact unlink（`984e52b`）
           - [ ] marker unlink后的sync retry与marker-free clean audit形成PublishedClean/terminal输出，并整体替换旧v1 publisher
+            - [x] 只有PublicationDurableWithMarker可消费exact unlink；五态结果及parent-sync四态映射为pending/retry/terminal且不返回裸core authority（`c3dd202`）
+            - [ ] 以Synced post-unlink held-root authority执行marker-free clean九段audit并形成PublishedClean或可重试/terminal owner
   - [ ] 完成repository import构造/durability/publication每一边界的Linux force-kill、hostile same-UID source/target race、artifact-bound residue与原生Windows矩阵
 - **Status:** in_progress（用户实测驱动的迁移/附件扩展；原Markdown-only实现仍保持已验证基线）
 
