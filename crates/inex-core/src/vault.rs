@@ -40,6 +40,9 @@ use crate::umbra_document::{
 use crate::umbra_keyslot::{
     UMBRA_DEFAULT_KEYSLOT_PATH, UmbraKey, UmbraKeyslotError, UmbraKeyslotV1,
 };
+use crate::umbra_render::{
+    RenderedUmbraProjection, UmbraRenderError, render_umbra_projection, validate_outer_marker_slots,
+};
 use crate::vault_config::{
     ConfigError, ConfigWarning, KdfPolicy, MAX_VAULT_JSON_BYTES, VaultConfig,
 };
@@ -207,6 +210,9 @@ pub enum VaultError {
     /// Umbra Outer container processing failed.
     #[error(transparent)]
     UmbraDocument(#[from] UmbraDocumentError),
+    /// Umbra projection rendering or selection-map processing failed.
+    #[error(transparent)]
+    UmbraRender(#[from] UmbraRenderError),
     /// An operation requires a currently unlocked Umbra session.
     #[error("Umbra is locked")]
     UmbraLocked,
@@ -846,6 +852,7 @@ impl Vault {
         if self.umbra.is_none() {
             return Err(VaultError::UmbraLocked);
         }
+        validate_outer_marker_slots(document)?;
         let plaintext = Zeroizing::new(document.to_json()?);
         let encrypted = crypto::encrypt_umbra_outer_document(
             &self.master_key,
@@ -905,6 +912,7 @@ impl Vault {
         let flags = current.header.content_flags;
         drop(current);
 
+        validate_outer_marker_slots(document)?;
         let plaintext = Zeroizing::new(document.to_json()?);
         let encrypted = crypto::encrypt_umbra_outer_document(
             &self.master_key,
@@ -950,8 +958,42 @@ impl Vault {
         )?)
     }
 
+    /// Render the fully unlocked canonical Umbra Markdown projection and its
+    /// bounded private-block map.
+    ///
+    /// Outer clients must use [`Self::read_umbra_outer_document`] instead;
+    /// this method requires a live `K_umbra` session and therefore never
+    /// exposes private Markdown, kinds, or tags while Umbra is locked.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError::UmbraLocked`] without `K_umbra`, or an error for
+    /// a missing/tampered slot, an invalid marker-to-slot mapping, or invalid
+    /// private payload.
+    pub fn render_umbra_projection(
+        &self,
+        logical_path: &LogicalPath,
+    ) -> Result<RenderedUmbraProjection, VaultError> {
+        let (_, document) = self.read_umbra_outer_document(logical_path)?;
+        let session = self.umbra.as_ref().ok_or(VaultError::UmbraLocked)?;
+        let mut payloads = std::collections::BTreeMap::new();
+        for slot_id in document.slots.keys() {
+            let payload = document.decrypt_private_slot(
+                self.config.vault_id,
+                logical_path.as_str(),
+                session.slot.key_id(),
+                &session.key,
+                slot_id,
+            )?;
+            payloads.insert(slot_id.clone(), payload);
+        }
+        Ok(render_umbra_projection(&document, &payloads)?)
+    }
+
     /// Insert one fresh encrypted private slot and atomically persist the
-    /// changed feature-2 Outer projection.
+    /// changed feature-2 Outer projection. `outer_markdown` must contain the
+    /// new canonical marker and retain exactly one marker for every existing
+    /// slot.
     ///
     /// # Errors
     ///
@@ -962,6 +1004,7 @@ impl Vault {
         &mut self,
         logical_path: &LogicalPath,
         expected_etag: &str,
+        outer_markdown: String,
         slot_id: String,
         outer: OuterSlotStrategy,
         payload: &PrivateSlotPayloadV1,
@@ -979,6 +1022,8 @@ impl Vault {
             outer,
             payload,
         )?;
+        document.outer_markdown = outer_markdown;
+        validate_outer_marker_slots(&document)?;
         self.save_umbra_outer_document(logical_path, &document, expected_etag, modified_at_ms)
     }
 
@@ -1018,7 +1063,9 @@ impl Vault {
     ///
     /// The caller may use the returned private payload to restore plaintext
     /// into an Umbra projection only after the outer-container commit has
-    /// succeeded. This method never moves that payload into an Outer index.
+    /// succeeded. `outer_markdown` must remove the matching marker while
+    /// retaining all other marker identities. This method never moves that
+    /// payload into an Outer index.
     ///
     /// # Errors
     ///
@@ -1028,6 +1075,7 @@ impl Vault {
         &mut self,
         logical_path: &LogicalPath,
         expected_etag: &str,
+        outer_markdown: String,
         slot_id: &str,
         modified_at_ms: i64,
     ) -> Result<(DocumentMetadata, PrivateSlotPayloadV1), VaultError> {
@@ -1044,6 +1092,8 @@ impl Vault {
             )?
         };
         document.remove_private_slot(slot_id)?;
+        document.outer_markdown = outer_markdown;
+        validate_outer_marker_slots(&document)?;
         let metadata =
             self.save_umbra_outer_document(logical_path, &document, expected_etag, modified_at_ms)?;
         Ok((metadata, payload))
@@ -2891,6 +2941,7 @@ mod tests {
             .insert_umbra_private_slot(
                 &path,
                 &created.etag,
+                "# outer text\n{{inex-private-slot:p_01}}\n".to_owned(),
                 "p_01".to_owned(),
                 OuterSlotStrategy {
                     mode: crate::umbra_config::OuterMode::Drop,
@@ -2913,6 +2964,11 @@ mod tests {
                 .expect("read private slot"),
             payload
         );
+        let rendered = vault
+            .render_umbra_projection(&path)
+            .expect("render unlocked Umbra projection");
+        assert!(rendered.markdown.contains("INEX_SECRET_SLOT_CANARY"));
+        assert_eq!(rendered.render_map.private_slots.len(), 1);
 
         let replacement = PrivateSlotPayloadV1 {
             updated_at_ms: 1_783_699_203_000,
@@ -2940,18 +2996,34 @@ mod tests {
         );
         vault.lock_umbra();
         assert!(matches!(
+            vault.render_umbra_projection(&path),
+            Err(VaultError::UmbraLocked)
+        ));
+        assert!(matches!(
             vault.read_umbra_private_slot(&path, "p_01"),
             Err(VaultError::UmbraLocked)
         ));
         assert!(matches!(
-            vault.remove_umbra_private_slot(&path, &replaced.etag, "p_01", 1_783_699_204_000),
+            vault.remove_umbra_private_slot(
+                &path,
+                &replaced.etag,
+                "# outer text\n".to_owned(),
+                "p_01",
+                1_783_699_204_000
+            ),
             Err(VaultError::UmbraLocked)
         ));
         vault
             .unlock_umbra(b"private slot password")
             .expect("unlock Umbra");
         let (removed, restored) = vault
-            .remove_umbra_private_slot(&path, &replaced.etag, "p_01", 1_783_699_204_000)
+            .remove_umbra_private_slot(
+                &path,
+                &replaced.etag,
+                "# outer text\n".to_owned(),
+                "p_01",
+                1_783_699_204_000,
+            )
             .expect("remove slot");
         assert_eq!(restored, replacement);
         assert_ne!(removed.etag, replaced.etag);
