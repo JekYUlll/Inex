@@ -246,6 +246,11 @@
         "command": "inex.choosePrivateAnnotation",
         "key": "ctrl+alt+shift+/",
         "when": "inex.vaultUnlocked"
+      },
+      {
+        "command": "inex.choosePrivateAnnotation",
+        "key": "ctrl+alt+h",
+        "when": "inex.vaultUnlocked"
       }
     ],
     "configuration": {

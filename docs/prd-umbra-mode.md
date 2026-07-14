@@ -104,7 +104,7 @@ keyboard events. Profile shortcuts use ordinary command arguments, for example
 The current VS Code implementation contributes `togglePrivateAnnotation`,
 `choosePrivateAnnotation`, `applyPrivateAnnotationProfile`,
 `editPrivateAnnotation`, and `removePrivateAnnotation`. `Ctrl+Alt+/` and `Ctrl+Alt+Shift+/` are contributed
-through normal keybinding metadata. A profile binding can be added in the user
+through normal keybinding metadata; `Ctrl+Alt+H` is a chooser alias. A profile binding can be added in the user
 keybindings file:
 
 ```json
