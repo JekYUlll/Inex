@@ -1026,3 +1026,8 @@
 
 - 提交 `5eeb657`（`feat(sublime): add private annotation picker state`）：无 Sublime API 依赖的 picker state 以加密 catalog 的 tag ID/label 构造 repeated-panel items；kind 与 Outer 保持单选，tag 可多选，spec 固定规范排序 tag IDs，并在 cover mode 强制非空公开 cover text。
 - 已选的 archived tag 仍展示，未选 archived tag 不进入默认 picker。`clear()` 主动清空 tags 和 label，给 lock/cancel/dispose 接线使用。验证：state + Python 3.8 syntax 12/12、compile、diff-check 通过；下一步接入 command 后必须在锁定回调清空 live picker。
+
+## 2026-07-15 — Sublime annotation profile picker state
+
+- 提交 `7b7624e`（`feat(sublime): apply encrypted annotation profiles`）：picker state 接受 daemon 已验证的完整 profile，原子替换 kind/tag IDs/Outer mode；严格校验 profile key set、stable ID/label、catalog tag references 和 `cover ↔ promptForCover` 语义。
+- Profile 只提供 metadata，不能提供公开实例 cover text；当 outer=cover 时仍由 `spec()` 强制单独输入。验证：picker 3/3、compile、diff-check 通过。

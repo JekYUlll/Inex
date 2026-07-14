@@ -121,6 +121,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
     - [x] Sublime strict RPC client 已支持 Umbra 独立 keyslot 的 initialize/unlock/enable/lock；其 lock 不触碰 Outer session，异常或不一致状态 fail closed（`5069253`）
     - [x] Sublime 已提供 `Inex: Unlock Umbra Private Mode` 与 `Inex: Lock Umbra Private Mode` 命令；首次初始化经不可恢复警告确认，成功解锁续期同一 Outer idle deadline，Umbra lock 保持 Outer 可用（`cae72cf`）
     - [x] Sublime stateful picker 基础已实现：kind/Outer 单选、tag 多选、归档已选 tag 可见、Cover 约束与 clear-on-cancel/lock state（`5eeb657`）；尚待连接 projection command
+    - [x] Sublime picker 可应用 encrypted annotation profile 的 kind/tag/Outer metadata；profile 永不携带实例 cover text，cover 仍在实际 apply 前单独采集（`7b7624e`）
     - [x] Sublime strict RPC client 已支持 authenticated `umbra.document.open` 与 apply/edit/remove：canonical generation、范围/条目/顺序和 feature-2 response metadata 都在交给 host 前验证；客户端只回传 daemon 返回的完整 projection/ETag/RenderMap（`e93a1a9`、`f788818`、`b027052`，本轮）
   - [x] 加密 tag catalog 现支持 stable-ID create/rename/archive/reorder：配置验证唯一性、canonical order、profile/default 引用与 Cover profile 语义；Vault 通过 load→mutate→CAS encrypted save 原子提交（`1298641`）
   - [x] daemon 已提供 `umbra.tag.create/rename/archive/reorder`：所有 tag 文本经 zeroizing 参数层读取，生命周期回归验证 create→rename→archive→reorder 后只有 Umbra 已解锁才能读回（`f46d2ff`）
