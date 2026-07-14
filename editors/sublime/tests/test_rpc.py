@@ -565,6 +565,38 @@ class RequestAndResponseTests(unittest.TestCase):
         with self.assertRaises(RpcProtocolError):
             client.create_private_annotation_profile(dict(profile, tagIds=["relationship", "family"]))
 
+    def test_umbra_catalog_schema_is_validated_before_host_ui(self):
+        client = InexRpcClient("/unused")
+        client._session = "A" * SESSION_TOKEN_TEXT_BYTES
+        catalog = {
+            "tags": [{
+                "id": "relationship", "label": "Relationship", "description": "",
+                "aliases": [], "sortOrder": 10, "defaultSelected": True, "archived": False,
+            }],
+            "profiles": [{
+                "id": "relationship-comment", "label": "Relationship comment", "kind": "comment",
+                "tagIds": ["relationship"], "outer": "drop", "promptForCover": False,
+            }],
+            "defaults": {
+                "kind": "comment", "tagIds": ["relationship"], "outer": "drop",
+                "defaultProfileId": "relationship-comment",
+            },
+        }
+        client._call_raw = lambda method, params: catalog
+        self.assertEqual(client.load_umbra_annotation_config(), catalog)
+        for invalid in (
+            dict(catalog, tags=catalog["tags"] * 2),
+            dict(catalog, profiles=[dict(catalog["profiles"][0], tagIds=["unknown"])]),
+            dict(catalog, defaults=dict(catalog["defaults"], tagIds=["relationship", "relationship"])),
+            dict(catalog, defaults=dict(catalog["defaults"], defaultProfileId="missing")),
+        ):
+            rejected = InexRpcClient("/unused")
+            rejected._session = "A" * SESSION_TOKEN_TEXT_BYTES
+            rejected._call_raw = lambda method, params, invalid=invalid: invalid
+            with self.assertRaises(RpcProtocolError):
+                rejected.load_umbra_annotation_config()
+            self.assertIsInstance(rejected._terminal_error, RpcProtocolError)
+
     def test_umbra_document_conversion_is_etag_bound_and_feature_two_only(self):
         client = InexRpcClient("/unused")
         client._session = "A" * SESSION_TOKEN_TEXT_BYTES

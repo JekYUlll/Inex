@@ -599,30 +599,7 @@ class InexRpcClient:
                 {"tags", "profiles", "defaults"},
                 "Umbra config result",
             )
-            tags = result.get("tags")
-            profiles = result.get("profiles")
-            defaults = result.get("defaults")
-            if not isinstance(tags, list) or not isinstance(profiles, list) or not isinstance(defaults, dict):
-                raise RpcProtocolError("RPC Umbra config is invalid")
-            if len(tags) > 4096 or len(profiles) > 4096:
-                raise RpcProtocolError("RPC Umbra config exceeds the client limit")
-            tag_ids = set()
-            for tag in tags:
-                if not isinstance(tag, dict) or not isinstance(tag.get("id"), str) or not tag.get("id"):
-                    raise RpcProtocolError("RPC Umbra tag is invalid")
-                tag_ids.add(tag["id"])
-            profile_ids = set()
-            for profile in profiles:
-                if not isinstance(profile, dict) or not isinstance(profile.get("id"), str) or not profile.get("id"):
-                    raise RpcProtocolError("RPC Umbra profile is invalid")
-                values = profile.get("tagIds")
-                if not isinstance(values, list) or any(not isinstance(value, str) or value not in tag_ids for value in values):
-                    raise RpcProtocolError("RPC Umbra profile tags are invalid")
-                profile_ids.add(profile["id"])
-            default_profile = defaults.get("defaultProfileId")
-            if not isinstance(default_profile, str) or (default_profile and default_profile not in profile_ids):
-                raise RpcProtocolError("RPC Umbra default profile is invalid")
-            return result
+            return _parse_umbra_annotation_config(result)
         except RpcProtocolError as error:
             self._terminate_protocol(error)
 
@@ -1604,6 +1581,100 @@ def _serialize_annotation_profile(value: Any) -> Dict[str, Any]:
         "tagIds": normalized,
         "outer": outer,
         "promptForCover": prompt,
+    }
+
+
+def _parse_umbra_annotation_config(value: Any) -> Dict[str, Any]:
+    """Validate every encrypted catalog field before it reaches a host UI."""
+    if not isinstance(value, dict) or set(value) != {"tags", "profiles", "defaults"}:
+        raise RpcProtocolError("RPC Umbra config is invalid")
+    tags = value.get("tags")
+    profiles = value.get("profiles")
+    defaults = value.get("defaults")
+    if (
+        not isinstance(tags, list)
+        or not isinstance(profiles, list)
+        or not isinstance(defaults, dict)
+        or len(tags) > MAX_UMBRA_TAGS
+        or len(profiles) > MAX_UMBRA_TAGS
+    ):
+        raise RpcProtocolError("RPC Umbra config exceeds the client limit")
+    normalized_tags = []
+    tag_ids = set()
+    for tag in tags:
+        if not isinstance(tag, dict) or set(tag) != {
+            "id", "label", "description", "aliases", "sortOrder", "defaultSelected", "archived"
+        }:
+            raise RpcProtocolError("RPC Umbra tag is invalid")
+        tag_id = _expect_umbra_id(tag.get("id"), "Umbra tag ID")
+        description = tag.get("description")
+        aliases = tag.get("aliases")
+        sort_order = tag.get("sortOrder")
+        if (
+            tag_id in tag_ids
+            or not isinstance(description, str)
+            or len(description.encode("utf-8")) > MAX_UMBRA_TEXT_BYTES
+            or not isinstance(aliases, list)
+            or len(aliases) > MAX_UMBRA_TAGS
+            or isinstance(sort_order, bool)
+            or not isinstance(sort_order, int)
+            or sort_order < -(2**53 - 1)
+            or sort_order > 2**53 - 1
+            or not isinstance(tag.get("defaultSelected"), bool)
+            or not isinstance(tag.get("archived"), bool)
+        ):
+            raise RpcProtocolError("RPC Umbra tag is invalid")
+        tag_ids.add(tag_id)
+        normalized_tags.append({
+            "id": tag_id,
+            "label": _expect_bounded_string(tag.get("label"), "Umbra tag label", MAX_UMBRA_TEXT_BYTES),
+            "description": description,
+            "aliases": [
+                _expect_bounded_string(alias, "Umbra tag alias", MAX_UMBRA_TEXT_BYTES)
+                for alias in aliases
+            ],
+            "sortOrder": sort_order,
+            "defaultSelected": tag["defaultSelected"],
+            "archived": tag["archived"],
+        })
+    normalized_profiles = []
+    profile_ids = set()
+    for profile in profiles:
+        normalized = _serialize_annotation_profile(profile)
+        if normalized["id"] in profile_ids or any(tag_id not in tag_ids for tag_id in normalized["tagIds"]):
+            raise RpcProtocolError("RPC Umbra profile is invalid")
+        profile_ids.add(normalized["id"])
+        normalized_profiles.append(normalized)
+    if set(defaults) != {"kind", "tagIds", "outer", "defaultProfileId"}:
+        raise RpcProtocolError("RPC Umbra defaults are invalid")
+    kind = defaults.get("kind")
+    outer = defaults.get("outer")
+    default_tags = defaults.get("tagIds")
+    default_profile = defaults.get("defaultProfileId")
+    if (
+        kind not in ("block", "comment")
+        or outer not in ("drop", "cover", "placeholder")
+        or not isinstance(default_tags, list)
+        or len(default_tags) > MAX_UMBRA_TAGS
+        or not isinstance(default_profile, str)
+    ):
+        raise RpcProtocolError("RPC Umbra defaults are invalid")
+    normalized_default_tags = [_expect_umbra_id(tag_id, "Umbra default tag ID") for tag_id in default_tags]
+    if (
+        normalized_default_tags != sorted(set(normalized_default_tags))
+        or any(tag_id not in tag_ids for tag_id in normalized_default_tags)
+        or (default_profile != "" and (not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", default_profile) or default_profile not in profile_ids))
+    ):
+        raise RpcProtocolError("RPC Umbra defaults are invalid")
+    return {
+        "tags": normalized_tags,
+        "profiles": normalized_profiles,
+        "defaults": {
+            "kind": kind,
+            "tagIds": normalized_default_tags,
+            "outer": outer,
+            "defaultProfileId": default_profile,
+        },
     }
 
 
