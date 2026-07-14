@@ -1092,7 +1092,7 @@
 
 ## 2026-07-15 — Sublime Umbra feature-2 conversion client
 
-- 提交 `91f7d7a`（`feat(sublime): convert documents to Umbra containers`）：strict RPC client 新增 `umbra.document.convert`，以当前 document ETag CAS 请求 feature-2 upgrade，并只接受 exact `{etag, metadata, durability}` response 且 metadata flag 为 2。
+- 提交 `91f7d7a`（`feat(sublime): convert documents to Umbra containers`）：strict RPC client 新增 `umbra.document.convert`，以当前 document ETag CAS 请求 feature-2 upgrade，并只接受 exact `{etag, metadata, durability}` response。后续真实 daemon 回归修正了早期说明中的混淆：feature-2 由 authenticated `required_features=[2]` 表达，`metadata.flags` 仍只允许普通内容 flags 0/1。
 - 这使后续 UI 可在 conversion 后重新经 `umbra.document.open` 获取 canonical projection/RenderMap，不能把原 normal buffer 或旧 ETag 当作私密容器状态。验证：RPC 27/27、compile、diff-check 通过。
 
 ## 2026-07-15 — Sublime authenticated Umbra projection model
@@ -1185,3 +1185,9 @@
 
 - 新增 `editors/neovim/tests/headless_smoke.lua`。测试从 `INEX_SIDECAR` 取得绝对 binary，启动 transport、发送 exact frozen `system.hello`、验证 `inexd`/protocol major，并在 3 秒 bounded wait 内 shutdown；README 记录 exact headless invocation。
 - 验证：以当前 system-GCC `inexd` 运行该 smoke 成功。该测试只覆盖 sidecar framing/lifecycle，不证明 password input、vault projection 或 Neovim plaintext-residue 安全。
+
+## 2026-07-15 — Neovim authenticated Umbra projection transition
+
+- Neovim 现在可在 Outer+Umbra live session 中用 `:InexEnableUmbra` 协商 feature-2，使用 `:InexConvertUmbra` 对当前 clean ordinary buffer 执行 daemon ETag CAS conversion，再由 `umbra.document.open` 读取 daemon 生成的 projection。`:InexOpenUmbra` 只显示既有 feature-2 projection；所有 `inex-umbra://` buffer 均为只读 nofile、unlisted、no-swap/no-undo/modeline disabled，并在 Umbra/Outer lock 或 stop 时 wipe。
+- transition 按 convert → authenticated projection open → local identity recheck → close normal handle/buffer 顺序；convert 成功后的 projection response、状态或 buffer identity 有任何失败会主动 Outer lock/scrub，绝不把已转换容器继续当普通 buffer 保存。Neovim 不持有密码、KEK、`K_umbra`、slot cipher 或 RenderMap cache。
+- 真实 daemon lifecycle 回归通过（新临时 vault：initialize/unlock Umbra、Outer document save/tree/search/mkdir、Outer relock、Umbra enable/convert/projection、Umbra lock wipe）。同时修正 Sublime 的协议校验：feature-2 是 header `required_features=[2]`，并非 `metadata.flags=2`；Umbra RPC metadata 现正确只接受内容 flags 0/1。验证：Sublime 96/96（1 项 pidfd/subreaper skip）、Neovim headless lifecycle、`git diff --check` 通过。

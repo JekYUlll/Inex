@@ -536,7 +536,7 @@
 - Sublime 的 repeated Quick Panel 无原生多选，安全实现应只把 encrypted catalog label 保留在 `AnnotationPickerState`，每次点击后再展示，且在 cancel/lock/dispose 调用 `clear()`；不能将标签 label 放进 settings、command args 或持久化状态。
 - Annotation profile 与 instance annotation spec 不能共用 cover payload：profile 的 `cover` 只表达 `promptForCover` 语义。Sublime 在 profile apply 后仍必须在真正 daemon mutation 之前请求一次公开 cover text，避免把无归属文字写入加密 profile catalog。
 - Sublime standard Quick Panel 没有可保存的 multi-select handle；stateful picker 必须在每次选择后重开，并在 lock 时同时 clear in-memory state 和 `hide_overlay`。仅 clear state 而让旧 overlay 保留会使锁后仍可见私密标签。
-- 进入 Umbra container 不是客户端 buffer 标记：普通 document 必须先用 current ciphertext ETag 调用 `umbra.document.convert`，然后放弃 normal document identity并重新读取 canonical Umbra projection。转换 response 的 feature flag 不是可选提示，必须精确为 2。
+- 进入 Umbra container 不是客户端 buffer 标记：普通 document 必须先用 current ciphertext ETag 调用 `umbra.document.convert`，然后放弃 normal document identity并重新读取 canonical Umbra projection。feature-2 由 EDRY header 的 authenticated `required_features=[2]` 表达；RPC `metadata.flags` 仍是内容 flags，只可为 0/1，客户端不得把两者混为一谈。
 - Umbra projection 不能伪装为 `document.open` handle：普通 close RPC 只对 daemon-issued normal handles 有效。Sublime model 必须以空 handle + authenticated RenderMap 表达 Umbra document，并在 mutation 成功时整体替换 projection identity。
 - normal→Umbra transition 的安全顺序是 daemon CAS convert、daemon authenticated projection open、main-thread identity recheck、model transition、再关闭旧 normal handle。任何 dirty/locked/stale model 都要在 transition 前拒绝，且传入 projection 必须 wipe。
 - 当 `umbra.document.convert` 已成功后，普通 document buffer 已不能安全继续作为 normal document 保存。若随后 projection open、UI identity recheck 或 transition 失败，Sublime 必须锁定并 scrub 全部 managed buffer，而不能仅恢复 view 可编辑性。
@@ -561,3 +561,5 @@
 - Neovim 内存搜索不能用普通 `input()`，因为 query 可能进入命令行 UI/历史；`inputsecret()` 至少避免明文回显。它仍不消除宿主/OS 内存边界，因此 query/result 都必须只驻留在当前回调或 lock/stop wipe 的 scratch buffer，且 README 不应声称该机制覆盖 shada、第三方插件或内存取证。
 - Neovim 目录创建应保持 daemon 的单层语义：不根据 `InexNew` 的嵌套路径隐式逐级 mkdir，也不把任意 parent 视为已认证。用户必须先显式执行 `InexMkdir`；这样失败路径和 Git/daemon 的 atomic directory invariant 不会被客户端便利逻辑重写。
 - Neovim Umbra lifecycle 只能保存非秘密状态旗标，绝不可缓存 password、KEK、slot cipher 或 `K_umbra`。初始化是否允许须先以 authenticated `umbra.status` 判断；Umbra-only lock 与 Outer lock/stop 的本地先行清理保证旧 RPC callback 不会把已锁状态重新标成解锁。
+- `required_features` 与 `metadata.flags` 是两个不同层次：feature-2 private container 的身份来自 authenticated EDRY header `required_features=[2]`，但 RPC metadata 的 `flags` 仍只是 content flags（normal/unresolved merge 为 0/1，draft 为 2/3）。把 feature number 当作 metadata flag 会让真实 daemon projection 被客户端错误拒绝；该问题已由 Neovim 实际 convert/open 回归发现并在 Sublime Umbra RPC 中修正。
+- Neovim normal→Umbra 不能只切换 buffer label：必须执行 CAS convert、再读取并严格验证 daemon projection/RenderMap、重检当前 session/Umbra/buffer identity，最后关闭 normal handle。CAS 成功后任一步失败都应直接 lock/scrub，因为普通 buffer 已没有合法 save path；只读 private projection 也必须在 Umbra-only lock 时主动 delete，而不仅在 Outer lock 时处理。
