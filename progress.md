@@ -1191,3 +1191,9 @@
 - Neovim 现在可在 Outer+Umbra live session 中用 `:InexEnableUmbra` 协商 feature-2，使用 `:InexConvertUmbra` 对当前 clean ordinary buffer 执行 daemon ETag CAS conversion，再由 `umbra.document.open` 读取 daemon 生成的 projection。`:InexOpenUmbra` 只显示既有 feature-2 projection；所有 `inex-umbra://` buffer 均为只读 nofile、unlisted、no-swap/no-undo/modeline disabled，并在 Umbra/Outer lock 或 stop 时 wipe。
 - transition 按 convert → authenticated projection open → local identity recheck → close normal handle/buffer 顺序；convert 成功后的 projection response、状态或 buffer identity 有任何失败会主动 Outer lock/scrub，绝不把已转换容器继续当普通 buffer 保存。Neovim 不持有密码、KEK、`K_umbra`、slot cipher 或 RenderMap cache。
 - 真实 daemon lifecycle 回归通过（新临时 vault：initialize/unlock Umbra、Outer document save/tree/search/mkdir、Outer relock、Umbra enable/convert/projection、Umbra lock wipe）。同时修正 Sublime 的协议校验：feature-2 是 header `required_features=[2]`，并非 `metadata.flags=2`；Umbra RPC metadata 现正确只接受内容 flags 0/1。验证：Sublime 96/96（1 项 pidfd/subreaper skip）、Neovim headless lifecycle、`git diff --check` 通过。
+
+## 2026-07-15 — Neovim authenticated private annotation mutation
+
+- Neovim private projection 现只在本地临时持有 daemon 返回的 ETag/RenderMap；`apply_private_annotation` 与 `remove_private_annotation` 将当前 projection、ETag、完整 RenderMap 和严格 byte ranges 原样交给 daemon，成功后只整体采用 daemon 新 projection。没有任何 Lua marker/slot 推导路径；lock/stop 仍 delete buffer 并丢弃 map。
+- 真实 lifecycle 已覆盖 convert → apply（空 tag list、comment/drop）→ complete-range remove → 还原原始 Umbra projection → Umbra lock wipe。回归首次发现 daemon 对 annotation/profile 的 `tagIds` 错误要求至少一项，已改为与 PRD 和 core 相符的零或多项并由 daemon 71/71 单测覆盖。
+- 提供临时可调用命令 `:InexApplyPrivateAnnotation startByte endByte` / `:InexRemovePrivateAnnotation startByte endByte`，默认 spec 为 comment/no-tags/drop；Lua API 供后续视觉选择和 picker 复用。Neovim 的 `nargs` 不接受数值 `2`，因此命令使用 `nargs="*"` 后在 callback 内严格验证两个参数；load check 与真实 lifecycle 均通过。

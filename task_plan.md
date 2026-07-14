@@ -77,7 +77,8 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
 - [x] 实现 Umbra 独立 keyslot 生命周期：status、不可恢复警告后的 initialize/unlock、Umbra-only lock；Lua 从不接触 `K_umbra`，Outer lock/stop 清理其本地状态（本轮）
 - [x] 复用 `inexd` JSON-RPC：vault 解锁/锁定、树浏览、受控 Markdown buffer、保存与搜索
 - [x] 实现 Umbra 最小投影命令：独立解锁/锁定、enable、普通文档 CAS 转换及只读 projection；所有私密内容继续只由 daemon 解密，转换后 projection 打开失败即 lock/scrub
-- [ ] 实现 Umbra 私密标注、标签/profile 选择与编辑；不得绕过 Outer/Umbra 隔离
+- [x] 实现 Umbra RenderMap mutation 基础：只转发 daemon 已认证的投影/ETag/RenderMap，支持 apply/remove 后整体替换 projection；空 tag IDs 与 PRD 一致，转换/锁定时不保留该私密状态
+- [ ] 实现 Umbra 私密标注视觉选择、标签/profile 选择和 edit 路由；不得绕过 Outer/Umbra 隔离
 - [ ] 使用 headless Neovim 回归验证，并对 swap、shada、undo、LSP 等宿主明文残留执行显式门控（当前 transport/Outer/Umbra lifecycle 已通过；完整 host-residue gate 仍未完成）
 - **Status:** in_progress（正式 goal；2026-07-15 已再次确认最后优先级：CLI/daemon 与 VS Code 为最高优先，Sublime 维持既定 experimental 范围后，才开始 Neovim；不得创建第二套协议/密码学实现）
 
