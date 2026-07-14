@@ -507,4 +507,5 @@
 - Outer projection 不需要 `K_umbra` 才能读取（它只含公开 Markdown、slot ID、公开 outer strategy 和 slot ciphertext），但创建或保存 feature-2 container 必须要求 live Umbra session；常规 `Vault::read` 必须拒绝 feature-2 envelope，避免普通客户端把内部 JSON 误当 Markdown 展示或回存。
 - 私密 slot 的“移除/解包”必须先在同一 live session 解密并验证 ciphertext，再在内存中移除并执行 ETag 条件保存；只有保存成功才能把 payload 返回给上层 RenderMap/编辑器。这样失败写回不会让上层把尚未持久化的私密 Markdown当作已恢复的普通正文。
 - Slot 表与 Outer marker 不是可独立保存的两份状态：缺 marker 会丢失 Umbra 可见性，dangling marker 会使渲染失败，重复 marker 会使同一私密正文多次进入投影。因此所有 feature-2 create/save/insert/remove 路径均需验证“每个 slot 恰一个 canonical marker”，而包裹/解包必须把 Outer Markdown 替换与 slot 密文变化放在同一 ETag 条件事务中。
+- `apply_private_annotation` 的安全提交边界是“当前 feature-2 ETag + 完整 Umbra 投影 + 完整 RenderMap”三者同时一致；单靠投影 hash 不能表达存储并发，因此写入仍由 feature-2 ciphertext ETag CAS 收尾。纯文本区先通过 RenderMap 映射回一个完整 Outer 段，随后按倒序替换 marker，才能在已有私密块周围安全处理多选且不发生坐标漂移。
 - RenderMap 不仅要记录私密 fenced block 范围，还必须记录普通 projection 段到 Outer Markdown 的一对一坐标；否则多选 wrap 无法在已有私密块周围安全地回写 Outer 容器。跨段或跨私密块的普通选区统一按 mixed/partial 拒绝。

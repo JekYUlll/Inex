@@ -779,3 +779,9 @@
 - 已实现“已解锁会话中重设密码”：新 salt/nonce/KEK 仅重新包装同一个内存 `K_umbra`，无须旧密码、不会重加密私密内容；真实 256 MiB KDF 测试确认旧密码失效、新密码解包得到同一数据密钥。
 - `.inex` 已成为 tree 的 root 保留目录，atomic writer 只允许该单一 canonical keyslot 作为额外受控目标。feature 2 目前仅保留编号，尚未对现有 EDRY reader 宣称支持，待 v2 document container 同步接入。
 - 验证：`cargo clippy -p inex-core --all-targets -- -D warnings` 与 `cargo test -p inex-core --lib`（279/279）通过。
+
+## 2026-07-15 — Umbra 私密标注原子包裹
+
+- 提交 `ee77855`（`feat(umbra): apply private annotations atomically`）：Vault 新增 `apply_private_annotation`，先以 caller 的 ETag、完整投影和 `OwnedRenderMap` 重建/比对当前 authenticated state；只接受规范化后的纯文本选区，按倒序将每个选区替换为独立 opaque marker，并在同一 ETag 条件保存内写入对应的 K_umbra slot。
+- 新测试覆盖两段非重叠 Markdown 多选、每 slot 共用 kind/tags、Outer 仍可见普通段、私密正文/tag ID 不出现在密文文件可读面、陈旧 ETag 与完整私密块选择均零写入。`cargo test -p inex-core --lib` 292/292、`cargo clippy -p inex-core --lib -- -D warnings`、`cargo fmt` 和 `git diff --check` 全部通过。
+- 下一切片：将此核心事务暴露为 daemon 的 session-bound RPC（客户端不自行计算/持久化 private payload），然后实现 VS Code QuickPick、命令与可配置 keybindings；Sublime 与 Neovim 继续保持后序。
