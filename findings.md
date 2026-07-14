@@ -515,3 +515,4 @@
 - `umbra.annotation.remove` 的 RPC RenderMap 将私密投影范围规范化为 `privateSlots[].startByte/endByte`（不是 Outer segment 使用的 `projectionStartByte/projectionEndByte`）。客户端或回归必须消费 daemon 返回的完整 map，而非从 marker 或 UI 坐标推导 slot/range；`cover` profile 也必须在 UI 端无条件收集公开文字，避免把不一致的 catalog flag 变成可到达的无效 core 请求。
 - `noSelectionTarget: paragraph` 必须按 UTF-8 byte buffer 的连续非空行解析，不能用“当前行”冒充；以纯函数返回不含换行符的 range，blank/whitespace-only line 返回 undefined，使 host 在复制 snapshot 后立刻清零，而不会把空白段提交给 daemon。
 - 编辑器本地偏好只允许影响交互（`paragraph`/`line`/`reject` 与 unwrap confirmation）；其解析必须对非法值安全回退。不能将“上次 tags/profile”塞入 VS Code settings，因为那些是受 `K_umbra` 保护的语义数据；若未来实现 useLast，必须仅保留可在锁定时清理的 session 内存状态并配套回归。
+- Cursor-inside-private 编辑不能把零长度 cursor 直接作为 RPC `TextRange`：core 的 canonical range type 故意拒绝空范围。客户端应由 authenticated RenderMap 确认 slot 后选择该 canonical fenced block 开头的一个 ASCII marker byte，作为严格 `InsidePrivateSlot` 的非空证明；绝不能由 slot ID 或未认证 UI 坐标直接编辑。

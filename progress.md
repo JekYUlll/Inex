@@ -898,3 +898,9 @@
 - 提交 `3ad47a5`（`feat(vscode): configure private annotation interactions`）：新增 window-local `inex.privateAnnotation.noSelectionTarget`（paragraph/line/reject）与 `confirmBeforeUnwrap`。前者只影响临时 snapshot 的 selection range，后者同时控制 toggle 与显式 remove 的确认；配置解析严格回退默认值，绝不存储私密标签、profile 或正文。
 - `headingSection`、multi-cursor 和记忆上次 spec 仍未暴露为设置，避免出现仅有表面配置、却未能满足 selection 原子性或锁定清理语义的路径。PRD 已同步当前能力边界。
 - 验证：package JSON、`git diff --check`、`pnpm --dir editors/vscode check`、tests 53/53、构建均通过。
+
+## 2026-07-15 — 私密标注 metadata edit 核心与 daemon
+
+- 提交 `aefd789`（`feat(umbra): edit private annotation metadata atomically`）：新增 Vault `edit_private_annotation`。它先重认证当前 ETag/完整 projection/RenderMap，再只接受单一 private block 内的非空 selection；解密原 payload，保留 Markdown、slot ID 与 created time，更新 kind、tag IDs、updated time 和 Outer 策略后一次性重加密保存。plain/complete/mixed/stale 不会触发写入。
+- 提交 `860227d`（`feat(daemon): edit private annotations over RPC`）：协议增加 `umbra.annotation.edit`，handler 沿用严格 JSON 资源限制与 apply/remove 的 response shape。生命周期回归现在是 apply → edit（block/tag/placeholder）→ remove，remove 只消费 edit 返回的 ETag/projection/RenderMap。
+- 首轮测试错误地将零长度 cursor 送入 core，但 `TextRange` 故意禁止空范围；已改为在 private block 内使用一字节 marker 范围。验证：core 295/295、core strict Clippy；daemon 71/71、daemon strict Clippy、fmt/diff-check 全通过。

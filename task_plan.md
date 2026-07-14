@@ -92,6 +92,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
   - [x] 实现 canonical Umbra projection、RenderMap generation、严格私密块范围分类，以及 marker/slot 一一对应的 ETag 原子变更；普通保存拒绝 dangling/duplicate/missing marker（`9d05c11`）
   - [x] 实现 `apply_private_annotation`：以 ETag 与完整 RenderMap/投影复核后，只对纯文本多选区从后向前创建独立 slot 与 marker，并一次性条件保存；过期、混合/私密选区零写入，slot/tag/正文 canary 不进入 Outer 或磁盘可读面（`ee77855`）
   - [x] 实现 complete-private-block 原子解包：完整投影/RenderMap/ETag 一致才可恢复 Markdown 并删除 slot；inside/partial/mixed 选区零写入，恢复正文和 tags 仍不进入磁盘 Outer 面（本轮）
+  - [x] 实现 inside-private-slot 原子 metadata edit：保留 slot ID、createdAt 和私密 Markdown，仅在同一 ETag 条件保存中更新 kind/tag IDs/updatedAt/Outer 策略；stale/plain/complete/mixed 选区均拒绝（`aefd789`）
   - [ ] 扩展daemon session/RPC及VS Code QuickPick/命令/可配置keybindings
     - [x] daemon 已声明 `umbraV1` capability，并提供独立 Umbra 状态、初始化、解锁、锁定、feature-2 启用和已解锁投影读取 RPC；普通 `document.open` 不获得 feature-2 plaintext（`f2660b3`）
     - [x] 将 `apply_private_annotation` 接入 daemon 的严格 range/spec RPC：受限嵌套对象/数组解析、base64 projection、完整 RenderMap/ETag 复核、原子返回新投影；RPC 写入 canary 不进入磁盘可读面（`9bd5297`）
@@ -106,6 +107,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
     - [x] VS Code `removePrivateAnnotation` 已经确认提示后将完整 block 选区提交至 `umbra.annotation.remove`，只采用 daemon 返回的新 projection（本轮）
     - [x] VS Code `applyPrivateAnnotationProfile` 已接收严格 profileId argument、从 encrypted catalog 解析 stable profile，并复用同一 session/convert/apply 路径（本轮）
     - [x] `cover` profile 一律先收集非空公开 cover text，不能让 legacy/malformed `promptForCover: false` 构造无效请求；daemon 生命周期回归覆盖 apply 后从 daemon 返回的 exact RenderMap 范围 remove 并恢复原 Umbra 投影（`b75f9ed`）
+    - [x] daemon 已新增 `umbra.annotation.edit`，复用完整 projection/RenderMap/ETag/spec 边界并由 apply→edit→remove 生命周期测试覆盖（`860227d`）；VS Code cursor-in-block command 接线待实现
     - [x] `togglePrivateAnnotation` 现按 active RenderMap 分类：完整 private block 走确认解包，其他选区走 chooser；不以裸 slot ID 判定（本轮）
     - [x] VS Code 空选区可安全扩展到当前 Markdown paragraph（光标所在连续非空行），临时 plaintext snapshot 会立即清零；heading/multicursor 策略仍 deferred（`f34e0dc`）
     - [x] VS Code 现将 `noSelectionTarget`（paragraph/line/reject）与 `confirmBeforeUnwrap` 作为 window-local 配置贡献；不保存 tag/profile/private content，toggle 与显式 remove 共用确认策略（`3ad47a5`）
