@@ -72,6 +72,10 @@
     "command": "inex_manage_private_tags"
   },
   {
+    "caption": "Inex: Manage Private Annotation Profiles",
+    "command": "inex_manage_private_annotation_profiles"
+  },
+  {
     "caption": "Inex: Show Security Status",
     "command": "inex_show_security_status"
   }

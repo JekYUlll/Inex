@@ -1861,6 +1861,103 @@ def _manage_private_tags(window: sublime.Window) -> None:
     _with_umbra_catalog(window, present)
 
 
+def _manage_private_annotation_profiles(window: sublime.Window) -> None:
+    """Manage encrypted profile metadata without storing instance cover text."""
+    def present(client: InexRpcClient, generation: int, umbra_generation: int, config: Dict[str, Any]) -> None:
+        profiles = config["profiles"]
+        actions = ["Create profile", "Edit profile", "Remove profile", "Set default profile"]
+
+        def mutate(operation: Callable[[], None]) -> None:
+            def worker() -> None:
+                try:
+                    operation()
+                    sublime.set_timeout(done, 0)
+                except Exception as error:
+                    sublime.set_timeout(lambda error=error: _show_error(error), 0)
+
+            def done() -> None:
+                if (
+                    _runtime_snapshot()[0] is client
+                    and _runtime_snapshot()[2] == generation
+                    and _umbra_generation == umbra_generation
+                ):
+                    window.status_message("Inex private annotation profiles updated")
+                    _manage_private_annotation_profiles(window)
+
+            sublime.set_timeout_async(worker, 0)
+
+        def configure(profile_id: str, label: str, existing: Optional[Dict[str, Any]]) -> None:
+            try:
+                state = AnnotationPickerState(config)
+                if existing is not None:
+                    state.apply_profile(existing)
+            except Exception as error:
+                _show_error(error)
+                return
+
+            def apply(metadata: Dict[str, Any]) -> None:
+                profile = dict(metadata, id=profile_id, label=label)
+                if existing is None:
+                    mutate(lambda: client.create_private_annotation_profile(profile))
+                else:
+                    mutate(lambda: client.edit_private_annotation_profile(profile_id, profile))
+
+            _show_annotation_profile_picker(window, state, apply)
+
+        def choose_profile(on_selected: Callable[[Dict[str, Any]], None], placeholder: str) -> None:
+            if not profiles:
+                _show_error(ModelError("No private annotation profiles are available"))
+                return
+            window.show_quick_panel(
+                [profile["label"] for profile in profiles],
+                lambda index: on_selected(profiles[index]) if 0 <= index < len(profiles) else None,
+                placeholder=placeholder,
+            )
+
+        def selected(index: int) -> None:
+            if index < 0:
+                return
+            if index == 0:
+                def label_done(label: str) -> None:
+                    if not label:
+                        return
+
+                    def id_done(profile_id: str) -> None:
+                        if profile_id:
+                            configure(profile_id, label, None)
+
+                    window.show_input_panel("Profile stable ID", "", id_done, None, None)
+
+                window.show_input_panel("Profile label", "", label_done, None, None)
+            elif index == 1:
+                def edit(profile: Dict[str, Any]) -> None:
+                    window.show_input_panel(
+                        "Profile label", profile["label"],
+                        lambda label: configure(profile["id"], label, profile) if label else None,
+                        None, None,
+                    )
+                choose_profile(edit, "Edit private annotation profile")
+            elif index == 2:
+                def remove(profile: Dict[str, Any]) -> None:
+                    if sublime.ok_cancel_dialog("Remove this private annotation profile? Existing annotations are unchanged.", "Remove Private Profile"):
+                        mutate(lambda: client.remove_private_annotation_profile(profile["id"]))
+                choose_profile(remove, "Remove private annotation profile")
+            else:
+                choices = ["No default profile"] + [profile["label"] for profile in profiles]
+
+                def default_selected(profile_index: int) -> None:
+                    if profile_index == 0:
+                        mutate(lambda: client.set_default_private_annotation_profile(""))
+                    elif 0 < profile_index <= len(profiles):
+                        mutate(lambda: client.set_default_private_annotation_profile(profiles[profile_index - 1]["id"]))
+
+                window.show_quick_panel(choices, default_selected, placeholder="Set default private annotation profile")
+
+        window.show_quick_panel(actions, selected, placeholder="Manage private annotation profiles")
+
+    _with_umbra_catalog(window, present)
+
+
 def _enter_active_umbra(window: sublime.Window) -> None:
     """Upgrade a clean active buffer, then replace it with daemon projection."""
     view = window.active_view()
@@ -2040,6 +2137,57 @@ def _show_annotation_picker(
                 _show_error(error)
 
         window.show_quick_panel(choices, selected, placeholder="Configure private annotation")
+
+    present()
+
+
+def _show_annotation_profile_picker(
+    window: sublime.Window,
+    state: AnnotationPickerState,
+    on_apply: Callable[[Dict[str, Any]], None],
+) -> None:
+    """Repeated picker for profile metadata; it never gathers cover text."""
+    _annotation_pickers.append((state, None))
+
+    def discard() -> None:
+        for index, (active, _callback) in enumerate(_annotation_pickers):
+            if active is state:
+                del _annotation_pickers[index]
+                break
+        state.clear()
+
+    def present() -> None:
+        if not any(active is state for active, _callback in _annotation_pickers):
+            return
+        items = state.items()
+        choices = [item["label"] for item in items]
+
+        def selected(index: int) -> None:
+            if index < 0 or index >= len(items):
+                discard()
+                return
+            try:
+                action = state.select(items[index]["id"])
+                if action == "cancel":
+                    discard()
+                elif action == "done":
+                    profile = {
+                        "kind": state.kind,
+                        "tagIds": sorted(state.tag_ids),
+                        "outer": state.outer,
+                        "promptForCover": state.outer == "cover",
+                    }
+                    try:
+                        on_apply(profile)
+                    finally:
+                        discard()
+                else:
+                    present()
+            except Exception as error:
+                discard()
+                _show_error(error)
+
+        window.show_quick_panel(choices, selected, placeholder="Configure private annotation profile")
 
     present()
 
@@ -3042,6 +3190,11 @@ class InexApplyPrivateAnnotationProfileCommand(sublime_plugin.WindowCommand):
 class InexManagePrivateTagsCommand(sublime_plugin.WindowCommand):
     def run(self) -> None:
         _manage_private_tags(self.window)
+
+
+class InexManagePrivateAnnotationProfilesCommand(sublime_plugin.WindowCommand):
+    def run(self) -> None:
+        _manage_private_annotation_profiles(self.window)
 
 
 class InexEditPrivateAnnotationCommand(sublime_plugin.WindowCommand):

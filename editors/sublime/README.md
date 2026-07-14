@@ -104,6 +104,12 @@ user keymap; the plugin does not intercept raw keyboard events. All resulting
 mutation requests remain authenticated by the daemon with the current Umbra
 projection, ETag, and RenderMap.
 
+Use **Inex: Manage Private Tags** to create, rename, archive, or reorder the
+encrypted shared tag catalog. Use **Inex: Manage Private Annotation Profiles**
+to create, edit, remove, or choose the encrypted default profile. The profile
+picker stores only kind, tag IDs, Outer mode, and the cover-prompt flag; it
+never asks for or persists an instance's public cover text.
+
 Opening a document creates `window.new_file()`, calls `set_scratch(true)`
 **before** insertion, leaves `view.file_name()` unset, and then inserts the
 decoded Markdown. Logical path, document handle, etag, content, saved version,
