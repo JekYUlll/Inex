@@ -494,7 +494,7 @@ class ReleaseArchiveTests(unittest.TestCase):
         )
         decoded = json.loads(inventory)
         self.assertEqual(decoded["target"]["rustTriple"], "x86_64-unknown-linux-gnu")
-        self.assertEqual(len(decoded["components"]), 77)
+        self.assertEqual(len(decoded["components"]), 78)
         self.assertEqual(
             len(
                 [
@@ -503,7 +503,7 @@ class ReleaseArchiveTests(unittest.TestCase):
                     if name.startswith("root/THIRD_PARTY_LICENSE_TEXTS/")
                 ]
             ),
-            147,
+            149,
         )
         sodium_path = "root/THIRD_PARTY_LICENSE_TEXTS/native/libsodium-1.0.22/LICENSE"
         self.assertEqual(
