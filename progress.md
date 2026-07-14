@@ -998,3 +998,9 @@
 
 - 提交 `657f697`（`feat(daemon): manage encrypted annotation profiles`）：新增 `umbra.profile.create/edit/remove`。profile id/label/kind/tag IDs/Outer 通过 strict sensitive nested object 解析；daemon 把 stable-ID/引用/cover 语义检查和加密写入全部委托 core。
 - lifecycle 回归在同一 Umbra session 内完成 create→edit（comment/drop 到 block/cover）→config get→remove，full daemon 71/71、严格 Clippy、fmt/diff-check 通过。下一步 VS Code typed client/UI。
+
+## 2026-07-15 — Sublime Umbra 投影与标注 RPC 边界
+
+- 提交 `e93a1a9`、`f788818`、`b027052` 先后加入 `umbra.document.open`、RenderMap shape/range 边界；本轮将这些检查收敛为 canonical parser，并新增 apply/edit/remove 客户端接口。generation 必须是 canonical 32-byte base64url，slot ID 唯一且 slot/outer ranges 有序、不重叠、投影长度精确一致。
+- 所有标注 mutation 只序列化同一 authenticated projection、ETag 和完整 RenderMap；返回内容亦需重新验证 feature-2 metadata、durability 与 RenderMap 后才交给 Sublime host。annotation spec 只接受 block/comment、规范排序去重 tag ID 和与 cover mode 一致的公开 cover text。
+- 验证：`PYTHONPATH=editors/sublime python3 -m unittest discover -s editors/sublime/tests -v` 为 85/85 通过、1 项平台跳过；`python3 -m py_compile`、`git diff --check` 通过。下一步在 scratch-buffer 生命周期中接入 Umbra projection 与 stateful picker，绝不将 catalog 标签写入普通设置。

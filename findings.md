@@ -529,3 +529,4 @@
 - Umbra 的 canary/atomicity 回归若长到难以审查，应拆为显式命名的 test helpers，而不是压低 Clippy 门槛：辅助函数仍在同一测试模块中持有真实 Vault、Outer container 与 ciphertext evidence，因而不改变安全测试的执行边界。
 - CustomEditor 的 textarea 不能原生表达多 cursor，因此多范围采用显式 Add range/Clear ranges UI，不在 extension 中截获原始键盘事件。host 仍限制每条 webview message 的 range 数、整数性与 UTF-8 byte 边界，最终 selection normalization/partial-private 拒绝仍由 daemon/core 认证。
 - Sublime tests 不是 Python package 安装模式；从 repo root 执行时必须指定 `PYTHONPATH=editors/sublime`。否则 `inex_rpc` 等插件同级模块无法被 unittest discover 导入，属于 test invocation 环境错误而非插件代码回归。
+- Sublime 的 Umbra mutation client 必须同时把 projection byte buffer、ciphertext ETag、完整 RenderMap 作为一个认证输入边界；不能由 UI 根据 fenced marker 推导 slot ID 或重新构造 map。响应 generation 应 canonical decode 为精确 32 bytes 后立即清零临时缓冲；客户端仅保留可再次序列化的 canonical text form。
