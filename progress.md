@@ -785,3 +785,9 @@
 - 提交 `ee77855`（`feat(umbra): apply private annotations atomically`）：Vault 新增 `apply_private_annotation`，先以 caller 的 ETag、完整投影和 `OwnedRenderMap` 重建/比对当前 authenticated state；只接受规范化后的纯文本选区，按倒序将每个选区替换为独立 opaque marker，并在同一 ETag 条件保存内写入对应的 K_umbra slot。
 - 新测试覆盖两段非重叠 Markdown 多选、每 slot 共用 kind/tags、Outer 仍可见普通段、私密正文/tag ID 不出现在密文文件可读面、陈旧 ETag 与完整私密块选择均零写入。`cargo test -p inex-core --lib` 292/292、`cargo clippy -p inex-core --lib -- -D warnings`、`cargo fmt` 和 `git diff --check` 全部通过。
 - 下一切片：将此核心事务暴露为 daemon 的 session-bound RPC（客户端不自行计算/持久化 private payload），然后实现 VS Code QuickPick、命令与可配置 keybindings；Sublime 与 Neovim 继续保持后序。
+
+## 2026-07-15 — Umbra daemon 会话入口
+
+- 提交 `f2660b3`（`feat(daemon): expose Umbra session controls`）：协议新增 `umbraV1` capability 和 `umbra.status`、`umbra.initialize`、`umbra.unlock`、`umbra.lock`、`umbra.enable`、`umbra.document.open`。Umbra 密码只由 zeroizing 参数读取；公开 feature-2 启用仍要求 live K_umbra；投影读取返回 base64 Markdown、ETag 与完整 RenderMap。
+- daemon 错误映射现覆盖 Umbra keyslot/config/document/render 错误：锁定/错误 Umbra 密码只给通用认证失败，stale RenderMap 给 ETag conflict，结构损坏给 integrity failure，绝不输出 slot/tag/正文。
+- 服务级回归覆盖 Outer 解锁→Umbra 初始化→feature-2 启用→投影读取→Umbra 锁定拒绝→再次解锁。`cargo test -p inex-daemon --lib` 71/71、严格 Clippy、fmt 和 diff-check 全通过。下一步接入严格 annotation apply RPC，再开始 VS Code picker。

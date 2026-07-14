@@ -91,6 +91,8 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
   - [x] 实现 canonical Umbra projection、RenderMap generation、严格私密块范围分类，以及 marker/slot 一一对应的 ETag 原子变更；普通保存拒绝 dangling/duplicate/missing marker（`9d05c11`）
     - [x] 实现 `apply_private_annotation`：以 ETag 与完整 RenderMap/投影复核后，只对纯文本多选区从后向前创建独立 slot 与 marker，并一次性条件保存；过期、混合/私密选区零写入，slot/tag/正文 canary 不进入 Outer 或磁盘可读面（`ee77855`）
   - [ ] 扩展daemon session/RPC及VS Code QuickPick/命令/可配置keybindings
+    - [x] daemon 已声明 `umbraV1` capability，并提供独立 Umbra 状态、初始化、解锁、锁定、feature-2 启用和已解锁投影读取 RPC；普通 `document.open` 不获得 feature-2 plaintext（`f2660b3`）
+    - [ ] 将 `apply_private_annotation` 接入 daemon 的严格 range/spec RPC，并绑定 VS Code 选择器返回的 ETag/RenderMap
   - [ ] 扩展Sublime stateful picker、profile命令和keymap示例
   - [ ] 跑通多选、wrap/unwrap/edit、跨编辑器目录、canary/残留及Outer隔离矩阵
 
