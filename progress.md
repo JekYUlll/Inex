@@ -1207,3 +1207,8 @@
 
 - `toggle_private_annotation` 现在将单一 RenderMap private block 内的非空 visual range 路由到 `umbra.annotation.edit`；完整 block 仍只会确认后 remove，partial crossing 继续拒绝。新增显式 `:InexEditPrivateAnnotation startByte endByte` 默认-spec 命令，供正常 mapping 或后续 picker 调用。
 - 真实 headless lifecycle 已覆盖 apply → in-block edit（comment/drop 改为 block/placeholder）→ complete block remove；每一步只采用 daemon 新 projection/RenderMap。标签/Profile picker 仍未实现。
+
+## 2026-07-15 — Neovim encrypted Umbra catalog boundary
+
+- 新增 `load_umbra_annotation_config(callback)`：仅 Umbra live session 可调用，严格验证 tag/profile/default 的 exact shape、ID、tag canonical order、cross-reference 与 cover prompt 语义，随后把临时 config 交给 callback；不写入 Neovim settings 或 module cache。
+- 真实 lifecycle 覆盖 enable 后 catalog read，并继续通过 convert/apply/edit/remove/lock 路径。下一步才允许用这个 transient callback 形成可清除的 picker UI。
