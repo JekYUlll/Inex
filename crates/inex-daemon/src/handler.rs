@@ -450,6 +450,7 @@ impl<C: MonotonicClock> RpcService<C> {
         Ok(json!({
             "contentBase64": encode_base64url(projection.markdown.as_bytes()).as_str(),
             "etag": metadata.etag,
+            "metadata": header_metadata_value(&metadata.header),
             "renderMap": render_map_value(&projection.render_map),
         }))
     }

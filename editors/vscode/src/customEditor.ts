@@ -13,7 +13,7 @@ import {
   parseMarkdownNavigation,
   resolveMarkdownTarget,
 } from "./markdown.ts";
-import type { DocumentMetadata } from "./sidecar.ts";
+import type { DocumentMetadata, RenderMap, UmbraProjection } from "./sidecar.ts";
 import { showSensitiveQuickPick } from "./sensitiveUi.ts";
 
 const MAX_DOCUMENT_BYTES = 16 * 1024 * 1024;
@@ -55,11 +55,12 @@ class InexDocument implements vscode.CustomDocument {
   private readonly snapshotRequests = new Map<number, SnapshotRequest>();
   private nextSnapshotRequest = 1;
   private selection: EditorSelection | undefined;
+  private umbraRenderMap: RenderMap | undefined;
 
   public constructor(
     public readonly uri: vscode.Uri,
     public readonly logicalPath: string,
-    public readonly handle: string,
+    private handle: string | undefined,
     private content: Buffer,
     public etag: string,
     public metadata: DocumentMetadata,
@@ -67,8 +68,18 @@ class InexDocument implements vscode.CustomDocument {
     private readonly onDispose: (document: InexDocument) => void,
     restoredBackup: boolean,
     private staleBackup: boolean,
+    umbraRenderMap?: RenderMap,
   ) {
     this.savedRevision = restoredBackup ? -1 : 0;
+    this.umbraRenderMap = umbraRenderMap;
+  }
+
+  public get isUmbraProjection(): boolean {
+    return this.umbraRenderMap !== undefined;
+  }
+
+  public renderMap(): RenderMap | undefined {
+    return this.umbraRenderMap;
   }
 
   public snapshot(): { readonly content: Buffer; readonly revision: number } {
@@ -128,6 +139,8 @@ class InexDocument implements vscode.CustomDocument {
   ): void {
     this.requireUsable();
     this.content.fill(0);
+    this.umbraRenderMap?.generation.fill(0);
+    this.umbraRenderMap = undefined;
     this.content = content;
     this.etag = etag;
     this.metadata = metadata;
@@ -135,6 +148,32 @@ class InexDocument implements vscode.CustomDocument {
     this.savedRevision = this.revision;
     this.staleBackup = false;
     this.broadcast();
+  }
+
+  public replaceFromUmbraProjection(
+    projection: UmbraProjection,
+    metadata: DocumentMetadata,
+  ): void {
+    this.requireUsable();
+    this.content.fill(0);
+    this.umbraRenderMap?.generation.fill(0);
+    this.content = projection.content;
+    this.etag = projection.etag;
+    this.metadata = metadata;
+    this.umbraRenderMap = projection.renderMap;
+    this.revision += 1;
+    this.savedRevision = this.revision;
+    this.staleBackup = false;
+    this.broadcast();
+  }
+
+  public async releaseOrdinaryHandle(): Promise<void> {
+    const handle = this.handle;
+    if (handle === undefined) {
+      return;
+    }
+    await this.session.sidecar.closeDocument(handle);
+    this.handle = undefined;
   }
 
   public acceptSave(
@@ -239,6 +278,7 @@ class InexDocument implements vscode.CustomDocument {
       type: "content",
       content: this.content.toString("utf8"),
       revision: this.revision,
+      readOnly: this.isUmbraProjection,
     });
     if (this.pendingReveal !== undefined) {
       void panel.webview.postMessage({ type: "reveal", ...this.pendingReveal });
@@ -259,6 +299,8 @@ class InexDocument implements vscode.CustomDocument {
     this.disposed = true;
     this.content.fill(0);
     this.content = Buffer.alloc(0);
+    this.umbraRenderMap?.generation.fill(0);
+    this.umbraRenderMap = undefined;
     this.selection = undefined;
     this.rejectSnapshotRequests(new Error("Inex document was disposed"));
     this.panels.clear();
@@ -274,6 +316,8 @@ class InexDocument implements vscode.CustomDocument {
     this.locked = true;
     this.content.fill(0);
     this.content = Buffer.alloc(0);
+    this.umbraRenderMap?.generation.fill(0);
+    this.umbraRenderMap = undefined;
     this.selection = undefined;
     this.rejectSnapshotRequests(new Error("Inex document was locked"));
     for (const panel of this.panels) {
@@ -322,7 +366,10 @@ class InexDocument implements vscode.CustomDocument {
   }
 
   private beginCloseHandle(): Promise<void> {
-    this.closeHandlePromise ??= this.session.sidecar.closeDocument(this.handle);
+    const handle = this.handle;
+    this.closeHandlePromise ??= handle === undefined
+      ? Promise.resolve()
+      : this.session.sidecar.closeDocument(handle);
     return this.closeHandlePromise;
   }
 
@@ -396,13 +443,29 @@ export class InexCustomEditorProvider
     const session = this.controller.acquireSession();
     const sidecar = session.sidecar;
     const logicalPath = this.controller.logicalPathForSession(uri, session);
-    const opened = await sidecar.openDocument(logicalPath);
-    let content = opened.content;
+    let opened: Awaited<ReturnType<typeof sidecar.openDocument>> | undefined;
+    let umbraProjection: UmbraProjection | undefined;
+    try {
+      opened = await sidecar.openDocument(logicalPath);
+    } catch (normalOpenError: unknown) {
+      const status = await sidecar.umbraStatus().catch(() => undefined);
+      if (status?.unlocked !== true) {
+        throw normalOpenError;
+      }
+      umbraProjection = await sidecar.openUmbraDocument(logicalPath);
+    }
+    let content = opened?.content ?? umbraProjection!.content;
     let restoredBackup = false;
     let staleBackup = false;
     try {
       ensureOpenAllowed(this.controller, session, token);
       if (openContext.backupId !== undefined) {
+        if (umbraProjection !== undefined) {
+          throw new Error("Umbra projection draft recovery is not supported; reopen the committed document");
+        }
+        if (opened === undefined) {
+          throw new Error("Inex ordinary document handle is unavailable for draft recovery");
+        }
         const backupUri = vscode.Uri.parse(openContext.backupId, true);
         if (backupUri.scheme !== "file") {
           throw new Error("Encrypted backup must be a local regular file");
@@ -446,10 +509,10 @@ export class InexCustomEditorProvider
       const document = new InexDocument(
         uri,
         logicalPath,
-        opened.handle,
+        opened?.handle,
         content,
-        opened.etag,
-        opened.metadata,
+        opened?.etag ?? umbraProjection!.etag,
+        opened?.metadata ?? umbraProjection!.metadata,
         session,
         (disposed) => {
           this.documents.delete(disposed);
@@ -459,12 +522,18 @@ export class InexCustomEditorProvider
         },
         restoredBackup,
         staleBackup,
+        umbraProjection?.renderMap,
       );
       this.documents.add(document);
       return document;
     } catch (error: unknown) {
       content.fill(0);
-      await sidecar.closeDocument(opened.handle).catch(() => undefined);
+      if (opened !== undefined) {
+        await sidecar.closeDocument(opened.handle).catch(() => undefined);
+      }
+      if (umbraProjection !== undefined) {
+        umbraProjection.renderMap.generation.fill(0);
+      }
       throw error;
     }
   }
@@ -635,6 +704,12 @@ export class InexCustomEditorProvider
     if (token.isCancellationRequested) {
       throw new vscode.CancellationError();
     }
+    if (document.isUmbraProjection) {
+      if (document.isDirty) {
+        throw new Error("Umbra projection edits are disabled until authenticated Outer editing is available");
+      }
+      return;
+    }
     if (document.requiresStaleBackupConfirmation) {
       const choice = await vscode.window.showWarningMessage(
         "This recovery draft is older than the current authenticated ciphertext. Overwrite the current version with this draft? A concurrent etag change will still abort the write.",
@@ -687,6 +762,22 @@ export class InexCustomEditorProvider
       throw new vscode.CancellationError();
     }
     const sidecar = this.requireCurrentDocumentSession(document);
+    if (document.isUmbraProjection) {
+      const projection = await sidecar.openUmbraDocument(document.logicalPath);
+      let adopted = false;
+      try {
+        this.requireCurrentDocumentSession(document);
+        document.replaceFromUmbraProjection(projection, projection.metadata);
+        this.previews.refreshDocument(document, 0);
+        adopted = true;
+      } finally {
+        if (!adopted) {
+          projection.content.fill(0);
+          projection.renderMap.generation.fill(0);
+        }
+      }
+      return;
+    }
     const reloaded = await sidecar.read(document.logicalPath);
     let adopted = false;
     try {
@@ -818,6 +909,50 @@ export class InexCustomEditorProvider
       ) {
         document.reveal(startByte, endByte);
       }
+    }
+  }
+
+  public async convertActiveDocumentToUmbra(): Promise<InexDocument> {
+    const document = this.activeDocument;
+    if (
+      document === undefined ||
+      !this.documents.has(document) ||
+      !this.controller.isSessionCurrent(document.session)
+    ) {
+      throw new Error("Focus an active Inex Markdown editor before enabling Umbra");
+    }
+    if (document.isUmbraProjection) {
+      return document;
+    }
+    const synchronization = new vscode.CancellationTokenSource();
+    try {
+      await document.flushWebview(synchronization.token);
+      if (document.isDirty) {
+        await this.saveCustomDocument(document, synchronization.token);
+      }
+      if (document.isDirty) {
+        throw new Error("Inex document changed while preparing Umbra conversion");
+      }
+      const sidecar = this.requireCurrentDocumentSession(document);
+      await document.releaseOrdinaryHandle();
+      const converted = await sidecar.convertDocumentToUmbra(document.logicalPath, document.etag);
+      this.requireCurrentDocumentSession(document);
+      const projection = await sidecar.openUmbraDocument(document.logicalPath);
+      let adopted = false;
+      try {
+        this.requireCurrentDocumentSession(document);
+        document.replaceFromUmbraProjection(projection, converted.metadata);
+        this.previews.refreshDocument(document, 0);
+        adopted = true;
+      } finally {
+        if (!adopted) {
+          projection.content.fill(0);
+          projection.renderMap.generation.fill(0);
+        }
+      }
+      return document;
+    } finally {
+      synchronization.dispose();
     }
   }
 
@@ -1390,7 +1525,7 @@ editor.addEventListener('click',(event)=>{if(event.ctrlKey||event.metaKey)sendNa
 editor.addEventListener('keydown',(event)=>{if((event.ctrlKey||event.metaKey)&&event.key==='Enter'){event.preventDefault();sendNavigation('followLink',editor.selectionStart);}});
 document.getElementById('headings').addEventListener('click',()=>sendNavigation('showHeadings',editor.selectionStart));
 document.getElementById('backlinks').addEventListener('click',()=>sendNavigation('showBacklinks',editor.selectionStart));
-window.addEventListener('message',(event)=>{const message=event.data;if(!message||typeof message!=='object')return;if(message.type==='content'&&typeof message.content==='string'){cancelEditTimer();applying=true;editor.value=message.content;applying=false;}else if(message.type==='reveal'&&Number.isSafeInteger(message.startByte)&&Number.isSafeInteger(message.endByte)){const start=byteIndex(editor.value,message.startByte);const end=byteIndex(editor.value,message.endByte);editor.focus();editor.setSelectionRange(start,end);}else if(message.type==='snapshotRequest'&&Number.isSafeInteger(message.requestId)){cancelEditTimer();vscode.postMessage({type:'snapshot',requestId:message.requestId,content:editor.value,editEpoch});}else if(message.type==='previewReset'){acceptPreviewReset(message);}else if(message.type==='assetStart'){acceptAssetStart(message);}else if(message.type==='assetChunk'){acceptAssetChunk(message);}else if(message.type==='assetEnd'){acceptAssetEnd(message);}else if(message.type==='assetRejected'&&!previewSuspended&&message.editEpoch===editEpoch&&message.generation===previewGeneration&&typeof message.logicalPath==='string'){if(typeof message.transferId==='string')rejectTransfer(message.transferId,false);blocked(message.logicalPath);}});
+window.addEventListener('message',(event)=>{const message=event.data;if(!message||typeof message!=='object')return;if(message.type==='content'&&typeof message.content==='string'&&typeof message.readOnly==='boolean'){cancelEditTimer();applying=true;editor.value=message.content;editor.readOnly=message.readOnly;applying=false;}else if(message.type==='reveal'&&Number.isSafeInteger(message.startByte)&&Number.isSafeInteger(message.endByte)){const start=byteIndex(editor.value,message.startByte);const end=byteIndex(editor.value,message.endByte);editor.focus();editor.setSelectionRange(start,end);}else if(message.type==='snapshotRequest'&&Number.isSafeInteger(message.requestId)){cancelEditTimer();vscode.postMessage({type:'snapshot',requestId:message.requestId,content:editor.value,editEpoch});}else if(message.type==='previewReset'){acceptPreviewReset(message);}else if(message.type==='assetStart'){acceptAssetStart(message);}else if(message.type==='assetChunk'){acceptAssetChunk(message);}else if(message.type==='assetEnd'){acceptAssetEnd(message);}else if(message.type==='assetRejected'&&!previewSuspended&&message.editEpoch===editEpoch&&message.generation===previewGeneration&&typeof message.logicalPath==='string'){if(typeof message.transferId==='string')rejectTransfer(message.transferId,false);blocked(message.logicalPath);}});
 window.addEventListener('beforeunload',suspendPreviews);
 vscode.postMessage({type:'ready',editEpoch});
 </script>

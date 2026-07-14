@@ -80,6 +80,7 @@ export interface RenderMap {
 export interface UmbraProjection {
   readonly content: Buffer;
   readonly etag: string;
+  readonly metadata: DocumentMetadata;
   readonly renderMap: RenderMap;
 }
 
@@ -1279,7 +1280,7 @@ export function parseUmbraProjection(
   expectedLogicalPath: string,
 ): UmbraProjection {
   const result = expectObject(value);
-  expectExactKeys(result, ["contentBase64", "etag", "renderMap"], "Umbra document open");
+  expectExactKeys(result, ["contentBase64", "etag", "metadata", "renderMap"], "Umbra document open");
   const content = decodeCanonicalBase64url(
     expectString(result.contentBase64, "Umbra projection"),
     MAX_DOCUMENT_BYTES,
@@ -1291,7 +1292,7 @@ export function parseUmbraProjection(
       throw new RpcProtocolError("RPC Umbra projection length does not match its RenderMap");
     }
     logicalFileComponents(expectedLogicalPath);
-    return { content, etag, renderMap };
+    return { content, etag, metadata: parseMetadata(result.metadata, expectedLogicalPath), renderMap };
   } catch (error: unknown) {
     content.fill(0);
     throw error;
@@ -1313,6 +1314,7 @@ export function parseUmbraAnnotationResult(
     {
       contentBase64: result.contentBase64 ?? null,
       etag: result.etag ?? null,
+      metadata: result.metadata ?? null,
       renderMap: result.renderMap ?? null,
     },
     expectedLogicalPath,
