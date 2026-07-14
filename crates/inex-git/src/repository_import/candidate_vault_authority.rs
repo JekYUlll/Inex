@@ -1,11 +1,11 @@
-//! Initial-only authenticated vault and target-config authority.
+//! Target-only canonical config evidence and initial authenticated authority.
 //!
-//! This module deliberately produces a short-lived process-local proof, not a
-//! persistent publication claim.  The constructor binds one independently
-//! unlocked [`Vault`] to the exact `vault.json` record in a marker-free
-//! physical manifest, then parses the exact held `.git/config` bytes through
-//! Git's stdin-only `--file - --no-includes` interface.  Returned authority
-//! retains no password, master key, filesystem path, file body, or Git output.
+//! The target-only constructor binds canonical `.git/config` bytes to one
+//! marker-free physical manifest without accepting a [`Vault`] or password.
+//! The initial-only constructor composes that evidence with one independently
+//! unlocked [`Vault`] and the exact authenticated `vault.json` record.  Both
+//! are short-lived process-local proofs, not persistent publication claims,
+//! and retain no password, master key, filesystem path, body, or Git output.
 //!
 //! A fresh publication reconciliation must not construct or require this
 //! value: it instead relies on the durable marker claim and a fresh target-only
@@ -26,6 +26,48 @@ use super::candidate_seal::CandidateSealError;
 const VAULT_JSON_PATH: &str = "vault.json";
 const TARGET_CONFIG_PATH: &str = ".git/config";
 
+/// Target-only evidence for one exact canonical `.git/config` record.
+///
+/// The manifest brand and opaque record ID are private. This type deliberately
+/// implements neither `Clone` nor `Copy`; detached config bytes or Git output
+/// are never retained as authority.
+#[must_use]
+pub(super) struct FreshTargetConfigEvidence<'physical> {
+    physical: &'physical MarkerFreePhysicalManifest,
+    record: PhysicalRecordId,
+}
+
+impl fmt::Debug for FreshTargetConfigEvidence<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FreshTargetConfigEvidence")
+            .field("physical", &"[REDACTED]")
+            .field("record", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl FreshTargetConfigEvidence<'_> {
+    /// Prove that this evidence belongs to the exact manifest allocation.
+    #[must_use]
+    pub(super) fn is_bound_to(&self, physical: &MarkerFreePhysicalManifest) -> bool {
+        std::ptr::eq(self.physical, physical)
+    }
+
+    /// Recheck the fixed config role in the exact branded manifest.
+    pub(super) fn role(
+        &self,
+        physical: &MarkerFreePhysicalManifest,
+    ) -> Result<super::candidate_seal::GitControlRole, CandidateSealError> {
+        if !self.is_bound_to(physical)
+            || !record_is_exact_file(physical, self.record, TARGET_CONFIG_PATH)
+        {
+            return Err(CandidateSealError::InvalidContext);
+        }
+        Ok(super::candidate_seal::GitControlRole::Config)
+    }
+}
+
 /// Initial-process proof that authenticated vault metadata and canonical Git
 /// configuration belong to one exact marker-free physical manifest.
 ///
@@ -36,7 +78,7 @@ const TARGET_CONFIG_PATH: &str = ".git/config";
 pub(super) struct AuthenticatedVaultConfigAuthority<'physical> {
     physical: &'physical MarkerFreePhysicalManifest,
     vault_json: PhysicalRecordId,
-    git_config: PhysicalRecordId,
+    git_config: FreshTargetConfigEvidence<'physical>,
     profile: VaultContentProfile,
 }
 
@@ -72,8 +114,10 @@ impl AuthenticatedVaultConfigAuthority<'_> {
         if !self.is_bound_to(physical)
             || self.profile != expected
             || !record_is_exact_file(physical, self.vault_json, VAULT_JSON_PATH)
-            || !record_is_exact_file(physical, self.git_config, TARGET_CONFIG_PATH)
         {
+            return Err(CandidateSealError::InvalidContext);
+        }
+        if self.git_config.role(physical)? != super::candidate_seal::GitControlRole::Config {
             return Err(CandidateSealError::InvalidContext);
         }
         Ok(())
@@ -130,32 +174,23 @@ mod linux {
     use super::super::candidate_seal::GitControlRole;
     use super::super::{GitRunner, RepositoryImportError};
     use super::{
-        AuthenticatedVaultConfigAuthority, CandidateSealError, MarkerFreePhysicalManifest,
-        PhysicalRecordId, PhysicalRecordKindRef, TARGET_CONFIG_PATH, VAULT_JSON_PATH,
-        authenticated_profile, exact_file_id,
+        AuthenticatedVaultConfigAuthority, CandidateSealError, FreshTargetConfigEvidence,
+        MarkerFreePhysicalManifest, PhysicalRecordId, PhysicalRecordKindRef, TARGET_CONFIG_PATH,
+        VAULT_JSON_PATH, authenticated_profile, exact_file_id,
     };
     use inex_core::vault::Vault;
 
     const MAX_TARGET_CONFIG_OUTPUT_BYTES: usize = 1024 * 1024;
 
-    /// Capture initial-only authenticated metadata/config authority.
-    ///
-    /// The caller must invoke this only after its independent fresh-vault
-    /// content audit.  The type intentionally proves authenticated metadata,
-    /// not that the caller compared every decrypted envelope with its source
-    /// plan.  That ordering remains a higher-level typestate obligation.
-    pub(in crate::repository_import) fn collect_authenticated_vault_config_authority<'physical>(
+    /// Collect target-only canonical config evidence without vault authority.
+    pub(in crate::repository_import) fn collect_fresh_target_config_evidence<'physical>(
         physical: &'physical MarkerFreePhysicalManifest,
         held_root: &SecureSourceDirectory,
-        vault: &Vault,
         runner: &GitRunner,
-    ) -> Result<AuthenticatedVaultConfigAuthority<'physical>, CandidateSealError> {
-        require_common_root(physical, held_root, vault, runner)?;
+    ) -> Result<FreshTargetConfigEvidence<'physical>, CandidateSealError> {
+        require_target_common_root(physical, held_root, runner)?;
 
-        let vault_json = exact_file_id(physical, VAULT_JSON_PATH)?;
-        verify_held_vault_json(physical, held_root, vault_json, vault)?;
-
-        let git_config = exact_file_id(physical, TARGET_CONFIG_PATH)?;
+        let record = exact_file_id(physical, TARGET_CONFIG_PATH)?;
         let expected_driver = super::super::super::installed_driver_command()
             .map_err(|_| CandidateSealError::InvalidContext)?;
         with_held_target_config_snapshot(physical, held_root, |snapshot| {
@@ -170,6 +205,37 @@ mod linux {
             })
         })?;
 
+        require_target_common_root(physical, held_root, runner)?;
+        held_root
+            .verify_no_alternate_data_streams()
+            .map_err(|_| CandidateSealError::InvalidRecord)?;
+
+        let evidence = FreshTargetConfigEvidence { physical, record };
+        if evidence.role(physical)? != GitControlRole::Config {
+            return Err(CandidateSealError::InvalidContext);
+        }
+        Ok(evidence)
+    }
+
+    /// Capture initial-only authenticated metadata/config authority.
+    ///
+    /// The caller must invoke this only after its independent fresh-vault
+    /// content audit.  The type intentionally proves authenticated metadata,
+    /// not that the caller compared every decrypted envelope with its source
+    /// plan.  That ordering remains a higher-level typestate obligation.
+    pub(in crate::repository_import) fn collect_authenticated_vault_config_authority<'physical>(
+        physical: &'physical MarkerFreePhysicalManifest,
+        held_root: &SecureSourceDirectory,
+        vault: &Vault,
+        runner: &GitRunner,
+    ) -> Result<AuthenticatedVaultConfigAuthority<'physical>, CandidateSealError> {
+        let git_config = collect_fresh_target_config_evidence(physical, held_root, runner)?;
+        require_common_root(physical, held_root, vault, runner)?;
+
+        let vault_json = exact_file_id(physical, VAULT_JSON_PATH)?;
+        verify_held_vault_json(physical, held_root, vault_json, vault)?;
+        let profile = authenticated_profile(vault)?;
+
         require_common_root(physical, held_root, vault, runner)?;
         physical
             .require_current_exact(vault.root())
@@ -182,7 +248,7 @@ mod linux {
             physical,
             vault_json,
             git_config,
-            profile: authenticated_profile(vault)?,
+            profile,
         })
     }
 
@@ -200,14 +266,26 @@ mod linux {
         vault: &Vault,
         runner: &GitRunner,
     ) -> Result<(), CandidateSealError> {
+        require_target_common_root(physical, held_root, runner)?;
+        if filesystem_directory_identity(vault.root()).ok().as_ref()
+            != Some(physical.root_identity())
+        {
+            return Err(CandidateSealError::InvalidContext);
+        }
+        Ok(())
+    }
+
+    fn require_target_common_root(
+        physical: &MarkerFreePhysicalManifest,
+        held_root: &SecureSourceDirectory,
+        runner: &GitRunner,
+    ) -> Result<(), CandidateSealError> {
         held_root
             .verify_binding()
             .map_err(|_| CandidateSealError::InvalidContext)?;
         if held_root.identity() != physical.root_identity()
             || !runner.target
             || runner.target_hooks.is_none()
-            || filesystem_directory_identity(vault.root()).ok().as_ref()
-                != Some(physical.root_identity())
             || filesystem_directory_identity(&runner.root).ok().as_ref()
                 != Some(physical.root_identity())
         {
@@ -324,16 +402,23 @@ mod linux {
         use std::process::Command;
         use std::sync::atomic::{AtomicU64, Ordering};
 
+        use inex_core::atomic::{
+            ExistingVaultMutationLock, HeldPublicationMarkerV2, HeldPublicationMarkerV2CreateInput,
+            PublicationIdentityScheme, SecureSourceDirectory, filesystem_directory_identity,
+        };
         use inex_core::crypto::VaultContentProfile;
         use inex_core::sodium::Argon2idParams;
         use inex_core::vault::Vault;
         use inex_core::vault_config::KdfPolicy;
 
-        use super::super::super::candidate_manifest::collect_marker_free_physical_manifest;
-        use super::super::super::candidate_seal::CandidateSealError;
+        use super::super::super::candidate_manifest::{
+            collect_held_marker_physical_manifest, collect_marker_free_physical_manifest,
+        };
+        use super::super::super::candidate_seal::{CandidateSealError, GitControlRole};
         use super::super::super::{GitRunner, discover_git_executable};
         use super::super::{
-            TARGET_CONFIG_PATH, VAULT_JSON_PATH, collect_authenticated_vault_config_authority,
+            MarkerFreePhysicalManifest, TARGET_CONFIG_PATH, VAULT_JSON_PATH,
+            collect_authenticated_vault_config_authority, collect_fresh_target_config_evidence,
         };
 
         static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -431,6 +516,199 @@ mod linux {
                 vault,
                 runner,
             }
+        }
+
+        fn physical_and_root(
+            fixture: &Fixture,
+        ) -> (MarkerFreePhysicalManifest, SecureSourceDirectory) {
+            let physical = collect_marker_free_physical_manifest(fixture.root.path())
+                .expect("physical manifest collects");
+            let held_root = inex_core::atomic::open_secure_source_root(fixture.root.path())
+                .expect("held root opens");
+            (physical, held_root)
+        }
+
+        fn create_held_marker(fixture: &Fixture) -> HeldPublicationMarkerV2 {
+            let physical = collect_marker_free_physical_manifest(fixture.root.path())
+                .expect("marker-free fixture collects");
+            let held_root = inex_core::atomic::open_secure_source_root(fixture.root.path())
+                .expect("fixture root holds");
+            let mutation_lock = ExistingVaultMutationLock::acquire(
+                fixture.root.path(),
+                physical.root_identity(),
+                physical.local_identity(),
+                physical.lock_identity(),
+            )
+            .expect("existing mutation lock holds");
+            let common_parent_identity = filesystem_directory_identity(
+                fixture
+                    .root
+                    .path()
+                    .parent()
+                    .expect("fixture root has a parent"),
+            )
+            .expect("common-parent identity captures");
+            let staging_child_name = fixture
+                .root
+                .path()
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .expect("fixture root has a portable child name");
+            mutation_lock
+                .create_held_publication_marker_v2(
+                    fixture.root.path(),
+                    held_root,
+                    HeldPublicationMarkerV2CreateInput {
+                        scheme: PublicationIdentityScheme::LinuxDevInodeV1,
+                        publication_id: [0x6d; 16],
+                        common_parent_identity: &common_parent_identity,
+                        staging_child_name,
+                        destination_child_name: "fresh-marker-aware-destination",
+                        domain: "inex.repository-import.v1",
+                        candidate_seal: &[0xa7; 32],
+                    },
+                )
+                .expect("held v2 publication marker creates")
+        }
+
+        #[test]
+        fn fresh_target_config_is_branded_role_checked_and_redacted() {
+            let first = fixture("fresh-first", VaultContentProfile::DocumentsOnly);
+            let (first_physical, first_root) = physical_and_root(&first);
+            let evidence =
+                collect_fresh_target_config_evidence(&first_physical, &first_root, &first.runner)
+                    .expect("fresh target config evidence collects");
+            assert!(evidence.is_bound_to(&first_physical));
+            assert_eq!(evidence.role(&first_physical), Ok(GitControlRole::Config));
+
+            let debug = format!("{evidence:?}");
+            assert!(debug.contains("FreshTargetConfigEvidence"));
+            assert!(debug.contains("[REDACTED]"));
+            assert!(!debug.contains(TARGET_CONFIG_PATH));
+            assert!(!debug.contains("merge.inex"));
+
+            let second = fixture("fresh-second", VaultContentProfile::DocumentsOnly);
+            let (second_physical, _second_root) = physical_and_root(&second);
+            assert!(!evidence.is_bound_to(&second_physical));
+            assert_eq!(
+                evidence.role(&second_physical),
+                Err(CandidateSealError::InvalidContext)
+            );
+        }
+
+        #[test]
+        fn fresh_target_config_composes_with_held_marker_manifest() {
+            let fixture = fixture("fresh-held-marker", VaultContentProfile::DocumentsOnly);
+            let held_marker = create_held_marker(&fixture);
+            let marker_present =
+                collect_held_marker_physical_manifest(fixture.root.path(), &held_marker)
+                    .expect("held-marker physical projection collects");
+
+            let evidence = collect_fresh_target_config_evidence(
+                marker_present.physical(),
+                marker_present.held_root(),
+                &fixture.runner,
+            )
+            .expect("target-only config accepts exact held-marker projection");
+            assert!(evidence.is_bound_to(marker_present.physical()));
+            assert_eq!(
+                evidence.role(marker_present.physical()),
+                Ok(GitControlRole::Config)
+            );
+            marker_present
+                .require_current_exact(fixture.root.path())
+                .expect("outer held-marker authority owns final whole-tree exactness");
+        }
+
+        #[test]
+        fn fresh_target_config_rejects_invalid_config_and_cross_root_inputs() {
+            let invalid = fixture("fresh-invalid", VaultContentProfile::DocumentsOnly);
+            let config = invalid.root.path().join(TARGET_CONFIG_PATH);
+            let mut bytes = fs::read(&config).expect("config reads");
+            bytes.extend_from_slice(b"\n[include]\n\tpath = /tmp/hostile\n");
+            fs::write(&config, bytes).expect("unsafe config writes");
+            let (invalid_physical, invalid_root) = physical_and_root(&invalid);
+            assert!(matches!(
+                collect_fresh_target_config_evidence(
+                    &invalid_physical,
+                    &invalid_root,
+                    &invalid.runner
+                ),
+                Err(CandidateSealError::InvalidRecord)
+            ));
+
+            let first = fixture("fresh-root-a", VaultContentProfile::DocumentsOnly);
+            let second = fixture("fresh-root-b", VaultContentProfile::DocumentsOnly);
+            let (first_physical, first_root) = physical_and_root(&first);
+            let (_second_physical, second_root) = physical_and_root(&second);
+            assert_eq!(
+                collect_fresh_target_config_evidence(&first_physical, &first_root, &second.runner)
+                    .err(),
+                Some(CandidateSealError::InvalidContext)
+            );
+            assert_eq!(
+                collect_fresh_target_config_evidence(&first_physical, &second_root, &first.runner)
+                    .err(),
+                Some(CandidateSealError::InvalidContext)
+            );
+        }
+
+        #[test]
+        fn production_api_keeps_target_config_vault_free_and_single_sourced() {
+            let source = include_str!("candidate_vault_authority.rs");
+            let production = source
+                .split_once("\n    #[cfg(test)]")
+                .map_or(source, |(production, _)| production);
+            let fresh = production
+                .split_once(
+                    "pub(in crate::repository_import) fn collect_fresh_target_config_evidence",
+                )
+                .and_then(|(_, tail)| {
+                    tail.split_once(
+                        "\n    /// Capture initial-only authenticated metadata/config authority.",
+                    )
+                })
+                .map_or_else(
+                    || panic!("fresh target config source boundary changed"),
+                    |(fresh, _)| fresh,
+                );
+            assert!(!fresh.contains("Vault"));
+            assert!(!fresh.contains("password"));
+            assert_eq!(fresh.matches("run_isolated_stdin_config").count(), 1);
+            assert_eq!(fresh.matches("validate_target_config_output").count(), 1);
+            assert_eq!(fresh.matches("installed_driver_command").count(), 1);
+            assert!(!fresh.contains("require_current_exact"));
+
+            let initial = production
+                .split_once(
+                    "pub(in crate::repository_import) fn collect_authenticated_vault_config_authority",
+                )
+                .and_then(|(_, tail)| tail.split_once("\n    fn map_repository_error"))
+                .map_or_else(
+                    || panic!("initial authority source boundary changed"),
+                    |(initial, _)| initial,
+                );
+            assert_eq!(
+                initial
+                    .matches("collect_fresh_target_config_evidence")
+                    .count(),
+                1
+            );
+            assert!(!initial.contains("run_isolated_stdin_config"));
+            assert!(!initial.contains("validate_target_config_output"));
+            assert_eq!(initial.matches("require_current_exact").count(), 1);
+
+            let declaration = production
+                .split_once("pub(super) struct FreshTargetConfigEvidence")
+                .and_then(|(_, tail)| {
+                    tail.split_once("impl fmt::Debug for FreshTargetConfigEvidence")
+                })
+                .map_or_else(
+                    || panic!("fresh evidence declaration boundary changed"),
+                    |(declaration, _)| declaration,
+                );
+            assert!(!declaration.contains("derive"));
+            assert!(!production.contains("impl Clone for FreshTargetConfigEvidence"));
         }
 
         #[test]
@@ -553,7 +831,18 @@ mod linux {
     unused_imports,
     reason = "the unified initial-publication assembler consumes this frozen authority next"
 )]
-pub(super) use linux::collect_authenticated_vault_config_authority;
+pub(super) use linux::{
+    collect_authenticated_vault_config_authority, collect_fresh_target_config_evidence,
+};
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn collect_fresh_target_config_evidence(
+    _physical: &MarkerFreePhysicalManifest,
+    _unsupported_held_root: (),
+    _unsupported_runner: (),
+) -> Result<FreshTargetConfigEvidence<'_>, CandidateSealError> {
+    Err(CandidateSealError::InvalidContext)
+}
 
 #[cfg(not(target_os = "linux"))]
 pub(super) fn collect_authenticated_vault_config_authority<'physical>(
