@@ -429,6 +429,95 @@ impl ExistingVaultMutationLockError {
     }
 }
 
+/// Failure to open one existing destination's canonical publication claim.
+///
+/// This error is deliberately scrubbed: no variant contains a path, marker
+/// body, publication identifier, candidate seal, or filesystem identity.
+#[derive(Error)]
+pub enum ExistingPublicationMarkerV2OpenError {
+    /// The destination root is not one exact, link-free local directory.
+    #[error("existing publication root is unsafe")]
+    UnsafeRoot,
+    /// The exact existing `.vault-local` directory is structurally unsafe.
+    #[error("existing publication private directory is unsafe")]
+    UnsafePrivateDirectory,
+    /// The exact existing zero-byte, single-link lock is structurally unsafe.
+    #[error("existing publication mutation lock is unsafe")]
+    UnsafeLock,
+    /// Another process or handle already holds the cooperative mutation lock.
+    #[error("existing publication mutation lock is busy")]
+    Busy,
+    /// The reserved publication-marker namespace is not the sole canonical v2
+    /// claim required by this opener.
+    #[error("existing publication marker namespace conflicts")]
+    NamespaceConflict,
+    /// A held root, private directory, lock, marker, or recorded role drifted.
+    #[error("existing publication authority changed")]
+    AuthorityChanged,
+    /// The target platform cannot provide the complete held Linux primitive.
+    #[error("existing publication marker opening is unsupported")]
+    Unsupported,
+    /// A scrubbed read-only filesystem or identity query failed. Only the
+    /// stable standard-library error class is retained.
+    #[error("existing publication marker opening failed")]
+    Io(io::ErrorKind),
+}
+
+impl fmt::Debug for ExistingPublicationMarkerV2OpenError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::UnsafeRoot => "ExistingPublicationMarkerV2OpenError::UnsafeRoot",
+            Self::UnsafePrivateDirectory => {
+                "ExistingPublicationMarkerV2OpenError::UnsafePrivateDirectory"
+            }
+            Self::UnsafeLock => "ExistingPublicationMarkerV2OpenError::UnsafeLock",
+            Self::Busy => "ExistingPublicationMarkerV2OpenError::Busy",
+            Self::NamespaceConflict => "ExistingPublicationMarkerV2OpenError::NamespaceConflict",
+            Self::AuthorityChanged => "ExistingPublicationMarkerV2OpenError::AuthorityChanged",
+            Self::Unsupported => "ExistingPublicationMarkerV2OpenError::Unsupported",
+            Self::Io(_) => "ExistingPublicationMarkerV2OpenError::Io(..)",
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl ExistingPublicationMarkerV2OpenError {
+    fn io(source: io::Error) -> Self {
+        let kind = source.kind();
+        // Consume and discard the potentially path-bearing source before the
+        // public error value is constructed.
+        drop(source);
+        if kind == io::ErrorKind::Unsupported {
+            Self::Unsupported
+        } else {
+            Self::Io(kind)
+        }
+    }
+
+    fn from_lock(error: ExistingVaultMutationLockError) -> Self {
+        match error {
+            ExistingVaultMutationLockError::UnsafeRoot => Self::UnsafeRoot,
+            ExistingVaultMutationLockError::UnsafeLocalDirectory => Self::UnsafePrivateDirectory,
+            ExistingVaultMutationLockError::UnsafeLock => Self::UnsafeLock,
+            ExistingVaultMutationLockError::Busy => Self::Busy,
+            ExistingVaultMutationLockError::Unsupported => Self::Unsupported,
+            ExistingVaultMutationLockError::RootIdentityMismatch
+            | ExistingVaultMutationLockError::LocalIdentityMismatch
+            | ExistingVaultMutationLockError::LockIdentityMismatch => Self::AuthorityChanged,
+            ExistingVaultMutationLockError::Io(source) => Self::io(source),
+        }
+    }
+
+    fn from_marker(error: HeldPublicationMarkerV2Error) -> Self {
+        match error {
+            HeldPublicationMarkerV2Error::InvalidInput
+            | HeldPublicationMarkerV2Error::AuthorityChanged => Self::AuthorityChanged,
+            HeldPublicationMarkerV2Error::NamespaceConflict => Self::NamespaceConflict,
+            HeldPublicationMarkerV2Error::Io(source) => Self::io(source),
+        }
+    }
+}
+
 /// Read-only classification of the reserved repository-publication namespace.
 ///
 /// This classification is only a routing decision. `V2Exact` proves one
@@ -566,10 +655,13 @@ struct PublicationMarkerV2Authority {
 /// fn requires_clone<T: Clone>() {}
 /// requires_clone::<HeldPublicationMarkerV2>();
 /// ```
-#[cfg(target_os = "linux")]
 pub struct HeldPublicationMarkerV2 {
+    #[cfg(target_os = "linux")]
     marker_file: SecureSourceFile,
+    #[cfg(target_os = "linux")]
     authority: PublicationMarkerV2Authority,
+    #[cfg(not(target_os = "linux"))]
+    unsupported: std::convert::Infallible,
 }
 
 #[cfg(target_os = "linux")]
@@ -596,6 +688,13 @@ fn linux_regular_file_handle_is_unlinked(file: &File) -> bool {
 impl fmt::Debug for HeldPublicationMarkerV2 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("HeldPublicationMarkerV2 { .. }")
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl fmt::Debug for HeldPublicationMarkerV2 {
+    fn fmt(&self, _formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.unsupported {}
     }
 }
 
@@ -1015,6 +1114,172 @@ fn require_no_repository_publication_claim(vault_root: &Path) -> Result<(), Atom
         )
         | Err(_) => Err(AtomicWriteError::RepositoryPublicationManualAuditRequired),
     }
+}
+
+/// Open one already-published canonical v2 claim and retain its exact
+/// existing mutation lock.
+///
+/// Linux opens the root, `.vault-local`, `mutation.lock`, and marker through
+/// one descriptor-bound chain. The lock file must already exist as an exact
+/// zero-byte, single-link regular file; acquisition is nonblocking. This
+/// function never creates or chmods a path, never runs ciphertext cleanup,
+/// never replays recovery, and never removes or rewrites a marker. The
+/// returned authority is valid only when `current_root` occupies the marker's
+/// recorded destination and the recorded staging sibling is absent.
+///
+/// Other targets fail closed with
+/// [`ExistingPublicationMarkerV2OpenError::Unsupported`].
+///
+/// # Errors
+///
+/// Returns a scrubbed structural, busy, namespace, authority, unsupported,
+/// or I/O error. Every failure drops any transient handles without modifying
+/// the existing namespace.
+pub fn open_existing_publication_marker_v2(
+    current_root: &Path,
+) -> Result<HeldPublicationMarkerV2, ExistingPublicationMarkerV2OpenError> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = current_root;
+        Err(ExistingPublicationMarkerV2OpenError::Unsupported)
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        open_existing_publication_marker_v2_linux(current_root)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn open_existing_publication_marker_v2_linux(
+    current_root: &Path,
+) -> Result<HeldPublicationMarkerV2, ExistingPublicationMarkerV2OpenError> {
+    if !current_root.is_absolute() || !path_is_lexically_normal(current_root) {
+        return Err(ExistingPublicationMarkerV2OpenError::UnsafeRoot);
+    }
+
+    let held_root =
+        open_secure_source_root(current_root).map_err(ExistingPublicationMarkerV2OpenError::io)?;
+    held_root
+        .verify_no_alternate_data_streams()
+        .map_err(ExistingPublicationMarkerV2OpenError::io)?;
+
+    let marker_parent = match held_root
+        .open_child(std::ffi::OsStr::new(VAULT_LOCAL_DIRECTORY))
+        .map_err(ExistingPublicationMarkerV2OpenError::io)?
+    {
+        SecureSourceChild::Directory(directory) => directory,
+        SecureSourceChild::File(_) | SecureSourceChild::Other => {
+            return Err(ExistingPublicationMarkerV2OpenError::UnsafePrivateDirectory);
+        }
+    };
+    marker_parent
+        .verify_no_alternate_data_streams()
+        .map_err(ExistingPublicationMarkerV2OpenError::io)?;
+
+    let mutation_lock =
+        acquire_held_existing_publication_lock(current_root, &held_root, &marker_parent)?;
+    drop(marker_parent);
+    let held = mutation_lock
+        .open_held_publication_marker_v2(current_root, held_root)
+        .map_err(ExistingPublicationMarkerV2OpenError::from_marker)?;
+    held.require_published_at(current_root)
+        .map_err(ExistingPublicationMarkerV2OpenError::from_marker)?;
+    Ok(held)
+}
+
+#[cfg(target_os = "linux")]
+fn acquire_held_existing_publication_lock(
+    current_root: &Path,
+    held_root: &SecureSourceDirectory,
+    marker_parent: &SecureSourceDirectory,
+) -> Result<ExistingVaultMutationLock, ExistingPublicationMarkerV2OpenError> {
+    let root_identity = held_root.identity().clone();
+    let local_identity = marker_parent.identity().clone();
+
+    let held_lock = match marker_parent
+        .open_child(std::ffi::OsStr::new(VAULT_MUTATION_LOCK_FILE))
+        .map_err(|source| {
+            if source.kind() == io::ErrorKind::NotFound {
+                ExistingPublicationMarkerV2OpenError::io(source)
+            } else {
+                ExistingPublicationMarkerV2OpenError::UnsafeLock
+            }
+        })? {
+        SecureSourceChild::File(file) => file,
+        SecureSourceChild::Directory(_) | SecureSourceChild::Other => {
+            return Err(ExistingPublicationMarkerV2OpenError::UnsafeLock);
+        }
+    };
+    if held_lock
+        .observed_len()
+        .map_err(ExistingPublicationMarkerV2OpenError::io)?
+        != 0
+    {
+        return Err(ExistingPublicationMarkerV2OpenError::UnsafeLock);
+    }
+    held_lock
+        .verify_no_alternate_data_streams()
+        .map_err(|_| ExistingPublicationMarkerV2OpenError::UnsafeLock)?;
+    let lock_identity = held_lock
+        .identity()
+        .map_err(|_| ExistingPublicationMarkerV2OpenError::UnsafeLock)?;
+    if lock_identity.projections.comparison_volume()
+        != local_identity.projections.comparison_volume()
+    {
+        return Err(ExistingPublicationMarkerV2OpenError::UnsafeLock);
+    }
+
+    validate_existing_vault_lock_state(
+        current_root,
+        &root_identity,
+        &local_identity,
+        &lock_identity,
+        &held_lock.file,
+    )
+    .map_err(ExistingPublicationMarkerV2OpenError::from_lock)?;
+    held_root
+        .verify_no_alternate_data_streams()
+        .map_err(ExistingPublicationMarkerV2OpenError::io)?;
+    marker_parent
+        .verify_no_alternate_data_streams()
+        .map_err(ExistingPublicationMarkerV2OpenError::io)?;
+    held_lock
+        .verify_no_alternate_data_streams()
+        .map_err(|_| ExistingPublicationMarkerV2OpenError::UnsafeLock)?;
+
+    if !platform::try_lock_exclusive(&held_lock.file)
+        .map_err(ExistingPublicationMarkerV2OpenError::io)?
+    {
+        return Err(ExistingPublicationMarkerV2OpenError::Busy);
+    }
+
+    held_root
+        .verify_no_alternate_data_streams()
+        .map_err(ExistingPublicationMarkerV2OpenError::io)?;
+    marker_parent
+        .verify_no_alternate_data_streams()
+        .map_err(ExistingPublicationMarkerV2OpenError::io)?;
+    held_lock
+        .verify_no_alternate_data_streams()
+        .map_err(|_| ExistingPublicationMarkerV2OpenError::UnsafeLock)?;
+    validate_existing_vault_lock_state(
+        current_root,
+        &root_identity,
+        &local_identity,
+        &lock_identity,
+        &held_lock.file,
+    )
+    .map_err(ExistingPublicationMarkerV2OpenError::from_lock)?;
+
+    let SecureSourceFile { file, .. } = held_lock;
+    let mutation_lock = ExistingVaultMutationLock {
+        root_identity,
+        local_identity,
+        lock_identity,
+        file,
+    };
+    Ok(mutation_lock)
 }
 
 impl ExistingVaultMutationLock {
@@ -8887,6 +9152,282 @@ mod tests {
             .map_err(io::Error::other)?;
         assert_eq!(reopened.marker().to_bytes(), expected_wire);
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn existing_publication_marker_opener_is_fused_and_retains_the_exact_lock() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        let (initial, published, identities) = published_held_marker(&fixture)?;
+        let expected_marker = initial.marker().to_bytes();
+        drop(initial);
+
+        let reopened = super::open_existing_publication_marker_v2(published.destination())
+            .map_err(io::Error::other)?;
+        reopened
+            .require_published_at(published.destination())
+            .map_err(io::Error::other)?;
+        assert_eq!(reopened.marker().to_bytes(), expected_marker);
+        assert!(reopened.matches_physical_baseline(
+            &identities.root,
+            &identities.local,
+            &identities.lock,
+        ));
+        assert_publication_lock_busy(published.destination(), &identities);
+
+        drop(reopened);
+        let reacquired = ExistingVaultMutationLock::acquire(
+            published.destination(),
+            &identities.root,
+            &identities.local,
+            &identities.lock,
+        )
+        .map_err(io::Error::other)?;
+        drop(reacquired);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn existing_publication_marker_opener_requires_destination_role_and_absent_staging()
+    -> io::Result<()> {
+        let staging = TestVault::new()?;
+        let destination_name = format!("published-{}", uuid::Uuid::new_v4().simple());
+        let held = try_create_test_held_marker(staging.root(), &destination_name)?
+            .map_err(io::Error::other)?;
+        let marker_path = staging.local().join(IMPORT_PUBLISH_MARKER_V2);
+        let marker_before = fs::read(&marker_path)?;
+        drop(held);
+        assert!(matches!(
+            super::open_existing_publication_marker_v2(staging.root()),
+            Err(super::ExistingPublicationMarkerV2OpenError::AuthorityChanged)
+        ));
+        assert_eq!(fs::read(&marker_path)?, marker_before);
+
+        let reappeared = TestVault::new()?;
+        let (held, published, _) = published_held_marker(&reappeared)?;
+        drop(held);
+        let marker_path = published
+            .destination()
+            .join(VAULT_LOCAL_DIRECTORY)
+            .join(IMPORT_PUBLISH_MARKER_V2);
+        let marker_before = fs::read(&marker_path)?;
+        fs::create_dir(reappeared.root())?;
+        assert!(matches!(
+            super::open_existing_publication_marker_v2(published.destination()),
+            Err(super::ExistingPublicationMarkerV2OpenError::NamespaceConflict)
+        ));
+        assert_eq!(fs::read(&marker_path)?, marker_before);
+        assert!(reappeared.root().is_dir());
+        fs::remove_dir(reappeared.root())?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn existing_publication_marker_opener_missing_entries_have_zero_side_effects() -> io::Result<()>
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let missing_root =
+            std::env::temp_dir().join(format!("inex-missing-publication-{}", uuid::Uuid::new_v4()));
+        assert!(!missing_root.exists());
+        assert!(super::open_existing_publication_marker_v2(&missing_root).is_err());
+        assert!(!missing_root.exists());
+
+        let missing_local = TestVault::new()?;
+        let root_entries_before = fs::read_dir(missing_local.root())?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<io::Result<HashSet<_>>>()?;
+        assert!(super::open_existing_publication_marker_v2(missing_local.root()).is_err());
+        let root_entries_after = fs::read_dir(missing_local.root())?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<io::Result<HashSet<_>>>()?;
+        assert_eq!(root_entries_after, root_entries_before);
+        assert!(!missing_local.local().exists());
+
+        let missing_lock = TestVault::new()?;
+        fs::create_dir(missing_lock.local())?;
+        let marker_canary = missing_lock.local().join(IMPORT_PUBLISH_MARKER_V2);
+        fs::write(&marker_canary, b"marker-canary-must-remain")?;
+        assert!(super::open_existing_publication_marker_v2(missing_lock.root()).is_err());
+        assert_eq!(fs::read(&marker_canary)?, b"marker-canary-must-remain");
+        assert!(!missing_lock.local().join(VAULT_MUTATION_LOCK_FILE).exists());
+
+        let missing_marker = TestVault::new()?;
+        let identities = initialize_existing_lock(missing_marker.root())?;
+        let lock_path = missing_marker.local().join(VAULT_MUTATION_LOCK_FILE);
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o646))?;
+        let recovery_canary = missing_marker.local().join(PENDING_REBIND_FILE);
+        let staging_canary = missing_marker
+            .local()
+            .join(".inex-ciphertext-stage-opener-canary.tmp");
+        fs::write(&recovery_canary, b"recovery-canary")?;
+        fs::write(&staging_canary, b"staging-canary")?;
+        assert!(super::open_existing_publication_marker_v2(missing_marker.root()).is_err());
+        assert!(
+            !missing_marker
+                .local()
+                .join(IMPORT_PUBLISH_MARKER_V2)
+                .exists()
+        );
+        assert_eq!(fs::metadata(&lock_path)?.len(), 0);
+        assert_eq!(
+            fs::metadata(&lock_path)?.permissions().mode() & 0o777,
+            0o646
+        );
+        assert_eq!(fs::read(&recovery_canary)?, b"recovery-canary");
+        assert_eq!(fs::read(&staging_canary)?, b"staging-canary");
+        let reacquired = ExistingVaultMutationLock::acquire(
+            missing_marker.root(),
+            &identities.root,
+            &identities.local,
+            &identities.lock,
+        )
+        .map_err(io::Error::other)?;
+        drop(reacquired);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn existing_publication_marker_opener_rejects_busy_and_unsafe_locks_without_mutation()
+    -> io::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let busy = TestVault::new()?;
+        let (initial, published, _) = published_held_marker(&busy)?;
+        let marker_path = published
+            .destination()
+            .join(VAULT_LOCAL_DIRECTORY)
+            .join(IMPORT_PUBLISH_MARKER_V2);
+        let marker_before = fs::read(&marker_path)?;
+        assert!(matches!(
+            super::open_existing_publication_marker_v2(published.destination()),
+            Err(super::ExistingPublicationMarkerV2OpenError::Busy)
+        ));
+        assert_eq!(fs::read(&marker_path)?, marker_before);
+        drop(initial);
+        drop(
+            super::open_existing_publication_marker_v2(published.destination())
+                .map_err(io::Error::other)?,
+        );
+
+        let symlinked = TestVault::new()?;
+        fs::create_dir(symlinked.local())?;
+        let symlink_target = symlinked.local().join("lock-target-canary");
+        fs::write(&symlink_target, b"symlink-target-canary")?;
+        let symlink_lock = symlinked.local().join(VAULT_MUTATION_LOCK_FILE);
+        symlink(&symlink_target, &symlink_lock)?;
+        assert!(matches!(
+            super::open_existing_publication_marker_v2(symlinked.root()),
+            Err(super::ExistingPublicationMarkerV2OpenError::UnsafeLock)
+        ));
+        assert_eq!(fs::read(&symlink_target)?, b"symlink-target-canary");
+        assert_eq!(fs::read_link(&symlink_lock)?, symlink_target);
+
+        let hardlinked = TestVault::new()?;
+        fs::create_dir(hardlinked.local())?;
+        let hardlink_source = hardlinked.local().join("lock-hardlink-canary");
+        let hardlink_lock = hardlinked.local().join(VAULT_MUTATION_LOCK_FILE);
+        fs::write(&hardlink_source, [])?;
+        fs::hard_link(&hardlink_source, &hardlink_lock)?;
+        assert!(matches!(
+            super::open_existing_publication_marker_v2(hardlinked.root()),
+            Err(super::ExistingPublicationMarkerV2OpenError::UnsafeLock)
+        ));
+        assert_eq!(fs::metadata(&hardlink_source)?.len(), 0);
+        assert_eq!(fs::metadata(&hardlink_lock)?.len(), 0);
+
+        let nonzero = TestVault::new()?;
+        fs::create_dir(nonzero.local())?;
+        let nonzero_lock = nonzero.local().join(VAULT_MUTATION_LOCK_FILE);
+        fs::write(&nonzero_lock, b"nonzero-lock-canary")?;
+        assert!(matches!(
+            super::open_existing_publication_marker_v2(nonzero.root()),
+            Err(super::ExistingPublicationMarkerV2OpenError::UnsafeLock)
+        ));
+        assert_eq!(fs::read(&nonzero_lock)?, b"nonzero-lock-canary");
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn existing_publication_marker_opener_rejects_marker_drift_aliases_and_extras() -> io::Result<()>
+    {
+        let drifted = TestVault::new()?;
+        let (held, published, _) = published_held_marker(&drifted)?;
+        drop(held);
+        let marker_path = published
+            .destination()
+            .join(VAULT_LOCAL_DIRECTORY)
+            .join(IMPORT_PUBLISH_MARKER_V2);
+        fs::write(&marker_path, b"drifted-marker-canary")?;
+        assert!(super::open_existing_publication_marker_v2(published.destination()).is_err());
+        assert_eq!(fs::read(&marker_path)?, b"drifted-marker-canary");
+
+        let aliased = TestVault::new()?;
+        let (held, published, _) = published_held_marker(&aliased)?;
+        drop(held);
+        let exact_path = published
+            .destination()
+            .join(VAULT_LOCAL_DIRECTORY)
+            .join(IMPORT_PUBLISH_MARKER_V2);
+        let exact_before = fs::read(&exact_path)?;
+        let alias_path = published
+            .destination()
+            .join(VAULT_LOCAL_DIRECTORY)
+            .join("IMPORT-PUBLISH-MARKER-V2");
+        fs::write(&alias_path, b"alias-canary")?;
+        assert!(matches!(
+            super::open_existing_publication_marker_v2(published.destination()),
+            Err(super::ExistingPublicationMarkerV2OpenError::NamespaceConflict)
+        ));
+        assert_eq!(fs::read(&exact_path)?, exact_before);
+        assert_eq!(fs::read(&alias_path)?, b"alias-canary");
+
+        let extra = TestVault::new()?;
+        let (held, published, _) = published_held_marker(&extra)?;
+        drop(held);
+        let exact_path = published
+            .destination()
+            .join(VAULT_LOCAL_DIRECTORY)
+            .join(IMPORT_PUBLISH_MARKER_V2);
+        let exact_before = fs::read(&exact_path)?;
+        let extra_path = published
+            .destination()
+            .join(VAULT_LOCAL_DIRECTORY)
+            .join("import-publish-marker-foreign");
+        fs::write(&extra_path, b"extra-canary")?;
+        assert!(matches!(
+            super::open_existing_publication_marker_v2(published.destination()),
+            Err(super::ExistingPublicationMarkerV2OpenError::NamespaceConflict)
+        ));
+        assert_eq!(fs::read(&exact_path)?, exact_before);
+        assert_eq!(fs::read(&extra_path)?, b"extra-canary");
+
+        let redacted = super::ExistingPublicationMarkerV2OpenError::Io(io::ErrorKind::Other);
+        assert_eq!(
+            format!("{redacted:?}"),
+            "ExistingPublicationMarkerV2OpenError::Io(..)"
+        );
+        assert!(std::error::Error::source(&redacted).is_none());
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn existing_publication_marker_opener_is_uniform_and_fails_closed_off_linux() {
+        let opener: fn(
+            &Path,
+        ) -> Result<
+            super::HeldPublicationMarkerV2,
+            super::ExistingPublicationMarkerV2OpenError,
+        > = super::open_existing_publication_marker_v2;
+        assert!(matches!(
+            opener(Path::new("unsupported-existing-publication")),
+            Err(super::ExistingPublicationMarkerV2OpenError::Unsupported)
+        ));
     }
 
     #[cfg(target_os = "linux")]
