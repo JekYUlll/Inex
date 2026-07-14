@@ -34,7 +34,9 @@ use crate::tree::{self, TreeEntryKind, TreeError, VaultTree, VaultTreeProfile};
 use crate::umbra_config::{
     EncryptedUmbraConfigV1, UMBRA_CONFIG_PATH, UmbraConfigError, UmbraConfigV1,
 };
-use crate::umbra_document::{UmbraDocumentError, UmbraDocumentV1};
+use crate::umbra_document::{
+    OuterSlotStrategy, PrivateSlotPayloadV1, UmbraDocumentError, UmbraDocumentV1,
+};
 use crate::umbra_keyslot::{
     UMBRA_DEFAULT_KEYSLOT_PATH, UmbraKey, UmbraKeyslotError, UmbraKeyslotV1,
 };
@@ -923,6 +925,128 @@ impl Vault {
         drop(guard);
         self.invalidate_search_index();
         Ok(document_metadata(encrypted, outcome))
+    }
+
+    /// Decrypt one private slot from a feature-2 document in the current
+    /// Umbra session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError::UmbraLocked`] without `K_umbra`, or an error for
+    /// a non-Umbra document, missing slot, or any authenticated slot failure.
+    pub fn read_umbra_private_slot(
+        &self,
+        logical_path: &LogicalPath,
+        slot_id: &str,
+    ) -> Result<PrivateSlotPayloadV1, VaultError> {
+        let (_, document) = self.read_umbra_outer_document(logical_path)?;
+        let session = self.umbra.as_ref().ok_or(VaultError::UmbraLocked)?;
+        Ok(document.decrypt_private_slot(
+            self.config.vault_id,
+            logical_path.as_str(),
+            session.slot.key_id(),
+            &session.key,
+            slot_id,
+        )?)
+    }
+
+    /// Insert one fresh encrypted private slot and atomically persist the
+    /// changed feature-2 Outer projection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError::UmbraLocked`] without `K_umbra`, or an error for
+    /// a stale etag, invalid slot/payload, or failed atomic persistence.
+    #[allow(clippy::too_many_arguments)] // annotation inputs are intentionally explicit at the security boundary
+    pub fn insert_umbra_private_slot(
+        &mut self,
+        logical_path: &LogicalPath,
+        expected_etag: &str,
+        slot_id: String,
+        outer: OuterSlotStrategy,
+        payload: &PrivateSlotPayloadV1,
+        modified_at_ms: i64,
+    ) -> Result<DocumentMetadata, VaultError> {
+        let (read, mut document) = self.read_umbra_outer_document(logical_path)?;
+        require_matching_etag(&read, expected_etag)?;
+        let session = self.umbra.as_ref().ok_or(VaultError::UmbraLocked)?;
+        document.insert_private_slot(
+            self.config.vault_id,
+            logical_path.as_str(),
+            session.slot.key_id(),
+            &session.key,
+            slot_id,
+            outer,
+            payload,
+        )?;
+        self.save_umbra_outer_document(logical_path, &document, expected_etag, modified_at_ms)
+    }
+
+    /// Replace one private slot's encrypted payload/metadata while retaining
+    /// its stable slot ID, then atomically persist the containing document.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError::UmbraLocked`] without `K_umbra`, or an error for
+    /// a stale etag, missing slot, invalid payload, or failed persistence.
+    #[allow(clippy::too_many_arguments)] // annotation inputs are intentionally explicit at the security boundary
+    pub fn replace_umbra_private_slot(
+        &mut self,
+        logical_path: &LogicalPath,
+        expected_etag: &str,
+        slot_id: &str,
+        outer: OuterSlotStrategy,
+        payload: &PrivateSlotPayloadV1,
+        modified_at_ms: i64,
+    ) -> Result<DocumentMetadata, VaultError> {
+        let (read, mut document) = self.read_umbra_outer_document(logical_path)?;
+        require_matching_etag(&read, expected_etag)?;
+        let session = self.umbra.as_ref().ok_or(VaultError::UmbraLocked)?;
+        document.replace_private_slot(
+            self.config.vault_id,
+            logical_path.as_str(),
+            session.slot.key_id(),
+            &session.key,
+            slot_id,
+            outer,
+            payload,
+        )?;
+        self.save_umbra_outer_document(logical_path, &document, expected_etag, modified_at_ms)
+    }
+
+    /// Decrypt and remove one complete private slot as one Vault mutation.
+    ///
+    /// The caller may use the returned private payload to restore plaintext
+    /// into an Umbra projection only after the outer-container commit has
+    /// succeeded. This method never moves that payload into an Outer index.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError::UmbraLocked`] without `K_umbra`, or an error for
+    /// a stale etag, missing/tampered slot, or failed persistence.
+    pub fn remove_umbra_private_slot(
+        &mut self,
+        logical_path: &LogicalPath,
+        expected_etag: &str,
+        slot_id: &str,
+        modified_at_ms: i64,
+    ) -> Result<(DocumentMetadata, PrivateSlotPayloadV1), VaultError> {
+        let (read, mut document) = self.read_umbra_outer_document(logical_path)?;
+        require_matching_etag(&read, expected_etag)?;
+        let payload = {
+            let session = self.umbra.as_ref().ok_or(VaultError::UmbraLocked)?;
+            document.decrypt_private_slot(
+                self.config.vault_id,
+                logical_path.as_str(),
+                session.slot.key_id(),
+                &session.key,
+                slot_id,
+            )?
+        };
+        document.remove_private_slot(slot_id)?;
+        let metadata =
+            self.save_umbra_outer_document(logical_path, &document, expected_etag, modified_at_ms)?;
+        Ok((metadata, payload))
     }
 
     /// Read and fully authenticate one committed opaque asset.
@@ -2379,6 +2503,19 @@ fn hex_nibble(byte: u8) -> Result<u8, VaultError> {
     }
 }
 
+fn require_matching_etag(
+    document: &DecryptedDocument,
+    expected_etag: &str,
+) -> Result<(), VaultError> {
+    let expected = decode_etag(expected_etag)?;
+    if decode_etag(&document.etag)? != expected {
+        return Err(VaultError::Conflict {
+            current_etag: Some(document.etag.clone()),
+        });
+    }
+    Ok(())
+}
+
 fn encode_etag(digest: [u8; 32]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(format::ETAG_PREFIX.len() + 64);
@@ -2721,6 +2858,107 @@ mod tests {
             .read_umbra_outer_document(&path)
             .expect("reopen feature two container");
         assert_eq!(reopened, updated);
+    }
+
+    #[test]
+    fn private_slot_mutations_require_umbra_and_keep_canaries_out_of_outer_state() {
+        let directory = TestDirectory::new();
+        let mut vault = create_test_vault(&directory);
+        let path = logical("2026-07-private.md");
+        vault
+            .initialize_umbra(b"private slot password")
+            .expect("initialize Umbra");
+        vault
+            .enable_umbra_private_annotations(test_policy())
+            .expect("enable feature two");
+        let created = vault
+            .create_umbra_outer_document(
+                &path,
+                &UmbraDocumentV1::new("# outer text\n".to_owned()),
+                1_783_699_201_000,
+            )
+            .expect("create outer document");
+        let payload = PrivateSlotPayloadV1 {
+            format: "inex-private-slot".to_owned(),
+            version: 1,
+            kind: crate::umbra_config::PrivateAnnotationKind::Comment,
+            tag_ids: vec!["relationship".to_owned(), "secret-tag".to_owned()],
+            markdown: "INEX_SECRET_SLOT_CANARY".to_owned(),
+            created_at_ms: 1_783_699_201_000,
+            updated_at_ms: 1_783_699_201_000,
+        };
+        let inserted = vault
+            .insert_umbra_private_slot(
+                &path,
+                &created.etag,
+                "p_01".to_owned(),
+                OuterSlotStrategy {
+                    mode: crate::umbra_config::OuterMode::Drop,
+                    cover_text: None,
+                },
+                &payload,
+                1_783_699_202_000,
+            )
+            .expect("insert slot");
+        let disk = fs::read(directory.path().join("2026-07-private.md.enc"))
+            .expect("read encrypted document");
+        assert!(!String::from_utf8_lossy(&disk).contains("INEX_SECRET_SLOT_CANARY"));
+        let (_, outer) = vault
+            .read_umbra_outer_document(&path)
+            .expect("read Outer projection");
+        assert!(!outer.outer_markdown.contains("INEX_SECRET_SLOT_CANARY"));
+        assert_eq!(
+            vault
+                .read_umbra_private_slot(&path, "p_01")
+                .expect("read private slot"),
+            payload
+        );
+
+        let replacement = PrivateSlotPayloadV1 {
+            updated_at_ms: 1_783_699_203_000,
+            markdown: "INEX_REPLACED_SLOT_CANARY".to_owned(),
+            ..payload.clone()
+        };
+        let replaced = vault
+            .replace_umbra_private_slot(
+                &path,
+                &inserted.etag,
+                "p_01",
+                OuterSlotStrategy {
+                    mode: crate::umbra_config::OuterMode::Placeholder,
+                    cover_text: None,
+                },
+                &replacement,
+                1_783_699_203_000,
+            )
+            .expect("replace slot");
+        assert_eq!(
+            vault
+                .read_umbra_private_slot(&path, "p_01")
+                .expect("read replaced slot"),
+            replacement
+        );
+        vault.lock_umbra();
+        assert!(matches!(
+            vault.read_umbra_private_slot(&path, "p_01"),
+            Err(VaultError::UmbraLocked)
+        ));
+        assert!(matches!(
+            vault.remove_umbra_private_slot(&path, &replaced.etag, "p_01", 1_783_699_204_000),
+            Err(VaultError::UmbraLocked)
+        ));
+        vault
+            .unlock_umbra(b"private slot password")
+            .expect("unlock Umbra");
+        let (removed, restored) = vault
+            .remove_umbra_private_slot(&path, &replaced.etag, "p_01", 1_783_699_204_000)
+            .expect("remove slot");
+        assert_eq!(restored, replacement);
+        assert_ne!(removed.etag, replaced.etag);
+        assert!(matches!(
+            vault.read_umbra_private_slot(&path, "p_01"),
+            Err(VaultError::UmbraDocument(UmbraDocumentError::SlotNotFound))
+        ));
     }
 
     #[test]

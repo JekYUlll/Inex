@@ -163,6 +163,62 @@ impl UmbraDocumentV1 {
         decrypt_slot(vault_id, logical_path, key_id, key, slot_id, entry)
     }
 
+    /// Replace one private slot while preserving its stable slot ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the slot is absent, the replacement payload is
+    /// invalid, or fresh private-slot encryption fails.
+    #[allow(clippy::too_many_arguments)] // explicit vault/path/key/slot binding inputs are security-relevant
+    pub fn replace_private_slot(
+        &mut self,
+        vault_id: Uuid,
+        logical_path: &str,
+        key_id: Uuid,
+        key: &UmbraKey,
+        slot_id: &str,
+        outer: OuterSlotStrategy,
+        payload: &PrivateSlotPayloadV1,
+    ) -> Result<(), UmbraDocumentError> {
+        if !valid_slot_id(slot_id) || !self.slots.contains_key(slot_id) {
+            return Err(UmbraDocumentError::SlotNotFound);
+        }
+        payload.validate()?;
+        let cipher = encrypt_slot(
+            vault_id,
+            logical_path,
+            key_id,
+            key,
+            slot_id,
+            &outer,
+            payload,
+        )?;
+        self.slots.insert(
+            slot_id.to_owned(),
+            OuterSlotEntry {
+                outer,
+                umbra_cipher: cipher,
+            },
+        );
+        Ok(())
+    }
+
+    /// Remove one complete private slot from this Outer container.
+    ///
+    /// Callers that unwrap content must decrypt it before removal, then commit
+    /// the changed Outer projection atomically through the Vault API.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UmbraDocumentError::SlotNotFound`] for an absent or invalid
+    /// stable slot ID.
+    pub fn remove_private_slot(&mut self, slot_id: &str) -> Result<(), UmbraDocumentError> {
+        if !valid_slot_id(slot_id) || self.slots.remove(slot_id).is_none() {
+            return Err(UmbraDocumentError::SlotNotFound);
+        }
+        Ok(())
+    }
+
     /// Serialize the Outer container. It intentionally has no private payload.
     ///
     /// # Errors
