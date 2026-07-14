@@ -52,6 +52,10 @@
     "command": "inex_enter_umbra_mode"
   },
   {
+    "caption": "Inex: Choose Private Annotation",
+    "command": "inex_choose_private_annotation"
+  },
+  {
     "caption": "Inex: Show Security Status",
     "command": "inex_show_security_status"
   }
