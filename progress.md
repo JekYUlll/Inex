@@ -1,5 +1,11 @@
 # Inex Progress Log
 
+## 2026-07-15 — VS Code multi-range private annotation
+
+- 提交 `1a2d665`：CustomEditor 从单一 selection 改为有上限的 validated range list。用户可在 webview 工具栏依次 Add range，再调用 annotation command；所有 ranges 伴随同一 projection/RenderMap/ETag 交给 daemon，失败仍由核心原子回滚。
+- 完整 private-block remove 支持多个 block；metadata edit 明确拒绝多 range，避免把不同 slot 的元数据混合。锁定、投影替换和 dispose 会清除所有 range。
+- 验证：VS Code check、57/57 tests、build、diff-check 通过。
+
 ## 2026-07-15 — Restore strict all-target Clippy baseline
 
 - 提交 `6d3ea0c`：将两个超过 Clippy 100-line 限制的 Umbra regression test 拆为命名辅助断言，保持私密 slot lock、canary 非泄漏、多选原子性、陈旧 ETag 与 private-range 拒绝的原测试语义；没有使用 lint `allow`。

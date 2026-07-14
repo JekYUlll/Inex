@@ -527,3 +527,4 @@
 - `headingSection` 只能以 Markdown ATX heading 识别当前章节，且应以 byte range 返回给既有 RenderMap/daemon 边界；没有前置 heading 时返回 undefined，而不是用整份文档作为便利回退。
 - `useDefaultProfile` 只有在用户可安全设置 encrypted default 时才是完整功能。默认 profile ID 必须由 `K_umbra` catalog transaction 写入/验证，不能由 VS Code window setting 或快捷键参数承担；profile 删除时同一 transaction 清空 default，避免悬空选择。
 - Umbra 的 canary/atomicity 回归若长到难以审查，应拆为显式命名的 test helpers，而不是压低 Clippy 门槛：辅助函数仍在同一测试模块中持有真实 Vault、Outer container 与 ciphertext evidence，因而不改变安全测试的执行边界。
+- CustomEditor 的 textarea 不能原生表达多 cursor，因此多范围采用显式 Add range/Clear ranges UI，不在 extension 中截获原始键盘事件。host 仍限制每条 webview message 的 range 数、整数性与 UTF-8 byte 边界，最终 selection normalization/partial-private 拒绝仍由 daemon/core 认证。
