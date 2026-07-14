@@ -94,6 +94,22 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(document.handle, "")
         self.assertEqual(snapshot, bytearray(b"new secret"))
 
+    def test_umbra_projection_has_no_normal_handle_and_replaces_atomically(self):
+        original = bytearray(b"private projection")
+        render_map = {"generationBase64": "g", "projectionBytes": len(original)}
+        document = ManagedDocument(14, "today.md", "", ETAG, original, render_map)
+        self.assertTrue(document.is_umbra)
+        updated = bytearray(b"updated projection")
+        next_map = {"generationBase64": "h", "projectionBytes": len(updated)}
+        document.replace_umbra_projection(updated, NEW_ETAG, next_map)
+        self.assertEqual(original, bytearray(len(original)))
+        self.assertFalse(document.dirty)
+        self.assertEqual(document.umbra_render_map, next_map)
+        document.close()
+        self.assertIsNone(document.umbra_render_map)
+        with self.assertRaisesRegex(ModelError, "normal handle"):
+            ManagedDocument(15, "today.md", "normal", ETAG, bytearray(), render_map)
+
     def test_registry_bypass_is_one_shot(self):
         registry = DocumentRegistry()
         document = ManagedDocument(10, "today.md", "h", ETAG, bytearray())

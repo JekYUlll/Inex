@@ -399,6 +399,7 @@ class ManagedDocument:
         handle: str,
         etag: str,
         content: bytearray,
+        umbra_render_map: Optional[Dict[str, Any]] = None,
         recovered: bool = False,
         stale_recovery: bool = False,
         recovery_base_etag: Optional[str] = None,
@@ -407,13 +408,18 @@ class ManagedDocument:
             raise ModelError("View id is invalid")
         self.view_id = view_id
         self.logical_path = validate_logical_path(logical_path)
-        if not isinstance(handle, str) or not handle or len(handle.encode("utf-8")) > 4096:
+        if not isinstance(handle, str) or len(handle.encode("utf-8")) > 4096:
             raise ModelError("Document handle is invalid")
+        if umbra_render_map is None and not handle:
+            raise ModelError("Document handle is invalid")
+        if umbra_render_map is not None and handle:
+            raise ModelError("Umbra document must not have a normal handle")
         if not isinstance(etag, str) or not _ETAG_RE.fullmatch(etag):
             raise ModelError("Document etag is invalid")
         if not isinstance(content, bytearray) or len(content) > MAX_DOCUMENT_BYTES:
             raise ModelError("Document content exceeds the client limit")
         self.handle = handle
+        self.umbra_render_map = umbra_render_map
         self.etag = etag
         if recovery_base_etag is not None and not _ETAG_RE.fullmatch(recovery_base_etag):
             raise ModelError("Recovery base etag is invalid")
@@ -432,6 +438,10 @@ class ManagedDocument:
     @property
     def dirty(self) -> bool:
         return self.version != self.saved_version
+
+    @property
+    def is_umbra(self) -> bool:
+        return self.umbra_render_map is not None
 
     def replace(self, content: bytearray) -> int:
         if self.closed or self.read_only:
@@ -461,6 +471,29 @@ class ManagedDocument:
         if version == self.version:
             self.saved_version = version
             self.requires_overwrite_confirmation = False
+
+    def replace_umbra_projection(
+        self, content: bytearray, etag: str, render_map: Dict[str, Any]
+    ) -> None:
+        if not self.is_umbra or self.closed or self.read_only:
+            wipe(content)
+            raise ModelError("Document is not an active Umbra projection")
+        if not isinstance(content, bytearray) or len(content) > MAX_DOCUMENT_BYTES:
+            wipe(content)
+            raise ModelError("Umbra projection exceeds the client limit")
+        if not isinstance(etag, str) or not _ETAG_RE.fullmatch(etag) or not isinstance(render_map, dict):
+            wipe(content)
+            raise ModelError("Umbra projection identity is invalid")
+        old = self.content
+        self.content = content
+        wipe(old)
+        self.etag = etag
+        self.draft_base_etag = etag
+        self.umbra_render_map = render_map
+        self.version += 1
+        self.saved_version = self.version
+        self.draft_version = self.version
+        self.requires_overwrite_confirmation = False
 
     def mark_drafted(self, version: int) -> None:
         if version <= self.version:
@@ -508,6 +541,7 @@ class ManagedDocument:
         # Handles/session tokens are immutable Python strings and cannot be
         # zeroized, but dropping the references is still useful.
         self.handle = ""
+        self.umbra_render_map = None
 
 
 class DocumentRegistry:
