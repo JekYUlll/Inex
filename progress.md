@@ -56,6 +56,10 @@
 
 - PRD now distinguishes the shipped VS Code command/profile path from deferred multi-cursor, no-selection expansion, metadata edit, management UI, Outer editing, and draft recovery. This prevents the frozen target specification from being misread as completed behavior.
 
+## 2026-07-15 — Cursor paragraph default
+
+- A zero-length VS Code textarea selection now expands to its current non-empty line before private annotation. The implementation operates on validated UTF-8 byte offsets and zeroizes the temporary content snapshot; it does not alter remove semantics. Typecheck and 50/50 tests pass.
+
 ## 2026-07-15 — Vault feature-2 启用事务
 
 - 提交 `538168d`：`Vault::enable_umbra_private_annotations` 只接受 live Umbra session；它调用已认证 core metadata upgrader，并以 vault.json etag CAS 提交，随后重新 parse 确认 exact committed metadata 才更新内存 config。锁定 session 的调用被拒绝。
