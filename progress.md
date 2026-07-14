@@ -921,3 +921,8 @@
 - 提交 `1298641`（`feat(umbra): manage encrypted private tag catalog`）：`UmbraConfigV1` 新增 create/rename/archive/reorder。稳定 tag ID 不会在 rename/reorder 中变化；archive 只影响 picker 可见性，不删除历史 document/profile 引用。Vault 包装器每次均 load 已认证 config、变更、再用 session CAS 原子加密保存。
 - config validation 现拒绝 duplicate tag/profile IDs、非 canonical catalog 顺序、profile/default 对不存在 tag 的引用、未知 default profile，及 `outer: cover` 与 `promptForCover` 不一致的 profile。这样管理命令无法产生“可解密、但不可用”的共享目录。
 - 验证：tag mutation 单测、Vault ciphertext-only catalog 测试、严格 core Clippy、fmt/diff-check 通过。下一步接 daemon RPC；VS Code/Sublime 仍不得直接写 `.inex/config.umbra.inex`。
+
+## 2026-07-15 — 加密私密标签 daemon RPC
+
+- 提交 `f46d2ff`（`feat(daemon): manage encrypted private tags over RPC`）：新增 `umbra.tag.create`、`rename`、`archive`、`reorder`。tag ID、label、description、aliases 和排序列表均由 zeroizing 参数提取器受限读取；handler 不构造 config 文件，只委托 Vault 的 authenticated catalog transaction。
+- daemon 生命周期回归覆盖创建→重命名→归档→重排→仅 Umbra 已解锁的 config 读取；全量 daemon 71/71 与严格 Clippy/fmt/diff-check 通过。下一步在 VS Code 增加管理命令，并为 Sublime 复用相同 RPC。
