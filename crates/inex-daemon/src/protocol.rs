@@ -60,6 +60,9 @@ pub enum Method {
     UmbraTagRename,
     UmbraTagArchive,
     UmbraTagReorder,
+    UmbraProfileCreate,
+    UmbraProfileEdit,
+    UmbraProfileRemove,
     VaultListTree,
     FileStat,
     FileRead,
@@ -79,7 +82,7 @@ pub enum Method {
 }
 
 impl Method {
-    const ALL: [Self; 38] = [
+    const ALL: [Self; 41] = [
         Self::SystemHello,
         Self::SystemPing,
         Self::SystemShutdown,
@@ -102,6 +105,9 @@ impl Method {
         Self::UmbraTagRename,
         Self::UmbraTagArchive,
         Self::UmbraTagReorder,
+        Self::UmbraProfileCreate,
+        Self::UmbraProfileEdit,
+        Self::UmbraProfileRemove,
         Self::VaultListTree,
         Self::FileStat,
         Self::FileRead,
@@ -146,6 +152,9 @@ impl Method {
             Self::UmbraTagRename => "umbra.tag.rename",
             Self::UmbraTagArchive => "umbra.tag.archive",
             Self::UmbraTagReorder => "umbra.tag.reorder",
+            Self::UmbraProfileCreate => "umbra.profile.create",
+            Self::UmbraProfileEdit => "umbra.profile.edit",
+            Self::UmbraProfileRemove => "umbra.profile.remove",
             Self::VaultListTree => "vault.listTree",
             Self::FileStat => "file.stat",
             Self::FileRead => "file.read",

@@ -22,7 +22,9 @@ use inex_core::search::{
 };
 use inex_core::sodium::{Argon2idParams, MAX_PASSWORD_BYTES};
 use inex_core::tree::{TreeEntryKind, TreeError};
-use inex_core::umbra_config::{OuterMode, PrivateAnnotationKind, PrivateTagDefinition};
+use inex_core::umbra_config::{
+    AnnotationProfile, OuterMode, PrivateAnnotationKind, PrivateTagDefinition,
+};
 use inex_core::umbra_document::{OuterSlotStrategy, PrivateAnnotationSpec};
 use inex_core::umbra_keyslot::UmbraKeyslotError;
 use inex_core::umbra_render::OwnedRenderMap;
@@ -161,6 +163,9 @@ impl<C: MonotonicClock> RpcService<C> {
             Method::UmbraTagRename => self.umbra_tag_rename(params),
             Method::UmbraTagArchive => self.umbra_tag_archive(params),
             Method::UmbraTagReorder => self.umbra_tag_reorder(params),
+            Method::UmbraProfileCreate => self.umbra_profile_create(params),
+            Method::UmbraProfileEdit => self.umbra_profile_edit(params),
+            Method::UmbraProfileRemove => self.umbra_profile_remove(params),
             Method::VaultListTree => self.vault_list_tree(params),
             Method::FileStat => self.file_stat(params),
             Method::FileRead => self.file_read(params),
@@ -676,6 +681,46 @@ impl<C: MonotonicClock> RpcService<C> {
             .vault_mut(session.as_str())
             .map_err(map_session_error)?
             .reorder_private_tags(&tag_ids)
+            .map_err(|error| map_vault_error(error, ErrorContext::Document))?;
+        Ok(acknowledgement())
+    }
+
+    fn umbra_profile_create(&mut self, params: Params) -> RpcResult {
+        let mut params = ParamObject::new(params);
+        let session = required_session(&mut params)?;
+        let profile = parse_annotation_profile(&mut params)?;
+        params.finish()?;
+        self.sessions
+            .vault_mut(session.as_str())
+            .map_err(map_session_error)?
+            .create_annotation_profile(profile)
+            .map_err(|error| map_vault_error(error, ErrorContext::Document))?;
+        Ok(acknowledgement())
+    }
+
+    fn umbra_profile_edit(&mut self, params: Params) -> RpcResult {
+        let mut params = ParamObject::new(params);
+        let session = required_session(&mut params)?;
+        let profile_id = params.required_sensitive_string("profileId", 1, 64)?;
+        let profile = parse_annotation_profile(&mut params)?;
+        params.finish()?;
+        self.sessions
+            .vault_mut(session.as_str())
+            .map_err(map_session_error)?
+            .edit_annotation_profile(profile_id.as_str(), profile)
+            .map_err(|error| map_vault_error(error, ErrorContext::Document))?;
+        Ok(acknowledgement())
+    }
+
+    fn umbra_profile_remove(&mut self, params: Params) -> RpcResult {
+        let mut params = ParamObject::new(params);
+        let session = required_session(&mut params)?;
+        let profile_id = params.required_sensitive_string("profileId", 1, 64)?;
+        params.finish()?;
+        self.sessions
+            .vault_mut(session.as_str())
+            .map_err(map_session_error)?
+            .remove_annotation_profile(profile_id.as_str())
             .map_err(|error| map_vault_error(error, ErrorContext::Document))?;
         Ok(acknowledgement())
     }
@@ -1289,6 +1334,38 @@ fn parse_private_tag_definition(
         sort_order,
         default_selected,
         archived: false,
+    })
+}
+
+fn parse_annotation_profile(params: &mut ParamObject) -> Result<AnnotationProfile, ErrorObject> {
+    let mut object = params.required_object("profile")?;
+    let id = object.required_sensitive_string("id", 1, 64)?;
+    let label = object.required_sensitive_string("label", 1, 4096)?;
+    let kind = match object.required_sensitive_string("kind", 1, 16)?.as_str() {
+        "block" => PrivateAnnotationKind::Block,
+        "comment" => PrivateAnnotationKind::Comment,
+        _ => return Err(ErrorObject::new(ErrorCode::InvalidParams)),
+    };
+    let tag_ids = object.required_sensitive_string_array("tagIds", MAX_UMBRA_MAP_ENTRIES, 1, 64)?;
+    let tag_ids = tag_ids
+        .iter()
+        .map(|tag_id| tag_id.as_str().to_owned())
+        .collect();
+    let outer = match object.required_sensitive_string("outer", 1, 16)?.as_str() {
+        "drop" => OuterMode::Drop,
+        "cover" => OuterMode::Cover,
+        "placeholder" => OuterMode::Placeholder,
+        _ => return Err(ErrorObject::new(ErrorCode::InvalidParams)),
+    };
+    let prompt_for_cover = object.required_bool("promptForCover")?;
+    object.finish()?;
+    Ok(AnnotationProfile {
+        id: id.to_string(),
+        label: label.to_string(),
+        kind,
+        tag_ids,
+        outer,
+        prompt_for_cover,
     })
 }
 
@@ -2211,6 +2288,66 @@ mod tests {
         assert_eq!(configured_tag["result"]["tags"][0]["label"], "Relations");
         assert_eq!(configured_tag["result"]["tags"][0]["archived"], true);
         scrub_object(&mut configured_tag);
+        let mut profile_created = response(
+            &mut service,
+            47,
+            "umbra.profile.create",
+            json!({
+                "session": session.as_str(),
+                "profile": {
+                    "id": "relationship-comment",
+                    "label": "Relationship comment",
+                    "kind": "comment",
+                    "tagIds": ["relationship"],
+                    "outer": "drop",
+                    "promptForCover": false,
+                },
+            }),
+        );
+        assert_eq!(profile_created["result"]["ok"], true);
+        scrub_object(&mut profile_created);
+        let mut profile_edited = response(
+            &mut service,
+            48,
+            "umbra.profile.edit",
+            json!({
+                "session": session.as_str(),
+                "profileId": "relationship-comment",
+                "profile": {
+                    "id": "relationship-comment",
+                    "label": "Relations",
+                    "kind": "block",
+                    "tagIds": ["relationship"],
+                    "outer": "cover",
+                    "promptForCover": true,
+                },
+            }),
+        );
+        assert_eq!(profile_edited["result"]["ok"], true);
+        scrub_object(&mut profile_edited);
+        let mut configured_profile = response(
+            &mut service,
+            49,
+            "umbra.config.get",
+            json!({"session": session.as_str()}),
+        );
+        assert_eq!(
+            configured_profile["result"]["profiles"][0]["id"],
+            "relationship-comment"
+        );
+        assert_eq!(
+            configured_profile["result"]["profiles"][0]["outer"],
+            "cover"
+        );
+        scrub_object(&mut configured_profile);
+        let mut profile_removed = response(
+            &mut service,
+            50,
+            "umbra.profile.remove",
+            json!({"session": session.as_str(), "profileId": "relationship-comment"}),
+        );
+        assert_eq!(profile_removed["result"]["ok"], true);
+        scrub_object(&mut profile_removed);
         let mut enabled = response(
             &mut service,
             5,
