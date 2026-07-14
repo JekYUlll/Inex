@@ -136,7 +136,7 @@ Phase 6 extension — 现有 Markdown Git 仓库与加密附件迁移（Phase 7 
             - [x] inex-git验证repository domain/staging grammar/destination policy，执行fresh九段审计并返回marker/lock最后析构的PublishedWithMarker owner（`3a8661c`）
           - [x] core以单一borrowed原语按held root fd→held common-parent fd建立durability barrier，三轮published-role gate包夹且不信任pathname sync（`0e89e32`）
           - [x] Initial经critical fresh复审与verified no-replace整根move汇入同一PublishedWithMarker；只有exact NotMoved复审后可重试（`5060856`）
-          - [ ] PublishedWithMarker经held durability+fresh复审进入PublicationDurableWithMarker，只有durable owner可消费exact unlink
+          - [x] PublishedWithMarker经held durability+fresh复审进入PublicationDurableWithMarker，只有durable owner可消费exact unlink（`984e52b`）
           - [ ] marker unlink后的sync retry与marker-free clean audit形成PublishedClean/terminal输出，并整体替换旧v1 publisher
   - [ ] 完成repository import构造/durability/publication每一边界的Linux force-kill、hostile same-UID source/target race、artifact-bound residue与原生Windows矩阵
 - **Status:** in_progress（用户实测驱动的迁移/附件扩展；原Markdown-only实现仍保持已验证基线）
