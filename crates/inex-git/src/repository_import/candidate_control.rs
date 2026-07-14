@@ -28,9 +28,55 @@ use super::candidate_seal::{CandidateSealError, GitControlRole};
 
 const TARGET_INDEX_PATH: &str = ".git/index";
 const TARGET_CONFIG_PATH: &str = ".git/config";
+const TARGET_MAIN_REF_PATH: &str = ".git/refs/heads/main";
 const MAX_TARGET_INDEX_BYTES: u64 = 68 * 1024 * 1024;
 const MAX_TARGET_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_TARGET_CONFIG_OUTPUT_BYTES: usize = 1024 * 1024;
+const TARGET_MAIN_REF_BYTES: u64 = 41;
+
+/// One exact fresh-target `refs/heads/main` value bound to section 1.
+///
+/// The physical-manifest brand, record ID, and decoded commit ID stay private.
+/// This value is deliberately neither `Clone` nor `Copy`: later bootstrap code
+/// must consume the one result produced through the held target-root snapshot.
+#[allow(
+    dead_code,
+    reason = "the fresh root-commit bootstrap consumes this audited slice next"
+)]
+pub(super) struct FreshTargetMainRef<'physical> {
+    physical: &'physical MarkerFreePhysicalManifest,
+    record: PhysicalRecordId,
+    commit_oid: [u8; 20],
+}
+
+impl fmt::Debug for FreshTargetMainRef<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FreshTargetMainRef")
+            .field("physical", &"[REDACTED]")
+            .field("record", &"[REDACTED]")
+            .field("commit_oid", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "the fresh root-commit bootstrap consumes this audited slice next"
+)]
+impl FreshTargetMainRef<'_> {
+    /// Prove that this ref belongs to the exact manifest allocation.
+    #[must_use]
+    pub(super) fn is_bound_to(&self, physical: &MarkerFreePhysicalManifest) -> bool {
+        std::ptr::eq(self.physical, physical)
+    }
+
+    /// Return the decoded non-zero SHA-1 commit ID.
+    #[must_use]
+    pub(super) const fn commit_oid(&self) -> [u8; 20] {
+        self.commit_oid
+    }
+}
 
 /// Internal callback result branded by its collection-time physical manifest.
 ///
@@ -330,6 +376,76 @@ pub(super) fn with_held_target_config_snapshot<'physical, T>(
     .and_then(|bound| bound.into_inner(physical))
 }
 
+/// Collect the exact fresh-target `refs/heads/main` through the held root.
+///
+/// Only a 41-byte body containing forty lowercase SHA-1 hexadecimal digits
+/// followed by one LF is accepted. The all-zero object ID is not a Git object
+/// authority and is rejected. File content, identity, namespace binding, and
+/// every ancestor binding are revalidated by the descriptor-relative snapshot
+/// before the typed result is released.
+#[cfg(target_os = "linux")]
+#[allow(
+    dead_code,
+    reason = "the fresh root-commit bootstrap consumes this audited slice next"
+)]
+pub(super) fn collect_fresh_target_main_ref<'physical>(
+    physical: &'physical MarkerFreePhysicalManifest,
+    held_root: &SecureSourceDirectory,
+) -> Result<FreshTargetMainRef<'physical>, CandidateSealError> {
+    collect_fresh_target_main_ref_with_hook(physical, held_root, || Ok(()))
+}
+
+#[cfg(target_os = "linux")]
+fn collect_fresh_target_main_ref_with_hook<'physical>(
+    physical: &'physical MarkerFreePhysicalManifest,
+    held_root: &SecureSourceDirectory,
+    after_parse: impl FnOnce() -> Result<(), CandidateSealError>,
+) -> Result<FreshTargetMainRef<'physical>, CandidateSealError> {
+    let record = exact_file_id(physical, TARGET_MAIN_REF_PATH)?;
+    with_held_physical_snapshot(
+        physical,
+        held_root,
+        record,
+        TARGET_MAIN_REF_BYTES,
+        |snapshot| {
+            let commit_oid = parse_fresh_target_main_ref(snapshot.bytes())?;
+            after_parse()?;
+            Ok(FreshTargetMainRef {
+                physical,
+                record: snapshot.physical_id(),
+                commit_oid,
+            })
+        },
+    )
+    .and_then(|bound| bound.into_inner(physical))
+}
+
+fn parse_fresh_target_main_ref(body: &[u8]) -> Result<[u8; 20], CandidateSealError> {
+    let hex = body
+        .strip_suffix(b"\n")
+        .filter(|hex| hex.len() == 40)
+        .ok_or(CandidateSealError::InvalidRecord)?;
+    let mut oid = [0_u8; 20];
+    for (output, pair) in oid.iter_mut().zip(hex.chunks_exact(2)) {
+        *output = lower_hex_nibble(pair[0])?
+            .checked_shl(4)
+            .ok_or(CandidateSealError::InvalidRecord)?
+            | lower_hex_nibble(pair[1])?;
+    }
+    if oid == [0; 20] {
+        return Err(CandidateSealError::InvalidRecord);
+    }
+    Ok(oid)
+}
+
+fn lower_hex_nibble(byte: u8) -> Result<u8, CandidateSealError> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        _ => Err(CandidateSealError::InvalidRecord),
+    }
+}
+
 #[cfg(not(target_os = "linux"))]
 pub(super) fn with_held_target_index_snapshot<'physical, T>(
     _physical: &'physical MarkerFreePhysicalManifest,
@@ -345,6 +461,19 @@ pub(super) fn with_held_target_config_snapshot<'physical, T>(
     _unsupported_held_root: (),
     _consume: impl FnOnce(&HeldTargetConfigSnapshot<'physical, '_>) -> Result<T, CandidateSealError>,
 ) -> Result<T, CandidateSealError> {
+    Err(CandidateSealError::InvalidContext)
+}
+
+/// Non-Linux builds expose no held-root implementation and fail closed.
+#[cfg(not(target_os = "linux"))]
+#[allow(
+    dead_code,
+    reason = "the fresh root-commit bootstrap consumes this audited slice next"
+)]
+pub(super) fn collect_fresh_target_main_ref(
+    _physical: &MarkerFreePhysicalManifest,
+    _unsupported_held_root: (),
+) -> Result<FreshTargetMainRef<'_>, CandidateSealError> {
     Err(CandidateSealError::InvalidContext)
 }
 
@@ -769,6 +898,15 @@ mod tests {
         target
     }
 
+    fn main_ref_fixture(body: &[u8]) -> TestDirectory {
+        let target = fixture(b"index", b"config");
+        let main_ref = target.path().join(TARGET_MAIN_REF_PATH);
+        fs::create_dir_all(main_ref.parent().expect("main ref has a parent"))
+            .expect("main ref parents create");
+        fs::write(main_ref, body).expect("main ref writes");
+        target
+    }
+
     fn physical_and_root(
         target: &TestDirectory,
     ) -> (MarkerFreePhysicalManifest, SecureSourceDirectory) {
@@ -816,6 +954,155 @@ mod tests {
             Ok(())
         })
         .expect("exact held config succeeds");
+    }
+
+    #[test]
+    fn fresh_target_main_ref_accepts_only_the_exact_branded_record() {
+        const MAIN_REF: &[u8; 41] = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
+        let target = main_ref_fixture(MAIN_REF);
+        let (physical, root) = physical_and_root(&target);
+
+        let main_ref = collect_fresh_target_main_ref(&physical, &root)
+            .expect("canonical fresh-target main ref collects");
+        assert!(main_ref.is_bound_to(&physical));
+        assert_eq!(main_ref.record, record_id(&physical, TARGET_MAIN_REF_PATH));
+        assert_eq!(main_ref.commit_oid(), [0xaa; 20]);
+
+        let debug = format!("{main_ref:?}");
+        assert!(debug.contains("FreshTargetMainRef"));
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("aaaaaaaa"));
+        assert!(!debug.contains("170"));
+    }
+
+    #[test]
+    fn fresh_target_main_ref_rejects_noncanonical_bodies_and_kind() {
+        for body in [
+            b"0000000000000000000000000000000000000000\n".as_slice(),
+            b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n".as_slice(),
+            b"gaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n".as_slice(),
+            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n".as_slice(),
+            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n".as_slice(),
+            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n".as_slice(),
+            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n!".as_slice(),
+            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".as_slice(),
+        ] {
+            let target = main_ref_fixture(body);
+            let (physical, root) = physical_and_root(&target);
+            assert!(
+                collect_fresh_target_main_ref(&physical, &root).is_err(),
+                "noncanonical body must fail closed"
+            );
+        }
+
+        let target = main_ref_fixture(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n");
+        let main_ref = target.path().join(TARGET_MAIN_REF_PATH);
+        fs::remove_file(&main_ref).expect("main ref removes");
+        fs::create_dir(&main_ref).expect("directory replacement creates");
+        let (physical, root) = physical_and_root(&target);
+        assert!(matches!(
+            collect_fresh_target_main_ref(&physical, &root),
+            Err(CandidateSealError::InvalidRecord)
+        ));
+    }
+
+    #[test]
+    fn fresh_target_main_ref_rejects_pre_collection_hash_and_identity_drift() {
+        const MAIN_REF: &[u8; 41] = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
+
+        let target = main_ref_fixture(MAIN_REF);
+        let (physical, root) = physical_and_root(&target);
+        fs::write(
+            target.path().join(TARGET_MAIN_REF_PATH),
+            b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
+        )
+        .expect("same-inode same-length pre-collection rewrite succeeds");
+        assert!(matches!(
+            collect_fresh_target_main_ref(&physical, &root),
+            Err(CandidateSealError::InvalidRecord)
+        ));
+
+        let target = main_ref_fixture(MAIN_REF);
+        let (physical, root) = physical_and_root(&target);
+        let main_ref = target.path().join(TARGET_MAIN_REF_PATH);
+        fs::rename(&main_ref, target.path().join(".git/refs/heads/old-main"))
+            .expect("original main ref retains a name");
+        fs::write(&main_ref, MAIN_REF).expect("same-body replacement writes");
+        assert!(matches!(
+            collect_fresh_target_main_ref(&physical, &root),
+            Err(CandidateSealError::InvalidRecord)
+        ));
+    }
+
+    #[test]
+    fn fresh_target_main_ref_brand_is_manifest_allocation_specific() {
+        const MAIN_REF: &[u8; 41] = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
+        let first_target = main_ref_fixture(MAIN_REF);
+        let second_target = main_ref_fixture(MAIN_REF);
+        let (first, first_root) = physical_and_root(&first_target);
+        let (second, second_root) = physical_and_root(&second_target);
+
+        let main_ref = collect_fresh_target_main_ref(&first, &first_root)
+            .expect("first branded main ref collects");
+        assert!(main_ref.is_bound_to(&first));
+        assert!(!main_ref.is_bound_to(&second));
+        assert!(matches!(
+            collect_fresh_target_main_ref(&first, &second_root),
+            Err(CandidateSealError::InvalidRecord)
+        ));
+    }
+
+    #[test]
+    fn fresh_target_main_ref_rejects_callback_namespace_drift() {
+        const MAIN_REF: &[u8; 41] = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
+
+        let target = main_ref_fixture(MAIN_REF);
+        let (physical, root) = physical_and_root(&target);
+        let main_ref = target.path().join(TARGET_MAIN_REF_PATH);
+        let replacement = collect_fresh_target_main_ref_with_hook(&physical, &root, || {
+            fs::rename(&main_ref, target.path().join(".git/refs/heads/held-main"))
+                .map_err(|_| CandidateSealError::InvalidRecord)?;
+            fs::write(&main_ref, MAIN_REF).map_err(|_| CandidateSealError::InvalidRecord)
+        });
+        assert!(matches!(
+            replacement,
+            Err(CandidateSealError::InvalidRecord)
+        ));
+
+        let target = main_ref_fixture(MAIN_REF);
+        let (physical, root) = physical_and_root(&target);
+        let refs = target.path().join(".git/refs");
+        let ancestor_rebind = collect_fresh_target_main_ref_with_hook(&physical, &root, || {
+            fs::rename(&refs, target.path().join(".git/held-refs"))
+                .map_err(|_| CandidateSealError::InvalidRecord)?;
+            fs::create_dir_all(refs.join("heads"))
+                .map_err(|_| CandidateSealError::InvalidRecord)?;
+            fs::write(refs.join("heads/main"), MAIN_REF)
+                .map_err(|_| CandidateSealError::InvalidRecord)
+        });
+        assert!(matches!(
+            ancestor_rebind,
+            Err(CandidateSealError::InvalidRecord)
+        ));
+    }
+
+    #[test]
+    fn callback_same_inode_rewrite_is_left_to_whole_manifest_revalidation() {
+        const MAIN_REF: &[u8; 41] = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
+        let target = main_ref_fixture(MAIN_REF);
+        let (physical, root) = physical_and_root(&target);
+        let main_ref_path = target.path().join(TARGET_MAIN_REF_PATH);
+
+        let main_ref = collect_fresh_target_main_ref_with_hook(&physical, &root, || {
+            fs::write(
+                &main_ref_path,
+                b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
+            )
+            .map_err(|_| CandidateSealError::InvalidRecord)
+        })
+        .expect("the single snapshot does not claim a callback-time second content hash");
+        assert_eq!(main_ref.commit_oid(), [0xaa; 20]);
+        assert!(physical.require_current_exact(target.path()).is_err());
     }
 
     #[test]
