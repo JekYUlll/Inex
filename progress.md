@@ -807,3 +807,8 @@
 
 - 提交 `058fb61`（`feat(vscode): capture verified webview selections`）：textarea 选区以 UTF-8 byte offsets 连同完整编辑内容发送；host 先同步内容，再验证范围并关联当前 document/session。锁定、dispose 会主动丢弃缓存选区，协议错误会恢复 host 内容而非保留 client 坐标。
 - `pnpm --dir editors/vscode check` 和 47/47 测试通过。下一步将当前 CustomEditor document/选区暴露给命令，并实现 stateful multi-select QuickPick；此提交尚未将 Umbra projection 替换进普通 feature-2 打开路径。
+
+## 2026-07-15 — VS Code Active Selection Authority
+
+- 提交 `52a9e6a`（`feat(vscode): expose active verified editor selection`）：CustomEditor 通过 webview view-state 维护 active document，只在 document 仍属当前 Vault session、仍被 provider 持有且有已验证选区时向命令返回 selection authority；dispose 自动清理 active 引用。
+- `pnpm --dir editors/vscode check` 通过。下一步实现 QuickPick 规格选择与将该 authority 接到 Umbra projection/apply 路径；当前 feature-2 文档尚不能用普通 open/save 路径编辑，保持 fail-closed。
