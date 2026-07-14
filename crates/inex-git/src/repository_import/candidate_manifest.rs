@@ -14,12 +14,16 @@ use inex_core::atomic::{
     VAULT_LOCAL_DIRECTORY, VAULT_MUTATION_LOCK_FILE, filesystem_directory_identity,
     path_is_supported_local_filesystem, verify_directory_has_no_alternate_data_streams,
 };
+#[cfg(target_os = "linux")]
+use inex_core::atomic::{SecureSourceChild, SecureSourceDirectory, open_secure_source_root};
 use inex_core::path::{CaseFoldKey, raw_portable_case_fold_key};
 
 use super::candidate_seal::{
     CandidateDirectoryIdentity, CandidateFileIdentity, CandidateSealError, PhysicalRecord,
     PhysicalRecordKind, PrivateBaselineRecord, validate_physical_record_path,
 };
+#[cfg(target_os = "linux")]
+use super::hash_secure_file;
 use super::{
     NamespaceKind, NamespacePolicy, NamespaceSeal, RepositoryImportError,
     canonical_normal_directory, inventory_namespace_with_file_limit,
@@ -66,6 +70,54 @@ enum AuditedPhysicalKind {
 struct AuditedPhysicalRecord {
     path: String,
     kind: AuditedPhysicalKind,
+}
+
+/// Stable index into one marker-free physical manifest.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(super) struct PhysicalRecordId(usize);
+
+/// Borrowed physical kind; no path or identity is cloned for consumers.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum PhysicalRecordKindRef<'a> {
+    Directory(&'a FilesystemDirectoryIdentity),
+    File {
+        identity: &'a FilesystemFileIdentity,
+        size: u64,
+        sha256: &'a [u8; 32],
+    },
+}
+
+impl fmt::Debug for PhysicalRecordKindRef<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Directory(_) => formatter.write_str("Directory([REDACTED])"),
+            Self::File { size, .. } => formatter
+                .debug_struct("File")
+                .field("identity", &"[REDACTED]")
+                .field("size", size)
+                .field("sha256", &"[REDACTED]")
+                .finish(),
+        }
+    }
+}
+
+/// Borrowed read-only view of one canonical physical record.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) struct PhysicalRecordRef<'a> {
+    pub(super) id: PhysicalRecordId,
+    pub(super) path: &'a str,
+    pub(super) kind: PhysicalRecordKindRef<'a>,
+}
+
+impl fmt::Debug for PhysicalRecordRef<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PhysicalRecordRef")
+            .field("id", &self.id)
+            .field("path", &"[REDACTED]")
+            .field("kind", &self.kind)
+            .finish()
+    }
 }
 
 /// Owned target-only evidence collected before any publication marker exists.
@@ -118,6 +170,114 @@ impl MarkerFreePhysicalManifest {
         &self.lock_identity
     }
 
+    /// Iterate the canonical physical records without cloning retained paths.
+    pub(super) fn records(
+        &self,
+    ) -> impl ExactSizeIterator<Item = PhysicalRecordRef<'_>> + DoubleEndedIterator + '_ {
+        self.records
+            .iter()
+            .enumerate()
+            .map(|(index, record)| physical_record_ref(PhysicalRecordId(index), record))
+    }
+
+    /// Resolve one stable record ID against this manifest.
+    pub(super) fn record(&self, id: PhysicalRecordId) -> Option<PhysicalRecordRef<'_>> {
+        self.records
+            .get(id.0)
+            .map(|record| physical_record_ref(id, record))
+    }
+
+    /// Number of directory records, including the target root.
+    pub(super) fn directory_count(&self) -> usize {
+        self.records
+            .iter()
+            .filter(|record| matches!(record.kind, AuditedPhysicalKind::Directory(_)))
+            .count()
+    }
+
+    /// Canonical path bytes retained by this sole owned physical manifest.
+    pub(super) fn retained_path_bytes(&self) -> usize {
+        self.records.iter().map(|record| record.path.len()).sum()
+    }
+
+    /// Revalidate the complete target against this exact baseline.
+    ///
+    /// Linux walks through held descriptor-relative children and retains only
+    /// one record-ID bitset plus the bounded recursion stack. It deliberately
+    /// does not rebuild a `Vec<NamespaceSeal>` or any second owned path
+    /// manifest. Other platforms remain fail closed until their native
+    /// held-handle traversal is implemented and tested.
+    pub(super) fn require_current_exact(&self, root: &Path) -> Result<(), RepositoryImportError> {
+        #[cfg(target_os = "linux")]
+        {
+            self.require_current_exact_linux(root)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (self, root);
+            Err(RepositoryImportError::TargetAuditFailed)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn require_current_exact_linux(&self, root: &Path) -> Result<(), RepositoryImportError> {
+        let root = canonical_normal_directory(root, RepositoryImportError::TargetAuditFailed)?;
+        if !path_is_supported_local_filesystem(&root)
+            .map_err(|_| RepositoryImportError::TargetAuditFailed)?
+        {
+            return Err(RepositoryImportError::TargetAuditFailed);
+        }
+        let directory =
+            open_secure_source_root(&root).map_err(|_| RepositoryImportError::TargetAuditFailed)?;
+        if directory.identity() != &self.root_identity {
+            return Err(RepositoryImportError::TargetAuditFailed);
+        }
+
+        let bit_words = self
+            .records
+            .len()
+            .checked_add(u64::BITS as usize - 1)
+            .ok_or(RepositoryImportError::ResourceLimit)?
+            / u64::BITS as usize;
+        let mut seen = Vec::new();
+        seen.try_reserve_exact(bit_words)
+            .map_err(|_| RepositoryImportError::ResourceLimit)?;
+        seen.resize(bit_words, 0_u64);
+        mark_physical_record_seen(&mut seen, PhysicalRecordId(0))?;
+        let mut observed_records = 1_usize;
+        let mut observed_path_bytes = 0_usize;
+
+        walk_current_physical_directory(
+            self,
+            &directory,
+            PhysicalRecordId(0),
+            0,
+            &mut seen,
+            &mut observed_records,
+            &mut observed_path_bytes,
+        )?;
+        directory
+            .verify_no_alternate_data_streams()
+            .map_err(|_| RepositoryImportError::TargetAuditFailed)?;
+
+        if observed_records != self.records.len()
+            || observed_path_bytes != self.retained_path_bytes()
+            || seen.iter().enumerate().any(|(word_index, word)| {
+                let first = word_index * u64::BITS as usize;
+                let remaining = self.records.len().saturating_sub(first).min(64);
+                let expected = if remaining == 64 {
+                    u64::MAX
+                } else {
+                    (1_u64 << remaining).wrapping_sub(1)
+                };
+                *word != expected
+            })
+        {
+            return Err(RepositoryImportError::TargetAuditFailed);
+        }
+        Ok(())
+    }
+
     /// Bind all physical identities to the publication marker's explicit
     /// scheme and construct only the encoder roles this collector owns.
     pub(super) fn project(
@@ -155,6 +315,166 @@ impl MarkerFreePhysicalManifest {
             },
         })
     }
+}
+
+fn physical_record_ref(
+    id: PhysicalRecordId,
+    record: &AuditedPhysicalRecord,
+) -> PhysicalRecordRef<'_> {
+    let kind = match &record.kind {
+        AuditedPhysicalKind::Directory(identity) => PhysicalRecordKindRef::Directory(identity),
+        AuditedPhysicalKind::File {
+            identity,
+            size,
+            sha256,
+        } => PhysicalRecordKindRef::File {
+            identity,
+            size: *size,
+            sha256,
+        },
+    };
+    PhysicalRecordRef {
+        id,
+        path: &record.path,
+        kind,
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn walk_current_physical_directory(
+    baseline: &MarkerFreePhysicalManifest,
+    directory: &SecureSourceDirectory,
+    parent_id: PhysicalRecordId,
+    depth: usize,
+    seen: &mut [u64],
+    observed_records: &mut usize,
+    observed_path_bytes: &mut usize,
+) -> Result<(), RepositoryImportError> {
+    if depth > MAX_PHYSICAL_DEPTH || *observed_records > baseline.records.len() {
+        return Err(RepositoryImportError::ResourceLimit);
+    }
+    let parent = baseline
+        .records
+        .get(parent_id.0)
+        .ok_or(RepositoryImportError::TargetAuditFailed)?;
+    if !matches!(parent.kind, AuditedPhysicalKind::Directory(_)) {
+        return Err(RepositoryImportError::TargetAuditFailed);
+    }
+    directory
+        .verify_no_alternate_data_streams()
+        .map_err(|_| RepositoryImportError::TargetAuditFailed)?;
+    for entry in directory
+        .read_dir()
+        .map_err(|_| RepositoryImportError::TargetAuditFailed)?
+    {
+        let entry = entry.map_err(|_| RepositoryImportError::TargetAuditFailed)?;
+        let name = entry.file_name();
+        let name_text = name
+            .to_str()
+            .ok_or(RepositoryImportError::TargetAuditFailed)?;
+        let index = baseline
+            .records
+            .binary_search_by(|record| {
+                compare_record_path_to_child(&record.path, &parent.path, name_text)
+            })
+            .map_err(|_| RepositoryImportError::TargetAuditFailed)?;
+        let id = PhysicalRecordId(index);
+        let expected = &baseline.records[index];
+        if expected.path.len() > MAX_PHYSICAL_PATH_BYTES {
+            return Err(RepositoryImportError::ResourceLimit);
+        }
+        mark_physical_record_seen(seen, id)?;
+        *observed_records = observed_records
+            .checked_add(1)
+            .filter(|count| *count <= baseline.records.len())
+            .ok_or(RepositoryImportError::TargetAuditFailed)?;
+        *observed_path_bytes = observed_path_bytes
+            .checked_add(expected.path.len())
+            .filter(|bytes| *bytes <= MAX_PHYSICAL_PATH_BUDGET)
+            .ok_or(RepositoryImportError::ResourceLimit)?;
+
+        match (
+            &expected.kind,
+            directory
+                .open_child(&name)
+                .map_err(|_| RepositoryImportError::TargetAuditFailed)?,
+        ) {
+            (
+                AuditedPhysicalKind::Directory(expected_identity),
+                SecureSourceChild::Directory(child),
+            ) if child.identity() == expected_identity => {
+                walk_current_physical_directory(
+                    baseline,
+                    &child,
+                    id,
+                    depth.saturating_add(1),
+                    seen,
+                    observed_records,
+                    observed_path_bytes,
+                )?;
+                child
+                    .verify_no_alternate_data_streams()
+                    .map_err(|_| RepositoryImportError::TargetAuditFailed)?;
+            }
+            (
+                AuditedPhysicalKind::File {
+                    identity: expected_identity,
+                    size: expected_size,
+                    sha256: expected_sha256,
+                },
+                SecureSourceChild::File(file),
+            ) => {
+                file.verify_no_alternate_data_streams()
+                    .map_err(|_| RepositoryImportError::TargetAuditFailed)?;
+                let (identity, size, sha256) = hash_secure_file(
+                    file,
+                    RepositoryImportError::TargetAuditFailed,
+                    Some(MAX_PHYSICAL_FILE_BYTES),
+                )?;
+                if &identity != expected_identity
+                    || size != *expected_size
+                    || sha256 != *expected_sha256
+                {
+                    return Err(RepositoryImportError::TargetAuditFailed);
+                }
+            }
+            _ => return Err(RepositoryImportError::TargetAuditFailed),
+        }
+    }
+    directory
+        .verify_no_alternate_data_streams()
+        .map_err(|_| RepositoryImportError::TargetAuditFailed)
+}
+
+#[cfg(target_os = "linux")]
+fn compare_record_path_to_child(
+    record_path: &str,
+    parent_path: &str,
+    child_name: &str,
+) -> std::cmp::Ordering {
+    record_path.bytes().cmp(
+        parent_path
+            .bytes()
+            .chain((!parent_path.is_empty()).then_some(b'/'))
+            .chain(child_name.bytes()),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn mark_physical_record_seen(
+    seen: &mut [u64],
+    id: PhysicalRecordId,
+) -> Result<(), RepositoryImportError> {
+    let word = seen
+        .get_mut(id.0 / u64::BITS as usize)
+        .ok_or(RepositoryImportError::TargetAuditFailed)?;
+    let mask = 1_u64 << (id.0 % u64::BITS as usize);
+    if *word & mask != 0 {
+        return Err(RepositoryImportError::TargetAuditFailed);
+    }
+    *word |= mask;
+    Ok(())
 }
 
 /// Recursively collect one complete marker-free target without modifying it.
@@ -626,6 +946,223 @@ mod tests {
             payload.kind,
             AuditedPhysicalKind::File { size, sha256, .. }
                 if size == body.len() as u64 && sha256 == expected_sha256
+        ));
+    }
+
+    #[test]
+    fn read_only_views_borrow_the_sole_retained_path_manifest() {
+        let target = minimal_target("borrowed-view");
+        fs::create_dir_all(target.path().join("deep/nested")).expect("nested directories create");
+        fs::write(target.path().join("deep/nested/payload.bin"), b"payload")
+            .expect("payload writes");
+        let manifest =
+            collect_marker_free_physical_manifest(target.path()).expect("fixture collects");
+
+        assert_eq!(
+            manifest.retained_path_bytes(),
+            manifest
+                .records
+                .iter()
+                .map(|record| record.path.len())
+                .sum::<usize>()
+        );
+        assert_eq!(manifest.directory_count(), 4);
+        assert_eq!(manifest.records().len(), manifest.records.len());
+        for borrowed in manifest.records() {
+            let owned = &manifest.records[borrowed.id.0];
+            assert_eq!(borrowed.path.as_ptr(), owned.path.as_ptr());
+            assert_eq!(borrowed.path.len(), owned.path.len());
+            assert_eq!(manifest.record(borrowed.id), Some(borrowed));
+        }
+        assert!(
+            manifest
+                .record(PhysicalRecordId(manifest.records.len()))
+                .is_none()
+        );
+        let debug = format!("{:?}", manifest.records().last().expect("record exists"));
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("payload.bin"));
+    }
+
+    #[test]
+    fn exact_revalidation_matches_deep_children_from_borrowed_baseline_paths() {
+        let target = minimal_target("borrowed-deep-walk");
+        let mut directory = target.path().to_path_buf();
+        for depth in 0..64 {
+            directory.push(format!("d{depth:02}"));
+            fs::create_dir(&directory).expect("deep directory creates");
+        }
+        fs::write(directory.join("payload.bin"), b"deep payload").expect("deep payload writes");
+        let manifest =
+            collect_marker_free_physical_manifest(target.path()).expect("deep baseline collects");
+
+        assert_eq!(manifest.directory_count(), 66);
+        manifest
+            .require_current_exact(target.path())
+            .expect("deep baseline revalidates without an owned cumulative path");
+        assert_eq!(
+            manifest
+                .records
+                .binary_search_by(|record| {
+                    compare_record_path_to_child(&record.path, "d00/d01", "d02")
+                })
+                .map(|index| manifest.records[index].path.as_str()),
+            Ok("d00/d01/d02")
+        );
+    }
+
+    #[test]
+    fn exact_revalidation_accepts_unchanged_and_rejects_post_baseline_addition() {
+        let target = minimal_target("exact-addition");
+        fs::write(target.path().join("baseline.bin"), b"baseline").expect("baseline writes");
+        let manifest =
+            collect_marker_free_physical_manifest(target.path()).expect("baseline collects");
+        manifest
+            .require_current_exact(target.path())
+            .expect("unchanged baseline revalidates");
+
+        fs::write(target.path().join("added.bin"), b"added").expect("addition writes");
+        assert!(matches!(
+            manifest.require_current_exact(target.path()),
+            Err(RepositoryImportError::TargetAuditFailed)
+        ));
+    }
+
+    #[test]
+    fn exact_revalidation_rejects_post_baseline_deletion() {
+        let target = minimal_target("exact-deletion");
+        let payload = target.path().join("payload.bin");
+        fs::write(&payload, b"payload").expect("payload writes");
+        let manifest =
+            collect_marker_free_physical_manifest(target.path()).expect("baseline collects");
+
+        fs::remove_file(payload).expect("payload removes");
+        assert!(matches!(
+            manifest.require_current_exact(target.path()),
+            Err(RepositoryImportError::TargetAuditFailed)
+        ));
+    }
+
+    #[test]
+    fn exact_revalidation_rejects_kind_symlink_and_hard_link_changes() {
+        use std::os::unix::fs::symlink;
+
+        let target = minimal_target("exact-kind-link");
+        let outside = TestDirectory::new("exact-kind-link-outside");
+        let outside_file = outside.path().join("outside.bin");
+        fs::write(&outside_file, b"payload").expect("outside payload writes");
+        let payload = target.path().join("payload.bin");
+        fs::write(&payload, b"payload").expect("payload writes");
+        let manifest =
+            collect_marker_free_physical_manifest(target.path()).expect("baseline collects");
+
+        fs::remove_file(&payload).expect("payload removes");
+        fs::create_dir(&payload).expect("same-name directory creates");
+        assert!(matches!(
+            manifest.require_current_exact(target.path()),
+            Err(RepositoryImportError::TargetAuditFailed)
+        ));
+
+        fs::remove_dir(&payload).expect("same-name directory removes");
+        symlink(&outside_file, &payload).expect("same-name symlink creates");
+        assert!(matches!(
+            manifest.require_current_exact(target.path()),
+            Err(RepositoryImportError::TargetAuditFailed)
+        ));
+
+        fs::remove_file(&payload).expect("same-name symlink removes");
+        fs::hard_link(&outside_file, &payload).expect("same-name hard link creates");
+        assert!(matches!(
+            manifest.require_current_exact(target.path()),
+            Err(RepositoryImportError::TargetAuditFailed)
+        ));
+    }
+
+    #[test]
+    fn exact_revalidation_rejects_same_name_inode_replacement() {
+        let target = minimal_target("exact-inode");
+        let payload = target.path().join("payload.bin");
+        fs::write(&payload, b"same body").expect("payload writes");
+        let original = fs::File::open(&payload).expect("original remains held");
+        let original_identity = filesystem_file_identity(&original).expect("identity captures");
+        let manifest =
+            collect_marker_free_physical_manifest(target.path()).expect("baseline collects");
+
+        fs::remove_file(&payload).expect("original unlinks");
+        fs::write(&payload, b"same body").expect("replacement writes");
+        let replacement = fs::File::open(&payload).expect("replacement opens");
+        assert_ne!(
+            filesystem_file_identity(&replacement).expect("replacement identity captures"),
+            original_identity
+        );
+        assert!(matches!(
+            manifest.require_current_exact(target.path()),
+            Err(RepositoryImportError::TargetAuditFailed)
+        ));
+    }
+
+    #[test]
+    fn exact_revalidation_rejects_same_inode_body_change() {
+        let target = minimal_target("exact-body");
+        let payload = target.path().join("payload.bin");
+        fs::write(&payload, b"first-body").expect("payload writes");
+        let manifest =
+            collect_marker_free_physical_manifest(target.path()).expect("baseline collects");
+        let before = fs::File::open(&payload).expect("payload opens");
+        let before_identity = filesystem_file_identity(&before).expect("identity captures");
+
+        fs::write(&payload, b"other-body").expect("body changes in place");
+        let after = fs::File::open(&payload).expect("changed payload opens");
+        assert_eq!(
+            filesystem_file_identity(&after).expect("changed identity captures"),
+            before_identity
+        );
+        assert!(matches!(
+            manifest.require_current_exact(target.path()),
+            Err(RepositoryImportError::TargetAuditFailed)
+        ));
+    }
+
+    #[test]
+    fn exact_revalidation_rejects_directory_identity_change() {
+        let target = minimal_target("exact-directory");
+        let directory = target.path().join("content");
+        fs::create_dir(&directory).expect("content directory creates");
+        let held = fs::File::open(&directory).expect("original directory remains held");
+        let original_identity = filesystem_directory_identity(&directory)
+            .expect("original directory identity captures");
+        let manifest =
+            collect_marker_free_physical_manifest(target.path()).expect("baseline collects");
+
+        fs::remove_dir(&directory).expect("original directory unlinks");
+        fs::create_dir(&directory).expect("replacement directory creates");
+        assert_ne!(
+            filesystem_directory_identity(&directory)
+                .expect("replacement directory identity captures"),
+            original_identity
+        );
+        assert!(matches!(
+            manifest.require_current_exact(target.path()),
+            Err(RepositoryImportError::TargetAuditFailed)
+        ));
+        drop(held);
+    }
+
+    #[test]
+    fn exact_revalidation_enforces_the_68_mib_file_boundary() {
+        let target = minimal_target("exact-file-limit");
+        let payload = target.path().join("maximum.bin");
+        let file = fs::File::create(&payload).expect("maximum file creates");
+        file.set_len(MAX_PHYSICAL_FILE_BYTES)
+            .expect("exact maximum sparse file sizes");
+        let manifest = collect_marker_free_physical_manifest(target.path())
+            .expect("exact maximum baseline collects");
+
+        file.set_len(MAX_PHYSICAL_FILE_BYTES + 1)
+            .expect("one-past maximum sparse file sizes");
+        assert!(matches!(
+            manifest.require_current_exact(target.path()),
+            Err(RepositoryImportError::ResourceLimit)
         ));
     }
 

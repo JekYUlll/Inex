@@ -3594,9 +3594,17 @@ mod windows_stream_info_tests {
 #[cfg(target_os = "linux")]
 pub struct SecureSourceDirectory {
     file: File,
-    path: PathBuf,
     identity: FilesystemDirectoryIdentity,
-    parent: Option<(File, std::ffi::OsString)>,
+    binding: SecureSourceDirectoryBinding,
+}
+
+#[cfg(target_os = "linux")]
+enum SecureSourceDirectoryBinding {
+    Root(PathBuf),
+    Child {
+        parent: File,
+        name: std::ffi::OsString,
+    },
 }
 
 #[cfg(target_os = "linux")]
@@ -3650,9 +3658,8 @@ pub fn open_secure_source_root(path: &Path) -> io::Result<SecureSourceDirectory>
     }
     Ok(SecureSourceDirectory {
         file,
-        path: path.to_path_buf(),
         identity,
-        parent: None,
+        binding: SecureSourceDirectoryBinding::Root(path.to_path_buf()),
     })
 }
 
@@ -3681,9 +3688,11 @@ impl SecureSourceDirectory {
             let identity = linux_directory_identity_from_file(&file)?;
             return Ok(SecureSourceChild::Directory(SecureSourceDirectory {
                 file,
-                path: self.path.join(name),
                 identity,
-                parent: Some((self.file.try_clone()?, name.to_os_string())),
+                binding: SecureSourceDirectoryBinding::Child {
+                    parent: self.file.try_clone()?,
+                    name: name.to_os_string(),
+                },
             }));
         }
         if metadata.file_type().is_file() {
@@ -3708,10 +3717,11 @@ impl SecureSourceDirectory {
     /// Returns an I/O error when the name is missing, link-like, cross-mount,
     /// or no longer has the captured identity.
     pub fn verify_binding(&self) -> io::Result<()> {
-        let current = if let Some((parent, name)) = &self.parent {
-            platform::open_source_child(parent, name)?
-        } else {
-            platform::open_source_directory_path(&self.path)?
+        let current = match &self.binding {
+            SecureSourceDirectoryBinding::Root(path) => platform::open_source_directory_path(path)?,
+            SecureSourceDirectoryBinding::Child { parent, name } => {
+                platform::open_source_child(parent, name)?
+            }
         };
         if !current.metadata()?.file_type().is_dir()
             || linux_directory_identity_from_file(&current)? != self.identity
@@ -3719,6 +3729,21 @@ impl SecureSourceDirectory {
             return Err(io::Error::other("source directory binding changed"));
         }
         Ok(())
+    }
+
+    /// Verify directory stream state through this held descriptor.
+    ///
+    /// The original root/parent-relative binding is checked before and after
+    /// the handle-only platform query. No descendant path is reconstructed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the binding drifts, the handle is no longer a
+    /// directory, or platform stream verification fails.
+    pub fn verify_no_alternate_data_streams(&self) -> io::Result<()> {
+        self.verify_binding()?;
+        platform::verify_directory_handle_has_no_alternate_data_streams(&self.file)?;
+        self.verify_binding()
     }
 
     /// Return the captured opaque directory identity.
@@ -3770,6 +3795,22 @@ impl SecureSourceFile {
             return Err(io::Error::other("source file binding changed"));
         }
         Ok(())
+    }
+
+    /// Verify alternate-stream state on this held single-link file.
+    ///
+    /// Both namespace checks use the parent descriptor and exact child name;
+    /// the stream query uses only the already-open file handle. A replacement
+    /// symlink, FIFO, or device is therefore rejected without a pathname open.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the binding drifts or handle-only stream
+    /// verification fails.
+    pub fn verify_no_alternate_data_streams(&self) -> io::Result<()> {
+        self.verify_binding()?;
+        platform::verify_regular_file_has_no_alternate_data_streams(&self.file)?;
+        self.verify_binding()
     }
 }
 
@@ -5116,6 +5157,19 @@ mod platform {
         Ok(())
     }
 
+    pub(super) fn verify_directory_handle_has_no_alternate_data_streams(
+        file: &File,
+    ) -> io::Result<()> {
+        if file.metadata()?.file_type().is_dir() {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "alternate-stream proof requires a held directory",
+            ))
+        }
+    }
+
     #[allow(clippy::unnecessary_wraps)]
     pub(super) fn verify_directory_has_no_alternate_data_streams(
         _path: &Path,
@@ -6175,8 +6229,12 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    #[cfg(target_os = "linux")]
+    use std::ffi::{CString, c_char, c_int};
     use std::fs;
     use std::io;
+    #[cfg(target_os = "linux")]
+    use std::os::unix::ffi::OsStrExt as _;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Barrier};
     use std::thread;
@@ -6208,6 +6266,24 @@ mod tests {
 
     const OLD_CIPHERTEXT: &[u8] = b"EDRY-old-authenticated-ciphertext";
     const NEW_CIPHERTEXT: &[u8] = b"EDRY-new-authenticated-ciphertext";
+
+    #[cfg(target_os = "linux")]
+    unsafe extern "C" {
+        fn mkfifo(path: *const c_char, mode: u32) -> c_int;
+    }
+
+    #[cfg(target_os = "linux")]
+    fn create_fifo(path: &Path) -> io::Result<()> {
+        let path = CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "FIFO path contains NUL"))?;
+        // SAFETY: `path` is a live NUL-terminated byte string and mode 0600
+        // contains only portable permission bits.
+        if unsafe { mkfifo(path.as_ptr(), 0o600) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
 
     #[cfg(any(target_os = "linux", windows))]
     struct ExistingLockIdentities {
@@ -6862,11 +6938,19 @@ mod tests {
         let fixture = TestVault::new()?;
         fs::write(fixture.notes().join("original.md"), b"source")?;
         let root = super::open_secure_source_root(fixture.root())?;
+        assert!(matches!(
+            &root.binding,
+            super::SecureSourceDirectoryBinding::Root(path) if path == fixture.root()
+        ));
         let super::SecureSourceChild::Directory(notes) =
             root.open_child(std::ffi::OsStr::new("notes"))?
         else {
             return Err(io::Error::other("notes was not a secure directory"));
         };
+        assert!(matches!(
+            &notes.binding,
+            super::SecureSourceDirectoryBinding::Child { name, .. } if name == "notes"
+        ));
         let retired = fixture.root().join("retired-notes");
         fs::rename(fixture.notes(), &retired)?;
         fs::create_dir(fixture.notes())?;
@@ -6879,6 +6963,58 @@ mod tests {
             .collect::<io::Result<Vec<_>>>()?;
         assert!(held_names.contains(&std::ffi::OsString::from("original.md")));
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn held_source_file_stream_proof_rejects_symlink_and_fifo_replacements_without_blocking()
+    -> io::Result<()> {
+        use std::os::unix::fs::symlink;
+        use std::sync::mpsc;
+
+        fn require_fast_rejection(file: super::SecureSourceFile) -> io::Result<()> {
+            let (sender, receiver) = mpsc::sync_channel(1);
+            let worker = thread::spawn(move || {
+                let _ = sender.send(file.verify_no_alternate_data_streams());
+            });
+            let result = receiver
+                .recv_timeout(Duration::from_secs(1))
+                .map_err(|_| io::Error::other("held stream proof blocked on replacement"))?;
+            worker
+                .join()
+                .map_err(|_| io::Error::other("held stream proof worker panicked"))?;
+            if result.is_err() {
+                Ok(())
+            } else {
+                Err(io::Error::other("replacement unexpectedly passed"))
+            }
+        }
+
+        let fixture = TestVault::new()?;
+        let path = fixture.root().join("race.bin");
+        let outside = fixture.root().join("outside.bin");
+        fs::write(&outside, b"outside")?;
+        fs::write(&path, b"baseline")?;
+        let root = super::open_secure_source_root(fixture.root())?;
+        let super::SecureSourceChild::File(held_for_symlink) =
+            root.open_child(std::ffi::OsStr::new("race.bin"))?
+        else {
+            return Err(io::Error::other("baseline was not a secure file"));
+        };
+        fs::remove_file(&path)?;
+        symlink(&outside, &path)?;
+        require_fast_rejection(held_for_symlink)?;
+
+        fs::remove_file(&path)?;
+        fs::write(&path, b"baseline")?;
+        let super::SecureSourceChild::File(held_for_fifo) =
+            root.open_child(std::ffi::OsStr::new("race.bin"))?
+        else {
+            return Err(io::Error::other("restored baseline was not a secure file"));
+        };
+        fs::remove_file(&path)?;
+        create_fifo(&path)?;
+        require_fast_rejection(held_for_fifo)
     }
 
     #[cfg(target_os = "linux")]
