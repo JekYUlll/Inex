@@ -1,5 +1,11 @@
 # Inex Progress Log
 
+## 2026-07-15 — Neovim 独立 Umbra keyslot 生命周期
+
+- 新增 `InexUmbraStatus`、`InexUnlockUmbra`、`InexLockUmbra`。插件先以 exact `umbra.status` 判定初始化状态；第一次初始化显示“密码无法恢复”警告并经用户确认后才将 masked password 发给 `umbra.initialize`，既有 keyslot 则使用 `umbra.unlock`。
+- 所有 status/lock 响应都严格检查 object key 与 boolean 状态。Lua 只保留 non-secret `umbra_unlocked` flag；Umbra lock、Outer lock 和 stop 都先将其清除。Umbra lock 不锁 Outer session。
+- headless 临时 vault 验证 initialize/unlock→Outer retained→Umbra lock→Outer retained，以及 Outer lock 后 Umbra local state 消失；transport smoke 与 `git diff --check` 通过。feature-2 projection、annotation picker/tag/profile UI 仍未在 Neovim 实现。
+
 ## 2026-07-15 — Neovim 受控目录创建
 
 - 新增 `InexMkdir`：目录 path 经过与 tree 一致的有界、相对、无控制字符/反斜杠/alias 验证后，才调用 daemon `file.mkdir`；结果必须为 exact `{ok:true}`，不作隐式父目录创建或本地文件系统写入。

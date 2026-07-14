@@ -560,3 +560,4 @@
 - `bufhidden=wipe` 与单窗口 browse 不可兼容：切换到 tree 会 wipe 原 document，而不是仅隐藏它。不要为便利改为 `hide`；tree 应在独立 split 显示，并与 document 一同由 lock/stop 主动 wipe，才能同时保持使用体验与关闭残留边界。
 - Neovim 内存搜索不能用普通 `input()`，因为 query 可能进入命令行 UI/历史；`inputsecret()` 至少避免明文回显。它仍不消除宿主/OS 内存边界，因此 query/result 都必须只驻留在当前回调或 lock/stop wipe 的 scratch buffer，且 README 不应声称该机制覆盖 shada、第三方插件或内存取证。
 - Neovim 目录创建应保持 daemon 的单层语义：不根据 `InexNew` 的嵌套路径隐式逐级 mkdir，也不把任意 parent 视为已认证。用户必须先显式执行 `InexMkdir`；这样失败路径和 Git/daemon 的 atomic directory invariant 不会被客户端便利逻辑重写。
+- Neovim Umbra lifecycle 只能保存非秘密状态旗标，绝不可缓存 password、KEK、slot cipher 或 `K_umbra`。初始化是否允许须先以 authenticated `umbra.status` 判断；Umbra-only lock 与 Outer lock/stop 的本地先行清理保证旧 RPC callback 不会把已锁状态重新标成解锁。
