@@ -48,6 +48,10 @@
     "command": "inex_lock_umbra"
   },
   {
+    "caption": "Inex: Enter Umbra Mode for Active Document",
+    "command": "inex_enter_umbra_mode"
+  },
+  {
     "caption": "Inex: Show Security Status",
     "command": "inex_show_security_status"
   }

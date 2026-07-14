@@ -1729,6 +1729,110 @@ def _lock_umbra(window: sublime.Window) -> None:
     sublime.set_timeout_async(worker, 0)
 
 
+def _enter_active_umbra(window: sublime.Window) -> None:
+    """Upgrade a clean active buffer, then replace it with daemon projection."""
+    view = window.active_view()
+    document = _registry.get(view.id()) if view is not None else None
+    session = _command_session(window)
+    if view is None or document is None or session is None:
+        if document is None:
+            _show_error(ModelError("An active Inex document is required"))
+        return
+    client, _vault_id, generation = session
+    if document.is_umbra:
+        window.status_message("Inex document is already in Umbra mode")
+        return
+    if document.dirty or document.read_only:
+        _show_error(ModelError("Save a clean active document before entering Umbra"))
+        return
+    logical_path = document.logical_path
+    expected_etag = document.etag
+    view.set_read_only(True)
+
+    def worker() -> None:
+        content = bytearray()
+        converted = False
+        try:
+            status = client.umbra_status()
+            if not status["unlocked"]:
+                raise RpcLifecycleError("Unlock Umbra private mode first")
+            converted_etag, durability = client.convert_document_to_umbra(
+                logical_path, expected_etag
+            )
+            converted = True
+            content, projection_etag, render_map = client.open_umbra_document(logical_path)
+            if projection_etag != converted_etag:
+                raise RpcProtocolError("Umbra projection ETag does not match conversion")
+            sublime.set_timeout(
+                lambda: completed(content, projection_etag, render_map, durability), 0
+            )
+            content = bytearray()
+        except Exception as error:
+            wipe(content)
+            sublime.set_timeout(
+                lambda error=error, converted=converted: failed(error, converted), 0
+            )
+
+    def completed(
+        content: bytearray, projection_etag: str, render_map: Dict[str, Any], durability: str
+    ) -> None:
+        old_handle = ""
+        try:
+            current, _vault_now, current_generation = _runtime_snapshot()
+            if (
+                current is not client
+                or current_generation != generation
+                or _registry.get(document.view_id) is not document
+                or document.logical_path != logical_path
+                or document.etag != expected_etag
+                or document.dirty
+                or document.is_umbra
+                or not view.is_valid()
+            ):
+                raise RpcLifecycleError("Inex session changed during Umbra conversion")
+            old_handle = document.transition_to_umbra_projection(
+                content, projection_etag, render_map
+            )
+            content = bytearray()
+            _scrubbing_views.add(view.id())
+            try:
+                _replace_buffer_from_bytes(view, bytearray(document.content))
+            finally:
+                _scrubbing_views.discard(view.id())
+            view.run_command("clear_undo_stack")
+            view.set_read_only(False)
+            _update_document_ui(document)
+            _warn_if_not_synced("save", (durability,))
+            window.status_message("Inex document entered Umbra mode")
+        except Exception as error:
+            wipe(content)
+            _perform_lock("Inex locked after an Umbra conversion state change")
+            _show_error(error)
+            return
+        if old_handle:
+            sublime.set_timeout_async(
+                lambda: _close_handle_best_effort(client, old_handle), 0
+            )
+
+    def failed(error: Exception, converted: bool) -> None:
+        if converted:
+            _perform_lock("Inex locked because Umbra conversion could not complete")
+            _show_error(error)
+            return
+        current, _vault_now, current_generation = _runtime_snapshot()
+        if (
+            current is client
+            and current_generation == generation
+            and _registry.get(document.view_id) is document
+            and view.is_valid()
+            and not document.is_umbra
+        ):
+            view.set_read_only(False)
+        _show_error(error)
+
+    sublime.set_timeout_async(worker, 0)
+
+
 def _clear_annotation_pickers() -> None:
     global _annotation_pickers
     for state in _annotation_pickers:
@@ -2334,6 +2438,11 @@ class InexUnlockUmbraCommand(sublime_plugin.WindowCommand):
 class InexLockUmbraCommand(sublime_plugin.WindowCommand):
     def run(self) -> None:
         _lock_umbra(self.window)
+
+
+class InexEnterUmbraModeCommand(sublime_plugin.WindowCommand):
+    def run(self) -> None:
+        _enter_active_umbra(self.window)
 
 
 class InexSearchCommand(sublime_plugin.WindowCommand):
