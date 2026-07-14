@@ -2,11 +2,11 @@
 
 ## Goal
 
-按照 `.agent/init_plan.md` 的架构与安全边界，优先交付“现有 Markdown Git 仓库 → 全新 Inex 密文仓库”的可安装迁移闭环：从干净且固定的 source HEAD 只读导入当前 tracked snapshot，完整加密 Markdown 与图片/附件，在同一隐藏 sibling staging root 内建立并审计全新密文 Git 根提交，再以一次 verified no-replace 整根发布暴露目标；使相对图片可在 VS Code 受控内存界面中读取，且原明文 Git 历史保持在源仓库、绝不进入目标 object database。完成该闭环后继续原 Phase 7 的跨平台验证、打包与发布准备，使磁盘仓库始终只保存密文而不产生临时明文 Markdown/附件。
+按照 `.agent/init_plan.md` 的架构与安全边界，优先交付“现有 Markdown Git 仓库 → 全新 Inex 密文仓库”的可安装迁移闭环：从干净且固定的 source HEAD 只读导入当前 tracked snapshot，完整加密 Markdown 与图片/附件，在同一隐藏 sibling staging root 内建立并审计全新密文 Git 根提交，再以一次 verified no-replace 整根发布暴露目标；使相对图片可在 VS Code 受控内存界面中读取，且原明文 Git 历史保持在源仓库、绝不进入目标 object database。随后交付 Umbra 私密标注系统：私密slot、标签、profile和元数据均经K_umbra加密，Outer投影、索引、设置与日志不泄漏它们。持续维护可安装编辑器体验、验证与发布准备，使磁盘仓库始终只保存密文而不产生临时明文 Markdown/附件。
 
 ## Current Phase
 
-Phase 6 extension — 现有 Markdown Git 仓库与加密附件迁移（Phase 7 发布收尾暂停但不撤销）
+Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私密标注设计冻结（Phase 7 发布收尾暂停但不撤销）
 
 ## Scope and Acceptance Baseline
 
@@ -65,6 +65,14 @@ Phase 6 extension — 现有 Markdown Git 仓库与加密附件迁移（Phase 7 
 - **Status:** complete（experimental；宿主崩溃后需重启 Sublime 的平台边界不宣称已消除）
 
 ### Phase 6: Git 合并、迁移与恢复工具
+
+  - [ ] 设计并实现 Umbra 私密标注系统（`docs/prd-umbra-mode.md`）
+  - [x] 冻结产品交互、私密标签/profile加密边界、Outer隔离、selection原子性及MVP/延期范围
+  - [x] 冻结K_umbra密钥层级、slot/config v1 envelope、logical `.inex/config.umbra.inex` 映射与兼容/迁移契约（`docs/spec/umbra-v1.md`；初始Umbra password lifecycle仍需实现前复审）
+  - [ ] 实现core私密slot、TagId、catalog/profile和RenderMap选择事务，并证明canary不进入磁盘Outer面
+  - [ ] 扩展daemon session/RPC及VS Code QuickPick/命令/可配置keybindings
+  - [ ] 扩展Sublime stateful picker、profile命令和keymap示例
+  - [ ] 跑通多选、wrap/unwrap/edit、跨编辑器目录、canary/残留及Outer隔离矩阵
 
 - [x] 实现 `.gitattributes`、locked-safe `inex merge-driver` 与已解锁 CLI 三方合并
 - [x] 实现加密冲突状态、普通编辑器保存清旗与 journal 恢复流程
