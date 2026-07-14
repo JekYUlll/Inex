@@ -244,6 +244,15 @@ export function activate(
         await editor.removePrivateAnnotationFromActive();
       });
     }),
+    vscode.commands.registerCommand("inex.applyPrivateAnnotationProfile", async (args?: unknown) => {
+      await runUiAction(async () => {
+        const profileId = isProfileArguments(args) ? args.profileId : undefined;
+        if (profileId === undefined) {
+          throw new Error("Private annotation profile ID is required");
+        }
+        await applyChosenPrivateAnnotation(controller, editor, profileId);
+      });
+    }),
     vscode.commands.registerCommand("inex.showSecurityStatus", async () => {
       const sidecar = controller.isUnlocked ? "unlocked in memory" : "locked";
       await vscode.window.showInformationMessage(
@@ -337,6 +346,7 @@ async function ensureVaultUnlocked(controller: VaultController): Promise<boolean
 async function applyChosenPrivateAnnotation(
   controller: VaultController,
   editor: InexCustomEditorProvider,
+  profileId?: string,
 ): Promise<void> {
   if (!(await ensureVaultUnlocked(controller))) {
     return;
@@ -386,12 +396,43 @@ async function applyChosenPrivateAnnotation(
   }
   await editor.convertActiveDocumentToUmbra();
   const config = await sidecar.loadUmbraAnnotationConfig();
-  const spec = await choosePrivateAnnotation(config, controller.onDidLock);
+  const profile = profileId === undefined
+    ? undefined
+    : config.profiles.find((candidate) => candidate.id === profileId);
+  if (profileId !== undefined && profile === undefined) {
+    throw new Error("Private annotation profile is unavailable");
+  }
+  let coverText: string | undefined;
+  if (profile?.promptForCover === true) {
+    coverText = await showSensitiveInputBox(
+      {
+        ignoreFocusOut: true,
+        prompt: "Public cover text (visible in Outer Mode)",
+        title: "Inex Outer Cover",
+        validateInput: (value) => Buffer.byteLength(value, "utf8") > 0 ? undefined : "Cover text is required",
+      },
+      controller.onDidLock,
+    );
+    if (coverText === undefined) return;
+  }
+  const spec = profile === undefined
+    ? await choosePrivateAnnotation(config, controller.onDidLock)
+    : {
+      kind: profile.kind,
+      tagIds: profile.tagIds,
+      outer: { mode: profile.outer, ...(coverText === undefined ? {} : { coverText }) },
+    };
   if (spec === undefined) return;
   if (!controller.isSessionCurrent(session)) {
     throw new Error("Inex vault session changed during private annotation selection");
   }
   await editor.applyPrivateAnnotationToActive(spec);
+}
+
+function isProfileArguments(value: unknown): value is { readonly profileId: string } {
+  return value !== null && typeof value === "object" &&
+    typeof (value as { readonly profileId?: unknown }).profileId === "string" &&
+    /^[a-z0-9][a-z0-9._-]{0,63}$/.test((value as { readonly profileId: string }).profileId);
 }
 
 async function runUiAction(action: () => Promise<void>): Promise<void> {

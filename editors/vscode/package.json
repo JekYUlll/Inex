@@ -37,7 +37,8 @@
     "onCommand:inex.delete",
     "onCommand:inex.togglePrivateAnnotation",
     "onCommand:inex.choosePrivateAnnotation",
-    "onCommand:inex.removePrivateAnnotation"
+    "onCommand:inex.removePrivateAnnotation",
+    "onCommand:inex.applyPrivateAnnotationProfile"
   ],
   "contributes": {
     "commands": [
@@ -79,6 +80,11 @@
       {
         "command": "inex.removePrivateAnnotation",
         "title": "Inex: Remove Private Annotation",
+        "enablement": "inex.vaultUnlocked"
+      },
+      {
+        "command": "inex.applyPrivateAnnotationProfile",
+        "title": "Inex: Apply Private Annotation Profile",
         "enablement": "inex.vaultUnlocked"
       },
       {
