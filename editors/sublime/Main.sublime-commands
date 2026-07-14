@@ -56,6 +56,10 @@
     "command": "inex_choose_private_annotation"
   },
   {
+    "caption": "Inex: Remove Private Annotation",
+    "command": "inex_remove_private_annotation"
+  },
+  {
     "caption": "Inex: Show Security Status",
     "command": "inex_show_security_status"
   }
