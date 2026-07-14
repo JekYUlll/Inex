@@ -467,6 +467,42 @@ export class InexSidecar {
     expectAcknowledgement(result);
   }
 
+  public async createUmbraAnnotationProfile(profile: UmbraAnnotationProfile): Promise<void> {
+    this.requireUmbraV1();
+    const result = await this.callRaw("umbra.profile.create", {
+      ...this.protectedParams(),
+      profile: serializeUmbraProfile(profile),
+    });
+    expectAcknowledgement(result);
+  }
+
+  public async editUmbraAnnotationProfile(
+    profileId: string,
+    profile: UmbraAnnotationProfile,
+  ): Promise<void> {
+    this.requireUmbraV1();
+    assertUmbraTagId(profileId);
+    if (profile.id !== profileId) {
+      throw new RpcProtocolError("Umbra profile ID cannot change during edit");
+    }
+    const result = await this.callRaw("umbra.profile.edit", {
+      ...this.protectedParams(),
+      profileId,
+      profile: serializeUmbraProfile(profile),
+    });
+    expectAcknowledgement(result);
+  }
+
+  public async removeUmbraAnnotationProfile(profileId: string): Promise<void> {
+    this.requireUmbraV1();
+    assertUmbraTagId(profileId);
+    const result = await this.callRaw("umbra.profile.remove", {
+      ...this.protectedParams(),
+      profileId,
+    });
+    expectAcknowledgement(result);
+  }
+
   public async enableUmbra(): Promise<"synced" | "notSynced"> {
     this.requireUmbraV1();
     const result = expectObject(
@@ -1318,6 +1354,37 @@ function serializeUmbraTagDefinition(tag: Omit<UmbraTagDefinition, "archived">):
     aliases: [...tag.aliases],
     sortOrder: tag.sortOrder,
     defaultSelected: tag.defaultSelected,
+  };
+}
+
+function serializeUmbraProfile(profile: UmbraAnnotationProfile): JsonObject {
+  assertUmbraTagId(profile.id);
+  assertUmbraText(profile.label, "Umbra profile label");
+  if (profile.kind !== "block" && profile.kind !== "comment") {
+    throw new RpcProtocolError("Umbra profile kind is invalid");
+  }
+  if (profile.outer !== "drop" && profile.outer !== "cover" && profile.outer !== "placeholder") {
+    throw new RpcProtocolError("Umbra profile outer mode is invalid");
+  }
+  if ((profile.outer === "cover") !== profile.promptForCover) {
+    throw new RpcProtocolError("Umbra profile cover prompt is invalid");
+  }
+  const tagIds = [...profile.tagIds];
+  if (
+    tagIds.length > MAX_UMBRA_TAGS ||
+    tagIds.some((tagId, index) =>
+      !/^[a-z0-9][a-z0-9._-]{0,63}$/.test(tagId) || (index > 0 && tagIds[index - 1]! >= tagId),
+    )
+  ) {
+    throw new RpcProtocolError("Umbra profile tags are invalid");
+  }
+  return {
+    id: profile.id,
+    label: profile.label,
+    kind: profile.kind,
+    tagIds,
+    outer: profile.outer,
+    promptForCover: profile.promptForCover,
   };
 }
 
