@@ -54,6 +54,46 @@ export interface VaultStatus {
   readonly opaqueAssetsV1: boolean;
 }
 
+export interface UmbraStatus {
+  readonly initialized: boolean;
+  readonly unlocked: boolean;
+}
+
+export interface TextRange {
+  readonly startByte: number;
+  readonly endByte: number;
+}
+
+export interface RenderMap {
+  readonly generation: Buffer;
+  readonly projectionBytes: number;
+  readonly privateSlots: readonly { readonly slotId: string; readonly range: TextRange }[];
+  readonly outerSegments: readonly {
+    readonly projectionRange: TextRange;
+    readonly outerRange: TextRange;
+  }[];
+}
+
+export interface UmbraProjection {
+  readonly content: Buffer;
+  readonly etag: string;
+  readonly renderMap: RenderMap;
+}
+
+export type PrivateAnnotationKind = "block" | "comment";
+export type OuterMode = "drop" | "cover" | "placeholder";
+
+export interface PrivateAnnotationSpec {
+  readonly kind: PrivateAnnotationKind;
+  readonly tagIds: readonly string[];
+  readonly outer: { readonly mode: OuterMode; readonly coverText?: string };
+}
+
+export interface UmbraAnnotationResult extends UmbraProjection {
+  readonly metadata: DocumentMetadata;
+  readonly durability: "synced" | "notSynced";
+}
+
 export interface DocumentMetadata {
   readonly fileId: string;
   readonly logicalPath: string;
@@ -146,6 +186,7 @@ export class InexSidecar {
   private child: ChildProcessWithoutNullStreams | undefined;
   private session: string | undefined;
   private negotiatedOpaqueAssetsV1 = false;
+  private negotiatedUmbraV1 = false;
   private authenticatedOpaqueAssetsV1 = false;
   private nextId = 1;
   private stderrBytes = 0;
@@ -239,6 +280,7 @@ export class InexSidecar {
       throw new RpcProtocolError("Inex sidecar capability negotiation failed");
     }
     this.negotiatedOpaqueAssetsV1 = result.capabilities.includes("opaqueAssetsV1");
+    this.negotiatedUmbraV1 = result.capabilities.includes("umbraV1");
     return result;
   }
 
@@ -292,6 +334,95 @@ export class InexSidecar {
       throw new RpcProtocolError("RPC authenticated vault feature is invalid");
     }
     return { opaqueAssetsV1: features.opaqueAssetsV1 };
+  }
+
+  public async umbraStatus(): Promise<UmbraStatus> {
+    this.requireUmbraV1();
+    return parseUmbraStatus(
+      await this.callRaw("umbra.status", this.protectedParams()),
+    );
+  }
+
+  public async initializeUmbra(password: string): Promise<UmbraStatus> {
+    this.requireUmbraV1();
+    try {
+      return parseUmbraStatus(
+        await this.callRaw("umbra.initialize", { ...this.protectedParams(), password }),
+      );
+    } finally {
+      password = "";
+    }
+  }
+
+  public async unlockUmbra(password: string): Promise<UmbraStatus> {
+    this.requireUmbraV1();
+    try {
+      return parseUmbraStatus(
+        await this.callRaw("umbra.unlock", { ...this.protectedParams(), password }),
+      );
+    } finally {
+      password = "";
+    }
+  }
+
+  public async lockUmbra(): Promise<void> {
+    this.requireUmbraV1();
+    const result = expectObject(
+      await this.callRaw("umbra.lock", this.protectedParams()),
+    );
+    expectExactKeys(result, ["ok", "unlocked"], "Umbra lock");
+    if (result.unlocked !== false) {
+      throw new RpcProtocolError("RPC Umbra lock result is invalid");
+    }
+    expectAcknowledgement(result);
+  }
+
+  public async enableUmbra(): Promise<"synced" | "notSynced"> {
+    this.requireUmbraV1();
+    const result = expectObject(
+      await this.callRaw("umbra.enable", this.protectedParams()),
+    );
+    expectExactKeys(result, ["durability", "ok"], "Umbra enable");
+    expectAcknowledgement(result);
+    return expectDurability(result.durability, "Umbra enable durability");
+  }
+
+  public async openUmbraDocument(logicalPath: string): Promise<UmbraProjection> {
+    this.requireUmbraV1();
+    logicalFileComponents(logicalPath);
+    return parseUmbraProjection(
+      await this.callRaw("umbra.document.open", {
+        ...this.protectedParams(),
+        logicalPath,
+      }),
+      logicalPath,
+    );
+  }
+
+  public async applyUmbraAnnotation(
+    logicalPath: string,
+    projection: UmbraProjection,
+    selections: readonly TextRange[],
+    spec: PrivateAnnotationSpec,
+    mergeAdjacent = false,
+  ): Promise<UmbraAnnotationResult> {
+    this.requireUmbraV1();
+    logicalFileComponents(logicalPath);
+    validateEtag(projection.etag);
+    const content = Buffer.from(projection.content);
+    const contentBase64 = content.toString("base64url");
+    content.fill(0);
+    const result = await this.callRaw("umbra.annotation.apply", {
+      ...this.protectedParams(),
+      logicalPath,
+      ifMatch: projection.etag,
+      contentBase64,
+      renderMap: serializeRenderMap(projection.renderMap),
+      selections: selections.map(serializeRange),
+      spec: serializeAnnotationSpec(spec),
+      mergeAdjacent,
+    });
+    return parseUmbraAnnotationResult(result, logicalPath);
   }
 
   public async touch(): Promise<number> {
@@ -691,6 +822,13 @@ export class InexSidecar {
     return { session: this.requireSession() };
   }
 
+  private requireUmbraV1(): void {
+    this.requireSession();
+    if (!this.negotiatedUmbraV1) {
+      throw new RpcProtocolError("Inex sidecar does not support Umbra v1");
+    }
+  }
+
   private requireSession(): string {
     if (this.session === undefined) {
       throw new SidecarLifecycleError("Inex vault is locked");
@@ -927,6 +1065,183 @@ function parseRead(value: JsonValue, expectedLogicalPath: string): ReadResult {
     content.fill(0);
     throw error;
   }
+}
+
+function parseUmbraStatus(value: JsonValue): UmbraStatus {
+  const result = expectObject(value);
+  expectExactKeys(result, ["initialized", "unlocked"], "Umbra status");
+  if (typeof result.initialized !== "boolean" || typeof result.unlocked !== "boolean") {
+    throw new RpcProtocolError("RPC Umbra status is invalid");
+  }
+  return { initialized: result.initialized, unlocked: result.unlocked };
+}
+
+/** @internal Exported for exact Umbra protocol-shape regression tests. */
+export function parseUmbraProjection(
+  value: JsonValue,
+  expectedLogicalPath: string,
+): UmbraProjection {
+  const result = expectObject(value);
+  expectExactKeys(result, ["contentBase64", "etag", "renderMap"], "Umbra document open");
+  const content = decodeCanonicalBase64url(
+    expectString(result.contentBase64, "Umbra projection"),
+    MAX_DOCUMENT_BYTES,
+  );
+  try {
+    const etag = expectEtag(result.etag, "Umbra document etag");
+    const renderMap = parseRenderMap(result.renderMap);
+    if (content.byteLength !== renderMap.projectionBytes) {
+      throw new RpcProtocolError("RPC Umbra projection length does not match its RenderMap");
+    }
+    logicalFileComponents(expectedLogicalPath);
+    return { content, etag, renderMap };
+  } catch (error: unknown) {
+    content.fill(0);
+    throw error;
+  }
+}
+
+/** @internal Exported for exact Umbra protocol-shape regression tests. */
+export function parseUmbraAnnotationResult(
+  value: JsonValue,
+  expectedLogicalPath: string,
+): UmbraAnnotationResult {
+  const result = expectObject(value);
+  expectExactKeys(
+    result,
+    ["contentBase64", "durability", "etag", "metadata", "renderMap"],
+    "Umbra annotation result",
+  );
+  const projection = parseUmbraProjection(
+    {
+      contentBase64: result.contentBase64 ?? null,
+      etag: result.etag ?? null,
+      renderMap: result.renderMap ?? null,
+    },
+    expectedLogicalPath,
+  );
+  try {
+    return {
+      ...projection,
+      metadata: parseMetadata(result.metadata, expectedLogicalPath),
+      durability: expectDurability(result.durability, "Umbra annotation durability"),
+    };
+  } catch (error: unknown) {
+    projection.content.fill(0);
+    projection.renderMap.generation.fill(0);
+    throw error;
+  }
+}
+
+function parseRenderMap(value: JsonValue | undefined): RenderMap {
+  const map = expectObject(value);
+  expectExactKeys(
+    map,
+    ["generationBase64", "outerSegments", "privateSlots", "projectionBytes"],
+    "Umbra RenderMap",
+  );
+  const generation = decodeCanonicalBase64url(
+    expectString(map.generationBase64, "Umbra RenderMap generation"),
+    32,
+  );
+  if (generation.byteLength !== 32) {
+    generation.fill(0);
+    throw new RpcProtocolError("RPC Umbra RenderMap generation is invalid");
+  }
+  try {
+    const projectionBytes = expectSafeInteger(map.projectionBytes, "Umbra projection length");
+    if (projectionBytes < 0 || projectionBytes > MAX_DOCUMENT_BYTES) {
+      throw new RpcProtocolError("RPC Umbra projection length is outside the v1 range");
+    }
+    const privateSlots = expectArray(map.privateSlots, "Umbra private slots").map((value) => {
+      const slot = expectObject(value);
+      expectExactKeys(slot, ["endByte", "slotId", "startByte"], "Umbra private slot");
+      return {
+        slotId: expectString(slot.slotId, "Umbra slot id"),
+        range: parseRange(slot.startByte, slot.endByte, "Umbra private slot range"),
+      };
+    });
+    const outerSegments = expectArray(map.outerSegments, "Umbra outer segments").map((value) => {
+      const segment = expectObject(value);
+      expectExactKeys(
+        segment,
+        ["outerEndByte", "outerStartByte", "projectionEndByte", "projectionStartByte"],
+        "Umbra outer segment",
+      );
+      return {
+        projectionRange: parseRange(
+          segment.projectionStartByte,
+          segment.projectionEndByte,
+          "Umbra projection segment",
+        ),
+        outerRange: parseRange(segment.outerStartByte, segment.outerEndByte, "Umbra outer range"),
+      };
+    });
+    return { generation, projectionBytes, privateSlots, outerSegments };
+  } catch (error: unknown) {
+    generation.fill(0);
+    throw error;
+  }
+}
+
+function parseRange(start: JsonValue | undefined, end: JsonValue | undefined, field: string): TextRange {
+  const startByte = expectSafeInteger(start, field);
+  const endByte = expectSafeInteger(end, field);
+  if (startByte < 0 || endByte <= startByte || endByte > MAX_DOCUMENT_BYTES) {
+    throw new RpcProtocolError("RPC Umbra range is invalid");
+  }
+  return { startByte, endByte };
+}
+
+function serializeRange(range: TextRange): JsonObject {
+  if (
+    !Number.isSafeInteger(range.startByte) ||
+    !Number.isSafeInteger(range.endByte) ||
+    range.startByte < 0 ||
+    range.endByte <= range.startByte ||
+    range.endByte > MAX_DOCUMENT_BYTES
+  ) {
+    throw new RpcProtocolError("Umbra range is invalid");
+  }
+  return { startByte: range.startByte, endByte: range.endByte };
+}
+
+function serializeRenderMap(renderMap: RenderMap): JsonObject {
+  if (renderMap.generation.byteLength !== 32 || renderMap.projectionBytes < 0) {
+    throw new RpcProtocolError("Umbra RenderMap is invalid");
+  }
+  return {
+    generationBase64: renderMap.generation.toString("base64url"),
+    projectionBytes: renderMap.projectionBytes,
+    privateSlots: renderMap.privateSlots.map((slot) => ({
+      slotId: slot.slotId,
+      ...serializeRange(slot.range),
+    })),
+    outerSegments: renderMap.outerSegments.map((segment) => ({
+      projectionStartByte: segment.projectionRange.startByte,
+      projectionEndByte: segment.projectionRange.endByte,
+      outerStartByte: segment.outerRange.startByte,
+      outerEndByte: segment.outerRange.endByte,
+    })),
+  };
+}
+
+function serializeAnnotationSpec(spec: PrivateAnnotationSpec): JsonObject {
+  if (
+    (spec.kind !== "block" && spec.kind !== "comment") ||
+    (spec.outer.mode !== "drop" && spec.outer.mode !== "cover" && spec.outer.mode !== "placeholder") ||
+    spec.tagIds.some((tag) => !/^[a-z0-9][a-z0-9._-]{0,63}$/.test(tag)) ||
+    !spec.tagIds.every((tag, index) => index === 0 || spec.tagIds[index - 1]! < tag) ||
+    (spec.outer.mode === "cover") !== (spec.outer.coverText !== undefined) ||
+    spec.outer.coverText === ""
+  ) {
+    throw new RpcProtocolError("Umbra annotation spec is invalid");
+  }
+  const outer: JsonObject = { mode: spec.outer.mode };
+  if (spec.outer.coverText !== undefined) {
+    outer.coverText = spec.outer.coverText;
+  }
+  return { kind: spec.kind, tagIds: [...spec.tagIds], outer };
 }
 
 /** @internal Exported for exact protocol-shape regression tests. */
