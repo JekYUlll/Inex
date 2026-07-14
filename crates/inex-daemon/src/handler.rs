@@ -153,6 +153,7 @@ impl<C: MonotonicClock> RpcService<C> {
             Method::UmbraEnable => self.umbra_enable(params),
             Method::UmbraDocumentOpen => self.umbra_document_open(params),
             Method::UmbraAnnotationApply => self.umbra_annotation_apply(params),
+            Method::UmbraConfigGet => self.umbra_config_get(params),
             Method::VaultListTree => self.vault_list_tree(params),
             Method::FileStat => self.file_stat(params),
             Method::FileRead => self.file_read(params),
@@ -486,6 +487,43 @@ impl<C: MonotonicClock> RpcService<C> {
             "durability": durability_name(applied.document.parent_sync),
             "contentBase64": encode_base64url(applied.projection.markdown.as_bytes()).as_str(),
             "renderMap": render_map_value(&applied.projection.render_map),
+        }))
+    }
+
+    fn umbra_config_get(&mut self, params: Params) -> RpcResult {
+        let mut params = ParamObject::new(params);
+        let session = required_session(&mut params)?;
+        params.finish()?;
+        let config = self
+            .sessions
+            .vault_mut(session.as_str())
+            .map_err(map_session_error)?
+            .load_umbra_config()
+            .map_err(|error| map_vault_error(error, ErrorContext::Document))?;
+        Ok(json!({
+            "tags": config.tag_catalog.into_iter().map(|tag| json!({
+                "id": tag.id,
+                "label": tag.label,
+                "description": tag.description,
+                "aliases": tag.aliases,
+                "sortOrder": tag.sort_order,
+                "defaultSelected": tag.default_selected,
+                "archived": tag.archived,
+            })).collect::<Vec<_>>(),
+            "profiles": config.annotation_profiles.into_iter().map(|profile| json!({
+                "id": profile.id,
+                "label": profile.label,
+                "kind": annotation_kind_name(profile.kind),
+                "tagIds": profile.tag_ids,
+                "outer": outer_mode_name(&profile.outer),
+                "promptForCover": profile.prompt_for_cover,
+            })).collect::<Vec<_>>(),
+            "defaults": {
+                "kind": annotation_kind_name(config.defaults.kind),
+                "tagIds": config.defaults.tag_ids,
+                "outer": outer_mode_name(&config.defaults.outer),
+                "defaultProfileId": config.defaults.default_profile_id,
+            },
         }))
     }
 
@@ -1077,6 +1115,21 @@ fn usize_from_rpc(value: u64) -> Result<usize, ErrorObject> {
 
 fn umbra_status_value(status: UmbraStatus) -> Value {
     json!({"initialized": status.initialized, "unlocked": status.unlocked})
+}
+
+const fn annotation_kind_name(kind: PrivateAnnotationKind) -> &'static str {
+    match kind {
+        PrivateAnnotationKind::Block => "block",
+        PrivateAnnotationKind::Comment => "comment",
+    }
+}
+
+const fn outer_mode_name(mode: &OuterMode) -> &'static str {
+    match mode {
+        OuterMode::Drop => "drop",
+        OuterMode::Cover => "cover",
+        OuterMode::Placeholder => "placeholder",
+    }
 }
 
 fn render_map_value(render_map: &OwnedRenderMap) -> Value {
@@ -1912,6 +1965,17 @@ mod tests {
         );
         assert!(!format!("{initialized:?}").contains("umbra handler password"));
         scrub_object(&mut initialized);
+        let mut config = response(
+            &mut service,
+            41,
+            "umbra.config.get",
+            json!({"session": session.as_str()}),
+        );
+        assert_eq!(config["result"]["tags"], json!([]));
+        assert_eq!(config["result"]["profiles"], json!([]));
+        assert_eq!(config["result"]["defaults"]["kind"], "comment");
+        assert_eq!(config["result"]["defaults"]["outer"], "drop");
+        scrub_object(&mut config);
         let mut enabled = response(
             &mut service,
             5,
@@ -1996,6 +2060,17 @@ mod tests {
         );
         assert_eq!(locked["result"]["ok"], true);
         scrub_object(&mut locked);
+        let mut config_denied = response(
+            &mut service,
+            71,
+            "umbra.config.get",
+            json!({"session": session.as_str()}),
+        );
+        assert_eq!(
+            config_denied["error"]["code"],
+            ErrorCode::AuthFailed.number()
+        );
+        scrub_object(&mut config_denied);
         let mut denied = response(
             &mut service,
             8,
