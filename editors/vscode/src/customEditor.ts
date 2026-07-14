@@ -30,6 +30,11 @@ interface SnapshotRequest {
   readonly cancellation: vscode.Disposable;
 }
 
+interface EditorSelection {
+  readonly startByte: number;
+  readonly endByte: number;
+}
+
 export interface FileMutationPreparation {
   readonly etag: string;
   readonly wasOpen: boolean;
@@ -49,6 +54,7 @@ class InexDocument implements vscode.CustomDocument {
   private pendingReveal: { readonly startByte: number; readonly endByte: number } | undefined;
   private readonly snapshotRequests = new Map<number, SnapshotRequest>();
   private nextSnapshotRequest = 1;
+  private selection: EditorSelection | undefined;
 
   public constructor(
     public readonly uri: vscode.Uri,
@@ -76,6 +82,26 @@ class InexDocument implements vscode.CustomDocument {
 
   public get requiresStaleBackupConfirmation(): boolean {
     return this.staleBackup;
+  }
+
+  public currentSelection(): EditorSelection | undefined {
+    return this.selection;
+  }
+
+  public updateSelection(text: string, startByte: number, endByte: number): boolean {
+    this.requireUsable();
+    if (
+      !Number.isSafeInteger(startByte) ||
+      !Number.isSafeInteger(endByte) ||
+      startByte < 0 ||
+      endByte < startByte ||
+      endByte > Buffer.byteLength(text, "utf8")
+    ) {
+      throw new Error("Inex editor selection is invalid");
+    }
+    const changed = this.applyEdit(text);
+    this.selection = { startByte, endByte };
+    return changed;
   }
 
   public applyEdit(text: string): boolean {
@@ -233,6 +259,7 @@ class InexDocument implements vscode.CustomDocument {
     this.disposed = true;
     this.content.fill(0);
     this.content = Buffer.alloc(0);
+    this.selection = undefined;
     this.rejectSnapshotRequests(new Error("Inex document was disposed"));
     this.panels.clear();
     this.readyPanels.clear();
@@ -247,6 +274,7 @@ class InexDocument implements vscode.CustomDocument {
     this.locked = true;
     this.content.fill(0);
     this.content = Buffer.alloc(0);
+    this.selection = undefined;
     this.rejectSnapshotRequests(new Error("Inex document was locked"));
     for (const panel of this.panels) {
       panel.webview.html = lockedHtml();
@@ -491,6 +519,28 @@ export class InexCustomEditorProvider
       }
       if (message.type === "activity") {
         this.controller.noteUserActivity(document.session);
+        return;
+      }
+      if (
+        message.type === "selection" &&
+        typeof message.content === "string" &&
+        Number.isSafeInteger(message.startByte) &&
+        Number.isSafeInteger(message.endByte) &&
+        typeof message.startByte === "number" &&
+        typeof message.endByte === "number" &&
+        isEditEpoch(message.editEpoch) &&
+        this.previews.acceptEditEpoch(document, webviewPanel, message.editEpoch)
+      ) {
+        try {
+          if (document.updateSelection(message.content, message.startByte, message.endByte)) {
+            this.changeEmitter.fire({ document });
+          }
+          this.controller.noteUserActivity(document.session);
+          this.previews.refreshDocument(document);
+        } catch (error: unknown) {
+          void vscode.window.showErrorMessage(safeError(error));
+          document.send(webviewPanel);
+        }
         return;
       }
       if (
@@ -1278,6 +1328,7 @@ let editEpoch=0;
 const transfers=new Map();
 const objectUrls=new Set();
 function byteIndex(text,target){let bytes=0,index=0;for(const scalar of text){if(bytes>=target)break;bytes+=encoder.encode(scalar).length;index+=scalar.length;}return index;}
+function byteOffset(text,target){return encoder.encode(text.slice(0,target)).length;}
 function cancelEditTimer(){if(editTimer!==undefined){clearTimeout(editTimer);editTimer=undefined;}}
 function sendEdit(){cancelEditTimer();if(!applying)vscode.postMessage({type:'edit',content:editor.value,editEpoch});}
 function sendNavigation(type,offset){cancelEditTimer();vscode.postMessage({type,offset,content:editor.value,editEpoch});}
@@ -1306,6 +1357,7 @@ function jpegDimensions(b){let i=2,width=0,height=0,inScan=false;while(i<b.lengt
 function isWebP(b){return b.length>=12&&ascii(b,0,4)==='RIFF'&&ascii(b,8,4)==='WEBP'&&u32le(b,4)+8===b.length;}
 function webpDimensions(b){let i=12,index=0,flags=0,canvasWidth=0,canvasHeight=0,frameWidth=0,frameHeight=0,primaryType='',previous='',extended=false,iccp=false,alpha=false,exif=false,xmp=false;while(i+8<=b.length){const type=ascii(b,i,4),length=u32le(b,i+4),data=i+8,end=data+length,padded=end+(length&1);if(end>b.length||padded>b.length||(length&1)!==0&&b[end]!==0)return undefined;if(type==='ANIM'||type==='ANMF')return undefined;if(type==='VP8X'){if(index!==0||extended||length!==10||(b[data]&193)!==0||(b[data]&2)!==0||b[data+1]!==0||b[data+2]!==0||b[data+3]!==0)return undefined;extended=true;flags=b[data];canvasWidth=u24le(b,data+4)+1;canvasHeight=u24le(b,data+7)+1;if(!validRasterDimensions([canvasWidth,canvasHeight]))return undefined;}else if(type==='ICCP'){if(!extended||index!==1||iccp||primaryType!==''||(flags&32)===0)return undefined;iccp=true;}else if(type==='ALPH'){if(!extended||alpha||primaryType!==''||(flags&16)===0)return undefined;alpha=true;}else if(type==='VP8 '){if(primaryType!==''||!extended&&index!==0||alpha&&previous!=='ALPH'||extended&&(flags&16)!==0&&!alpha||length<10||b[data+3]!==157||b[data+4]!==1||b[data+5]!==42)return undefined;frameWidth=(b[data+6]+b[data+7]*256)&16383;frameHeight=(b[data+8]+b[data+9]*256)&16383;if(!validRasterDimensions([frameWidth,frameHeight]))return undefined;primaryType=type;}else if(type==='VP8L'){if(primaryType!==''||alpha||!extended&&index!==0||length<5||b[data]!==47)return undefined;frameWidth=1+b[data+1]+((b[data+2]&63)<<8);frameHeight=1+(b[data+2]>>6)+(b[data+3]<<2)+((b[data+4]&15)<<10);if(!validRasterDimensions([frameWidth,frameHeight]))return undefined;primaryType=type;}else if(type==='EXIF'){if(!extended||primaryType===''||exif||xmp||(flags&8)===0)return undefined;exif=true;}else if(type==='XMP '){if(!extended||primaryType===''||xmp||(flags&4)===0)return undefined;xmp=true;}else{return undefined;}previous=type;i=padded;index+=1;}if(i!==b.length||primaryType===''||extended&&(canvasWidth!==frameWidth||canvasHeight!==frameHeight||iccp!==((flags&32)!==0)||exif!==((flags&8)!==0)||xmp!==((flags&4)!==0)))return undefined;return [frameWidth,frameHeight];}
 editor.addEventListener('input',()=>{if(!applying){if(editEpoch>=Number.MAX_SAFE_INTEGER){suspendPreviews();return;}editEpoch+=1;suspendPreviews();const now=Date.now();if(now-lastActivity>=1000){lastActivity=now;vscode.postMessage({type:'activity'});}cancelEditTimer();editTimer=setTimeout(sendEdit,150);}});
+editor.addEventListener('select',()=>{if(!applying)vscode.postMessage({type:'selection',content:editor.value,startByte:byteOffset(editor.value,editor.selectionStart),endByte:byteOffset(editor.value,editor.selectionEnd),editEpoch});});
 editor.addEventListener('click',(event)=>{if(event.ctrlKey||event.metaKey)sendNavigation('followLink',editor.selectionStart);});
 editor.addEventListener('keydown',(event)=>{if((event.ctrlKey||event.metaKey)&&event.key==='Enter'){event.preventDefault();sendNavigation('followLink',editor.selectionStart);}});
 document.getElementById('headings').addEventListener('click',()=>sendNavigation('showHeadings',editor.selectionStart));
