@@ -98,7 +98,7 @@ export function activate(
         );
       });
     }),
-    vscode.commands.registerCommand("inex.importRepository", async () => {
+    vscode.commands.registerCommand("inex.importRepository", async (source?: unknown) => {
       await runUiAction(async () => {
         if (controller.isUnlocked) {
           await vscode.window.showInformationMessage(
@@ -106,7 +106,10 @@ export function activate(
           );
           return;
         }
-        const target = await importMarkdownRepository(context);
+        const target = await importMarkdownRepository(
+          context,
+          source instanceof vscode.Uri ? source : undefined,
+        );
         if (target === undefined) {
           return;
         }
@@ -298,12 +301,12 @@ async function ensureVaultUnlocked(controller: VaultController): Promise<boolean
   const choice = await vscode.window.showInformationMessage(
     "Unlock an Inex vault, or import an existing Markdown Git repository into a new encrypted vault.",
     "Unlock Vault",
-    "Import Existing Markdown Repository",
+    "Initialize from Markdown Repository",
   );
   if (choice === "Unlock Vault") {
     return (await controller.unlockInteractive()) !== undefined;
   }
-  if (choice === "Import Existing Markdown Repository") {
+  if (choice === "Initialize from Markdown Repository") {
     await vscode.commands.executeCommand("inex.importRepository");
   }
   return false;

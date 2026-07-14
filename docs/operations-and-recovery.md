@@ -108,18 +108,21 @@ The Linux engineering-preview path for an existing tracked Markdown repository
 is:
 
 ```text
-inex import-repository <source-repository> <new-vault> [--dry-run]
+inex import-repository <source-repository> <destination-vault> [--dry-run]
 ```
 
-The source must be one clean top-level ordinary SHA-1 worktree. Dry-run binds
-and revalidates its current tracked `HEAD` snapshot without prompting for a
-password or writing product state. The real run accepts only tracked stage-zero
-`100644` files: exact lowercase `.md` paths become Markdown and the remainder
-become opaque assets. Unsupported modes or source states abort instead of being
-skipped. It then builds the complete vault and a fresh parentless ciphertext Git
-commit in one hidden sibling staging root. One checked no-replace directory
-publication exposes the target. Source commits, refs, objects, and remotes remain
-only in the unchanged plaintext source repository.
+For an absent target, dry-run binds and revalidates one clean top-level ordinary
+SHA-1 worktree's current tracked `HEAD` snapshot without prompting for a
+password or writing product state. For an existing target, it performs no
+source Git planning and only previews target-only reconciliation of an exact
+canonical marker-v2 claim; every other state fails closed. A fresh real run
+accepts only tracked stage-zero `100644` files: exact lowercase `.md` paths
+become Markdown and the remainder become opaque assets. Unsupported modes or
+source states abort instead of being skipped. It then builds the complete vault
+and a fresh parentless ciphertext Git commit in one hidden sibling staging root.
+One checked no-replace directory publication exposes the target. Source commits,
+refs, objects, and remotes remain only in the unchanged plaintext source
+repository.
 
 After a trustworthy source plan, every nonzero exit prints four stable terminal
 fields before its scrubbed diagnostic:
@@ -137,10 +140,14 @@ recovery-required: prepublication-cleanup | publication-reconcile | none
   destination after investigating the fixed error category.
 - `publication-indeterminate` or `publication-reconcile` means stop all manual
   cleanup. Preserve the destination, sibling staging entries, and parent
-  directory state before deciding which complete root is authoritative.
+  directory state. If the target retains the exact canonical v2 claim, rerun
+  the same command and destination: it enters target-only reconciliation before
+  source Git planning, password input, or KDF work. Every other existing state
+  fails closed and requires manual audit.
 - `published` on a nonzero exit means a complete target was observed, but its
-  cleanup, final audit, or parent durability was not confirmed. Do not rerun
-  over it or delete markers merely to make Git look clean.
+  cleanup, final audit, or parent durability was not confirmed. Preserve it and
+  use only the same command's exact-v2 reconcile path; never delete a marker
+  merely to make Git look clean.
 
 Always retain the original repository and import report. The current Linux
 implementation is suitable for a trusted-local engineering demo, not a GA

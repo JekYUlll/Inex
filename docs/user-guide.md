@@ -31,21 +31,33 @@ not recoverable. Inex has no reset password, escrow, or backdoor.
 
 ## First use from an existing Git repository
 
-On Linux, the locked **Encrypted Vault** view offers **Import an Existing
-Markdown Repository**. Use it only with a backed-up, clean local Git worktree:
+On Linux, the locked **Encrypted Vault** view offers **Initialize from an
+Existing Markdown Repository**. The same action is available from the Command
+Palette and by right-clicking a local Explorer folder. Use it only with a
+backed-up, clean local Git worktree:
 
 1. Confirm `git status --short` is empty in the source repository.
 2. Select that repository, an existing target parent directory, and a new target
-   folder name. The target must not already exist or be inside the source.
-3. Enter and confirm a new vault password in the dedicated Inex task terminal.
+   folder name. A sole local workspace is selected by default. A fresh target
+   must not already exist or be inside the source; only an exact interrupted
+   marker-v2 publication can use the explicitly warned existing-target path.
+3. Confirm that only the clean tracked `HEAD` snapshot will be imported into one
+   new encrypted root commit. The old commits remain only in the unchanged
+   plaintext source repository.
+4. Enter and confirm a new vault password in the dedicated Inex task terminal.
    The extension does not put the password in command arguments, settings, or
-   environment variables.
-4. After the task reports a complete repository import, choose **Open New
+   environment variables. Exact existing-target reconciliation never asks for
+   a password; cancel if such a prompt appears after choosing that path.
+5. After the task reports a complete repository import, choose **Open New
    Vault**. VS Code reloads on the ciphertext repository; then run **Unlock
    Vault** and enter the same password in the hidden input.
-5. Keep the original repository. It remains the plaintext history archive; the
+6. Keep the original repository. It remains the plaintext history archive; the
    new Inex repository contains one parentless encrypted current-snapshot
    commit, not a copy of the old commits.
+
+After unlock, create, rename, and delete encrypted content from the **Encrypted
+Vault** view. Native Explorer file operations are ordinary filesystem changes,
+not authenticated Inex CRUD.
 
 Every accepted tracked stage-zero `100644` file is imported. Exact lowercase
 `.md` paths become encrypted documents and the remainder become encrypted opaque

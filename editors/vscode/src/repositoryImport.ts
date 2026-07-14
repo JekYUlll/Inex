@@ -1,21 +1,34 @@
-import { lstatSync } from "node:fs";
 import * as path from "node:path";
 
 import * as vscode from "vscode";
 
 import { resolveCliExecutable } from "./cliExecutable.ts";
+import { runProcessTask } from "./processTask.ts";
+import {
+  classifyImportTarget,
+  rejectOverlappingTarget,
+  RepositoryImportError,
+  requireRegularDirectory,
+  validateTargetFolderName,
+} from "./repositoryImportPaths.ts";
 
-export class RepositoryImportError extends Error {
-  public override readonly name = "RepositoryImportError";
-}
+export { RepositoryImportError } from "./repositoryImportPaths.ts";
+
+const RECONCILE_EXISTING_ACTION = "Audit and Reconcile Existing Target";
 
 export async function importMarkdownRepository(
   context: vscode.ExtensionContext,
+  preferredSource?: vscode.Uri,
 ): Promise<vscode.Uri | undefined> {
-  const source = await pickOneLocalFolder({
-    openLabel: "Select Markdown Repository",
-    title: "Select the existing Markdown Git repository to copy",
-  });
+  const defaultUri = defaultSourceFolder();
+  const source =
+    preferredSource === undefined
+      ? await pickOneLocalFolder({
+          ...(defaultUri === undefined ? {} : { defaultUri }),
+          openLabel: "Select Markdown/Git Folder",
+          title: "Select the existing Markdown Git repository to initialize from",
+        })
+      : requireLocalFolderUri(preferredSource);
   if (source === undefined) {
     return undefined;
   }
@@ -34,8 +47,8 @@ export async function importMarkdownRepository(
   const suggested = `${path.basename(source.fsPath)}-inex`;
   const folderName = await vscode.window.showInputBox({
     ignoreFocusOut: true,
-    prompt: "Name of the new, currently absent encrypted repository",
-    title: "Import Existing Markdown Repository",
+    prompt: "Name a new encrypted repository, or an interrupted Inex target to reconcile",
+    title: "Initialize Inex from Existing Markdown",
     value: suggested,
     valueSelection: [0, suggested.length],
     validateInput: validateTargetFolderName,
@@ -44,8 +57,27 @@ export async function importMarkdownRepository(
     return undefined;
   }
   const target = vscode.Uri.file(path.join(targetParent.fsPath, folderName));
-  requireAbsent(target.fsPath);
-  rejectNestedTarget(source.fsPath, target.fsPath);
+  rejectOverlappingTarget(source.fsPath, target.fsPath);
+  const targetState = classifyImportTarget(target.fsPath);
+  if (targetState === "existing-directory") {
+    const choice = await vscode.window.showWarningMessage(
+      "The target currently exists. Inex will only audit and reconcile an exact interrupted v2 publication; every other existing directory fails without modification. Exact reconciliation never requests a password—cancel the task if a password prompt appears because the target changed before dispatch.",
+      { modal: true },
+      RECONCILE_EXISTING_ACTION,
+    );
+    if (choice !== RECONCILE_EXISTING_ACTION) {
+      return undefined;
+    }
+  } else {
+    const choice = await vscode.window.showWarningMessage(
+      "Inex will import only the clean tracked HEAD snapshot, including tracked images and attachments, into one new encrypted root commit. The source and its plaintext Git history remain unchanged and are not copied.",
+      { modal: true },
+      "Initialize Encrypted Snapshot",
+    );
+    if (choice !== "Initialize Encrypted Snapshot") {
+      return undefined;
+    }
+  }
   if (process.env.INEX_PASSWORD_STDIN !== undefined) {
     throw new RepositoryImportError(
       "Repository import requires hidden terminal password input; remove INEX_PASSWORD_STDIN from the VS Code environment and reload the window",
@@ -64,7 +96,7 @@ export async function importMarkdownRepository(
   const task = new vscode.Task(
     { type: "inex", operation: "importRepository" },
     vscode.TaskScope.Global,
-    "Import Existing Markdown Repository",
+    "Initialize Inex from Existing Markdown",
     "Inex",
     execution,
     [],
@@ -77,8 +109,17 @@ export async function importMarkdownRepository(
     reveal: vscode.TaskRevealKind.Always,
     showReuseMessage: false,
   };
-  const running = await vscode.tasks.executeTask(task);
-  const exitCode = await waitForProcessTask(running);
+  const exitCode = await runProcessTask({
+    start: () => vscode.tasks.executeTask(task),
+    onProcessStart: (listener) =>
+      vscode.tasks.onDidStartTaskProcess((event) => listener(event.execution)),
+    onProcessEnd: (listener) =>
+      vscode.tasks.onDidEndTaskProcess((event) =>
+        listener(event.execution, event.exitCode),
+      ),
+    onTaskEnd: (listener) =>
+      vscode.tasks.onDidEndTask((event) => listener(event.execution)),
+  });
   if (exitCode !== 0) {
     if (exitCode === undefined) {
       throw new RepositoryImportError("Inex repository import ended without an exit status");
@@ -88,6 +129,14 @@ export async function importMarkdownRepository(
     );
   }
   return target;
+}
+
+function defaultSourceFolder(): vscode.Uri | undefined {
+  const folders = vscode.workspace.workspaceFolders?.filter(
+    (folder) =>
+      folder.uri.scheme === "file" && !folder.uri.query && !folder.uri.fragment,
+  );
+  return folders?.length === 1 ? folders[0]?.uri : undefined;
 }
 
 async function pickOneLocalFolder(
@@ -106,96 +155,9 @@ async function pickOneLocalFolder(
   return folder;
 }
 
-function requireRegularDirectory(folderPath: string, label: string): void {
-  let metadata;
-  try {
-    metadata = lstatSync(folderPath);
-  } catch {
-    throw new RepositoryImportError(`${label} is unavailable`);
+function requireLocalFolderUri(folder: vscode.Uri): vscode.Uri {
+  if (folder.scheme !== "file" || folder.query || folder.fragment) {
+    throw new RepositoryImportError("Inex repository import supports local folders only");
   }
-  if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
-    throw new RepositoryImportError(`${label} must be a real local directory`);
-  }
-}
-
-function requireAbsent(targetPath: string): void {
-  try {
-    lstatSync(targetPath);
-  } catch (error: unknown) {
-    if (isNodeError(error) && error.code === "ENOENT") {
-      return;
-    }
-    throw new RepositoryImportError("Could not verify that the target is absent");
-  }
-  throw new RepositoryImportError("The encrypted repository target already exists");
-}
-
-function rejectNestedTarget(sourcePath: string, targetPath: string): void {
-  const relative = path.relative(sourcePath, targetPath);
-  if (
-    relative.length === 0 ||
-    (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative))
-  ) {
-    throw new RepositoryImportError(
-      "The new encrypted repository must not be created inside the source repository",
-    );
-  }
-}
-
-function validateTargetFolderName(value: string): string | undefined {
-  if (
-    value.length === 0 ||
-    value === "." ||
-    value === ".." ||
-    value.includes("/") ||
-    value.includes("\\") ||
-    /\p{Cc}/u.test(value) ||
-    /[<>:"|?*]/u.test(value) ||
-    value.startsWith(" ") ||
-    value.endsWith(" ") ||
-    value.endsWith(".")
-  ) {
-    return "Enter one portable new folder name without separators";
-  }
-  if (Buffer.byteLength(value, "utf8") > 255) {
-    return "Folder name exceeds the portable byte limit";
-  }
-  const base = (value.split(".", 1)[0] ?? value).replace(/ +$/u, "").toUpperCase();
-  if (
-    ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"].includes(base) ||
-    /^(?:COM|LPT)(?:[1-9]|[¹²³])$/u.test(base) ||
-    /~[0-9]$/u.test(base)
-  ) {
-    return "Folder name is not portable to Windows and Git";
-  }
-  return undefined;
-}
-
-function waitForProcessTask(execution: vscode.TaskExecution): Promise<number | undefined> {
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = (exitCode: number | undefined) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      processSubscription.dispose();
-      taskSubscription.dispose();
-      resolve(exitCode);
-    };
-    const processSubscription = vscode.tasks.onDidEndTaskProcess((event) => {
-      if (event.execution === execution) {
-        finish(event.exitCode);
-      }
-    });
-    const taskSubscription = vscode.tasks.onDidEndTask((event) => {
-      if (event.execution === execution) {
-        setTimeout(() => finish(undefined), 0);
-      }
-    });
-  });
-}
-
-function isNodeError(error: unknown): error is NodeJS.ErrnoException {
-  return error instanceof Error && "code" in error;
+  return folder;
 }

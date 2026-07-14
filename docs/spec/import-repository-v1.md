@@ -4,14 +4,12 @@ Status: **implementation contract frozen for the first repository-import
 slice**. This contract does not change the existing
 [`inex import`](import-v1.md) plaintext-tree command.
 
-The source, candidate, and normal whole-root publication path are implemented
-by the current Linux engineering preview. The cross-process publication
-recovery requirements below are an explicit **GA target**, not a description of
-the current publisher: the preview still uses a legacy random 16-byte marker
-whose ownership proof depends on the creating process's held handles and
-in-memory candidate seal. Until generic publication marker v2 and its fault
-matrix are implemented, a post-publication nonzero result must be preserved for
-manual audit and must not be treated as safe-to-rerun recovery evidence.
+The source, candidate, marker-v2 whole-root publication, and exact-v2
+existing-only reconciliation paths are implemented by the current Linux
+engineering preview. Native force-kill coverage at every boundary, hostile
+same-UID races, and the native Windows filesystem matrix remain explicit
+**GA gates**. Legacy, malformed, marker-free, aliased, or otherwise
+unattributed existing targets always fail closed and remain manual-audit state.
 
 Repository import creates one new encrypted snapshot and one new Git root
 commit from the exact, clean `HEAD` worktree of an existing repository. It is
@@ -22,7 +20,7 @@ not a history-rewriting or history-preserving migration.
 The only form is:
 
 ```text
-inex import-repository <source-repository> <new-vault> [--dry-run]
+inex import-repository <source-repository> <destination-vault> [--dry-run]
 ```
 
 The command rejects password, KDF, revision, filter, dirty-tree, history, and
@@ -66,10 +64,13 @@ continue to contain plaintext exactly as before. Inex never deletes, rewrites,
 pushes, or disconnects them. Archiving or removing those copies is a separate,
 explicit manual lifecycle after independent target verification.
 
-`--dry-run` performs the complete source, Git, content, path, resource, and
-destination validation. It reads and hashes every source file but does not ask
-for a password, calibrate a KDF, create a directory, initialize Git, or write
-product state.
+Against an absent destination, `--dry-run` performs the complete source, Git,
+content, path, resource, and destination validation and reads and hashes every
+source file. Against an existing destination, it never repeats source Git
+planning: only an exact canonical marker-v2 target can produce the target-only
+reconciliation preview; every other existing state fails closed. Neither path
+asks for a password, calibrates a KDF, creates a directory, initializes Git, or
+writes product state.
 
 ## Frozen source profile
 
@@ -461,14 +462,16 @@ The complete source checkpoint runs after candidate audit and durability. The
 destination parent identity, filesystem, absent destination, staging identity,
 and exact candidate seals are re-proved immediately before publication.
 
-### GA generic publication marker v2
+### Generic publication marker v2
 
-GA cross-process recovery requires one fixed, canonical binary marker v2. The
-current random 16-byte marker is legacy and does not satisfy this requirement.
-All scalar version, scheme, total, length, and identity-volume integers use
-unsigned big-endian encoding. The 16-byte normalized identity payload retains
-the explicit platform byte semantics below. There is no alignment padding, and
-the byte layout is exactly:
+Cross-process recovery uses one fixed, canonical binary marker v2. The current
+Linux engineering preview implements this marker and its exact-v2
+existing-only guard; the force-kill, hostile same-UID race, and native Windows
+evidence below remain GA gates. The earlier random 16-byte marker is legacy and
+does not grant fresh-process recovery authority. All scalar version, scheme,
+total, length, and identity-volume integers use unsigned big-endian encoding.
+The 16-byte normalized identity payload retains the explicit platform byte
+semantics below. There is no alignment padding, and the byte layout is exactly:
 
 | Offset | Size | Field |
 |---:|---:|---|
@@ -918,11 +921,11 @@ already complete vault and `.git`; there is no vault-without-Git or partial
 final-Git state. A kill before parent sync or marker cleanup may make the CLI
 result indeterminate, but it cannot expose a partially constructed repository.
 
-For GA, a later `import-repository` invocation checks an existing-only
-reconciliation guard before ordinary existing-destination rejection. The guard
-uses a new open-existing/no-create/no-recovery lock API; it must not call a
-normal vault guard whose acquisition can create `mutation.lock`, recover
-private ciphertext staging, or replay `pending-rebind-v1`. It opens the exact
+The current implementation checks an existing-only reconciliation guard before
+ordinary existing-destination rejection. The guard uses an
+open-existing/no-create/no-recovery lock API; it does not call a normal vault
+guard whose acquisition can create `mutation.lock`, recover private ciphertext
+staging, or replay `pending-rebind-v1`. It opens the exact
 pre-existing zero-byte `mutation.lock` without following links, proves its
 single-link identity and empty digest, and attempts the existing platform lock
 with a nonblocking try-lock or an explicitly bounded deadline; it never waits
@@ -1009,11 +1012,12 @@ unknown marker version, is a conflict. Only the original still-live legacy
 publisher holding the marker handle and its in-memory candidate proof can
 finish its old same-process cleanup path.
 
-The current Linux engineering preview has neither marker v2 nor this
-existing-only guard. Its `publication-reconcile` terminal state therefore
-means preserve the target, staging siblings, and marker and do not blindly
-rerun the command or remove the marker. The preview is not GA evidence for the
-cross-process clauses above.
+The current Linux engineering preview has marker v2 and the existing-only
+guard. An exact canonical claim may be re-audited by rerunning the same command;
+legacy, invalid, marker-free, aliased, or conflicting states still mean
+preserve the target, staging siblings, and marker for manual audit. The preview
+is not yet GA evidence for the complete force-kill, hostile-race, and native
+Windows clauses above.
 
 There is no `finalize-repository-import` command. Normal post-success changes
 belong to ordinary Inex/Git workflows and `inex verify`, not initialization

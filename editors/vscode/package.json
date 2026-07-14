@@ -49,7 +49,7 @@
       },
       {
         "command": "inex.importRepository",
-        "title": "Inex: Import Existing Markdown Repository",
+        "title": "Inex: Initialize from Existing Markdown Repository",
         "icon": "$(repo-clone)",
         "enablement": "!inex.vaultUnlocked"
       },
@@ -112,7 +112,7 @@
     "viewsWelcome": [
       {
         "view": "inex.vault",
-        "contents": "No Inex vault is unlocked.\n[Unlock an Inex Vault](command:inex.unlockVault)\n[Import an Existing Markdown Repository](command:inex.importRepository)",
+        "contents": "No Inex vault is unlocked.\n[Unlock an Inex Vault](command:inex.unlockVault)\n[Initialize from an Existing Markdown Repository](command:inex.importRepository)",
         "when": "!inex.vaultUnlocked"
       }
     ],
@@ -184,6 +184,13 @@
           "command": "inex.delete",
           "when": "view == inex.vault && inex.vaultUnlocked && viewItem == inex.file",
           "group": "inex@2"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "inex.importRepository",
+          "when": "explorerResourceIsFolder && resourceScheme == file && !inex.vaultUnlocked",
+          "group": "inex@1"
         }
       ]
     },

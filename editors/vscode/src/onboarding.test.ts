@@ -10,7 +10,10 @@ test("locked vault onboarding exposes unlock/import and gates CRUD by context", 
     contributes: {
       commands: Array<{ command: string; enablement?: string }>;
       viewsWelcome: Array<{ view: string; contents: string; when: string }>;
-      menus: { "view/title": Array<{ command: string; when: string }> };
+      menus: {
+        "view/title": Array<{ command: string; when: string }>;
+        "explorer/context": Array<{ command: string; when: string }>;
+      };
     };
   };
   const welcome = packageJson.contributes.viewsWelcome.find(
@@ -35,4 +38,10 @@ test("locked vault onboarding exposes unlock/import and gates CRUD by context", 
     titleCommands.find((entry) => entry.command === "inex.newFolder")?.when ?? "",
     /inex\.vaultUnlocked/u,
   );
+  const explorerImport = packageJson.contributes.menus["explorer/context"].find(
+    (entry) => entry.command === "inex.importRepository",
+  );
+  assert.match(explorerImport?.when ?? "", /explorerResourceIsFolder/u);
+  assert.match(explorerImport?.when ?? "", /resourceScheme == file/u);
+  assert.match(explorerImport?.when ?? "", /!inex\.vaultUnlocked/u);
 });

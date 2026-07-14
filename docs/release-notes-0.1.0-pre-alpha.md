@@ -111,9 +111,11 @@ The repository importer additionally remains a trusted-local Linux engineering
 demo until its full source-race, force-kill/publication-ambiguity, resource, and
 native Windows acceptance matrix is complete. A normal full-size MyBlog run has
 passed with 323 tracked files, 306 Markdown documents, 17 assets, and the exact
-25,074,521-byte image while preserving the clean 728-commit source. That does
-not close post-move kill retry/reconciliation, independent raw-tree
-serialization, streaming object comparison, or artifact-bound residue gates.
+25,074,521-byte image while preserving the clean 728-commit source. Marker-v2
+retry/reconciliation, independent raw-tree serialization, and streaming object
+comparison are implemented; complete boundary-by-boundary force-kill evidence,
+hostile same-UID race closure, artifact-bound residue, and native Windows gates
+remain open.
 
 ## Deferred or unsupported states
 

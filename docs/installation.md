@@ -160,8 +160,11 @@ Linux engineering preview; non-Linux source traversal fails closed until the
 native handle/FileId implementation and fault matrix are complete.
 
 The source must be the top level of a clean ordinary SHA-1 Git worktree. Back it
-up first, then confirm that `git status --short` prints nothing. The destination
-must not exist, and its parent must already be a supported local directory.
+up first, then confirm that `git status --short` prints nothing. For a fresh
+initialization the destination must not exist, and its parent must already be a
+supported local directory. The only existing-target path is a rerun against an
+exact interrupted marker-v2 publication; it performs target-only audit and
+reconciliation and never treats an arbitrary directory as import input.
 
 ```sh
 git -C /absolute/plaintext-repository status --short
@@ -171,10 +174,12 @@ git -C /absolute/plaintext-repository status --short
   /absolute/plaintext-repository /absolute/inex-vault
 ```
 
-Dry-run reads and revalidates the complete tracked snapshot but performs no
-password prompt, KDF, staging creation, Git initialization, or product-state
-write. Review the exact Markdown, asset, byte, directory, and normalization
-counts. The real run prompts for and confirms a new password.
+For an absent target, dry-run reads and revalidates the complete tracked
+snapshot but performs no password prompt, KDF, staging creation, Git
+initialization, or product-state write. Review the exact Markdown, asset, byte,
+directory, and normalization counts. For an existing target, dry-run performs
+only the exact marker-v2 target reconciliation preview and never repeats source
+Git planning. A fresh real run prompts for and confirms a new password.
 
 Exact lowercase UTF-8 `.md` files become encrypted Markdown. Every other
 tracked stage-zero `100644` regular file becomes an encrypted opaque asset;
@@ -192,13 +197,17 @@ unchanged as the readable history archive; encrypted full-history rewriting is
 not implemented.
 
 The packaged Linux VS Code extension exposes the same flow from the locked
-**Encrypted Vault** welcome view through **Import an Existing Markdown
-Repository**. It launches the bundled audited `inex` executable with an argv
-array and collects the new password only in the dedicated task terminal. On
-success choose **Open New Vault**: VS Code reloads with the ciphertext target as
-the real workspace, after which you explicitly unlock it. Inex does not unlock
-the target while Explorer, Search, and Git still point at the plaintext source
-repository.
+**Encrypted Vault** welcome view through **Initialize from an Existing Markdown
+Repository**, from the Command Palette, or by right-clicking the source folder
+in Explorer. With one local workspace open, that workspace is the initial
+source selection. It launches the bundled audited `inex` executable with an
+argv array and collects the new password only in the dedicated task terminal.
+On success choose **Open New Vault**: VS Code reloads with the ciphertext target
+as the real workspace, after which you explicitly unlock it. Inex does not
+unlock the target while Explorer, Search, and Git still point at the plaintext
+source repository. Create and rename encrypted content from the **Encrypted
+Vault** view after unlocking; native Explorer operations are not encrypted Inex
+CRUD.
 
 ### Plain non-Git Markdown tree
 

@@ -75,7 +75,7 @@ def run_binary(executable: Path, arguments: list[str], expected_stdout: str | No
 def require_repository_import_command(executable: Path) -> None:
     usage = run_binary(executable, ["--help"], None)
     expected = (
-        "  inex import-repository <source-repository> <new-vault> [--dry-run]"
+        "  inex import-repository <source-repository> <destination-vault> [--dry-run]"
     )
     if usage.splitlines().count(expected) != 1:
         raise ReleaseError(

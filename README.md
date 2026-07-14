@@ -21,7 +21,7 @@ Code extension identifier continues to use publisher `horeb`.
 | Surface | Current evidence | Release limitation |
 |---------|------------------|--------------------|
 | Rust core, CLI, daemon, import, and Git | Linux tests and strict static gates pass, including authenticated detected/split rename/modify, legacy v1-v4 recovery, and the production v5 immutable candidate-bundle writer. Six native Linux SHA-1/SHA-256 shards cover 230 InPlace/DetectedRename/SplitRename OS force-kill cases spanning the durable state matrix; active transaction capabilities converge through fresh-process recovery and durable cleanup. Windows GNU compiles, and the Windows source rejects unexpected ADS on every v5 transaction owner; Wine fails closed where its backing filesystem cannot query streams | A kill before any scratch entry's no-replace publication may retain one orthogonal nonblocking entry for audit: a directory during bundle preparation or a regular file during publish/marker/journal preparation. Active cleanup intentionally does not guess-delete it. The ADS adversarial matrix still needs native NTFS/ReFS execution. Native Windows also needs the same 230-case matrix with Job Object active-process-zero and handle-release proof, plus separate NTFS/ReFS write-through and power-loss evidence. OS force-kill is not power-loss evidence. Deliberate parallel Git remains outside supported use until native evidence and ref-mutation/legacy-recovery boundaries are closed |
-| VS Code | 39 unit tests pass; the local VS Code host plus controlled 1.125.0 and 1.126.0 hosts use the real CLI/daemon to import a clean feature-1 repository, open/chunk/close a same-vault image, prove hide/reveal and lock/shutdown ordering, exercise production CRUD and encrypted backup/recovery, and scan isolated roots for residue | The locked first-use folder/input/task-terminal UI is not mouse-driven; persistent-profile cross-process Hot Exit/Local History/crash restore, exact delivery-VSIX lifecycle, and native Windows residue tests are pending |
+| VS Code | 45 unit tests pass; the local VS Code host plus controlled 1.125.0 and 1.126.0 hosts use the real CLI/daemon to import a clean feature-1 repository, open/chunk/close a same-vault image, prove hide/reveal and lock/shutdown ordering, exercise production CRUD and encrypted backup/recovery, and scan isolated roots for residue | The locked first-use folder/input/task-terminal UI is not mouse-driven; persistent-profile cross-process Hot Exit/Local History/crash restore, exact delivery-VSIX lifecycle, and native Windows residue tests are pending |
 | Sublime Text | 84/84 Python tests pass: 61 product tests plus 23 runner/evidence tests. On Linux, separately preserved canonical reports bind exact packaged Build 4200 normal v2, plugin-host SIGKILL v2, and full-application SIGKILL/restart v4 scenarios. Each starts from a fresh isolated profile and the same audited package bytes; restart v4 alone reuses its profile/install across both launches. It binds a subreaper/pidfd process closure, rejects root-bound survivors or mounts, scans every view continuously for two seconds before the second unlock, then reopens the same encrypted saved-content fingerprint | The plugin-host SIGKILL leaves the visible buffer copyable, cannot restart the host in-process, and requires a full Sublime restart. That is boundary evidence, not plaintext-erasure success. The passed restart is one isolated harness path, not a real-user persistent-profile result. Keyboard/menu Save and the remaining kill, profile/history/sync, full-platform, and signed-release matrix remain pending, so the client remains experimental |
 | Packaging | Strict release-tool tests pass 86/86. The binding workflow requires two standalone clean builds, byte-identical binaries/packages, target-bound license and native audits, isolated editor smoke, and a third clean-clone lifecycle drill with dynamic secret scanning | Bundled documentation is intentionally non-self-attesting: accept an archive only when an external evidence record matches its `PACKAGE-MANIFEST.json` and `SHA256SUMS`. Native Windows/arm64, injected failure/two-version drills, persistent editor profiles, signatures, publication, hosted CI, and independent legal review remain pending |
 
@@ -35,10 +35,11 @@ assurance.
 The current Linux importer has also completed a full read-only migration of a
 clean 728-commit source repository: 306 Markdown files and 17 assets were
 authenticated into one new parentless ciphertext commit, including one
-25,074,521-byte image. The source HEAD and history remained unchanged. This is
-normal-completion evidence only; post-move process-kill retry/reconciliation,
-independently serialized raw Git trees, streaming object comparison, and the
-native Windows matrix remain release blockers.
+25,074,521-byte image. The source HEAD and history remained unchanged. Marker-v2
+retry/reconciliation and independent raw-tree/streaming object proofs are now
+implemented; complete boundary-by-boundary force-kill evidence, hostile same-UID
+race closure, artifact-bound residue, and the native Windows matrix remain
+release blockers.
 
 The binding evidence and remaining gates are listed in the
 [release checklist](docs/release-checklist.md) and
@@ -94,10 +95,13 @@ encrypted Markdown and the remainder become encrypted opaque assets. Unsupported
 Git modes and source states abort instead of being skipped. It builds a fresh
 parentless ciphertext Git history and never copies the source repository's
 plaintext commits, objects, or refs. The real import prompts twice for a new
-password, never changes the source, and publishes only to an absent destination
-after auditing the complete vault and Git candidate. Preserve the original
-repository as the history archive. Do not put a password in argv, a shell
-variable, or an environment value.
+password, never changes the source, and publishes a fresh import only to an
+absent destination after auditing the complete vault and Git candidate. The
+sole existing-target exception is an exact marker-v2 interrupted publication:
+rerunning the same command performs target-only audit and reconciliation before
+source Git planning or password input. Preserve the original repository as the
+history archive. Do not put a password in argv, a shell variable, or an
+environment value.
 
 For a plain non-Git Markdown tree, the older `inex import` copy flow remains
 available, but it imports only exact lowercase `.md` files and reports other

@@ -8,12 +8,17 @@ webview, and the Rust `inexd` child process. It is never registered as a VS Code
 ## Current features
 
 - Explicit vault unlock/lock with a hidden password input.
-- A locked-state welcome page with explicit **Unlock** and **Import Existing
-  Markdown Repository** actions; encrypted CRUD commands remain disabled until
-  an authenticated vault session exists.
+- A locked-state welcome page with explicit **Unlock** and **Initialize from an
+  Existing Markdown Repository** actions; the same initializer is available by
+  right-clicking a local Explorer folder, and a sole local workspace is the
+  default source. Encrypted CRUD commands remain disabled until an authenticated
+  vault session exists.
 - Linux engineering-preview snapshot import of an existing local Markdown Git
-  repository into a new, absent encrypted repository through a dedicated VS
-  Code process task. The extension
+  repository into a fresh encrypted repository through a dedicated VS Code
+  process task. A fresh target must be absent; an existing real directory is
+  passed only after an explicit warning so the CLI can reconcile an exact
+  interrupted marker-v2 publication, while every other existing state fails
+  closed. The extension
   passes an argv array directly to `inex import-repository` (never a shell
   command), so password prompts remain in the real task terminal. After a
   successful copy it offers **Open New Vault**, reloads VS Code onto the real
@@ -82,9 +87,11 @@ The locked import Task terminal still requires a packaged Linux manual
 acceptance pass because its password is deliberately read from a hidden real
 TTY; the automated host must not add a password-injection backdoor. Browser
 rendering itself also remains in the manual visual pass. Automated tests bind
-command wiring, argv execution, the post-import workspace transition, real
-sidecar preview RPCs, image parsing, stale-transfer rejection, and handle
-cleanup, but they must not be described as mouse-driving the password prompt.
+the command contribution, path policy, Task event coordination, post-import
+workspace-transition helper, real sidecar preview RPCs, image parsing,
+stale-transfer rejection, and handle cleanup. The host integration invokes the
+real CLI directly rather than driving the folder picker or Task UI, and must not
+be described as mouse-driving the password prompt.
 
 VS Code forces application, profile, and workspace storage to be in-memory
 whenever `extensionTestsLocationURI` is present. Consequently,

@@ -292,10 +292,15 @@ cannot prove this because it performs no authenticated unlock.
 
 ### Import reports destination exists
 
-Import is no-replace and never resumes into an existing destination. Choose a
-fresh absent destination. If the existing path came from an earlier failed run,
-classify it using [operations-and-recovery.md](operations-and-recovery.md)
-before touching it.
+Both import modes are no-replace and never write into an arbitrary existing
+destination. For `inex import`, always choose a fresh absent destination. For
+`import-repository`, if the existing path contains the exact canonical
+marker-v2 claim from an interrupted repository publication, rerun the same
+source/destination pair: the command audits and reconciles the target before
+source Git planning or password input. Every other existing state fails closed.
+Preserve it and classify it using
+[operations-and-recovery.md](operations-and-recovery.md) rather than deleting
+or renaming marker files manually.
 
 ### Copy import skipped files
 

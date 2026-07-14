@@ -23,6 +23,8 @@ test("successful import offers a workspace reload into the ciphertext vault", as
     }),
     true,
   );
+  assert.match(message, /initialized or reconciled/u);
+  assert.match(message, /does not copy its plaintext Git history/u);
   assert.match(message, /VS Code will reload/u);
   assert.match(message, /unlock it explicitly/u);
   assert.deepEqual(opened, [target]);
