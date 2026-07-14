@@ -665,6 +665,45 @@ impl Vault {
         Ok(())
     }
 
+    /// Enable authenticated feature 2 after Umbra has been initialized and
+    /// unlocked in this session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError::UmbraLocked`] without a live Umbra session, or an
+    /// error if the metadata update conflicts or fails authentication.
+    pub fn enable_umbra_private_annotations(
+        &mut self,
+        policy: KdfPolicy,
+    ) -> Result<ParentSyncStatus, VaultError> {
+        if self.umbra.is_none() {
+            return Err(VaultError::UmbraLocked);
+        }
+        let updated =
+            crypto::enable_umbra_private_annotations(&self.config, &self.master_key, policy)?;
+        let metadata = updated.to_json_bytes(policy)?;
+        let target = self.root.join(VAULT_CONFIG_FILE);
+        let guard = self.acquire_mutation_guard()?;
+        ensure_regular_file_bounded(&target, MAX_VAULT_JSON_BYTES)?;
+        let outcome = guard
+            .write(
+                &target,
+                &metadata,
+                WriteCondition::IfMatch(self.config_etag),
+            )
+            .map_err(map_atomic_error)?;
+        drop(guard);
+        let (reopened, _) = VaultConfig::parse_untrusted(&metadata, policy)?;
+        // The constructor above has already authenticated the update. This
+        // explicit byte/etag check prevents adopting a different commit.
+        if digest(&metadata) != outcome.etag {
+            return Err(VaultError::AtomicVerificationFailed);
+        }
+        self.config = reopened;
+        self.config_etag = outcome.etag;
+        Ok(outcome.parent_sync)
+    }
+
     /// Load the encrypted shared tag catalog and annotation profiles.
     ///
     /// # Errors
@@ -2477,6 +2516,23 @@ mod tests {
             vault.load_umbra_config(),
             Err(VaultError::UmbraLocked)
         ));
+    }
+
+    #[test]
+    fn feature_two_requires_live_umbra_session_and_is_committed_to_metadata() {
+        let directory = TestDirectory::new();
+        let mut vault = create_test_vault(&directory);
+        assert!(matches!(
+            vault.enable_umbra_private_annotations(test_policy()),
+            Err(VaultError::UmbraLocked)
+        ));
+        vault
+            .initialize_umbra(b"feature two password")
+            .expect("initialize");
+        vault
+            .enable_umbra_private_annotations(test_policy())
+            .expect("enable feature two");
+        assert_eq!(vault.config().required_features, vec![2]);
     }
 
     #[test]
