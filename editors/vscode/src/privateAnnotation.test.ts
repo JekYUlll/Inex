@@ -6,6 +6,7 @@ import {
   annotationPickerStateFromSpec,
   defaultAnnotationPickerState,
   emptySelectionRange,
+  markdownHeadingSectionRange,
   parseVisiblePrivateAnnotationBlock,
   markdownParagraphRange,
   selectAnnotationKind,
@@ -51,6 +52,13 @@ test("empty selection supports line and explicit-selection modes", () => {
   const content = Buffer.from("first line\nsecond line\n", "utf8");
   assert.deepEqual(emptySelectionRange(content, 13, "line"), { startByte: 11, endByte: 22 });
   assert.equal(emptySelectionRange(content, 13, "reject"), undefined);
+});
+
+test("empty selection can target the current Markdown heading section", () => {
+  const content = Buffer.from("# One\nfirst\n## Nested\nsecond\n# Two\nthird\n", "utf8");
+  assert.deepEqual(markdownHeadingSectionRange(content, 20), { startByte: 12, endByte: 28 });
+  assert.deepEqual(emptySelectionRange(content, 20, "headingSection"), { startByte: 12, endByte: 28 });
+  assert.equal(markdownHeadingSectionRange(Buffer.from("plain\ntext\n"), 2), undefined);
 });
 
 test("existing annotation metadata preselects only catalog-resolvable tags", () => {

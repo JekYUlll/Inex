@@ -15,13 +15,13 @@ test("private annotation preferences accept only editor-local supported values",
   });
   assert.deepEqual(
     parsePrivateAnnotationPreferences({
-      noSelectionTarget: "line",
+      noSelectionTarget: "headingSection",
       confirmBeforeUnwrap: false,
       toggleBehavior: "useDefaultProfile",
       rememberLastSelection: false,
     }),
     {
-      noSelectionTarget: "line",
+      noSelectionTarget: "headingSection",
       confirmBeforeUnwrap: false,
       toggleBehavior: "useDefaultProfile",
       rememberLastSelection: false,
@@ -29,7 +29,7 @@ test("private annotation preferences accept only editor-local supported values",
   );
   assert.deepEqual(
     parsePrivateAnnotationPreferences({
-      noSelectionTarget: "headingSection",
+      noSelectionTarget: "unknown",
       confirmBeforeUnwrap: "no",
       toggleBehavior: "unsafe",
       rememberLastSelection: "yes",

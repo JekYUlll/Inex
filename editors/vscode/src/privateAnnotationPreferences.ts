@@ -1,4 +1,4 @@
-export type NoSelectionTarget = "line" | "paragraph" | "reject";
+export type NoSelectionTarget = "line" | "paragraph" | "headingSection" | "reject";
 export type ToggleBehavior = "alwaysAsk" | "useLast" | "useDefaultProfile" | "askOnFirstUse";
 
 export interface PrivateAnnotationPreferences {
@@ -25,7 +25,7 @@ export function parsePrivateAnnotationPreferences(
   const behavior = values.toggleBehavior;
   return {
     noSelectionTarget:
-      target === "line" || target === "paragraph" || target === "reject"
+      target === "line" || target === "paragraph" || target === "headingSection" || target === "reject"
         ? target
         : DEFAULT_PREFERENCES.noSelectionTarget,
     confirmBeforeUnwrap:

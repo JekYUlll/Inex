@@ -288,7 +288,7 @@
         },
         "inex.privateAnnotation.noSelectionTarget": {
           "type": "string",
-          "enum": ["line", "paragraph", "reject"],
+          "enum": ["line", "paragraph", "headingSection", "reject"],
           "default": "paragraph",
           "scope": "window",
           "description": "Private annotation target when the cursor has no selection."

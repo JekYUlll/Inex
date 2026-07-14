@@ -50,10 +50,46 @@ export function emptySelectionRange(
 ): ByteRange | undefined {
   if (target === "reject") return undefined;
   if (target === "paragraph") return markdownParagraphRange(content, offset);
+  if (target === "headingSection") return markdownHeadingSectionRange(content, offset);
   if (offset < 0 || offset > content.byteLength) return undefined;
   const start = lineStart(content, offset);
   const end = lineEnd(content, offset);
   return lineIsBlank(content, start, end) ? undefined : { startByte: start, endByte: end };
+}
+
+/** Returns the current ATX heading section, ending before an equal/higher heading. */
+export function markdownHeadingSectionRange(content: Buffer, offset: number): ByteRange | undefined {
+  if (offset < 0 || offset > content.byteLength) return undefined;
+  const currentLineStart = lineStart(content, offset);
+  let headingStart: number | undefined;
+  let headingLevel: number | undefined;
+  let cursor = 0;
+  while (cursor <= currentLineStart && cursor < content.byteLength) {
+    const end = lineEnd(content, cursor);
+    const level = atxHeadingLevel(content, cursor, end);
+    if (level !== undefined) {
+      headingStart = cursor;
+      headingLevel = level;
+    }
+    if (end >= content.byteLength) break;
+    cursor = end + 1;
+  }
+  if (headingStart === undefined || headingLevel === undefined) return undefined;
+  let end = content.byteLength;
+  cursor = lineEnd(content, headingStart);
+  cursor = cursor >= content.byteLength ? content.byteLength : cursor + 1;
+  while (cursor < content.byteLength) {
+    const lineEndOffset = lineEnd(content, cursor);
+    const level = atxHeadingLevel(content, cursor, lineEndOffset);
+    if (level !== undefined && level <= headingLevel) {
+      end = cursor;
+      break;
+    }
+    if (lineEndOffset >= content.byteLength) break;
+    cursor = lineEndOffset + 1;
+  }
+  while (end > headingStart && (content[end - 1] === 0x0a || content[end - 1] === 0x0d)) end -= 1;
+  return end > headingStart ? { startByte: headingStart, endByte: end } : undefined;
 }
 
 export function defaultAnnotationPickerState(
@@ -163,4 +199,16 @@ function lineIsBlank(content: Buffer, start: number, end: number): boolean {
     if (byte !== 0x20 && byte !== 0x09 && byte !== 0x0d) return false;
   }
   return true;
+}
+
+function atxHeadingLevel(content: Buffer, start: number, end: number): number | undefined {
+  let cursor = start;
+  let level = 0;
+  while (cursor < end && content[cursor] === 0x23 && level < 6) {
+    cursor += 1;
+    level += 1;
+  }
+  return level > 0 && cursor < end && (content[cursor] === 0x20 || content[cursor] === 0x09)
+    ? level
+    : undefined;
 }
