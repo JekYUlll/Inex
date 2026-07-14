@@ -42,6 +42,11 @@
 - 新增 `Inex: Remove Private Annotation` 命令，默认需 modal confirmation，且必须选择完整 private block；没有 active/unlocked Umbra projection 或空选区时拒绝。
 - 验证：daemon 71/71、严格 Clippy；VS Code typecheck 和 50/50 tests 通过。下一步 profile shortcut 与 metadata edit；当前不把普通 selected text 当作 remove，保持 core 分类拒绝。
 
+## 2026-07-15 — VS Code annotation profile application
+
+- `inex.applyPrivateAnnotationProfile` 接受 `{ profileId }` command args，并只接受 canonical stable ID。profile 由 Umbra-unlocked encrypted config 返回，找不到/锁定/session 改变均拒绝。
+- profile 复用普通 chooser 的 initialization/unlock/feature-2 conversion/verified selection/apply 流程；`promptForCover` 仅收集明确公开的 cover text。`pnpm --dir editors/vscode check` 和 50/50 tests 通过。
+
 ## 2026-07-15 — Vault feature-2 启用事务
 
 - 提交 `538168d`：`Vault::enable_umbra_private_annotations` 只接受 live Umbra session；它调用已认证 core metadata upgrader，并以 vault.json etag CAS 提交，随后重新 parse 确认 exact committed metadata 才更新内存 config。锁定 session 的调用被拒绝。
