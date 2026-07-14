@@ -1,5 +1,9 @@
 # Inex Progress Log
 
+## 2026-07-15 — 已认证 feature-2 metadata 升级基础
+
+- 提交 `92c0bc6`：新增 `enable_umbra_private_annotations`，先验证当前 metadata MAC，再排序加入 feature-2、重算 MAC 并通过 reader policy 复验；不改变 master key 或 Outer password slots。该函数为 Vault 后续原子启用事务提供核心基础。
+
 ## 2026-07-15 — Feature-2 Outer EDRY profile
 
 - 提交 `72b639d`：feature registry 与 EDRY header 现在识别 `[2]`，但只允许它和 UTF-8 Markdown logical-path profile 精确组合；新增 `encrypt_umbra_outer_document` 会先认证 `vault.json` metadata，再写入带 feature-2 的 Outer container header。
