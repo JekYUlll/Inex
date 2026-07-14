@@ -69,6 +69,15 @@ export function defaultAnnotationPickerState(
   };
 }
 
+export function annotationPickerStateFromSpec(
+  spec: PrivateAnnotationSpec,
+  availableTags: readonly PrivateTagChoice[],
+): AnnotationPickerState {
+  const available = new Set(availableTags.map((tag) => tag.id));
+  const tagIds = [...new Set(spec.tagIds)].filter((tagId) => available.has(tagId)).sort();
+  return { kind: spec.kind, tagIds, outerMode: spec.outer.mode };
+}
+
 export function selectAnnotationKind(
   state: AnnotationPickerState,
   kind: PrivateAnnotationKind,
@@ -112,6 +121,28 @@ export function annotationSpecFromPicker(
     tagIds: [...state.tagIds],
     outer: { mode: state.outerMode, ...(coverText === undefined ? {} : { coverText }) },
   };
+}
+
+/** Parses canonical unlocked private-block headers only for edit-picker preselection. */
+export function parseVisiblePrivateAnnotationBlock(content: Buffer): PrivateAnnotationSpec {
+  const header = content.toString("utf8");
+  const match = /^:::inex-private\nid: p_[a-f0-9]{32}\nkind: (block|comment)\ntags: \[([^\]\n]*)\]\nouter: (drop|cover|placeholder)\n---\n/u.exec(header);
+  if (match === null) {
+    throw new Error("Current private annotation metadata is invalid");
+  }
+  const kind = match[1] ?? "";
+  const rawTags = match[2] ?? "";
+  const tagIds = rawTags === "" ? [] : rawTags.split(", ");
+  const outerMode = match[3] ?? "";
+  if (
+    (kind !== "block" && kind !== "comment") ||
+    (outerMode !== "drop" && outerMode !== "cover" && outerMode !== "placeholder") ||
+    tagIds.some((tag) => !/^[a-z0-9][a-z0-9._-]{0,63}$/u.test(tag)) ||
+    !tagIds.every((tag, index) => index === 0 || tagIds[index - 1]! < tag)
+  ) {
+    throw new Error("Current private annotation metadata is invalid");
+  }
+  return { kind, tagIds, outer: { mode: outerMode } };
 }
 
 function lineStart(content: Buffer, offset: number): number {

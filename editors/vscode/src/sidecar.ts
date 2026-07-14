@@ -507,6 +507,32 @@ export class InexSidecar {
     return parseUmbraAnnotationResult(result, logicalPath);
   }
 
+  public async editUmbraAnnotation(
+    logicalPath: string,
+    projection: UmbraProjection,
+    selections: readonly TextRange[],
+    spec: PrivateAnnotationSpec,
+    mergeAdjacent = false,
+  ): Promise<UmbraAnnotationResult> {
+    this.requireUmbraV1();
+    logicalFileComponents(logicalPath);
+    validateEtag(projection.etag);
+    const content = Buffer.from(projection.content);
+    const contentBase64 = content.toString("base64url");
+    content.fill(0);
+    const result = await this.callRaw("umbra.annotation.edit", {
+      ...this.protectedParams(),
+      logicalPath,
+      ifMatch: projection.etag,
+      contentBase64,
+      renderMap: serializeRenderMap(projection.renderMap),
+      selections: selections.map(serializeRange),
+      spec: serializeAnnotationSpec(spec),
+      mergeAdjacent,
+    });
+    return parseUmbraAnnotationResult(result, logicalPath);
+  }
+
   public async touch(): Promise<number> {
     const result = expectObject(
       await this.callRaw("system.ping", { session: this.requireSession() }),

@@ -11,6 +11,7 @@ import {
   parsePrivateAnnotationPreferences,
   type PrivateAnnotationPreferences,
 } from "./privateAnnotationPreferences.ts";
+import type { PrivateAnnotationSpec } from "./sidecar.ts";
 import { showSensitiveInputBox, showSensitiveQuickPick } from "./sensitiveUi.ts";
 import { InexTreeProvider } from "./tree.ts";
 
@@ -250,6 +251,18 @@ export function activate(
         await editor.removePrivateAnnotationFromActive();
       });
     }),
+    vscode.commands.registerCommand("inex.editPrivateAnnotation", async () => {
+      await runUiAction(async () => {
+        const initialSpec = editor.activePrivateAnnotationSpec();
+        await applyChosenPrivateAnnotation(
+          controller,
+          editor,
+          undefined,
+          privateAnnotationPreferences(),
+          initialSpec,
+        );
+      });
+    }),
     vscode.commands.registerCommand("inex.applyPrivateAnnotationProfile", async (args?: unknown) => {
       await runUiAction(async () => {
         const profileId = isProfileArguments(args) ? args.profileId : undefined;
@@ -354,6 +367,7 @@ async function applyChosenPrivateAnnotation(
   editor: InexCustomEditorProvider,
   profileId?: string,
   preferences: PrivateAnnotationPreferences = privateAnnotationPreferences(),
+  initialSpec?: PrivateAnnotationSpec,
 ): Promise<void> {
   if (!(await ensureVaultUnlocked(controller))) {
     return;
@@ -426,7 +440,7 @@ async function applyChosenPrivateAnnotation(
     if (coverText === undefined) return;
   }
   const spec = profile === undefined
-    ? await choosePrivateAnnotation(config, controller.onDidLock)
+    ? await choosePrivateAnnotation(config, controller.onDidLock, initialSpec)
     : {
       kind: profile.kind,
       tagIds: profile.tagIds,
@@ -436,7 +450,11 @@ async function applyChosenPrivateAnnotation(
   if (!controller.isSessionCurrent(session)) {
     throw new Error("Inex vault session changed during private annotation selection");
   }
-  await editor.applyPrivateAnnotationToActive(spec, preferences.noSelectionTarget);
+  if (initialSpec === undefined) {
+    await editor.applyPrivateAnnotationToActive(spec, preferences.noSelectionTarget);
+  } else {
+    await editor.editPrivateAnnotationAtActive(spec);
+  }
 }
 
 function privateAnnotationPreferences(): PrivateAnnotationPreferences {

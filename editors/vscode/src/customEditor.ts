@@ -6,7 +6,7 @@ import * as vscode from "vscode";
 import { AssetPreviewCoordinator } from "./assetPreviewCoordinator.ts";
 import { readBoundedRegularFile } from "./boundedFile.ts";
 import type { VaultController, VaultSession } from "./controller.ts";
-import { emptySelectionRange } from "./privateAnnotation.ts";
+import { emptySelectionRange, parseVisiblePrivateAnnotationBlock } from "./privateAnnotation.ts";
 import type { NoSelectionTarget } from "./privateAnnotationPreferences.ts";
 import {
   headingForFragment,
@@ -19,6 +19,7 @@ import type {
   DocumentMetadata,
   PrivateAnnotationSpec,
   RenderMap,
+  TextRange,
   UmbraProjection,
 } from "./sidecar.ts";
 import { showSensitiveQuickPick } from "./sensitiveUi.ts";
@@ -1072,6 +1073,72 @@ export class InexCustomEditorProvider
     }
   }
 
+  /** Read current unlocked block metadata only to prefill the edit picker. */
+  public activePrivateAnnotationSpec(): PrivateAnnotationSpec {
+    const document = this.requireActiveUmbraDocument();
+    const selection = document.currentSelection();
+    const renderMap = document.renderMap();
+    if (selection === undefined || renderMap === undefined) {
+      throw new Error("Place the cursor inside one private annotation to edit it");
+    }
+    const slot = privateSlotContaining(renderMap, selection);
+    if (slot === undefined) {
+      throw new Error("Place the cursor inside one private annotation to edit it");
+    }
+    const snapshot = document.snapshot();
+    try {
+      return parseVisiblePrivateAnnotationBlock(
+        snapshot.content.subarray(slot.range.startByte, slot.range.endByte),
+      );
+    } finally {
+      snapshot.content.fill(0);
+    }
+  }
+
+  public async editPrivateAnnotationAtActive(spec: PrivateAnnotationSpec): Promise<void> {
+    const document = this.requireActiveUmbraDocument();
+    const selection = document.currentSelection();
+    const renderMap = document.renderMap();
+    if (selection === undefined || renderMap === undefined) {
+      throw new Error("Place the cursor inside one private annotation to edit it");
+    }
+    const slot = privateSlotContaining(renderMap, selection);
+    if (slot === undefined) {
+      throw new Error("Place the cursor inside one private annotation to edit it");
+    }
+    const resolvedSelection = selection.startByte === selection.endByte
+      ? { startByte: slot.range.startByte + 1, endByte: slot.range.startByte + 2 }
+      : selection;
+    const snapshot = document.snapshot();
+    try {
+      const sidecar = this.requireCurrentDocumentSession(document);
+      const edited = await sidecar.editUmbraAnnotation(
+        document.logicalPath,
+        { content: snapshot.content, etag: document.etag, metadata: document.metadata, renderMap },
+        [resolvedSelection],
+        spec,
+      );
+      this.requireCurrentDocumentSession(document);
+      document.replaceFromUmbraProjection(edited, edited.metadata);
+      this.previews.refreshDocument(document, 0);
+    } finally {
+      snapshot.content.fill(0);
+    }
+  }
+
+  private requireActiveUmbraDocument(): InexDocument {
+    const document = this.activeDocument;
+    if (
+      document === undefined ||
+      !document.isUmbraProjection ||
+      !this.documents.has(document) ||
+      !this.controller.isSessionCurrent(document.session)
+    ) {
+      throw new Error("Open an unlocked Umbra projection before editing a private annotation");
+    }
+    return document;
+  }
+
   public async prepareFileMutation(
     session: VaultSession,
     logicalPath: string,
@@ -1583,6 +1650,17 @@ export class InexCustomEditorProvider
       snapshot.content.fill(0);
     }
   }
+}
+
+function privateSlotContaining(
+  renderMap: RenderMap,
+  selection: EditorSelection,
+): { readonly slotId: string; readonly range: TextRange } | undefined {
+  return renderMap.privateSlots.find((slot) =>
+    selection.startByte >= slot.range.startByte &&
+    selection.endByte <= slot.range.endByte &&
+    (selection.startByte !== slot.range.startByte || selection.endByte !== slot.range.endByte),
+  );
 }
 
 function editorHtml(): string {

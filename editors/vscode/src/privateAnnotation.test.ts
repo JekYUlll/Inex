@@ -3,8 +3,10 @@ import test from "node:test";
 
 import {
   annotationSpecFromPicker,
+  annotationPickerStateFromSpec,
   defaultAnnotationPickerState,
   emptySelectionRange,
+  parseVisiblePrivateAnnotationBlock,
   markdownParagraphRange,
   selectAnnotationKind,
   selectOuterMode,
@@ -49,4 +51,27 @@ test("empty selection supports line and explicit-selection modes", () => {
   const content = Buffer.from("first line\nsecond line\n", "utf8");
   assert.deepEqual(emptySelectionRange(content, 13, "line"), { startByte: 11, endByte: 22 });
   assert.equal(emptySelectionRange(content, 13, "reject"), undefined);
+});
+
+test("existing annotation metadata preselects only catalog-resolvable tags", () => {
+  assert.deepEqual(
+    annotationPickerStateFromSpec(
+      { kind: "block", tagIds: ["missing", "relationship", "relationship"], outer: { mode: "cover" } },
+      tags,
+    ),
+    { kind: "block", tagIds: ["relationship"], outerMode: "cover" },
+  );
+});
+
+test("canonical unlocked private-block headers can prefill editing without cover text", () => {
+  const block = Buffer.from(
+    ":::inex-private\nid: p_0123456789abcdef0123456789abcdef\nkind: block\ntags: [family, relationship]\nouter: cover\n---\nprivate text\n:::\n",
+    "utf8",
+  );
+  assert.deepEqual(parseVisiblePrivateAnnotationBlock(block), {
+    kind: "block",
+    tagIds: ["family", "relationship"],
+    outer: { mode: "cover" },
+  });
+  assert.throws(() => parseVisiblePrivateAnnotationBlock(Buffer.from("not a private block")));
 });

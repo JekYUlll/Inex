@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 
 import {
   annotationSpecFromPicker,
+  annotationPickerStateFromSpec,
   defaultAnnotationPickerState,
   selectAnnotationKind,
   selectOuterMode,
@@ -23,11 +24,14 @@ interface AnnotationQuickPickItem extends vscode.QuickPickItem {
 export async function choosePrivateAnnotation(
   config: UmbraAnnotationConfig,
   onDidInvalidate: vscode.Event<void>,
+  initialSpec?: PrivateAnnotationSpec,
 ): Promise<PrivateAnnotationSpec | undefined> {
   const tags: PrivateTagChoice[] = config.tags
-    .filter((tag) => !tag.archived)
+    .filter((tag) => !tag.archived || initialSpec?.tagIds.includes(tag.id) === true)
     .map((tag) => ({ id: tag.id, label: tag.label, defaultSelected: tag.defaultSelected }));
-  let state = defaultAnnotationPickerState(tags);
+  let state = initialSpec === undefined
+    ? defaultAnnotationPickerState(tags)
+    : annotationPickerStateFromSpec(initialSpec, tags);
   const accepted = await chooseState(state, tags, onDidInvalidate);
   if (accepted === undefined) {
     return undefined;
