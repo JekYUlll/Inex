@@ -47,6 +47,10 @@ SESSION_RENEWING_METHODS = frozenset(
         "search.query",
         "cache.evict",
         "umbra.status",
+        "umbra.initialize",
+        "umbra.unlock",
+        "umbra.lock",
+        "umbra.enable",
         "umbra.config.get",
     )
 )
@@ -528,16 +532,52 @@ class InexRpcClient:
     def umbra_status(self) -> Dict[str, bool]:
         """Return only the non-secret Umbra lock state for this session."""
         try:
-            result = _expect_exact_object(
-                self._call_raw("umbra.status", self._protected_params()),
-                {"initialized", "unlocked"},
-                "Umbra status result",
+            return _parse_umbra_status(
+                self._call_raw("umbra.status", self._protected_params())
             )
-            initialized = result.get("initialized")
-            unlocked = result.get("unlocked")
-            if not isinstance(initialized, bool) or not isinstance(unlocked, bool):
-                raise RpcProtocolError("RPC Umbra status is invalid")
-            return {"initialized": initialized, "unlocked": unlocked}
+        except RpcProtocolError as error:
+            self._terminate_protocol(error)
+
+    def initialize_umbra(self, password: str) -> Dict[str, bool]:
+        """Create the independent Umbra keyslot and unlock its live key."""
+        return self._authenticate_umbra("umbra.initialize", password)
+
+    def unlock_umbra(self, password: str) -> Dict[str, bool]:
+        """Unwrap K_umbra without changing the already-unlocked Outer session."""
+        return self._authenticate_umbra("umbra.unlock", password)
+
+    def _authenticate_umbra(self, method: str, password: str) -> Dict[str, bool]:
+        if not isinstance(password, str) or not password or len(password.encode("utf-8")) > 4096:
+            raise RpcProtocolError("Umbra password is invalid")
+        try:
+            return _parse_umbra_status(
+                self._call_raw(method, dict(self._protected_params(), password=password))
+            )
+        except RpcProtocolError as error:
+            self._terminate_protocol(error)
+
+    def lock_umbra(self) -> None:
+        """Discard K_umbra while leaving the Outer vault session valid."""
+        try:
+            result = _expect_exact_object(
+                self._call_raw("umbra.lock", self._protected_params()),
+                {"ok", "unlocked"}, "Umbra lock result",
+            )
+            if result.get("ok") is not True or result.get("unlocked") is not False:
+                raise RpcProtocolError("RPC Umbra lock result is invalid")
+        except RpcProtocolError as error:
+            self._terminate_protocol(error)
+
+    def enable_umbra(self) -> str:
+        """Enable feature-2 containers only while a live Umbra session exists."""
+        try:
+            result = _expect_exact_object(
+                self._call_raw("umbra.enable", self._protected_params()),
+                {"ok", "durability"}, "Umbra enable result",
+            )
+            if result.get("ok") is not True:
+                raise RpcProtocolError("RPC Umbra enable result is invalid")
+            return _expect_durability(result.get("durability"), "Umbra enable")
         except RpcProtocolError as error:
             self._terminate_protocol(error)
 
@@ -1258,6 +1298,19 @@ def _expect_durability(value: Any, operation: str) -> str:
     if value not in ("synced", "notSynced"):
         raise RpcProtocolError("RPC %s durability is invalid" % operation)
     return value
+
+
+def _parse_umbra_status(value: Any) -> Dict[str, bool]:
+    result = _expect_exact_object(
+        value, {"initialized", "unlocked"}, "Umbra status result"
+    )
+    initialized = result.get("initialized")
+    unlocked = result.get("unlocked")
+    if not isinstance(initialized, bool) or not isinstance(unlocked, bool):
+        raise RpcProtocolError("RPC Umbra status is invalid")
+    if unlocked and not initialized:
+        raise RpcProtocolError("RPC Umbra status is inconsistent")
+    return {"initialized": initialized, "unlocked": unlocked}
 
 
 def _expect_umbra_range(value: Any, name: str, maximum: int) -> Dict[str, int]:

@@ -481,6 +481,39 @@ class RequestAndResponseTests(unittest.TestCase):
             invalid.open_umbra_document("today.md")
         self.assertIsInstance(invalid._terminal_error, RpcProtocolError)
 
+    def test_umbra_keyslot_lifecycle_uses_independent_authenticated_calls(self):
+        client = InexRpcClient("/unused")
+        client._session = "A" * SESSION_TOKEN_TEXT_BYTES
+        calls = []
+
+        def call(method, params):
+            calls.append((method, params))
+            if method == "umbra.status":
+                return {"initialized": False, "unlocked": False}
+            if method in ("umbra.initialize", "umbra.unlock"):
+                return {"initialized": True, "unlocked": True}
+            if method == "umbra.enable":
+                return {"ok": True, "durability": "synced"}
+            if method == "umbra.lock":
+                return {"ok": True, "unlocked": False}
+            self.fail("unexpected RPC method: %s" % method)
+
+        client._call_raw = call
+        self.assertEqual(client.umbra_status(), {"initialized": False, "unlocked": False})
+        self.assertEqual(client.initialize_umbra("umbra-password"), {"initialized": True, "unlocked": True})
+        self.assertEqual(client.unlock_umbra("umbra-password"), {"initialized": True, "unlocked": True})
+        self.assertEqual(client.enable_umbra(), "synced")
+        client.lock_umbra()
+        self.assertEqual(calls[1][1], {"session": "A" * SESSION_TOKEN_TEXT_BYTES, "password": "umbra-password"})
+        self.assertEqual(calls[-1][1], {"session": "A" * SESSION_TOKEN_TEXT_BYTES})
+
+        inconsistent = InexRpcClient("/unused")
+        inconsistent._session = "A" * SESSION_TOKEN_TEXT_BYTES
+        inconsistent._call_raw = lambda method, params: {"initialized": False, "unlocked": True}
+        with self.assertRaises(RpcProtocolError):
+            inconsistent.umbra_status()
+        self.assertIsInstance(inconsistent._terminal_error, RpcProtocolError)
+
 
 class SidecarResolutionTests(unittest.TestCase):
     def test_no_path_fallback_and_regular_executable_required(self):
