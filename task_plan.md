@@ -115,6 +115,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
     - [x] VS Code 现将 `noSelectionTarget`（paragraph/line/reject）与 `confirmBeforeUnwrap` 作为 window-local 配置贡献；不保存 tag/profile/private content，toggle 与显式 remove 共用确认策略（`3ad47a5`）
     - [ ] 接入 CustomEditor webview 选区、QuickPick、多标签及配置化命令/keybindings
   - [ ] 扩展Sublime stateful picker、profile命令和keymap示例
+  - [x] 加密 tag catalog 现支持 stable-ID create/rename/archive/reorder：配置验证唯一性、canonical order、profile/default 引用与 Cover profile 语义；Vault 通过 load→mutate→CAS encrypted save 原子提交（`1298641`）
   - [ ] 跑通多选、wrap/unwrap/edit、跨编辑器目录、canary/残留及Outer隔离矩阵
 
 - [x] 实现 `.gitattributes`、locked-safe `inex merge-driver` 与已解锁 CLI 三方合并

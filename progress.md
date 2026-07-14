@@ -915,3 +915,9 @@
 
 - 提交 `175d865`（`feat(vscode): add private annotation chooser alias`）：通过 package keybinding contribution 新增 `Ctrl+Alt+H` → `inex.choosePrivateAnnotation`，与 Ctrl+Alt+/、Ctrl+Alt+Shift+/ 一样可由用户普通 keybindings 覆盖；没有加入任何 raw key handling。
 - `Ctrl+Alt+O` 尚未贡献：它需要一个独立的 Quick Redact/保存/退出 Umbra 事务，不能错误复用“锁定整个 Vault”。验证：JSON parse、VS Code check、55/55 测试通过。
+
+## 2026-07-15 — 加密私密标签目录核心管理
+
+- 提交 `1298641`（`feat(umbra): manage encrypted private tag catalog`）：`UmbraConfigV1` 新增 create/rename/archive/reorder。稳定 tag ID 不会在 rename/reorder 中变化；archive 只影响 picker 可见性，不删除历史 document/profile 引用。Vault 包装器每次均 load 已认证 config、变更、再用 session CAS 原子加密保存。
+- config validation 现拒绝 duplicate tag/profile IDs、非 canonical catalog 顺序、profile/default 对不存在 tag 的引用、未知 default profile，及 `outer: cover` 与 `promptForCover` 不一致的 profile。这样管理命令无法产生“可解密、但不可用”的共享目录。
+- 验证：tag mutation 单测、Vault ciphertext-only catalog 测试、严格 core Clippy、fmt/diff-check 通过。下一步接 daemon RPC；VS Code/Sublime 仍不得直接写 `.inex/config.umbra.inex`。
