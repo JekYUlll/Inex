@@ -56,6 +56,10 @@ pub enum Method {
     UmbraAnnotationEdit,
     UmbraAnnotationRemove,
     UmbraConfigGet,
+    UmbraTagCreate,
+    UmbraTagRename,
+    UmbraTagArchive,
+    UmbraTagReorder,
     VaultListTree,
     FileStat,
     FileRead,
@@ -75,7 +79,7 @@ pub enum Method {
 }
 
 impl Method {
-    const ALL: [Self; 34] = [
+    const ALL: [Self; 38] = [
         Self::SystemHello,
         Self::SystemPing,
         Self::SystemShutdown,
@@ -94,6 +98,10 @@ impl Method {
         Self::UmbraAnnotationEdit,
         Self::UmbraAnnotationRemove,
         Self::UmbraConfigGet,
+        Self::UmbraTagCreate,
+        Self::UmbraTagRename,
+        Self::UmbraTagArchive,
+        Self::UmbraTagReorder,
         Self::VaultListTree,
         Self::FileStat,
         Self::FileRead,
@@ -134,6 +142,10 @@ impl Method {
             Self::UmbraAnnotationEdit => "umbra.annotation.edit",
             Self::UmbraAnnotationRemove => "umbra.annotation.remove",
             Self::UmbraConfigGet => "umbra.config.get",
+            Self::UmbraTagCreate => "umbra.tag.create",
+            Self::UmbraTagRename => "umbra.tag.rename",
+            Self::UmbraTagArchive => "umbra.tag.archive",
+            Self::UmbraTagReorder => "umbra.tag.reorder",
             Self::VaultListTree => "vault.listTree",
             Self::FileStat => "file.stat",
             Self::FileRead => "file.read",

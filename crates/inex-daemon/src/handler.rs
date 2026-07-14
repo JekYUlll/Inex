@@ -22,7 +22,7 @@ use inex_core::search::{
 };
 use inex_core::sodium::{Argon2idParams, MAX_PASSWORD_BYTES};
 use inex_core::tree::{TreeEntryKind, TreeError};
-use inex_core::umbra_config::{OuterMode, PrivateAnnotationKind};
+use inex_core::umbra_config::{OuterMode, PrivateAnnotationKind, PrivateTagDefinition};
 use inex_core::umbra_document::{OuterSlotStrategy, PrivateAnnotationSpec};
 use inex_core::umbra_keyslot::UmbraKeyslotError;
 use inex_core::umbra_render::OwnedRenderMap;
@@ -157,6 +157,10 @@ impl<C: MonotonicClock> RpcService<C> {
             Method::UmbraAnnotationEdit => self.umbra_annotation_edit(params),
             Method::UmbraAnnotationRemove => self.umbra_annotation_remove(params),
             Method::UmbraConfigGet => self.umbra_config_get(params),
+            Method::UmbraTagCreate => self.umbra_tag_create(params),
+            Method::UmbraTagRename => self.umbra_tag_rename(params),
+            Method::UmbraTagArchive => self.umbra_tag_archive(params),
+            Method::UmbraTagReorder => self.umbra_tag_reorder(params),
             Method::VaultListTree => self.vault_list_tree(params),
             Method::FileStat => self.file_stat(params),
             Method::FileRead => self.file_read(params),
@@ -616,6 +620,64 @@ impl<C: MonotonicClock> RpcService<C> {
                 "defaultProfileId": config.defaults.default_profile_id,
             },
         }))
+    }
+
+    fn umbra_tag_create(&mut self, params: Params) -> RpcResult {
+        let mut params = ParamObject::new(params);
+        let session = required_session(&mut params)?;
+        let tag = parse_private_tag_definition(&mut params)?;
+        params.finish()?;
+        self.sessions
+            .vault_mut(session.as_str())
+            .map_err(map_session_error)?
+            .create_private_tag(tag)
+            .map_err(|error| map_vault_error(error, ErrorContext::Document))?;
+        Ok(acknowledgement())
+    }
+
+    fn umbra_tag_rename(&mut self, params: Params) -> RpcResult {
+        let mut params = ParamObject::new(params);
+        let session = required_session(&mut params)?;
+        let tag_id = params.required_sensitive_string("tagId", 1, 64)?;
+        let label = params.required_sensitive_string("label", 1, 4096)?;
+        params.finish()?;
+        self.sessions
+            .vault_mut(session.as_str())
+            .map_err(map_session_error)?
+            .rename_private_tag(tag_id.as_str(), label.to_string())
+            .map_err(|error| map_vault_error(error, ErrorContext::Document))?;
+        Ok(acknowledgement())
+    }
+
+    fn umbra_tag_archive(&mut self, params: Params) -> RpcResult {
+        let mut params = ParamObject::new(params);
+        let session = required_session(&mut params)?;
+        let tag_id = params.required_sensitive_string("tagId", 1, 64)?;
+        params.finish()?;
+        self.sessions
+            .vault_mut(session.as_str())
+            .map_err(map_session_error)?
+            .archive_private_tag(tag_id.as_str())
+            .map_err(|error| map_vault_error(error, ErrorContext::Document))?;
+        Ok(acknowledgement())
+    }
+
+    fn umbra_tag_reorder(&mut self, params: Params) -> RpcResult {
+        let mut params = ParamObject::new(params);
+        let session = required_session(&mut params)?;
+        let tag_ids =
+            params.required_sensitive_string_array("tagIds", MAX_UMBRA_MAP_ENTRIES, 1, 64)?;
+        let tag_ids = tag_ids
+            .iter()
+            .map(|tag_id| tag_id.to_string())
+            .collect::<Vec<_>>();
+        params.finish()?;
+        self.sessions
+            .vault_mut(session.as_str())
+            .map_err(map_session_error)?
+            .reorder_private_tags(&tag_ids)
+            .map_err(|error| map_vault_error(error, ErrorContext::Document))?;
+        Ok(acknowledgement())
     }
 
     fn vault_list_tree(&mut self, params: Params) -> RpcResult {
@@ -1197,6 +1259,36 @@ fn parse_private_annotation_spec(
         kind,
         tag_ids,
         outer: OuterSlotStrategy { mode, cover_text },
+    })
+}
+
+fn parse_private_tag_definition(
+    params: &mut ParamObject,
+) -> Result<PrivateTagDefinition, ErrorObject> {
+    let mut object = params.required_object("tag")?;
+    let id = object.required_sensitive_string("id", 1, 64)?;
+    let label = object.required_sensitive_string("label", 1, 4096)?;
+    let description = object.required_sensitive_string("description", 0, 16 * 1024)?;
+    let aliases = object.required_sensitive_string_array("aliases", 256, 0, 4096)?;
+    let sort_order = i32::try_from(object.required_i64(
+        "sortOrder",
+        i64::from(i32::MIN),
+        i64::from(i32::MAX),
+    )?)
+    .map_err(|_| ErrorObject::new(ErrorCode::InvalidParams))?;
+    let default_selected = object.required_bool("defaultSelected")?;
+    object.finish()?;
+    Ok(PrivateTagDefinition {
+        id: id.to_string(),
+        label: label.to_string(),
+        description: description.to_string(),
+        aliases: aliases
+            .iter()
+            .map(|alias| alias.as_str().to_owned())
+            .collect(),
+        sort_order,
+        default_selected,
+        archived: false,
     })
 }
 
@@ -2067,6 +2159,58 @@ mod tests {
         assert_eq!(config["result"]["defaults"]["kind"], "comment");
         assert_eq!(config["result"]["defaults"]["outer"], "drop");
         scrub_object(&mut config);
+        let mut tag_created = response(
+            &mut service,
+            42,
+            "umbra.tag.create",
+            json!({
+                "session": session.as_str(),
+                "tag": {
+                    "id": "relationship",
+                    "label": "Relationship",
+                    "description": "private category",
+                    "aliases": ["personal"],
+                    "sortOrder": 10,
+                    "defaultSelected": false,
+                },
+            }),
+        );
+        assert_eq!(tag_created["result"]["ok"], true);
+        scrub_object(&mut tag_created);
+        let mut tag_renamed = response(
+            &mut service,
+            43,
+            "umbra.tag.rename",
+            json!({"session": session.as_str(), "tagId": "relationship", "label": "Relations"}),
+        );
+        assert_eq!(tag_renamed["result"]["ok"], true);
+        scrub_object(&mut tag_renamed);
+        let mut tag_archived = response(
+            &mut service,
+            44,
+            "umbra.tag.archive",
+            json!({"session": session.as_str(), "tagId": "relationship"}),
+        );
+        assert_eq!(tag_archived["result"]["ok"], true);
+        scrub_object(&mut tag_archived);
+        let mut tag_reordered = response(
+            &mut service,
+            45,
+            "umbra.tag.reorder",
+            json!({"session": session.as_str(), "tagIds": ["relationship"]}),
+        );
+        assert_eq!(tag_reordered["result"]["ok"], true);
+        scrub_object(&mut tag_reordered);
+        let mut configured_tag = response(
+            &mut service,
+            46,
+            "umbra.config.get",
+            json!({"session": session.as_str()}),
+        );
+        assert_eq!(configured_tag["result"]["tags"][0]["id"], "relationship");
+        assert_eq!(configured_tag["result"]["tags"][0]["label"], "Relations");
+        assert_eq!(configured_tag["result"]["tags"][0]["archived"], true);
+        scrub_object(&mut configured_tag);
         let mut enabled = response(
             &mut service,
             5,
