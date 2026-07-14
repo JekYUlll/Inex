@@ -1212,3 +1212,7 @@
 
 - 新增 `load_umbra_annotation_config(callback)`：仅 Umbra live session 可调用，严格验证 tag/profile/default 的 exact shape、ID、tag canonical order、cross-reference 与 cover prompt 语义，随后把临时 config 交给 callback；不写入 Neovim settings 或 module cache。
 - 真实 lifecycle 覆盖 enable 后 catalog read，并继续通过 convert/apply/edit/remove/lock 路径。下一步才允许用这个 transient callback 形成可清除的 picker UI。
+
+## 2026-07-15 — Neovim encrypted default annotation
+
+- `InexApplyDefaultPrivateAnnotation` 只在 live `umbra.config.get` callback 内读取 encrypted defaults 并构造 one-shot apply spec；默认 tag IDs/profile 语义不进入 editor-local configuration。UI picker 仍待实现。

@@ -569,3 +569,4 @@
 - Neovim visual mark 的 API 坐标不可混用：`nvim_buf_get_mark` 返回 1-based row、0-based byte column，而 `nvim_buf_get_offset` 接受 0-based row。私密 selection 要传 UTF-8 byte range，必须在这两个边界显式转换。canonical private fenced block 末尾含换行，字符级 visual range 不能表达完整 block；linewise selection 应把 end 扩到下一行的起始 offset（或文件末尾），才能安全路由到 confirmed remove。
 - Toggle 分类不能只分 plain/complete/partial：RenderMap 单一 private block 内的严格非空 range 应走 `umbra.annotation.edit`，而完整 block 必须继续只走需确认的 remove。客户端只负责 range 路由，不可从 visible fence/slot ID 重建 metadata；daemon 的 projection+ETag+RenderMap 复核仍是授权边界。
 - Neovim catalog 读取必须在私密 label 进入 picker 前完整验证 tag/profile/default 的 schema 与交叉引用；AEAD 认证不能替代语义验证。读取 API 只能把 result 交给同一 live Umbra callback，不能在 module state/editor setting 中缓存，以便 Umbra lock 不留下标签或 profile 名称。
+- Editor-local shortcut 不能承担 Umbra default profile/tag 配置；它最多触发一次 live encrypted catalog read，再将 validated defaults 作为 one-shot mutation spec 使用。
