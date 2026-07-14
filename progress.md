@@ -1197,3 +1197,8 @@
 - Neovim private projection 现只在本地临时持有 daemon 返回的 ETag/RenderMap；`apply_private_annotation` 与 `remove_private_annotation` 将当前 projection、ETag、完整 RenderMap 和严格 byte ranges 原样交给 daemon，成功后只整体采用 daemon 新 projection。没有任何 Lua marker/slot 推导路径；lock/stop 仍 delete buffer 并丢弃 map。
 - 真实 lifecycle 已覆盖 convert → apply（空 tag list、comment/drop）→ complete-range remove → 还原原始 Umbra projection → Umbra lock wipe。回归首次发现 daemon 对 annotation/profile 的 `tagIds` 错误要求至少一项，已改为与 PRD 和 core 相符的零或多项并由 daemon 71/71 单测覆盖。
 - 提供临时可调用命令 `:InexApplyPrivateAnnotation startByte endByte` / `:InexRemovePrivateAnnotation startByte endByte`，默认 spec 为 comment/no-tags/drop；Lua API 供后续视觉选择和 picker 复用。Neovim 的 `nargs` 不接受数值 `2`，因此命令使用 `nargs="*"` 后在 callback 内严格验证两个参数；load check 与真实 lifecycle 均通过。
+
+## 2026-07-15 — Neovim visual private-annotation toggle
+
+- 新增 `:InexTogglePrivateAnnotation`，不提供硬编码 keymap，因而用户可按普通 Neovim mapping 机制绑定。它将一个 visual range 转成 UTF-8 byte range：plain range 使用 default comment/no-tags/drop 调用 apply；精确等于 RenderMap private range 时先确认再调用 remove；任何 partial private overlap 在 RPC 前 fail closed。
+- headless lifecycle 覆盖 visual plain apply 与 linewise complete-block confirm/remove，最终恢复原 Umbra projection。该回归先暴露 visual mark API 的坐标差异：`nvim_buf_get_mark` 给出 1-based row / 0-based byte column，且 fenced private block 的末尾换行只能用 linewise visual range 完整表达；现已分别转换并验证。
