@@ -121,6 +121,10 @@ Phase 6 extension — 现有 Markdown Git 仓库与加密附件迁移（Phase 7 
         - [ ] marker-aware physical/live collector只排除exact held marker identity，并重新形成完整九段candidate evidence
           - [x] 形成lifetime-bound marker-aware physical projection：只排除descriptor-open identity匹配的exact v2 marker，marker不进入section 1/9及record/path预算，并保留同brand最终exact复验（`5d9e686`）
           - [ ] 从target-only held main ref、canonical config、Git control shape preflight与bounded canonical commit读取自举fresh root-commit evidence
+            - [x] descriptor-relative读取exact `refs/heads/main`，只接受40位lowercase SHA-1与单LF，并永久绑定同一physical brand（`01effef`）
+            - [x] 将Git control唯一allowlist拆为fixed-size shape preflight，在任何repository-aware Git读取前拒绝pack/alternates/额外refs/hooks/control（`7b4da74`）
+            - [x] 抽出不接受Vault/password的target-only canonical config evidence，initial authority复用同一实现且合法marker由外层held wrapper封口（`8bd6d31`）
+            - [ ] 固定root-identity guard与`cat-file commit <oid>`的512-byte bounded reader，验证canonical parentless commit的typed OID等于held main ref
           - [ ] 基于同一marker-aware physical brand重建sections 2–8、runtime object proof与candidate aggregate，并与marker claim seal逐项对账
         - [ ] publication-specific exact unlink outcome与Initial/Fresh consuming typestate
   - [ ] 完成repository import构造/durability/publication每一边界的Linux force-kill、hostile same-UID source/target race、artifact-bound residue与原生Windows矩阵
@@ -244,7 +248,7 @@ Phase 6 extension — 现有 Markdown Git 仓库与加密附件迁移（Phase 7 
 
 | Error | Attempt | Resolution |
 |-------|---------|------------|
-| `create_goal` 拒绝新的迁移objective，因为线程已有paused但unfinished的长期Goal | 4 | 不伪造complete/blocked；把可执行细化Goal写入根`task_plan.md`并继续Git开发，待产品侧恢复/替换后端Goal |
+| `create_goal` 拒绝新的迁移objective，因为线程已有paused但unfinished的长期Goal | 5 | 不伪造complete/blocked；把可执行细化Goal写入根`task_plan.md`并继续Git开发，待产品侧恢复/替换后端Goal |
 | 完整core回归中的既有OS-lock竞争测试偶发得到一条成功和一条pre-lock fail-closed错误，而非预期Conflict | 2 | 在竞争前先建立并释放稳定lock namespace，让测试只测同一既有lock上的串行语义；精确50轮及完整254/254通过（`70fc0b2`） |
 | raw index parser首版拒绝“有IEOT但无EOIE”的真实Git 2.43 index | 1 | 以真实Git生成的v4 index和Git格式契约确认IEOT可独立存在；放宽该组合但保持唯一extension、分区与block独立解码校验，定向测试和Windows GNU检查通过 |
 | `cat-file --batch`初版在错误清理路径调用无界`Child::wait` | 1 | 改为固定2秒`try_wait`轮询并绑定reaped/finished状态；直接子进程路径闭合，恶意后代继承pipe仍保留为GA进程组/Windows Job门禁 |
