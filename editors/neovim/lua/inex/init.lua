@@ -487,6 +487,20 @@ function M.load_umbra_annotation_config(callback)
   end)
 end
 
+function M.apply_default_private_annotation(selections)
+  M.load_umbra_annotation_config(function(config)
+    local defaults = config.defaults
+    M.apply_private_annotation(selections, {
+      kind = defaults.kind,
+      tagIds = defaults.tagIds,
+      outer = { mode = defaults.outer },
+    })
+    -- Do not retain catalog labels, profiles, or tag IDs after constructing the
+    -- one-shot daemon request.
+    config = nil
+  end)
+end
+
 local function parse_umbra_projection(logical_path, result)
   if not has_exact_keys(result, { contentBase64 = true, etag = true, metadata = true, renderMap = true, count = 4 })
     or type(result.etag) ~= "string" or not result.etag:match(ETAG_RE)
