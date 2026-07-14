@@ -503,6 +503,18 @@ export class InexSidecar {
     expectAcknowledgement(result);
   }
 
+  public async setUmbraDefaultAnnotationProfile(profileId: string): Promise<void> {
+    this.requireUmbraV1();
+    if (profileId !== "") {
+      assertUmbraTagId(profileId);
+    }
+    const result = await this.callRaw("umbra.profile.setDefault", {
+      ...this.protectedParams(),
+      profileId,
+    });
+    expectAcknowledgement(result);
+  }
+
   public async enableUmbra(): Promise<"synced" | "notSynced"> {
     this.requireUmbraV1();
     const result = expectObject(

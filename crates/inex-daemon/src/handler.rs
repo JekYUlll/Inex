@@ -166,6 +166,7 @@ impl<C: MonotonicClock> RpcService<C> {
             Method::UmbraProfileCreate => self.umbra_profile_create(params),
             Method::UmbraProfileEdit => self.umbra_profile_edit(params),
             Method::UmbraProfileRemove => self.umbra_profile_remove(params),
+            Method::UmbraProfileSetDefault => self.umbra_profile_set_default(params),
             Method::VaultListTree => self.vault_list_tree(params),
             Method::FileStat => self.file_stat(params),
             Method::FileRead => self.file_read(params),
@@ -721,6 +722,19 @@ impl<C: MonotonicClock> RpcService<C> {
             .vault_mut(session.as_str())
             .map_err(map_session_error)?
             .remove_annotation_profile(profile_id.as_str())
+            .map_err(|error| map_vault_error(error, ErrorContext::Document))?;
+        Ok(acknowledgement())
+    }
+
+    fn umbra_profile_set_default(&mut self, params: Params) -> RpcResult {
+        let mut params = ParamObject::new(params);
+        let session = required_session(&mut params)?;
+        let profile_id = params.required_sensitive_string("profileId", 0, 64)?;
+        params.finish()?;
+        self.sessions
+            .vault_mut(session.as_str())
+            .map_err(map_session_error)?
+            .set_default_annotation_profile(profile_id.as_str())
             .map_err(|error| map_vault_error(error, ErrorContext::Document))?;
         Ok(acknowledgement())
     }
@@ -2325,9 +2339,17 @@ mod tests {
         );
         assert_eq!(profile_edited["result"]["ok"], true);
         scrub_object(&mut profile_edited);
-        let mut configured_profile = response(
+        let mut profile_defaulted = response(
             &mut service,
             49,
+            "umbra.profile.setDefault",
+            json!({"session": session.as_str(), "profileId": "relationship-comment"}),
+        );
+        assert_eq!(profile_defaulted["result"]["ok"], true);
+        scrub_object(&mut profile_defaulted);
+        let mut configured_profile = response(
+            &mut service,
+            50,
             "umbra.config.get",
             json!({"session": session.as_str()}),
         );
@@ -2339,10 +2361,14 @@ mod tests {
             configured_profile["result"]["profiles"][0]["outer"],
             "cover"
         );
+        assert_eq!(
+            configured_profile["result"]["defaults"]["defaultProfileId"],
+            "relationship-comment"
+        );
         scrub_object(&mut configured_profile);
         let mut profile_removed = response(
             &mut service,
-            50,
+            51,
             "umbra.profile.remove",
             json!({"session": session.as_str(), "profileId": "relationship-comment"}),
         );

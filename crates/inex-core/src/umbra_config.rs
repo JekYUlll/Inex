@@ -278,6 +278,25 @@ impl UmbraConfigV1 {
         }
         self.validate()
     }
+
+    /// Select one existing encrypted profile as the default quick annotation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-config error unless `profile_id` exists. The empty
+    /// string clears the default without deleting any profile.
+    pub fn set_default_profile(&mut self, profile_id: &str) -> Result<(), UmbraConfigError> {
+        if !profile_id.is_empty()
+            && !self
+                .annotation_profiles
+                .iter()
+                .any(|profile| profile.id == profile_id)
+        {
+            return Err(UmbraConfigError::InvalidConfig);
+        }
+        profile_id.clone_into(&mut self.defaults.default_profile_id);
+        self.validate()
+    }
 }
 
 /// Canonical public envelope around encrypted config bytes.
@@ -574,8 +593,10 @@ mod tests {
         config
             .create_profile(profile.clone())
             .expect("create profile");
-        config.defaults.default_profile_id = profile.id.clone();
-        config.validate().expect("default profile is valid");
+        config
+            .set_default_profile(&profile.id)
+            .expect("set default profile");
+        assert!(config.set_default_profile("missing").is_err());
         let mut edited = profile.clone();
         edited.label = "Relations".to_owned();
         edited.outer = OuterMode::Cover;

@@ -884,6 +884,17 @@ impl Vault {
         self.save_umbra_config(&config)
     }
 
+    /// Set or clear the encrypted default private annotation profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the profile is absent or Umbra is not live.
+    pub fn set_default_annotation_profile(&mut self, profile_id: &str) -> Result<(), VaultError> {
+        let mut config = self.load_umbra_config()?;
+        config.set_default_profile(profile_id)?;
+        self.save_umbra_config(&config)
+    }
+
     /// Discover a deterministic logical tree without opening document bytes.
     ///
     /// # Errors

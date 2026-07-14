@@ -686,7 +686,7 @@ async function managePrivateAnnotationProfiles(controller: VaultController): Pro
       ...config.profiles.map((profile) => ({
         label: `$(symbol-method) ${profile.label}`,
         description: profile.id,
-        detail: `${profile.kind} / ${profile.outer}`,
+        detail: `${profile.kind} / ${profile.outer}${config.defaults.defaultProfileId === profile.id ? " / Default" : ""}`,
       })),
     ],
     { title: "Manage Private Annotation Profiles", placeHolder: "Create a profile or select one to edit/remove" },
@@ -699,11 +699,26 @@ async function managePrivateAnnotationProfiles(controller: VaultController): Pro
   }
   const profile = config.profiles.find((candidate) => candidate.id === selected.description);
   if (profile === undefined) throw new Error("Selected private annotation profile is unavailable");
-  const action = await vscode.window.showQuickPick(["Edit", "Remove"], {
+  const action = await vscode.window.showQuickPick(
+    config.defaults.defaultProfileId === profile.id
+      ? ["Edit", "Clear Default", "Remove"]
+      : ["Edit", "Set as Default", "Remove"],
+    {
     title: "Manage selected private annotation profile",
     ignoreFocusOut: true,
-  });
+    },
+  );
   if (action === undefined || !controller.isSessionCurrent(ready.session)) return;
+  if (action === "Set as Default" || action === "Clear Default") {
+    await ready.sidecar.setUmbraDefaultAnnotationProfile(action === "Set as Default" ? profile.id : "");
+    await ready.sidecar.loadUmbraAnnotationConfig();
+    await vscode.window.showInformationMessage(
+      action === "Set as Default"
+        ? "Private annotation default profile set."
+        : "Private annotation default profile cleared.",
+    );
+    return;
+  }
   if (action === "Remove") {
     const confirmed = await vscode.window.showWarningMessage(
       "Remove this private annotation profile? Existing private annotations are unchanged.",
