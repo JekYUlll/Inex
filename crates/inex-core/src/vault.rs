@@ -35,13 +35,16 @@ use crate::umbra_config::{
     EncryptedUmbraConfigV1, UMBRA_CONFIG_PATH, UmbraConfigError, UmbraConfigV1,
 };
 use crate::umbra_document::{
-    OuterSlotStrategy, PrivateSlotPayloadV1, UmbraDocumentError, UmbraDocumentV1,
+    OuterSlotStrategy, PrivateAnnotationSpec, PrivateSlotPayloadV1, UmbraDocumentError,
+    UmbraDocumentV1,
 };
 use crate::umbra_keyslot::{
     UMBRA_DEFAULT_KEYSLOT_PATH, UmbraKey, UmbraKeyslotError, UmbraKeyslotV1,
 };
 use crate::umbra_render::{
-    RenderedUmbraProjection, UmbraRenderError, render_umbra_projection, validate_outer_marker_slots,
+    OwnedRenderMap, RenderedUmbraProjection, SelectionClass, TextRange, UmbraRenderError,
+    map_plain_ranges_to_outer, normalize_and_classify_selections, render_umbra_projection,
+    validate_outer_marker_slots,
 };
 use crate::vault_config::{
     ConfigError, ConfigWarning, KdfPolicy, MAX_VAULT_JSON_BYTES, VaultConfig,
@@ -262,6 +265,18 @@ pub struct RenameOutcome {
     pub document: DocumentMetadata,
     /// Whether source retirement passed the platform durability checkpoint.
     pub source_parent_sync: ParentSyncStatus,
+}
+
+/// Result of one atomic private-annotation wrap operation.
+///
+/// The projection is freshly rendered from the ciphertext that was just
+/// committed. Callers must replace their old buffer and `RenderMap` together.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppliedPrivateAnnotation {
+    /// Metadata for the committed feature-2 document envelope.
+    pub document: DocumentMetadata,
+    /// Fresh unlocked projection and range map for the committed state.
+    pub projection: RenderedUmbraProjection,
 }
 
 /// An unlocked repository session.
@@ -988,6 +1003,113 @@ impl Vault {
             payloads.insert(slot_id.clone(), payload);
         }
         Ok(render_umbra_projection(&document, &payloads)?)
+    }
+
+    /// Atomically wrap one or more plain Umbra projection selections in fresh
+    /// encrypted private slots.
+    ///
+    /// The supplied projection and map must exactly match the currently
+    /// authenticated document and `expected_etag`. This prevents a client
+    /// from applying byte ranges calculated for stale content. All ranges use
+    /// the same validated private annotation spec; overlapping ranges are
+    /// merged and replacements run from the end of the Outer document.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError::UmbraLocked`] without a live `K_umbra`,
+    /// [`VaultError::Conflict`] for a stale ciphertext etag, and a
+    /// secret-free render error when a selection is private, mixed, stale, or
+    /// otherwise cannot be mapped to one Outer replacement. No mutation is
+    /// written until every selection and private payload has been validated.
+    #[allow(clippy::too_many_arguments)] // all editor-supplied consistency inputs are explicit at this boundary
+    pub fn apply_private_annotation(
+        &mut self,
+        logical_path: &LogicalPath,
+        expected_etag: &str,
+        supplied_projection: &str,
+        supplied_render_map: &OwnedRenderMap,
+        selections: &[TextRange],
+        spec: &PrivateAnnotationSpec,
+        merge_adjacent: bool,
+        modified_at_ms: i64,
+    ) -> Result<AppliedPrivateAnnotation, VaultError> {
+        spec.validate()?;
+        let (read, mut document) = self.read_umbra_outer_document(logical_path)?;
+        require_matching_etag(&read, expected_etag)?;
+
+        let current_projection = {
+            let session = self.umbra.as_ref().ok_or(VaultError::UmbraLocked)?;
+            let mut payloads = std::collections::BTreeMap::new();
+            for slot_id in document.slots.keys() {
+                let payload = document.decrypt_private_slot(
+                    self.config.vault_id,
+                    logical_path.as_str(),
+                    session.slot.key_id(),
+                    &session.key,
+                    slot_id,
+                )?;
+                payloads.insert(slot_id.clone(), payload);
+            }
+            render_umbra_projection(&document, &payloads)?
+        };
+        if supplied_projection != current_projection.markdown
+            || supplied_render_map != &current_projection.render_map
+        {
+            return Err(UmbraRenderError::StaleRenderMap.into());
+        }
+
+        let SelectionClass::Plain(plain_ranges) = normalize_and_classify_selections(
+            &current_projection.markdown,
+            &current_projection.render_map,
+            selections,
+            merge_adjacent,
+        )?
+        else {
+            return Err(UmbraRenderError::AnnotationSelectionNotPlain.into());
+        };
+        let outer_ranges =
+            map_plain_ranges_to_outer(&current_projection.render_map, &plain_ranges)?;
+
+        {
+            let session = self.umbra.as_ref().ok_or(VaultError::UmbraLocked)?;
+            for (projection_range, outer_range) in
+                plain_ranges.iter().zip(outer_ranges.iter()).rev()
+            {
+                let slot_id = fresh_private_slot_id(&document);
+                let payload = PrivateSlotPayloadV1 {
+                    format: "inex-private-slot".to_owned(),
+                    version: 1,
+                    kind: spec.kind,
+                    tag_ids: spec.tag_ids.clone(),
+                    markdown: current_projection.markdown
+                        [projection_range.start..projection_range.end]
+                        .to_owned(),
+                    created_at_ms: modified_at_ms,
+                    updated_at_ms: modified_at_ms,
+                };
+                document.insert_private_slot(
+                    self.config.vault_id,
+                    logical_path.as_str(),
+                    session.slot.key_id(),
+                    &session.key,
+                    slot_id.clone(),
+                    spec.outer.clone(),
+                    &payload,
+                )?;
+                let marker = format!("{{{{inex-private-slot:{slot_id}}}}}");
+                document
+                    .outer_markdown
+                    .replace_range(outer_range.start..outer_range.end, &marker);
+            }
+        }
+        validate_outer_marker_slots(&document)?;
+        let metadata =
+            self.save_umbra_outer_document(logical_path, &document, expected_etag, modified_at_ms)?;
+        let projection = self.render_umbra_projection(logical_path)?;
+        Ok(AppliedPrivateAnnotation {
+            document: metadata,
+            projection,
+        })
     }
 
     /// Insert one fresh encrypted private slot and atomically persist the
@@ -2566,6 +2688,15 @@ fn require_matching_etag(
     Ok(())
 }
 
+fn fresh_private_slot_id(document: &UmbraDocumentV1) -> String {
+    loop {
+        let candidate = format!("p_{}", Uuid::new_v4().simple());
+        if !document.slots.contains_key(&candidate) {
+            return candidate;
+        }
+    }
+}
+
 fn encode_etag(digest: [u8; 32]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(format::ETAG_PREFIX.len() + 64);
@@ -3031,6 +3162,124 @@ mod tests {
             vault.read_umbra_private_slot(&path, "p_01"),
             Err(VaultError::UmbraDocument(UmbraDocumentError::SlotNotFound))
         ));
+    }
+
+    #[test]
+    fn private_annotation_wraps_multiple_plain_ranges_atomically() {
+        let directory = TestDirectory::new();
+        let mut vault = create_test_vault(&directory);
+        let path = logical("2026-07-annotations.md");
+        vault
+            .initialize_umbra(b"annotation password")
+            .expect("initialize Umbra");
+        vault
+            .enable_umbra_private_annotations(test_policy())
+            .expect("enable feature two");
+        let created = vault
+            .create_umbra_outer_document(
+                &path,
+                &UmbraDocumentV1::new(
+                    "INEX_SECRET_SLOT_A\\nordinary text\\nINEX_SECRET_SLOT_B\\n".to_owned(),
+                ),
+                1_783_699_201_000,
+            )
+            .expect("create outer document");
+        let before = vault
+            .render_umbra_projection(&path)
+            .expect("render plain projection");
+        let first_start = before
+            .markdown
+            .find("INEX_SECRET_SLOT_A")
+            .expect("first selection");
+        let second_start = before
+            .markdown
+            .find("INEX_SECRET_SLOT_B")
+            .expect("second selection");
+        let selections = [
+            TextRange::new(first_start, first_start + "INEX_SECRET_SLOT_A".len())
+                .expect("first range"),
+            TextRange::new(second_start, second_start + "INEX_SECRET_SLOT_B".len())
+                .expect("second range"),
+        ];
+        let spec = PrivateAnnotationSpec {
+            kind: crate::umbra_config::PrivateAnnotationKind::Comment,
+            tag_ids: vec!["comment-content".to_owned(), "secret-tag".to_owned()],
+            outer: OuterSlotStrategy {
+                mode: crate::umbra_config::OuterMode::Drop,
+                cover_text: None,
+            },
+        };
+
+        let applied = vault
+            .apply_private_annotation(
+                &path,
+                &created.etag,
+                &before.markdown,
+                &before.render_map,
+                &selections,
+                &spec,
+                false,
+                1_783_699_202_000,
+            )
+            .expect("atomically annotate both ranges");
+        assert_eq!(applied.projection.render_map.private_slots.len(), 2);
+        assert!(applied.projection.markdown.contains("INEX_SECRET_SLOT_A"));
+        assert!(applied.projection.markdown.contains("INEX_SECRET_SLOT_B"));
+
+        let (_, outer) = vault
+            .read_umbra_outer_document(&path)
+            .expect("read Outer projection");
+        assert_eq!(outer.slots.len(), 2);
+        assert!(outer.outer_markdown.contains("ordinary text"));
+        assert!(!outer.outer_markdown.contains("INEX_SECRET_SLOT_A"));
+        assert!(!outer.outer_markdown.contains("INEX_SECRET_SLOT_B"));
+        for slot_id in outer.slots.keys() {
+            let payload = vault
+                .read_umbra_private_slot(&path, slot_id)
+                .expect("decrypt wrapped payload");
+            assert_eq!(payload.kind, spec.kind);
+            assert_eq!(payload.tag_ids, spec.tag_ids);
+        }
+        let disk = fs::read(directory.path().join("2026-07-annotations.md.enc"))
+            .expect("read encrypted document");
+        let disk = String::from_utf8_lossy(&disk);
+        assert!(!disk.contains("INEX_SECRET_SLOT_A"));
+        assert!(!disk.contains("INEX_SECRET_SLOT_B"));
+        assert!(!disk.contains("secret-tag"));
+
+        assert!(matches!(
+            vault.apply_private_annotation(
+                &path,
+                &created.etag,
+                &applied.projection.markdown,
+                &applied.projection.render_map,
+                &[TextRange::new(0, 1).expect("stale range")],
+                &spec,
+                false,
+                1_783_699_203_000,
+            ),
+            Err(VaultError::Conflict { .. })
+        ));
+        let private_range = applied.projection.render_map.private_slots[0].projection_range;
+        assert!(matches!(
+            vault.apply_private_annotation(
+                &path,
+                &applied.document.etag,
+                &applied.projection.markdown,
+                &applied.projection.render_map,
+                &[private_range],
+                &spec,
+                false,
+                1_783_699_203_000,
+            ),
+            Err(VaultError::UmbraRender(
+                UmbraRenderError::AnnotationSelectionNotPlain
+            ))
+        ));
+        let (_, after_rejections) = vault
+            .read_umbra_outer_document(&path)
+            .expect("read unchanged document");
+        assert_eq!(after_rejections, outer);
     }
 
     #[test]

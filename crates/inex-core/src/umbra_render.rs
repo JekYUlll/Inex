@@ -404,6 +404,8 @@ pub enum UmbraRenderError {
     InvalidPrivatePayload,
     #[error("plain selection crosses an Umbra private boundary")]
     MixedPlainSelection,
+    #[error("private annotation requires one or more plain selections")]
+    AnnotationSelectionNotPlain,
 }
 
 #[cfg(test)]
