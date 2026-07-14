@@ -877,3 +877,9 @@
 
 - 提交 `8aab1d2`（`feat(vscode): add private annotation picker state`）：纯 TypeScript picker state 明确 kind/Outer 为单选、tag ID 只接受 catalog 中值并排序、Cover 只在 cover mode 有且不能为空。该模块直接产生 sidecar 的 `PrivateAnnotationSpec`，不会把 tag label 当作稳定 ID。
 - 新增 2 项状态/cover 回归；`pnpm --dir editors/vscode check` 和 49/49 测试通过。下一步将 encrypted Umbra catalog 暴露给 daemon/extension，再用 VS Code multi-select QuickPick 驱动此状态并把已有 webview selection 应用于 feature-2 投影。
+
+## 2026-07-15 — Umbra profile cover 与 remove RPC 回归
+
+- 提交 `b75f9ed`（`fix(umbra): validate profile cover annotations`）：VS Code 对 profile 的 `outer: cover` 强制收集非空公开 cover text，不再信任 `promptForCover` 是否被旧配置错误关闭；因此不会把结构无效的 Cover 请求交给 daemon。
+- daemon 生命周期测试现以 apply 响应给出的 ETag、projection 和 RenderMap 的 exact private-slot 范围调用 `umbra.annotation.remove`，断言恢复原投影且不再有 private slot。首轮误用 RPC RenderMap 的 `projectionStartByte`/`projectionEndByte` 字段而失败；实际协议字段为 `startByte`/`endByte`，已按 canonical response 修正后通过。
+- 验证：`cargo fmt --check`、targeted daemon lifecycle 1/1、`pnpm --dir editors/vscode check`、VS Code tests 50/50 通过。

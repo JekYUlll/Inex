@@ -105,6 +105,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
     - [x] VS Code 已提供 `togglePrivateAnnotation`/`choosePrivateAnnotation` 命令及默认 Ctrl+Alt+/、Ctrl+Alt+Shift+/ 贡献式绑定；首次 Umbra 初始化显示不可恢复警告，QuickPick 多选 tags 并将 projection/RenderMap/verified selection 一同交给 daemon（本轮）
     - [x] VS Code `removePrivateAnnotation` 已经确认提示后将完整 block 选区提交至 `umbra.annotation.remove`，只采用 daemon 返回的新 projection（本轮）
     - [x] VS Code `applyPrivateAnnotationProfile` 已接收严格 profileId argument、从 encrypted catalog 解析 stable profile，并复用同一 session/convert/apply 路径（本轮）
+    - [x] `cover` profile 一律先收集非空公开 cover text，不能让 legacy/malformed `promptForCover: false` 构造无效请求；daemon 生命周期回归覆盖 apply 后从 daemon 返回的 exact RenderMap 范围 remove 并恢复原 Umbra 投影（`b75f9ed`）
     - [x] `togglePrivateAnnotation` 现按 active RenderMap 分类：完整 private block 走确认解包，其他选区走 chooser；不以裸 slot ID 判定（本轮）
     - [x] VS Code 空选区可安全扩展到当前非空行，临时 plaintext snapshot 会立即清零；heading/multicursor 策略仍 deferred（本轮）
     - [ ] 接入 CustomEditor webview 选区、QuickPick、多标签及配置化命令/keybindings

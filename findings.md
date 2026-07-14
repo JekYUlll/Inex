@@ -512,3 +512,4 @@
 - `umbra.annotation.apply` 必须接收完整、由同一 `umbra.document.open` 返回的 RenderMap，而不是仅接受 client 的 range：handler 逐项限定 map/selection/spec 的结构与资源上限后，核心仍以传入投影 hash、RenderMap 等值和 ciphertext ETag 重新认证。响应只在成功提交后附带新 ETag、投影和 RenderMap，客户端不得自行推演 slot ID 或 marker。
 - RenderMap 不仅要记录私密 fenced block 范围，还必须记录普通 projection 段到 Outer Markdown 的一对一坐标；否则多选 wrap 无法在已有私密块周围安全地回写 Outer 容器。跨段或跨私密块的普通选区统一按 mixed/partial 拒绝。
 - Neovim 已被纳入正式交付目标，但优先级固定最后。它必须以 Lua 客户端复用 `inexd` 的已验证 Umbra RPC，绝不能绕过 `K_umbra` 会话或直接解析 feature-2 容器；因此先完成 daemon/VS Code 共享协议与隔离回归，再进入其骨架实现。
+- `umbra.annotation.remove` 的 RPC RenderMap 将私密投影范围规范化为 `privateSlots[].startByte/endByte`（不是 Outer segment 使用的 `projectionStartByte/projectionEndByte`）。客户端或回归必须消费 daemon 返回的完整 map，而非从 marker 或 UI 坐标推导 slot/range；`cover` profile 也必须在 UI 端无条件收集公开文字，避免把不一致的 catalog flag 变成可到达的无效 core 请求。
