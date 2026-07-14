@@ -45,6 +45,8 @@ SESSION_RENEWING_METHODS = frozenset(
         "draft.decrypt",
         "search.query",
         "cache.evict",
+        "umbra.status",
+        "umbra.config.get",
     )
 )
 
@@ -520,6 +522,41 @@ class InexRpcClient:
             return handle, content, etag
         except RpcProtocolError as error:
             wipe(content)
+            self._terminate_protocol(error)
+
+    def umbra_status(self) -> Dict[str, bool]:
+        """Return only the non-secret Umbra lock state for this session."""
+        try:
+            result = _expect_exact_object(
+                self._call_raw("umbra.status", self._protected_params()),
+                {"initialized", "unlocked"},
+                "Umbra status result",
+            )
+            initialized = result.get("initialized")
+            unlocked = result.get("unlocked")
+            if not isinstance(initialized, bool) or not isinstance(unlocked, bool):
+                raise RpcProtocolError("RPC Umbra status is invalid")
+            return {"initialized": initialized, "unlocked": unlocked}
+        except RpcProtocolError as error:
+            self._terminate_protocol(error)
+
+    def load_umbra_annotation_config(self) -> Dict[str, Any]:
+        """Load the encrypted catalog only after daemon-side Umbra unlock."""
+        try:
+            result = _expect_exact_object(
+                self._call_raw("umbra.config.get", self._protected_params()),
+                {"tags", "profiles", "defaults"},
+                "Umbra config result",
+            )
+            tags = result.get("tags")
+            profiles = result.get("profiles")
+            defaults = result.get("defaults")
+            if not isinstance(tags, list) or not isinstance(profiles, list) or not isinstance(defaults, dict):
+                raise RpcProtocolError("RPC Umbra config is invalid")
+            if len(tags) > 4096 or len(profiles) > 4096:
+                raise RpcProtocolError("RPC Umbra config exceeds the client limit")
+            return result
+        except RpcProtocolError as error:
             self._terminate_protocol(error)
 
     def write_document(
