@@ -22,9 +22,9 @@ use inex_core::atomic::{ExistingPublicationMarkerV2OpenError, FilesystemDirector
 #[cfg(target_os = "linux")]
 use inex_core::atomic::{
     HeldPublicationMarkerV2, HeldPublicationMarkerV2Error, HeldPublicationMarkerV2UnlinkOutcome,
-    IMPORT_STAGING_PREFIX, PostUnlinkMarkerParentSyncOutcome, SyncedPostUnlinkPublicationMarkerV2,
-    TerminalPublicationMarkerV2Authority, UnsyncedPostUnlinkPublicationMarkerV2,
-    open_existing_publication_marker_v2,
+    IMPORT_STAGING_PREFIX, PostUnlinkMarkerParentSyncOutcome, PostUnlinkPublicationMarkerV2Error,
+    SyncedPostUnlinkPublicationMarkerV2, TerminalPublicationMarkerV2Authority,
+    UnsyncedPostUnlinkPublicationMarkerV2, open_existing_publication_marker_v2,
 };
 #[cfg(target_os = "linux")]
 use inex_core::path::raw_portable_case_fold_key;
@@ -34,7 +34,7 @@ use super::RepositoryImportError;
 #[cfg(target_os = "linux")]
 use super::candidate_fresh_audit::{
     CandidateSummaryMismatch, FreshMarkerCandidateAudit, audit_fresh_marker_candidate,
-    compare_candidate_summaries,
+    audit_post_unlink_candidate, compare_candidate_summaries,
 };
 #[cfg(target_os = "linux")]
 use super::candidate_initial_authority::VerifiedInitialMove;
@@ -530,6 +530,12 @@ impl CleanAuditPending {
     pub(super) const fn audit(&self) -> &FreshMarkerCandidateAudit {
         &self.audit
     }
+
+    /// Consume synchronized marker-free authority into one complete clean
+    /// audit attempt.
+    pub(super) fn audit_clean(self) -> CleanAuditOutcome {
+        audit_clean_candidate_impl(self, audit_post_unlink_candidate)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -542,6 +548,229 @@ impl fmt::Debug for CleanAuditPending {
             .field("authority", &"[HELD]")
             .finish()
     }
+}
+
+/// Terminal category from one marker-free clean audit attempt.
+#[cfg(target_os = "linux")]
+pub(super) enum CleanAuditTerminalFailure {
+    AuditFailedAndAuthorityLost {
+        audit: RepositoryImportError,
+        authority: PostUnlinkPublicationMarkerV2Error,
+    },
+    SummaryMismatch(CandidateSummaryMismatch),
+    FinalAuthority(PostUnlinkPublicationMarkerV2Error),
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for CleanAuditTerminalFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AuditFailedAndAuthorityLost { authority, .. } => formatter
+                .debug_struct("AuditFailedAndAuthorityLost")
+                .field("audit", &"[REDACTED]")
+                .field("authority", authority)
+                .finish(),
+            Self::SummaryMismatch(field) => formatter
+                .debug_tuple("SummaryMismatch")
+                .field(field)
+                .finish(),
+            Self::FinalAuthority(error) => formatter
+                .debug_tuple("FinalAuthority")
+                .field(error)
+                .finish(),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Display for CleanAuditTerminalFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::AuditFailedAndAuthorityLost { .. } => {
+                "clean audit failed and retained authority changed"
+            }
+            Self::SummaryMismatch(_) => "clean audit candidate summary changed",
+            Self::FinalAuthority(_) => "clean audit final authority changed",
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::error::Error for CleanAuditTerminalFailure {}
+
+/// Terminal clean-audit owner with synchronized post-unlink authority retained.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub(super) struct FailedCleanAudit {
+    failure: CleanAuditTerminalFailure,
+    root: PathBuf,
+    audit: FreshMarkerCandidateAudit,
+    authority: SyncedPostUnlinkPublicationMarkerV2,
+}
+
+#[cfg(target_os = "linux")]
+impl FailedCleanAudit {
+    pub(super) const fn failure(&self) -> &CleanAuditTerminalFailure {
+        &self.failure
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for FailedCleanAudit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FailedCleanAudit")
+            .field("failure", &self.failure)
+            .field("root", &"[REDACTED]")
+            .field("audit", &self.audit)
+            .field("authority", &"[HELD]")
+            .finish()
+    }
+}
+
+/// Complete marker-free published candidate with clean authority retained.
+///
+/// This value is not wired to any CLI success path in this slice and exposes
+/// no raw authority, marker reconstruction, unlink, or synchronization API.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub(super) struct PublishedClean {
+    root: PathBuf,
+    audit: FreshMarkerCandidateAudit,
+    authority: SyncedPostUnlinkPublicationMarkerV2,
+}
+
+#[cfg(target_os = "linux")]
+impl PublishedClean {
+    pub(super) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub(super) const fn audit(&self) -> &FreshMarkerCandidateAudit {
+        &self.audit
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for PublishedClean {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PublishedClean")
+            .field("root", &"[REDACTED]")
+            .field("audit", &self.audit)
+            .field("authority", &"[HELD]")
+            .finish()
+    }
+}
+
+/// Consuming outcome of one marker-free clean audit attempt.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub(super) enum CleanAuditOutcome {
+    PublishedClean(PublishedClean),
+    Retryable(CleanAuditPending),
+    Terminal(Box<FailedCleanAudit>),
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for CleanAuditOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PublishedClean(owner) => formatter
+                .debug_tuple("PublishedClean")
+                .field(owner)
+                .finish(),
+            Self::Retryable(owner) => formatter.debug_tuple("Retryable").field(owner).finish(),
+            Self::Terminal(owner) => formatter.debug_tuple("Terminal").field(owner).finish(),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn audit_clean_candidate_impl<AuditDriver>(
+    pending: CleanAuditPending,
+    audit_driver: AuditDriver,
+) -> CleanAuditOutcome
+where
+    AuditDriver: FnOnce(
+        &Path,
+        &SyncedPostUnlinkPublicationMarkerV2,
+    ) -> Result<FreshMarkerCandidateAudit, RepositoryImportError>,
+{
+    let CleanAuditPending {
+        root,
+        audit,
+        authority,
+    } = pending;
+    let clean_audit = match audit_driver(&root, &authority) {
+        Ok(clean_audit) => clean_audit,
+        Err(audit_failure) => {
+            return match authority.revalidate_absent_at(&root) {
+                Ok(()) | Err(PostUnlinkPublicationMarkerV2Error::Indeterminate) => {
+                    CleanAuditOutcome::Retryable(CleanAuditPending {
+                        root,
+                        audit,
+                        authority,
+                    })
+                }
+                Err(authority_failure) => terminal_clean_audit(
+                    root,
+                    audit,
+                    CleanAuditTerminalFailure::AuditFailedAndAuthorityLost {
+                        audit: audit_failure,
+                        authority: authority_failure,
+                    },
+                    authority,
+                ),
+            };
+        }
+    };
+
+    let mismatch = compare_candidate_summaries(&clean_audit, &audit).err();
+    let final_authority = authority.revalidate_absent_at(&root);
+    if let Some(mismatch) = mismatch {
+        return terminal_clean_audit(
+            root,
+            audit,
+            CleanAuditTerminalFailure::SummaryMismatch(mismatch),
+            authority,
+        );
+    }
+    match final_authority {
+        Ok(()) => CleanAuditOutcome::PublishedClean(PublishedClean {
+            root,
+            audit: clean_audit,
+            authority,
+        }),
+        Err(PostUnlinkPublicationMarkerV2Error::Indeterminate) => {
+            CleanAuditOutcome::Retryable(CleanAuditPending {
+                root,
+                audit: clean_audit,
+                authority,
+            })
+        }
+        Err(error) => terminal_clean_audit(
+            root,
+            clean_audit,
+            CleanAuditTerminalFailure::FinalAuthority(error),
+            authority,
+        ),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn terminal_clean_audit(
+    root: PathBuf,
+    audit: FreshMarkerCandidateAudit,
+    failure: CleanAuditTerminalFailure,
+    authority: SyncedPostUnlinkPublicationMarkerV2,
+) -> CleanAuditOutcome {
+    CleanAuditOutcome::Terminal(Box::new(FailedCleanAudit {
+        failure,
+        root,
+        audit,
+        authority,
+    }))
 }
 
 /// Exact marker absence whose held parent synchronization is unconfirmed.
@@ -1293,6 +1522,38 @@ mod tests {
         }
     }
 
+    fn clean_pending(fixture: &PublishedFixture) -> CleanAuditPending {
+        match fresh_durable(fixture).unlink_marker() {
+            PublicationMarkerUnlinkOutcome::CleanAuditPending(owner) => owner,
+            other => panic!("expected fixture clean-audit pending owner, got {other:?}"),
+        }
+    }
+
+    fn synthetic_summary_mismatch(
+        expected: &FreshMarkerCandidateAudit,
+        mismatch: CandidateSummaryMismatch,
+    ) -> FreshMarkerCandidateAudit {
+        let mut context = expected.context();
+        let mut seal = expected.content_seal();
+        let mut oid = expected.root_commit_oid();
+        let mut worktree = expected.worktree_files();
+        let mut markdown = expected.encrypted_markdown();
+        let mut assets = expected.encrypted_assets();
+        let mut objects = expected.git_objects();
+        match mismatch {
+            CandidateSummaryMismatch::Context => context.publication_id[0] ^= 1,
+            CandidateSummaryMismatch::ContentSeal => seal[0] ^= 1,
+            CandidateSummaryMismatch::RootCommit => oid[0] ^= 1,
+            CandidateSummaryMismatch::WorktreeCount => worktree = worktree.saturating_add(1),
+            CandidateSummaryMismatch::MarkdownCount => markdown = markdown.saturating_add(1),
+            CandidateSummaryMismatch::AssetCount => assets = assets.saturating_add(1),
+            CandidateSummaryMismatch::GitObjectCount => objects = objects.saturating_add(1),
+        }
+        FreshMarkerCandidateAudit::test_only_synthetic(
+            context, seal, oid, worktree, markdown, assets, objects,
+        )
+    }
+
     fn assert_expected_audit(audit: &FreshMarkerCandidateAudit, expected: &ExpectedAudit) {
         assert_eq!(audit.context(), expected.context);
         assert_eq!(audit.content_seal(), expected.content_seal);
@@ -1793,6 +2054,271 @@ mod tests {
     }
 
     #[test]
+    fn clean_audit_real_marker_free_candidate_reaches_published_clean() {
+        let fixture = fixture("clean-audit-real");
+        let published = match clean_pending(&fixture).audit_clean() {
+            CleanAuditOutcome::PublishedClean(owner) => owner,
+            other => panic!("expected published-clean owner, got {other:?}"),
+        };
+        assert_eq!(published.root(), fixture.destination_root);
+        assert_expected_audit(published.audit(), &fixture.expected);
+        assert!(!fixture.marker_path().exists());
+        fixture.assert_lock_busy();
+        let debug = format!("{published:?}");
+        assert!(!debug.contains(fixture.destination_root.to_string_lossy().as_ref()));
+        drop(published);
+        fixture.assert_lock_available();
+    }
+
+    #[test]
+    fn clean_audit_error_with_exact_absence_is_retryable_then_clean() {
+        let fixture = fixture("clean-audit-retry");
+        let retry = match audit_clean_candidate_impl(clean_pending(&fixture), |_, _| {
+            Err(RepositoryImportError::TargetAuditFailed)
+        }) {
+            CleanAuditOutcome::Retryable(owner) => owner,
+            other => panic!("expected retryable clean audit, got {other:?}"),
+        };
+        assert!(!fixture.marker_path().exists());
+        fixture.assert_lock_busy();
+        let published = match retry.audit_clean() {
+            CleanAuditOutcome::PublishedClean(owner) => owner,
+            other => panic!("expected clean retry to publish, got {other:?}"),
+        };
+        assert_expected_audit(published.audit(), &fixture.expected);
+        assert!(!fixture.marker_path().exists());
+        fixture.assert_lock_busy();
+        drop(published);
+        fixture.assert_lock_available();
+    }
+
+    #[test]
+    fn clean_audit_error_with_replacement_is_terminal_and_preserves_replacement() {
+        use super::super::candidate_manifest::collect_synced_post_unlink_physical_manifest;
+
+        let fixture = fixture("clean-audit-replacement");
+        let pending = clean_pending(&fixture);
+        let replacement = b"foreign post-unlink marker replacement";
+        fs::write(fixture.marker_path(), replacement).expect("replacement marker creates");
+        assert!(
+            collect_synced_post_unlink_physical_manifest(
+                &fixture.destination_root,
+                &pending.authority,
+            )
+            .is_err()
+        );
+        let terminal = match audit_clean_candidate_impl(pending, |_, _| {
+            Err(RepositoryImportError::TargetAuditFailed)
+        }) {
+            CleanAuditOutcome::Terminal(owner) => owner,
+            other => panic!("expected replacement terminal owner, got {other:?}"),
+        };
+        assert!(matches!(
+            terminal.failure(),
+            CleanAuditTerminalFailure::AuditFailedAndAuthorityLost {
+                authority: PostUnlinkPublicationMarkerV2Error::NamespaceConflict,
+                ..
+            }
+        ));
+        assert_eq!(
+            fs::read(fixture.marker_path()).expect("replacement marker reads"),
+            replacement
+        );
+        fixture.assert_lock_busy();
+        drop(terminal);
+        fixture.assert_lock_available();
+    }
+
+    #[test]
+    fn clean_audit_all_summary_mismatches_are_terminal() {
+        for (index, mismatch) in [
+            CandidateSummaryMismatch::Context,
+            CandidateSummaryMismatch::ContentSeal,
+            CandidateSummaryMismatch::RootCommit,
+            CandidateSummaryMismatch::WorktreeCount,
+            CandidateSummaryMismatch::MarkdownCount,
+            CandidateSummaryMismatch::AssetCount,
+            CandidateSummaryMismatch::GitObjectCount,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture = fixture(&format!("clean-audit-mismatch-{index}"));
+            let pending = clean_pending(&fixture);
+            let synthetic = synthetic_summary_mismatch(pending.audit(), mismatch);
+            let terminal = match audit_clean_candidate_impl(pending, |_, _| Ok(synthetic)) {
+                CleanAuditOutcome::Terminal(owner) => owner,
+                other => panic!("expected summary-mismatch terminal owner, got {other:?}"),
+            };
+            assert!(matches!(
+                terminal.failure(),
+                CleanAuditTerminalFailure::SummaryMismatch(actual) if *actual == mismatch
+            ));
+            assert!(!fixture.marker_path().exists());
+            fixture.assert_lock_busy();
+            drop(terminal);
+            fixture.assert_lock_available();
+        }
+    }
+
+    #[test]
+    fn post_unlink_physical_wrapper_rejects_root_rebind() {
+        use super::super::candidate_manifest::collect_synced_post_unlink_physical_manifest;
+
+        let fixture = fixture("clean-audit-root-rebind");
+        let pending = clean_pending(&fixture);
+        let displaced = fixture.parent.join("displaced-published-root");
+        fs::rename(&fixture.destination_root, &displaced).expect("published root displaces");
+        fs::create_dir(&fixture.destination_root).expect("foreign root replacement creates");
+        assert!(
+            collect_synced_post_unlink_physical_manifest(
+                &fixture.destination_root,
+                &pending.authority,
+            )
+            .is_err()
+        );
+        drop(pending);
+    }
+
+    #[test]
+    fn clean_audit_and_post_unlink_collector_surfaces_are_frozen() {
+        let publication = include_str!("candidate_publication_authority.rs");
+        let clean_impl = publication
+            .split("impl CleanAuditPending")
+            .nth(1)
+            .and_then(|tail| tail.split("impl fmt::Debug for CleanAuditPending").next())
+            .expect("clean pending implementation exists");
+        assert!(clean_impl.contains("pub(super) fn audit_clean(self)"));
+        assert!(clean_impl.contains("audit_post_unlink_candidate"));
+        for forbidden in [
+            "unlink_exact_published_marker_at",
+            "retry_marker_parent_sync_at",
+            "sync_directory",
+            "authority(",
+            "into_parts",
+        ] {
+            assert!(
+                !clean_impl.contains(forbidden),
+                "clean audit escalation: {forbidden}"
+            );
+        }
+
+        for owner_name in ["PublishedClean", "FailedCleanAudit"] {
+            let owner = publication
+                .split(&format!("pub(super) struct {owner_name}"))
+                .nth(1)
+                .and_then(|tail| tail.split(&format!("impl {owner_name}")).next())
+                .expect("clean owner source exists");
+            assert!(!owner.contains("derive(Clone"));
+            assert!(!owner.contains("derive(Copy"));
+            assert!(
+                owner.find("audit:").expect("audit field")
+                    < owner.find("authority:").expect("authority final field")
+            );
+            assert!(!publication.contains(&format!("impl Drop for {owner_name}")));
+            assert!(!publication.contains(&format!("ManuallyDrop<{owner_name}")));
+        }
+        let published_impl = publication
+            .split("impl PublishedClean")
+            .nth(1)
+            .and_then(|tail| tail.split("impl fmt::Debug for PublishedClean").next())
+            .expect("published clean implementation exists");
+        for forbidden in [
+            "authority(",
+            "into_parts",
+            "marker",
+            "unlink",
+            "sync",
+            "reconstruct",
+        ] {
+            assert!(
+                !published_impl.contains(forbidden),
+                "published clean escalation: {forbidden}"
+            );
+        }
+
+        let manifest = include_str!("candidate_manifest.rs");
+        let collector = manifest
+            .split("pub(super) fn collect_synced_post_unlink_physical_manifest")
+            .nth(1)
+            .and_then(|tail| tail.split("fn require_post_unlink_physical_binding").next())
+            .expect("post-unlink collector exists");
+        assert!(collector.contains("held_root_view_at"));
+        assert!(collector.contains("PhysicalMarkerPolicy::Forbidden"));
+        assert!(collector.matches("revalidate_absent_at").count() >= 3);
+        assert!(collector.contains("require_current_exact_from_held"));
+        assert!(!collector.contains("collect_marker_free_physical_manifest"));
+        assert!(!collector.contains("open_secure_source_root"));
+
+        let wrapper = manifest
+            .split("pub(super) struct SyncedPostUnlinkPhysicalManifest")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("impl fmt::Debug for SyncedPostUnlinkPhysicalManifest")
+                    .next()
+            })
+            .expect("post-unlink wrapper exists");
+        assert!(
+            wrapper.find("held_root:").expect("held root field")
+                < wrapper
+                    .find("authority:")
+                    .expect("borrowed authority final")
+        );
+        assert!(!wrapper.contains("derive(Clone"));
+        assert!(!wrapper.contains("derive(Copy"));
+        assert!(!manifest.contains("impl Drop for SyncedPostUnlinkPhysicalManifest"));
+        assert!(!manifest.contains("ManuallyDrop<SyncedPostUnlinkPhysicalManifest"));
+    }
+
+    #[test]
+    fn clean_audit_transition_and_fresh_source_contract_are_frozen() {
+        let publication = include_str!("candidate_publication_authority.rs");
+        let clean_transition = publication
+            .split("fn audit_clean_candidate_impl")
+            .nth(1)
+            .and_then(|tail| tail.split("fn terminal_clean_audit").next())
+            .expect("clean audit transition exists");
+        let audit_driver = clean_transition
+            .find("audit_driver(&root, &authority)")
+            .expect("private audit driver is used");
+        let error_revalidate = clean_transition
+            .find("authority.revalidate_absent_at(&root)")
+            .expect("audit error immediately revalidates absence");
+        let compare = clean_transition
+            .find("compare_candidate_summaries")
+            .expect("shared summary comparison is used");
+        let final_revalidate = clean_transition
+            .rfind("authority.revalidate_absent_at(&root)")
+            .expect("successful audit has final absent revalidation");
+        assert!(audit_driver < error_revalidate && error_revalidate < compare);
+        assert!(compare < final_revalidate);
+        assert!(clean_transition.contains("PostUnlinkPublicationMarkerV2Error::Indeterminate"));
+        for forbidden in [
+            "unlink_exact_published_marker_at",
+            "retry_marker_parent_sync_at",
+            "sync_directory",
+            "open_existing_publication_marker_v2",
+            "drop(authority)",
+        ] {
+            assert!(!clean_transition.contains(forbidden));
+        }
+
+        let fresh = include_str!("candidate_fresh_audit.rs");
+        let post_unlink_audit = fresh
+            .split("fn audit_post_unlink_candidate_impl")
+            .nth(1)
+            .and_then(|tail| tail.split("fn assemble_candidate_summary").next())
+            .expect("post-unlink fresh audit exists");
+        assert!(post_unlink_audit.contains("collect_synced_post_unlink_physical_manifest"));
+        assert!(post_unlink_audit.contains("marker_free.require_current_exact"));
+        assert!(post_unlink_audit.contains("marker.candidate_seal_matches"));
+        assert!(post_unlink_audit.matches("revalidate_absent_at").count() >= 2);
+        assert!(!post_unlink_audit.contains("collect_marker_free_physical_manifest"));
+        assert!(!post_unlink_audit.contains("collect_held_marker_physical_manifest"));
+        assert!(!post_unlink_audit.contains("open_secure_source_root"));
+    }
+
+    #[test]
     fn marker_unlink_and_parent_sync_api_surfaces_are_frozen() {
         let source = include_str!("candidate_publication_authority.rs");
         let durable_impl = source
@@ -1883,7 +2409,14 @@ mod tests {
             .nth(1)
             .and_then(|tail| tail.split("impl fmt::Debug for CleanAuditPending").next())
             .expect("clean pending implementation exists");
-        for forbidden in ["success", "clean_claim", "unlink", "retry", "authority("] {
+        for forbidden in [
+            "success",
+            "clean_claim",
+            "pub(super) fn unlink_marker",
+            "unlink_exact_published_marker_at",
+            "retry_parent_sync",
+            "authority(",
+        ] {
             assert!(
                 !clean_impl.contains(forbidden),
                 "clean pending escalation: {forbidden}"

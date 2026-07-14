@@ -15,8 +15,8 @@ use inex_core::atomic::{
 #[cfg(target_os = "linux")]
 use inex_core::atomic::{
     HeldPublicationMarkerV2, IMPORT_PUBLISH_MARKER_V2, SecureSourceChild, SecureSourceDirectory,
-    VAULT_LOCAL_DIRECTORY, VAULT_MUTATION_LOCK_FILE, open_secure_source_root,
-    path_is_supported_local_filesystem,
+    SyncedPostUnlinkPublicationMarkerV2, VAULT_LOCAL_DIRECTORY, VAULT_MUTATION_LOCK_FILE,
+    open_secure_source_root, path_is_supported_local_filesystem,
 };
 #[cfg(target_os = "linux")]
 use inex_core::path::{PortableCaseFoldFingerprint, raw_portable_case_fold_fingerprint};
@@ -178,6 +178,67 @@ impl HeldMarkerPhysicalManifest<'_> {
             self.held_marker,
             &self.held_root,
         )
+    }
+}
+
+/// Marker-free physical evidence lifetime-bound to synchronized post-unlink
+/// authority and the exact held root view derived from that authority.
+///
+/// Neither the owned manifest nor authority can be extracted. Downstream
+/// collectors may only borrow the physical evidence and held root, then ask
+/// this wrapper for one final exact rewalk under the same absent-marker claim.
+#[cfg(target_os = "linux")]
+pub(super) struct SyncedPostUnlinkPhysicalManifest<'authority> {
+    physical: MarkerFreePhysicalManifest,
+    held_root: SecureSourceDirectory,
+    authority: &'authority SyncedPostUnlinkPublicationMarkerV2,
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for SyncedPostUnlinkPhysicalManifest<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SyncedPostUnlinkPhysicalManifest")
+            .field("physical", &self.physical)
+            .field("held_root", &"[HELD]")
+            .field("authority", &"[BORROWED]")
+            .finish()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl SyncedPostUnlinkPhysicalManifest<'_> {
+    pub(super) const fn physical(&self) -> &MarkerFreePhysicalManifest {
+        &self.physical
+    }
+
+    pub(super) const fn held_root(&self) -> &SecureSourceDirectory {
+        &self.held_root
+    }
+
+    /// Rewalk the marker-free tree through the retained held root and bracket
+    /// it with the same synchronized post-unlink authority.
+    pub(super) fn require_current_exact(
+        &self,
+        current_root: &Path,
+    ) -> Result<(), RepositoryImportError> {
+        let root =
+            canonical_normal_directory(current_root, RepositoryImportError::TargetAuditFailed)?;
+        if !path_is_supported_local_filesystem(&root)
+            .map_err(|_| RepositoryImportError::TargetAuditFailed)?
+        {
+            return Err(RepositoryImportError::TargetAuditFailed);
+        }
+        self.authority
+            .revalidate_absent_at(&root)
+            .map_err(|_| RepositoryImportError::TargetAuditFailed)?;
+        require_post_unlink_physical_binding(self.authority, &self.physical, &self.held_root)?;
+        self.physical
+            .require_current_exact_from_held(&self.held_root, PhysicalMarkerPolicy::Forbidden)?;
+        self.authority
+            .revalidate_absent_at(&root)
+            .map_err(|_| RepositoryImportError::TargetAuditFailed)?;
+        require_post_unlink_physical_binding(self.authority, &self.physical, &self.held_root)
     }
 }
 
@@ -697,6 +758,68 @@ pub(super) fn collect_held_marker_physical_manifest<'marker>(
     held_marker: &'marker HeldPublicationMarkerV2,
 ) -> Result<HeldMarkerPhysicalManifest<'marker>, RepositoryImportError> {
     collect_held_marker_physical_manifest_with_limits(root, held_marker, V1_LIMITS)
+}
+
+/// Collect one complete marker-free physical projection without reopening the
+/// root independently of synchronized post-unlink authority.
+#[cfg(target_os = "linux")]
+pub(super) fn collect_synced_post_unlink_physical_manifest<'authority>(
+    root: &Path,
+    authority: &'authority SyncedPostUnlinkPublicationMarkerV2,
+) -> Result<SyncedPostUnlinkPhysicalManifest<'authority>, RepositoryImportError> {
+    let root = canonical_normal_directory(root, RepositoryImportError::TargetAuditFailed)?;
+    if !path_is_supported_local_filesystem(&root)
+        .map_err(|_| RepositoryImportError::TargetAuditFailed)?
+    {
+        return Err(RepositoryImportError::TargetAuditFailed);
+    }
+    authority
+        .revalidate_absent_at(&root)
+        .map_err(|_| RepositoryImportError::TargetAuditFailed)?;
+    let held_root = authority
+        .held_root_view_at(&root)
+        .map_err(|_| RepositoryImportError::TargetAuditFailed)?;
+    if held_root.identity() != authority.root_identity() {
+        return Err(RepositoryImportError::TargetAuditFailed);
+    }
+    let physical = collect_physical_manifest_from_held_root(
+        &held_root,
+        V1_LIMITS,
+        &raw_portable_case_fold_fingerprint,
+        PhysicalMarkerPolicy::Forbidden,
+    )?;
+    authority
+        .revalidate_absent_at(&root)
+        .map_err(|_| RepositoryImportError::TargetAuditFailed)?;
+    require_post_unlink_physical_binding(authority, &physical, &held_root)?;
+    physical.require_current_exact_from_held(&held_root, PhysicalMarkerPolicy::Forbidden)?;
+    authority
+        .revalidate_absent_at(&root)
+        .map_err(|_| RepositoryImportError::TargetAuditFailed)?;
+    require_post_unlink_physical_binding(authority, &physical, &held_root)?;
+    Ok(SyncedPostUnlinkPhysicalManifest {
+        physical,
+        held_root,
+        authority,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn require_post_unlink_physical_binding(
+    authority: &SyncedPostUnlinkPublicationMarkerV2,
+    physical: &MarkerFreePhysicalManifest,
+    held_root: &SecureSourceDirectory,
+) -> Result<(), RepositoryImportError> {
+    if held_root.identity() != physical.root_identity()
+        || !authority.matches_physical_baseline(
+            physical.root_identity(),
+            physical.local_identity(),
+            physical.lock_identity(),
+        )
+    {
+        return Err(RepositoryImportError::TargetAuditFailed);
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]

@@ -9,7 +9,9 @@ use std::fmt;
 use std::path::Path;
 
 #[cfg(target_os = "linux")]
-use inex_core::atomic::HeldPublicationMarkerV2;
+use inex_core::atomic::{
+    HeldPublicationMarkerV2, SecureSourceDirectory, SyncedPostUnlinkPublicationMarkerV2,
+};
 
 use super::RepositoryImportError;
 #[cfg(target_os = "linux")]
@@ -18,7 +20,10 @@ use super::candidate_git::{
     prove_fresh_runtime_objects,
 };
 #[cfg(target_os = "linux")]
-use super::candidate_manifest::collect_held_marker_physical_manifest;
+use super::candidate_manifest::{
+    MarkerFreePhysicalManifest, collect_held_marker_physical_manifest,
+    collect_synced_post_unlink_physical_manifest,
+};
 use super::candidate_seal::{CandidateContentSeal, CandidateSealContext};
 #[cfg(target_os = "linux")]
 use super::candidate_seal::{CandidateSealError, DOMAIN, aggregate_candidate_content_seal_v1};
@@ -195,54 +200,109 @@ fn audit_fresh_marker_candidate_impl(
     // Exactly one physical collection owns the marker omission and the final
     // exact revalidation. Every later evidence value borrows this allocation.
     let marker_physical = collect_held_marker_physical_manifest(&root, held_marker)?;
-    let (
-        content_seal,
-        root_commit_oid,
-        worktree_files,
-        encrypted_markdown,
-        encrypted_assets,
-        git_objects,
-    ) = {
-        let runner = make_runner(&root)?;
-        let physical = marker_physical.physical();
-        let root_commit = collect_fresh_target_root_commit_evidence(
-            physical,
-            marker_physical.held_root(),
-            &runner,
-        )?;
-        let root_commit_oid = root_commit.commit_oid();
-        let tracked = collect_fresh_tracked_evidence(physical, marker_physical.held_root())
-            .map_err(map_candidate_error)?;
-        let trees = construct_fresh_tree_evidence(&tracked).map_err(map_candidate_error)?;
-        let git = collect_fresh_git_evidence(physical, &tracked, &trees, root_commit)
-            .map_err(map_candidate_error)?;
-        let runtime = prove_fresh_runtime_objects(&git, &tracked, &trees, &runner)?;
-        let content_seal =
-            aggregate_candidate_content_seal_v1(context, physical, &tracked, &trees, &runtime)
-                .map_err(map_candidate_error)?;
-        let (worktree_files, encrypted_markdown, encrypted_assets) =
-            tracked.checked_counts().map_err(map_candidate_error)?;
-        let git_objects = runtime
-            .checked_object_count()
-            .map_err(map_candidate_error)?;
-        after_aggregate();
-        (
-            content_seal,
-            root_commit_oid,
-            worktree_files,
-            encrypted_markdown,
-            encrypted_assets,
-            git_objects,
-        )
-    };
+    let audit = assemble_candidate_summary(
+        &root,
+        context,
+        marker_physical.physical(),
+        marker_physical.held_root(),
+        make_runner,
+        after_aggregate,
+    )?;
 
     marker_physical.require_current_exact(&root)?;
 
     // No filesystem or process operation occurs after the final exact check.
     // Marker comparison is the core primitive's constant-time seal compare.
-    if !marker.candidate_seal_matches(&content_seal.into_digest()) {
+    if !marker.candidate_seal_matches(&audit.content_seal()) {
         return Err(RepositoryImportError::TargetAuditFailed);
     }
+    Ok(audit)
+}
+
+/// Audit all nine candidate-seal sections after exact marker unlink and held
+/// marker-parent synchronization, while borrowing the retained claim.
+#[cfg(target_os = "linux")]
+pub(super) fn audit_post_unlink_candidate(
+    current_root: &Path,
+    authority: &SyncedPostUnlinkPublicationMarkerV2,
+) -> Result<FreshMarkerCandidateAudit, RepositoryImportError> {
+    audit_post_unlink_candidate_impl(
+        current_root,
+        authority,
+        |root| {
+            let executable = discover_git_executable()
+                .map_err(|_| RepositoryImportError::GitExecutableUnavailable)?;
+            GitRunner::target(executable, root.to_path_buf())
+        },
+        || {},
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn audit_post_unlink_candidate_impl(
+    current_root: &Path,
+    authority: &SyncedPostUnlinkPublicationMarkerV2,
+    make_runner: impl FnOnce(&Path) -> Result<GitRunner, RepositoryImportError>,
+    after_aggregate: impl FnOnce(),
+) -> Result<FreshMarkerCandidateAudit, RepositoryImportError> {
+    let root = canonical_normal_directory(current_root, RepositoryImportError::TargetAuditFailed)?;
+    authority
+        .revalidate_absent_at(&root)
+        .map_err(|_| RepositoryImportError::TargetAuditFailed)?;
+    let marker = authority.marker();
+    if marker.domain() != DOMAIN {
+        return Err(RepositoryImportError::TargetAuditFailed);
+    }
+    let context = CandidateSealContext {
+        scheme: marker.scheme(),
+        publication_id: *marker.publication_id(),
+    };
+    let marker_free = collect_synced_post_unlink_physical_manifest(&root, authority)?;
+    let audit = assemble_candidate_summary(
+        &root,
+        context,
+        marker_free.physical(),
+        marker_free.held_root(),
+        make_runner,
+        after_aggregate,
+    )?;
+    marker_free.require_current_exact(&root)?;
+    if !marker.candidate_seal_matches(&audit.content_seal()) {
+        return Err(RepositoryImportError::TargetAuditFailed);
+    }
+    authority
+        .revalidate_absent_at(&root)
+        .map_err(|_| RepositoryImportError::TargetAuditFailed)?;
+    Ok(audit)
+}
+
+#[cfg(target_os = "linux")]
+fn assemble_candidate_summary(
+    root: &Path,
+    context: CandidateSealContext,
+    physical: &MarkerFreePhysicalManifest,
+    held_root: &SecureSourceDirectory,
+    make_runner: impl FnOnce(&Path) -> Result<GitRunner, RepositoryImportError>,
+    after_aggregate: impl FnOnce(),
+) -> Result<FreshMarkerCandidateAudit, RepositoryImportError> {
+    let runner = make_runner(root)?;
+    let root_commit = collect_fresh_target_root_commit_evidence(physical, held_root, &runner)?;
+    let root_commit_oid = root_commit.commit_oid();
+    let tracked =
+        collect_fresh_tracked_evidence(physical, held_root).map_err(map_candidate_error)?;
+    let trees = construct_fresh_tree_evidence(&tracked).map_err(map_candidate_error)?;
+    let git = collect_fresh_git_evidence(physical, &tracked, &trees, root_commit)
+        .map_err(map_candidate_error)?;
+    let runtime = prove_fresh_runtime_objects(&git, &tracked, &trees, &runner)?;
+    let content_seal =
+        aggregate_candidate_content_seal_v1(context, physical, &tracked, &trees, &runtime)
+            .map_err(map_candidate_error)?;
+    let (worktree_files, encrypted_markdown, encrypted_assets) =
+        tracked.checked_counts().map_err(map_candidate_error)?;
+    let git_objects = runtime
+        .checked_object_count()
+        .map_err(map_candidate_error)?;
+    after_aggregate();
     Ok(FreshMarkerCandidateAudit {
         context,
         content_seal,
@@ -273,9 +333,10 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use inex_core::atomic::{
-        ExistingVaultMutationLock, HeldPublicationMarkerV2CreateInput, IMPORT_PUBLISH_MARKER_V2,
-        PublicationIdentityScheme, VAULT_LOCAL_DIRECTORY, filesystem_directory_identity,
-        open_secure_source_root,
+        ExistingVaultMutationLock, HeldPublicationMarkerV2CreateInput,
+        HeldPublicationMarkerV2UnlinkOutcome, IMPORT_PUBLISH_MARKER_V2,
+        PostUnlinkPublicationMarkerV2Error, PublicationIdentityScheme, VAULT_LOCAL_DIRECTORY,
+        filesystem_directory_identity, open_secure_source_root,
     };
     use inex_core::crypto::VaultContentProfile;
     use inex_core::sodium::Argon2idParams;
@@ -458,6 +519,31 @@ mod tests {
             .expect("held marker creates")
     }
 
+    fn create_synced_post_unlink_authority(
+        mut root: TestDirectory,
+        seal: &[u8],
+    ) -> (TestDirectory, SyncedPostUnlinkPublicationMarkerV2) {
+        let destination_name = format!(
+            "inex-fresh-marker-audit-post-unlink-destination-{}-{}",
+            std::process::id(),
+            NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+        );
+        let destination = root
+            .path()
+            .parent()
+            .expect("root has parent")
+            .join(&destination_name);
+        let marker = create_marker(root.path(), &destination_name, &domain(), seal);
+        fs::rename(root.path(), &destination).expect("whole root publishes");
+        root.0 = destination;
+
+        let authority = match marker.unlink_exact_published_marker_at(root.path()) {
+            HeldPublicationMarkerV2UnlinkOutcome::RemovedAndParentSynced(authority) => authority,
+            other => panic!("marker unlink must synchronously complete: {other:?}"),
+        };
+        (root, authority)
+    }
+
     #[test]
     fn real_fresh_audit_returns_exact_fixed_summary_and_redacts_debug() {
         let root = create_target("success");
@@ -511,6 +597,74 @@ mod tests {
                 .is_file()
         );
         assert!(marker.revalidate_at(root.path()).is_ok());
+    }
+
+    #[test]
+    fn post_unlink_final_exact_rejects_equal_length_post_aggregate_rewrite() {
+        let root = create_target("post-unlink-final-exact");
+        let (seal, _, _, _) = expected_summary(root.path());
+        let (root, authority) = create_synced_post_unlink_authority(root, &seal);
+        let content = root.path().join("notes/a.md.enc");
+        let original = fs::read(&content).expect("content reads");
+        let replacement = vec![b'x'; original.len()];
+
+        let result = audit_post_unlink_candidate_impl(root.path(), &authority, real_runner, || {
+            fs::write(&content, &replacement).expect("equal-length rewrite succeeds");
+        });
+
+        assert!(matches!(
+            result,
+            Err(RepositoryImportError::TargetAuditFailed)
+        ));
+        assert!(authority.revalidate_absent_at(root.path()).is_ok());
+    }
+
+    #[test]
+    fn post_unlink_final_exact_rejects_marker_replacement_and_retains_it() {
+        let root = create_target("post-unlink-marker-replacement");
+        let (seal, _, _, _) = expected_summary(root.path());
+        let (root, authority) = create_synced_post_unlink_authority(root, &seal);
+        let marker_path = root
+            .path()
+            .join(VAULT_LOCAL_DIRECTORY)
+            .join(IMPORT_PUBLISH_MARKER_V2);
+        let replacement = b"foreign replacement retained";
+
+        let result = audit_post_unlink_candidate_impl(root.path(), &authority, real_runner, || {
+            fs::write(&marker_path, replacement).expect("replacement creates");
+        });
+
+        assert!(matches!(
+            result,
+            Err(RepositoryImportError::TargetAuditFailed)
+        ));
+        assert_eq!(
+            fs::read(&marker_path).expect("replacement remains readable"),
+            replacement
+        );
+        assert_eq!(
+            authority.revalidate_absent_at(root.path()),
+            Err(PostUnlinkPublicationMarkerV2Error::NamespaceConflict)
+        );
+    }
+
+    #[test]
+    fn post_unlink_audit_rejects_retained_marker_seal_mismatch() {
+        let root = create_target("post-unlink-seal-mismatch");
+        let (root, authority) = create_synced_post_unlink_authority(root, &[0x19; 32]);
+
+        assert!(matches!(
+            audit_post_unlink_candidate(root.path(), &authority),
+            Err(RepositoryImportError::TargetAuditFailed)
+        ));
+        assert!(authority.revalidate_absent_at(root.path()).is_ok());
+        assert!(
+            !root
+                .path()
+                .join(VAULT_LOCAL_DIRECTORY)
+                .join(IMPORT_PUBLISH_MARKER_V2)
+                .exists()
+        );
     }
 
     #[test]
