@@ -1,4 +1,5 @@
 import type { OuterMode, PrivateAnnotationKind, PrivateAnnotationSpec } from "./sidecar.ts";
+import type { NoSelectionTarget } from "./privateAnnotationPreferences.ts";
 
 export interface PrivateTagChoice {
   readonly id: string;
@@ -40,6 +41,19 @@ export function markdownParagraphRange(content: Buffer, offset: number): ByteRan
     end = nextEnd;
   }
   return { startByte: start, endByte: end };
+}
+
+export function emptySelectionRange(
+  content: Buffer,
+  offset: number,
+  target: NoSelectionTarget,
+): ByteRange | undefined {
+  if (target === "reject") return undefined;
+  if (target === "paragraph") return markdownParagraphRange(content, offset);
+  if (offset < 0 || offset > content.byteLength) return undefined;
+  const start = lineStart(content, offset);
+  const end = lineEnd(content, offset);
+  return lineIsBlank(content, start, end) ? undefined : { startByte: start, endByte: end };
 }
 
 export function defaultAnnotationPickerState(

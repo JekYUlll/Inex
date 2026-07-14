@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   annotationSpecFromPicker,
   defaultAnnotationPickerState,
+  emptySelectionRange,
   markdownParagraphRange,
   selectAnnotationKind,
   selectOuterMode,
@@ -42,4 +43,10 @@ test("empty selection expands to its Markdown paragraph, not merely one line", (
   assert.deepEqual(markdownParagraphRange(content, 13), { startByte: 0, endByte: 22 });
   assert.deepEqual(markdownParagraphRange(content, 25), { startByte: 24, endByte: 34 });
   assert.equal(markdownParagraphRange(content, 23), undefined);
+});
+
+test("empty selection supports line and explicit-selection modes", () => {
+  const content = Buffer.from("first line\nsecond line\n", "utf8");
+  assert.deepEqual(emptySelectionRange(content, 13, "line"), { startByte: 11, endByte: 22 });
+  assert.equal(emptySelectionRange(content, 13, "reject"), undefined);
 });

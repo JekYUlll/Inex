@@ -7,6 +7,10 @@ import { offerToOpenImportedVault } from "./importCompletion.ts";
 import { RpcRemoteError } from "./rpc.ts";
 import { importMarkdownRepository } from "./repositoryImport.ts";
 import { choosePrivateAnnotation } from "./privateAnnotationPicker.ts";
+import {
+  parsePrivateAnnotationPreferences,
+  type PrivateAnnotationPreferences,
+} from "./privateAnnotationPreferences.ts";
 import { showSensitiveInputBox, showSensitiveQuickPick } from "./sensitiveUi.ts";
 import { InexTreeProvider } from "./tree.ts";
 
@@ -225,33 +229,24 @@ export function activate(
     }),
     vscode.commands.registerCommand("inex.togglePrivateAnnotation", async () => {
       await runUiAction(async () => {
+        const preferences = privateAnnotationPreferences();
         if (editor.activeSelectionIsCompletePrivateBlock()) {
-          const choice = await vscode.window.showWarningMessage(
-            "Remove the selected private annotation? Its Markdown will become ordinary Umbra content after save.",
-            { modal: true },
-            "Remove Private Annotation",
-          );
-          if (choice === "Remove Private Annotation") {
+          if (await confirmPrivateAnnotationRemoval(preferences)) {
             await editor.removePrivateAnnotationFromActive();
           }
           return;
         }
-        await applyChosenPrivateAnnotation(controller, editor);
+        await applyChosenPrivateAnnotation(controller, editor, undefined, preferences);
       });
     }),
     vscode.commands.registerCommand("inex.choosePrivateAnnotation", async () => {
       await runUiAction(async () => {
-        await applyChosenPrivateAnnotation(controller, editor);
+        await applyChosenPrivateAnnotation(controller, editor, undefined, privateAnnotationPreferences());
       });
     }),
     vscode.commands.registerCommand("inex.removePrivateAnnotation", async () => {
       await runUiAction(async () => {
-        const choice = await vscode.window.showWarningMessage(
-          "Remove the selected private annotation? Its Markdown will become ordinary Umbra content after save.",
-          { modal: true },
-          "Remove Private Annotation",
-        );
-        if (choice !== "Remove Private Annotation") return;
+        if (!(await confirmPrivateAnnotationRemoval(privateAnnotationPreferences()))) return;
         await editor.removePrivateAnnotationFromActive();
       });
     }),
@@ -261,7 +256,7 @@ export function activate(
         if (profileId === undefined) {
           throw new Error("Private annotation profile ID is required");
         }
-        await applyChosenPrivateAnnotation(controller, editor, profileId);
+        await applyChosenPrivateAnnotation(controller, editor, profileId, privateAnnotationPreferences());
       });
     }),
     vscode.commands.registerCommand("inex.showSecurityStatus", async () => {
@@ -358,6 +353,7 @@ async function applyChosenPrivateAnnotation(
   controller: VaultController,
   editor: InexCustomEditorProvider,
   profileId?: string,
+  preferences: PrivateAnnotationPreferences = privateAnnotationPreferences(),
 ): Promise<void> {
   if (!(await ensureVaultUnlocked(controller))) {
     return;
@@ -440,7 +436,27 @@ async function applyChosenPrivateAnnotation(
   if (!controller.isSessionCurrent(session)) {
     throw new Error("Inex vault session changed during private annotation selection");
   }
-  await editor.applyPrivateAnnotationToActive(spec);
+  await editor.applyPrivateAnnotationToActive(spec, preferences.noSelectionTarget);
+}
+
+function privateAnnotationPreferences(): PrivateAnnotationPreferences {
+  const configuration = vscode.workspace.getConfiguration("inex.privateAnnotation");
+  return parsePrivateAnnotationPreferences({
+    noSelectionTarget: configuration.get<unknown>("noSelectionTarget"),
+    confirmBeforeUnwrap: configuration.get<unknown>("confirmBeforeUnwrap"),
+  });
+}
+
+async function confirmPrivateAnnotationRemoval(
+  preferences: PrivateAnnotationPreferences,
+): Promise<boolean> {
+  if (!preferences.confirmBeforeUnwrap) return true;
+  const choice = await vscode.window.showWarningMessage(
+    "Remove the selected private annotation? Its Markdown will become ordinary Umbra content after save.",
+    { modal: true },
+    "Remove Private Annotation",
+  );
+  return choice === "Remove Private Annotation";
 }
 
 function isProfileArguments(value: unknown): value is { readonly profileId: string } {

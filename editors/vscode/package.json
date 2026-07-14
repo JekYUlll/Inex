@@ -256,6 +256,19 @@
           "default": "",
           "scope": "machine",
           "description": "Optional absolute path to an audited inex CLI for repository import. Empty uses the extension-bundled binary."
+        },
+        "inex.privateAnnotation.noSelectionTarget": {
+          "type": "string",
+          "enum": ["line", "paragraph", "reject"],
+          "default": "paragraph",
+          "scope": "window",
+          "description": "Private annotation target when the cursor has no selection."
+        },
+        "inex.privateAnnotation.confirmBeforeUnwrap": {
+          "type": "boolean",
+          "default": true,
+          "scope": "window",
+          "description": "Confirm before private Markdown is restored into ordinary Umbra content."
         }
       }
     }

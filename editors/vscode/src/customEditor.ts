@@ -6,7 +6,8 @@ import * as vscode from "vscode";
 import { AssetPreviewCoordinator } from "./assetPreviewCoordinator.ts";
 import { readBoundedRegularFile } from "./boundedFile.ts";
 import type { VaultController, VaultSession } from "./controller.ts";
-import { markdownParagraphRange } from "./privateAnnotation.ts";
+import { emptySelectionRange } from "./privateAnnotation.ts";
+import type { NoSelectionTarget } from "./privateAnnotationPreferences.ts";
 import {
   headingForFragment,
   linkAtUtf16,
@@ -987,6 +988,7 @@ export class InexCustomEditorProvider
 
   public async applyPrivateAnnotationToActive(
     spec: PrivateAnnotationSpec,
+    noSelectionTarget: NoSelectionTarget,
   ): Promise<void> {
     const document = this.activeDocument;
     if (
@@ -1006,13 +1008,21 @@ export class InexCustomEditorProvider
     if (selection.startByte === selection.endByte) {
       const selectionSnapshot = document.snapshot();
       try {
-        resolvedSelection = markdownParagraphRange(selectionSnapshot.content, selection.startByte);
+        resolvedSelection = emptySelectionRange(
+          selectionSnapshot.content,
+          selection.startByte,
+          noSelectionTarget,
+        );
       } finally {
         selectionSnapshot.content.fill(0);
       }
     }
     if (resolvedSelection === undefined) {
-      throw new Error("Current Markdown paragraph is empty or unavailable for private annotation");
+      throw new Error(
+        noSelectionTarget === "reject"
+          ? "Select Markdown content before adding a private annotation"
+          : "Current Markdown target is empty or unavailable for private annotation",
+      );
     }
     const snapshot = document.snapshot();
     try {

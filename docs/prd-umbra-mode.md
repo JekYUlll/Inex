@@ -116,10 +116,13 @@ keybindings file:
 }
 ```
 
-The MVP supports one textarea selection; with an empty selection it applies to
-the current Markdown paragraph (the contiguous nonblank lines containing the
-cursor). Multi-cursor adapters, heading-section expansion, cursor-inside metadata edit, and
-tag/profile management commands remain pending. Outer projection editing
+The MVP supports one textarea selection. `inex.privateAnnotation.noSelectionTarget`
+is a window-local setting with `paragraph` (default), `line`, and `reject`;
+the first two resolve an empty selection without retaining content in settings.
+`inex.privateAnnotation.confirmBeforeUnwrap` defaults to `true` and governs
+both toggle unwrap and explicit removal. Multi-cursor adapters, heading-section
+expansion, cursor-inside metadata edit, shortcut `toggleBehavior`, and tag/profile
+management commands remain pending. Outer projection editing
 and Umbra draft recovery are deliberately fail-closed until their dedicated
 authenticated save paths are implemented.
 
