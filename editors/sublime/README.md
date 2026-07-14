@@ -93,6 +93,11 @@ Linux default keymap contributes normal Sublime-configurable bindings:
   request removal confirmation; a cursor inside one opens metadata edit; plain
   selected Markdown opens the annotation picker.
 - `Ctrl+Alt+Shift+/` and `Ctrl+Alt+H` — **Inex: Choose Private Annotation**.
+- `Ctrl+Alt+1`, `Ctrl+Alt+2`, and `Ctrl+Alt+3` — apply the encrypted catalog
+  profiles `private-comment`, `relationship-comment`, and `family-comment`.
+  They fail closed if the named profile is unavailable. Bind any other profile
+  using the normal command argument, for example
+  `"command": "inex_apply_private_annotation_profile", "args": {"profile_id": "my-profile"}`.
 
 These are ordinary `.sublime-keymap` contributions. Rebind or remove them in a
 user keymap; the plugin does not intercept raw keyboard events. All resulting

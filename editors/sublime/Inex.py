@@ -1951,7 +1951,9 @@ def _private_annotation_input(
     return selections, projection
 
 
-def _apply_private_annotation_from_active_view(window: sublime.Window) -> None:
+def _apply_private_annotation_from_active_view(
+    window: sublime.Window, profile_id: Optional[str] = None,
+) -> None:
     view = window.active_view()
     document = _registry.get(view.id()) if view is not None else None
     session = _command_session(window)
@@ -1980,6 +1982,7 @@ def _apply_private_annotation_from_active_view(window: sublime.Window) -> None:
             if not client.umbra_status()["unlocked"]:
                 raise RpcLifecycleError("Unlock Umbra private mode first")
             config = client.load_umbra_annotation_config()
+            config_profiles[:] = config["profiles"]
             state = AnnotationPickerState(config)
             sublime.set_timeout(lambda: present(state), 0)
         except Exception as error:
@@ -1995,6 +1998,49 @@ def _apply_private_annotation_from_active_view(window: sublime.Window) -> None:
         ):
             state.clear()
             wipe(projection)
+            return
+        if profile_id is not None:
+            try:
+                profile = next(
+                    candidate for candidate in config_profiles
+                    if candidate.get("id") == profile_id
+                )
+                state.apply_profile(profile)
+            except StopIteration:
+                state.clear()
+                wipe(projection)
+                _show_error(ModelError("Private annotation profile is unavailable"))
+                return
+            except Exception as error:
+                state.clear()
+                wipe(projection)
+                _show_error(error)
+                return
+
+            def discard_profile() -> None:
+                state.clear()
+                wipe(projection)
+
+            if state.outer != "cover":
+                try:
+                    apply(state.spec())
+                except Exception as error:
+                    wipe(projection)
+                    _show_error(error)
+                finally:
+                    state.clear()
+                return
+
+            def cover_done(cover_text: str) -> None:
+                try:
+                    apply(state.spec(cover_text))
+                except Exception as error:
+                    wipe(projection)
+                    _show_error(error)
+                finally:
+                    state.clear()
+
+            window.show_input_panel("Public cover text", "", cover_done, None, discard_profile)
             return
         _show_annotation_picker(window, state, lambda spec: apply(spec), lambda: wipe(projection))
 
@@ -2045,6 +2091,7 @@ def _apply_private_annotation_from_active_view(window: sublime.Window) -> None:
             wipe(content)
             _show_error(error)
 
+    config_profiles: List[Dict[str, Any]] = []
     sublime.set_timeout_async(load_picker, 0)
 
 
@@ -2858,6 +2905,20 @@ class InexChoosePrivateAnnotationCommand(sublime_plugin.WindowCommand):
 class InexTogglePrivateAnnotationCommand(sublime_plugin.WindowCommand):
     def run(self) -> None:
         _toggle_private_annotation_from_active_view(self.window)
+
+
+class InexApplyPrivateAnnotationProfileCommand(sublime_plugin.WindowCommand):
+    def run(self, profile_id: Optional[str] = None) -> None:
+        if (
+            not isinstance(profile_id, str)
+            or not profile_id
+            or len(profile_id) > 64
+            or not ("a" <= profile_id[0] <= "z" or "0" <= profile_id[0] <= "9")
+            or any(not ("a" <= character <= "z" or "0" <= character <= "9" or character in "._-") for character in profile_id)
+        ):
+            _show_error(ModelError("Private annotation profile ID is invalid"))
+            return
+        _apply_private_annotation_from_active_view(self.window, profile_id)
 
 
 class InexEditPrivateAnnotationCommand(sublime_plugin.WindowCommand):

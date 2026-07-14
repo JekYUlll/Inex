@@ -10,5 +10,20 @@
   {
     "keys": ["ctrl+alt+h"],
     "command": "inex_choose_private_annotation"
+  },
+  {
+    "keys": ["ctrl+alt+1"],
+    "command": "inex_apply_private_annotation_profile",
+    "args": {"profile_id": "private-comment"}
+  },
+  {
+    "keys": ["ctrl+alt+2"],
+    "command": "inex_apply_private_annotation_profile",
+    "args": {"profile_id": "relationship-comment"}
+  },
+  {
+    "keys": ["ctrl+alt+3"],
+    "command": "inex_apply_private_annotation_profile",
+    "args": {"profile_id": "family-comment"}
   }
 ]
