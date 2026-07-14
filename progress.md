@@ -892,3 +892,9 @@
 ## 2026-07-15 — Umbra daemon 全量复验
 
 - 在上述 RPC 回归并入后，`cargo test -p inex-daemon --lib` 为 71/71 通过，`cargo clippy -p inex-daemon --all-targets -- -D warnings` 通过；工作树保持 clean。下一项仍是将编辑器本地的 toggle/unwrap 交互偏好落实为配置，而非把快捷键语义写死在 extension 代码中。
+
+## 2026-07-15 — VS Code 私密标注本地偏好
+
+- 提交 `3ad47a5`（`feat(vscode): configure private annotation interactions`）：新增 window-local `inex.privateAnnotation.noSelectionTarget`（paragraph/line/reject）与 `confirmBeforeUnwrap`。前者只影响临时 snapshot 的 selection range，后者同时控制 toggle 与显式 remove 的确认；配置解析严格回退默认值，绝不存储私密标签、profile 或正文。
+- `headingSection`、multi-cursor 和记忆上次 spec 仍未暴露为设置，避免出现仅有表面配置、却未能满足 selection 原子性或锁定清理语义的路径。PRD 已同步当前能力边界。
+- 验证：package JSON、`git diff --check`、`pnpm --dir editors/vscode check`、tests 53/53、构建均通过。
