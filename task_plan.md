@@ -130,10 +130,10 @@ Phase 6 extension — 现有 Markdown Git 仓库与加密附件迁移（Phase 7 
           - [x] core以consuming outcome区分old-present、exact-absent+held-parent-synced、exact-absent+unsynced、replacement与indeterminate；所有分支保留原marker fd及同一lock，post owner禁止重建/二次unlink（`afc9132`）
           - [x] core在marker create-new前及held staging claim期间以common-parent descriptor观察destination absent；链接类与不确定状态一律fail closed，且明确absence不构成名称预留（`4f9b074`）
           - [x] Initial authority按值创建v2 marker、释放旧大manifest后执行marker-aware fresh复审，并逐项对账context/seal/root OID及四类计数；所有post-marker失败保留同一owner/lock（`88eab2f`）
-          - [ ] Fresh existing-only opener进入同一PublishedWithMarker后半状态链
+          - [x] Fresh existing-only opener进入同一PublishedWithMarker后半状态链
             - [x] core借用式published-role gate只接受destination角色、descriptor-relative staging缺失及最终完整authority重验，不把有界观察冒充reservation/durability（`597301c`）
-            - [ ] core fused existing-only opener从同一descriptor链捕获root/local/zero-byte lock、nonblocking持锁并打开exact canonical v2 marker；零create/recovery且不接受caller identities
-            - [ ] inex-git验证repository domain/staging grammar/destination policy，执行fresh九段审计并返回marker/lock最后析构的PublishedWithMarker owner
+            - [x] core fused existing-only opener从同一descriptor链捕获root/local/zero-byte lock、nonblocking持锁并打开exact canonical v2 marker；零create/recovery且不接受caller identities（`2e84b4f`）
+            - [x] inex-git验证repository domain/staging grammar/destination policy，执行fresh九段审计并返回marker/lock最后析构的PublishedWithMarker owner（`3a8661c`）
   - [ ] 完成repository import构造/durability/publication每一边界的Linux force-kill、hostile same-UID source/target race、artifact-bound residue与原生Windows矩阵
 - **Status:** in_progress（用户实测驱动的迁移/附件扩展；原Markdown-only实现仍保持已验证基线）
 
