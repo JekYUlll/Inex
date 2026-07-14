@@ -1,5 +1,11 @@
 # Inex Progress Log
 
+## 2026-07-15 — Neovim 受控 vault tree 浏览
+
+- 新增 `InexBrowse`：只接受 daemon `vault.listTree` 的有界、无重复且 kind/path 受限条目；tree 进入 `nofile`、swap/undofile/modeline/buflisted 关闭、`bufhidden=wipe` 的 scratch buffer。Enter 仅可打开已验证的 Markdown file entry；目录和附件不会被误作明文文件打开。
+- tree buffer 在独立 split 中创建。初版在当前窗口替换 document，触发既有 `bufhidden=wipe` 并导致测试 `Invalid buffer id`；修正为保留文档窗口、只让 tree 占用新 split，未削弱 wipe-on-hide 安全策略。
+- headless lifecycle 现在验证 tree 行、buffer 选项、文档窗口保留及 lock 时同时 wipe document/tree；transport smoke 也通过。
+
 ## 2026-07-15 — Neovim Outer 受控编辑与保存
 
 - Neovim ordinary Outer buffer 改为 `acwrite`：`InexSave` 与普通 `:write` 都由 buffer-local `BufWriteCmd` 拦截，只向 `inexd` 发送带 current ETag 的 `file.write`，绝不把 `inex://` 内容写至宿主文件路径。

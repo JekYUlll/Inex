@@ -71,6 +71,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
 - [x] 在 CLI/daemon、VS Code Umbra MVP 与核心隔离验证完成后，建立 Lua 插件骨架与安装说明；`InexStart`/`InexStatus`/`InexStop` 以 strict Content-Length JSON-RPC 启动并认证 `inexd`（本轮）
 - [x] 实现 Outer 受控 buffer 最小闭环：独立解锁/锁定、普通 Markdown 创建/打开、`document.close` 与 wipe-on-lock；headless 临时 vault 回归验证 swap/undo/modeline/列表禁用和 buffer 清理（本轮）
 - [x] 实现 Outer 受控编辑/保存：`acwrite` buffer 的 `BufWriteCmd` 仅经 ETag-conditional `file.write` 加密写回；空内容、Unicode、锁定后重新解锁读取和 daemon response canonical Base64URL 均在 headless 回归验证（本轮）
+- [x] 实现 Outer vault tree 浏览：严格验证 `vault.listTree` 条目后在 lock/stop wipe 的 nofile scratch buffer 中显示；tree 使用独立 split，避免 `bufhidden=wipe` 意外清除仍可见的文档（本轮）
 - [ ] 复用 `inexd` JSON-RPC：vault 解锁/锁定、树浏览、受控 Markdown buffer、保存与搜索
 - [ ] 实现 Umbra 最小命令：解锁、私密标注、标签/profile 选择与锁定清理；不得绕过 Outer/Umbra 隔离
 - [ ] 使用 headless Neovim 回归验证，并对 swap、shada、undo、LSP 等宿主明文残留执行显式门控
