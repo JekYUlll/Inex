@@ -1072,3 +1072,8 @@
 
 - 新增 `Inex: Edit Private Annotation`。命令只接受一条位于 RenderMap 私密块内部（不是完整块）的 selection；空 cursor 以该 block 首个可认证非空 byte 作为 daemon `umbra.annotation.edit` 的 proof。完整 block 继续只属于 remove 流程。
 - picker 从 canonical visible fence header 读取 kind/tag IDs/Outer mode 作为预选值；header 不含 slot ID 传递路径，tag IDs 仍必须存在于已解锁 encrypted catalog，最终 mutation 始终发送 projection/ETag/完整 RenderMap 并只安装 daemon 回包。投影副本在 cancel、session 变化和 RPC finally 中清零。验证：94/94 Sublime tests（1 项 pidfd platform skip）、Python compile、JSON 与 diff-check 通过。
+
+## 2026-07-15 — Sublime comment-like annotation toggle and package inclusion
+
+- 新增 `Inex: Toggle Private Annotation`：complete private blocks 复用 remove 的确认；一条 block 内 cursor/selection 复用 edit；无 private 交叉的明确普通多选复用 chooser；partial/mixed private selection 或空普通 cursor 均拒绝，不在客户端推断 slot identity。Linux `Default (Linux).sublime-keymap` 贡献 Ctrl+Alt+/、Ctrl+Alt+Shift+/、Ctrl+Alt+H，用户可在自己的 keymap 重绑。
+- 修正 release source 清单：`inex_annotation.py` 与 Linux keymap 现在会进入 Sublime archive，避免源码可用而安装包缺模块。验证：Sublime 94/94（1 项 pidfd platform skip）。release unittest 为 58/61，3 项 lifecycle 进程门禁因本机缺少 Linux pidfd/subreaper fail closed；未将其计作发布通过。
