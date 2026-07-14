@@ -6,11 +6,14 @@
 
 use std::borrow::Borrow;
 use std::fmt;
+use std::iter::Peekable;
 use std::path::{Component, Path, PathBuf};
-use std::str::FromStr;
+use std::str::{Chars, FromStr};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
+use unicode_normalization::char::{canonical_combining_class, compose, decompose_canonical};
 use unicode_normalization::{UnicodeNormalization, is_nfc};
 
 const _: () = {
@@ -620,6 +623,51 @@ pub fn raw_portable_case_fold_key(input: &str) -> CaseFoldKey {
     CaseFoldKey(portable_case_fold(input))
 }
 
+/// A fixed-size identity for one portable Unicode case-folded spelling.
+///
+/// Equality binds both the checked UTF-8 byte length and SHA-256 digest of the
+/// exact NFC case-folded byte stream. The fields remain private so callers can
+/// compare identities but cannot construct unverified values.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct PortableCaseFoldFingerprint {
+    utf8_length: u64,
+    sha256: [u8; 32],
+}
+
+/// Fingerprint the portable Unicode case fold of an unvalidated raw spelling.
+///
+/// The fold and NFC normalization are emitted directly into SHA-256. Scratch
+/// storage has a Unicode-17-pinned fixed bound even for an arbitrarily long
+/// sequence of combining characters.
+///
+/// # Panics
+///
+/// Panics only if the folded UTF-8 length cannot fit in `u64`, or if the pinned
+/// Unicode 17 scalar mapping exceeds the exhaustively tested fixed bounds.
+#[must_use]
+pub fn raw_portable_case_fold_fingerprint(input: &str) -> PortableCaseFoldFingerprint {
+    let mut utf8_length = 0_u64;
+    let mut sha256 = Sha256::new();
+
+    stream_portable_case_fold_nfc(input, |character| {
+        let mut encoded = [0_u8; 4];
+        let bytes = character.encode_utf8(&mut encoded).as_bytes();
+        let Ok(byte_count) = u64::try_from(bytes.len()) else {
+            panic!("one UTF-8 scalar length must fit in u64");
+        };
+        utf8_length = match utf8_length.checked_add(byte_count) {
+            Some(length) => length,
+            None => panic!("portable case-folded UTF-8 length exceeds u64"),
+        };
+        sha256.update(bytes);
+    });
+
+    PortableCaseFoldFingerprint {
+        utf8_length,
+        sha256: sha256.finalize().into(),
+    }
+}
+
 fn require_single_component(name: &str) -> Result<(), PathError> {
     if name.is_empty() || name.contains('/') || name.contains('\\') {
         return Err(PathError::ExpectedSingleComponent);
@@ -756,6 +804,353 @@ fn is_windows_device_basename(basename: &str) -> bool {
     };
     (prefix.eq_ignore_ascii_case("COM") || prefix.eq_ignore_ascii_case("LPT"))
         && (matches!(suffix.as_bytes(), [b'1'..=b'9']) || matches!(suffix, "¹" | "²" | "³"))
+}
+
+// Rust's Unicode-17 case mappings emit at most three scalars per mapping
+// stage, so lower -> upper -> lower has a finite product bound of 27. Keep a
+// little pinned-version headroom; the exhaustive scalar test below fails
+// closed before a Unicode/table update could exceed it.
+const MAX_PORTABLE_CASE_FOLD_SCALARS: usize = 32;
+
+// Unicode 17 canonical decomposition is finite per scalar (including the
+// algorithmic three-Jamo Hangul decomposition). This deliberately conservative
+// fixed bound is also exhaustively checked over every scalar below.
+const MAX_CANONICAL_DECOMPOSITION_SCALARS: usize = 32;
+
+#[derive(Clone)]
+struct PortableCaseFoldChars<'a> {
+    input: Chars<'a>,
+    pending: [char; MAX_PORTABLE_CASE_FOLD_SCALARS],
+    pending_index: usize,
+    pending_length: usize,
+}
+
+impl<'a> PortableCaseFoldChars<'a> {
+    fn new(input: &'a str) -> Self {
+        Self {
+            input: input.chars(),
+            pending: ['\0'; MAX_PORTABLE_CASE_FOLD_SCALARS],
+            pending_index: 0,
+            pending_length: 0,
+        }
+    }
+}
+
+impl Iterator for PortableCaseFoldChars<'_> {
+    type Item = char;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.pending_index < self.pending_length {
+                let character = self.pending[self.pending_index];
+                self.pending_index += 1;
+                return Some(character);
+            }
+
+            let character = self.input.next()?;
+            self.pending_length = portable_case_fold_scalar(character, &mut self.pending);
+            self.pending_index = 0;
+        }
+    }
+}
+
+fn portable_case_fold_scalar(
+    character: char,
+    output: &mut [char; MAX_PORTABLE_CASE_FOLD_SCALARS],
+) -> usize {
+    let mut length = 0;
+    let mut emit = |mapped| push_fixed_scalar(output, &mut length, mapped, "case fold");
+
+    match character {
+        // Full default case folding preserves LATIN SMALL LETTER DOTLESS I.
+        // Cherokee folds to uppercase, unlike all other cased scripts.
+        '\u{0131}' | '\u{13a0}'..='\u{13f5}' => emit(character),
+        '\u{13f8}'..='\u{13fd}' => {
+            if let Some(mapped) = char::from_u32(u32::from(character) - 8) {
+                emit(mapped);
+            }
+        }
+        '\u{ab70}'..='\u{abbf}' => {
+            if let Some(mapped) = char::from_u32(u32::from(character) - 0x97d0) {
+                emit(mapped);
+            }
+        }
+        _ => {
+            for lowercase in character.to_lowercase() {
+                for uppercase in lowercase.to_uppercase() {
+                    for final_lowercase in uppercase.to_lowercase() {
+                        emit(final_lowercase);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    observe_portable_fold_expansion(length);
+    length
+}
+
+#[derive(Clone)]
+struct CanonicalFoldChars<'a> {
+    folded: PortableCaseFoldChars<'a>,
+    pending: [char; MAX_CANONICAL_DECOMPOSITION_SCALARS],
+    pending_index: usize,
+    pending_length: usize,
+}
+
+impl<'a> CanonicalFoldChars<'a> {
+    fn new(input: &'a str) -> Self {
+        Self {
+            folded: PortableCaseFoldChars::new(input),
+            pending: ['\0'; MAX_CANONICAL_DECOMPOSITION_SCALARS],
+            pending_index: 0,
+            pending_length: 0,
+        }
+    }
+}
+
+impl Iterator for CanonicalFoldChars<'_> {
+    type Item = char;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.pending_index < self.pending_length {
+                let character = self.pending[self.pending_index];
+                self.pending_index += 1;
+                return Some(character);
+            }
+
+            let character = self.folded.next()?;
+            let mut length = 0;
+            decompose_canonical(character, |decomposed| {
+                push_fixed_scalar(
+                    &mut self.pending,
+                    &mut length,
+                    decomposed,
+                    "canonical decomposition",
+                );
+            });
+            #[cfg(test)]
+            observe_canonical_decomposition(length);
+            self.pending_length = length;
+            self.pending_index = 0;
+        }
+    }
+}
+
+fn push_fixed_scalar<const N: usize>(
+    output: &mut [char; N],
+    length: &mut usize,
+    character: char,
+    operation: &str,
+) {
+    let Some(slot) = output.get_mut(*length) else {
+        panic!("Unicode 17 {operation} exceeded its fixed scalar bound");
+    };
+    *slot = character;
+    *length += 1;
+}
+
+#[derive(Clone)]
+struct CanonicalSegment<'a> {
+    start: Peekable<CanonicalFoldChars<'a>>,
+    length: usize,
+    nonstarter_classes: [u64; 4],
+    starts_with_starter: bool,
+}
+
+impl CanonicalSegment<'_> {
+    fn characters(&self) -> impl Iterator<Item = char> + '_ {
+        self.start.clone().take(self.length)
+    }
+
+    fn has_nonstarter_class(&self, class: u8) -> bool {
+        let word = usize::from(class / 64);
+        let bit = u32::from(class % 64);
+        self.nonstarter_classes[word] & (1_u64 << bit) != 0
+    }
+}
+
+struct CanonicalSegments<'a> {
+    units: Peekable<CanonicalFoldChars<'a>>,
+}
+
+impl<'a> CanonicalSegments<'a> {
+    fn new(input: &'a str) -> Self {
+        Self {
+            units: CanonicalFoldChars::new(input).peekable(),
+        }
+    }
+}
+
+impl<'a> Iterator for CanonicalSegments<'a> {
+    type Item = CanonicalSegment<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let first = *self.units.peek()?;
+        let starts_with_starter = canonical_combining_class(first) == 0;
+        let start = self.units.clone();
+        let mut length = 0_usize;
+        let mut nonstarter_classes = [0_u64; 4];
+
+        while let Some(&character) = self.units.peek() {
+            let class = canonical_combining_class(character);
+            if length != 0 && class == 0 {
+                break;
+            }
+            let _ = self.units.next();
+            length = match length.checked_add(1) {
+                Some(length) => length,
+                None => panic!("canonical segment scalar count exceeds usize"),
+            };
+            if class != 0 {
+                let word = usize::from(class / 64);
+                let bit = u32::from(class % 64);
+                nonstarter_classes[word] |= 1_u64 << bit;
+            }
+        }
+
+        Some(CanonicalSegment {
+            start,
+            length,
+            nonstarter_classes,
+            starts_with_starter,
+        })
+    }
+}
+
+fn for_each_ordered_nonstarter(
+    segment: &CanonicalSegment<'_>,
+    skip_starter: bool,
+    mut emit: impl FnMut(char, u8),
+) {
+    for class in 1_u8..=u8::MAX {
+        if !segment.has_nonstarter_class(class) {
+            continue;
+        }
+        for character in segment.characters().skip(usize::from(skip_starter)) {
+            if canonical_combining_class(character) == class {
+                emit(character, class);
+            }
+        }
+    }
+}
+
+fn compose_segment_nonstarters(
+    segment: &CanonicalSegment<'_>,
+    initial_starter: char,
+    mut emit_uncomposed: impl FnMut(char),
+) -> (char, bool) {
+    let mut starter = initial_starter;
+    let mut last_uncomposed_class = None;
+    let mut has_uncomposed = false;
+
+    for_each_ordered_nonstarter(segment, true, |character, class| {
+        let is_unblocked = last_uncomposed_class.is_none_or(|previous| previous < class);
+        if is_unblocked && let Some(composed) = compose(starter, character) {
+            starter = composed;
+            return;
+        }
+
+        last_uncomposed_class = Some(class);
+        has_uncomposed = true;
+        emit_uncomposed(character);
+    });
+
+    (starter, has_uncomposed)
+}
+
+fn stream_portable_case_fold_nfc(input: &str, mut emit: impl FnMut(char)) {
+    // Canonical ordering can require an input-sized buffer for an unbounded run
+    // of nonstarters. Replaying the borrowed input once per present combining
+    // class gives the same stable order with only fixed arrays and checkpoints.
+    let mut pending_starter = None;
+
+    for segment in CanonicalSegments::new(input) {
+        if !segment.starts_with_starter {
+            for_each_ordered_nonstarter(&segment, false, |character, _| emit(character));
+            continue;
+        }
+
+        let Some(mut starter) = segment.characters().next() else {
+            continue;
+        };
+        if let Some(previous_starter) = pending_starter.take() {
+            if let Some(composed) = compose(previous_starter, starter) {
+                starter = composed;
+            } else {
+                emit(previous_starter);
+            }
+        }
+
+        if segment.length == 1 {
+            pending_starter = Some(starter);
+            continue;
+        }
+
+        let starter_before_nonstarters = starter;
+        let (composed_starter, has_uncomposed) =
+            compose_segment_nonstarters(&segment, starter_before_nonstarters, |_| {});
+        if has_uncomposed {
+            emit(composed_starter);
+            let (replayed_starter, _) =
+                compose_segment_nonstarters(&segment, starter_before_nonstarters, &mut emit);
+            debug_assert_eq!(composed_starter, replayed_starter);
+        } else {
+            pending_starter = Some(composed_starter);
+        }
+    }
+
+    if let Some(starter) = pending_starter {
+        emit(starter);
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PortableFoldStreamObservation {
+    maximum_case_fold_expansion: usize,
+    maximum_canonical_decomposition: usize,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static PORTABLE_FOLD_STREAM_OBSERVATION: std::cell::Cell<PortableFoldStreamObservation> =
+        const { std::cell::Cell::new(PortableFoldStreamObservation {
+            maximum_case_fold_expansion: 0,
+            maximum_canonical_decomposition: 0,
+        }) };
+}
+
+#[cfg(test)]
+fn reset_portable_fold_stream_observation() {
+    PORTABLE_FOLD_STREAM_OBSERVATION.set(PortableFoldStreamObservation::default());
+}
+
+#[cfg(test)]
+fn portable_fold_stream_observation() -> PortableFoldStreamObservation {
+    PORTABLE_FOLD_STREAM_OBSERVATION.get()
+}
+
+#[cfg(test)]
+fn observe_portable_fold_expansion(length: usize) {
+    PORTABLE_FOLD_STREAM_OBSERVATION.with(|cell| {
+        let mut observation = cell.get();
+        observation.maximum_case_fold_expansion =
+            observation.maximum_case_fold_expansion.max(length);
+        cell.set(observation);
+    });
+}
+
+#[cfg(test)]
+fn observe_canonical_decomposition(length: usize) {
+    PORTABLE_FOLD_STREAM_OBSERVATION.with(|cell| {
+        let mut observation = cell.get();
+        observation.maximum_canonical_decomposition =
+            observation.maximum_canonical_decomposition.max(length);
+        cell.set(observation);
+    });
 }
 
 /// Produce a full, locale-independent case fold and restore NFC afterwards.
@@ -970,6 +1365,113 @@ mod tests {
             Ok(path) => path,
             Err(error) => panic!("expected valid asset path `{input}`: {error}"),
         }
+    }
+
+    fn legacy_case_fold_fingerprint(input: &str) -> PortableCaseFoldFingerprint {
+        let folded = portable_case_fold(input);
+        let mut sha256 = Sha256::new();
+        sha256.update(folded.as_bytes());
+        PortableCaseFoldFingerprint {
+            utf8_length: u64::try_from(folded.len()).expect("test input length fits in u64"),
+            sha256: sha256.finalize().into(),
+        }
+    }
+
+    fn assert_streamed_fingerprint_matches_legacy(input: &str) {
+        assert_eq!(
+            raw_portable_case_fold_fingerprint(input),
+            legacy_case_fold_fingerprint(input),
+            "streamed portable fold differs for {input:?}"
+        );
+    }
+
+    #[test]
+    fn streamed_case_fold_fingerprint_matches_legacy_edge_corpus() {
+        for input in [
+            "",
+            "Inex/README.MD",
+            "Stra\u{df}e",
+            "STRASSE",
+            "\u{3a3}\u{3c3}\u{3c2}",
+            "\u{131}I\u{130}i",
+            "\u{13a0}\u{13f0}\u{13f8}\u{ab70}",
+            "caf\u{e9}",
+            "cafe\u{301}",
+            "\u{344}",
+            "\u{315}\u{300}",
+            "A\u{315}\u{300}",
+            "\u{ac00}",
+            "\u{1100}\u{1161}",
+            "\u{1100}\u{1161}\u{11a8}",
+        ] {
+            assert_streamed_fingerprint_matches_legacy(input);
+        }
+
+        assert_eq!(
+            raw_portable_case_fold_fingerprint("Stra\u{df}e"),
+            raw_portable_case_fold_fingerprint("STRASSE")
+        );
+        assert_eq!(
+            raw_portable_case_fold_fingerprint("\u{3c3}"),
+            raw_portable_case_fold_fingerprint("\u{3c2}")
+        );
+        assert_eq!(
+            raw_portable_case_fold_fingerprint("\u{13a0}\u{13f0}"),
+            raw_portable_case_fold_fingerprint("\u{ab70}\u{13f8}")
+        );
+        assert_ne!(
+            raw_portable_case_fold_fingerprint("\u{131}"),
+            raw_portable_case_fold_fingerprint("i")
+        );
+        assert_eq!(
+            raw_portable_case_fold_fingerprint("caf\u{e9}"),
+            raw_portable_case_fold_fingerprint("cafe\u{301}")
+        );
+    }
+
+    #[test]
+    fn streamed_case_fold_has_fixed_scratch_for_long_nonstarter_runs() {
+        reset_portable_fold_stream_observation();
+        assert_streamed_fingerprint_matches_legacy("A\u{301}");
+        let short_observation = portable_fold_stream_observation();
+
+        let input = format!("A{}", "\u{301}".repeat(16_384));
+        reset_portable_fold_stream_observation();
+        assert_streamed_fingerprint_matches_legacy(&input);
+        let long_observation = portable_fold_stream_observation();
+
+        assert_eq!(short_observation, long_observation);
+        assert_eq!(
+            long_observation,
+            PortableFoldStreamObservation {
+                maximum_case_fold_expansion: 1,
+                maximum_canonical_decomposition: 1,
+            }
+        );
+        assert!(
+            std::mem::size_of::<PortableCaseFoldChars<'static>>()
+                + std::mem::size_of::<CanonicalFoldChars<'static>>()
+                + std::mem::size_of::<CanonicalSegment<'static>>()
+                + std::mem::size_of::<Sha256>()
+                < 4_096
+        );
+    }
+
+    #[test]
+    fn streamed_case_fold_exhausts_unicode_17_scalars_against_legacy_pipeline() {
+        let mut input = String::with_capacity(6_000_000);
+        for scalar in 0..=0x10_ffff {
+            if let Some(character) = char::from_u32(scalar) {
+                input.push(character);
+                input.push('\0');
+            }
+        }
+
+        reset_portable_fold_stream_observation();
+        assert_streamed_fingerprint_matches_legacy(&input);
+        let observation = portable_fold_stream_observation();
+        assert!(observation.maximum_case_fold_expansion <= MAX_PORTABLE_CASE_FOLD_SCALARS);
+        assert!(observation.maximum_canonical_decomposition <= MAX_CANONICAL_DECOMPOSITION_SCALARS);
     }
 
     #[test]
