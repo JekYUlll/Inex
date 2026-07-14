@@ -5,6 +5,7 @@ local configuration = { sidecar_path = "", vault_path = "" }
 local session = nil
 local documents = {}
 local tree_buffers = {}
+local search_buffers = {}
 local MAX_DOCUMENT_BYTES = 16 * 1024 * 1024
 local MAX_DOCUMENT_BASE64_BYTES = 4 * math.ceil(MAX_DOCUMENT_BYTES / 3)
 local MAX_TREE_ENTRIES = 100000
@@ -40,6 +41,19 @@ local function wipe_tree_buffers()
   end
   for _, buffer in ipairs(buffers) do
     tree_buffers[buffer] = nil
+    if vim.api.nvim_buf_is_valid(buffer) then
+      vim.api.nvim_buf_delete(buffer, { force = true })
+    end
+  end
+end
+
+local function wipe_search_buffers()
+  local buffers = {}
+  for buffer, _ in pairs(search_buffers) do
+    table.insert(buffers, buffer)
+  end
+  for _, buffer in ipairs(buffers) do
+    search_buffers[buffer] = nil
     if vim.api.nvim_buf_is_valid(buffer) then
       vim.api.nvim_buf_delete(buffer, { force = true })
     end
@@ -85,6 +99,20 @@ local function valid_tree_path(logical_path)
     and not logical_path:find("//", 1, true)
     and not logical_path:find("..", 1, true)
     and not logical_path:find("%c")
+end
+
+local function has_exact_keys(value, expected)
+  if type(value) ~= "table" then
+    return false
+  end
+  local count = 0
+  for key, _ in pairs(value) do
+    if not expected[key] then
+      return false
+    end
+    count = count + 1
+  end
+  return count == expected.count
 end
 
 local function tree_entry_label(kind, logical_path)
@@ -150,6 +178,7 @@ function M.status()
 end
 
 function M.stop()
+  wipe_search_buffers()
   wipe_tree_buffers()
   wipe_documents()
   session = nil
@@ -186,6 +215,7 @@ function M.unlock(password)
 end
 
 function M.lock()
+  wipe_search_buffers()
   wipe_tree_buffers()
   wipe_documents()
   local active_session = session
@@ -197,6 +227,85 @@ function M.lock()
   end
 end
 
+function M.search(query)
+  if not session then
+    vim.notify("Unlock an Inex Outer vault before searching", vim.log.levels.ERROR)
+    return
+  end
+  query = query or vim.fn.inputsecret("Inex search: ")
+  if type(query) ~= "string" or #query == 0 or #query > 4096 or query:find("%c") then
+    query = ""
+    vim.notify("Inex search query is invalid", vim.log.levels.ERROR)
+    return
+  end
+  local active_session = session
+  rpc.request("search.query", {
+    session = active_session,
+    query = query,
+    limit = 100,
+    caseSensitive = false,
+    snippetByteLimit = 4096,
+  }, function(result, error)
+    query = ""
+    if error or session ~= active_session or not has_exact_keys(result, { results = true, count = 1 }) or type(result.results) ~= "table" or #result.results > 100 then
+      vim.notify(error or "Inex search response is invalid", vim.log.levels.ERROR)
+      return
+    end
+    local hits = {}
+    for _, hit in ipairs(result.results) do
+      if not has_exact_keys(hit, { logicalPath = true, startByte = true, endByte = true, line = true, utf16Column = true, snippet = true, count = 6 }) or type(hit.logicalPath) ~= "string" or type(hit.snippet) ~= "string" or not valid_logical_path(hit.logicalPath) or #hit.snippet > 8192 or hit.snippet:find("%z") or type(hit.startByte) ~= "number" or type(hit.endByte) ~= "number" or type(hit.line) ~= "number" or type(hit.utf16Column) ~= "number" or hit.startByte < 0 or hit.endByte < hit.startByte or hit.endByte > MAX_DOCUMENT_BYTES or hit.line < 0 or hit.utf16Column < 0 or hit.startByte % 1 ~= 0 or hit.endByte % 1 ~= 0 or hit.line % 1 ~= 0 or hit.utf16Column % 1 ~= 0 then
+        vim.notify("Inex search response is invalid", vim.log.levels.ERROR)
+        return
+      end
+      table.insert(hits, {
+        logical_path = hit.logicalPath,
+        line = hit.line,
+        utf16_column = hit.utf16Column,
+        snippet = hit.snippet:gsub("%c", " "),
+      })
+    end
+    wipe_search_buffers()
+    local buffer = vim.api.nvim_create_buf(false, true)
+    vim.bo[buffer].buftype = "nofile"
+    vim.bo[buffer].swapfile = false
+    vim.bo[buffer].undofile = false
+    vim.bo[buffer].bufhidden = "wipe"
+    vim.bo[buffer].buflisted = false
+    vim.bo[buffer].modeline = false
+    vim.bo[buffer].modifiable = true
+    vim.api.nvim_buf_set_name(buffer, "inex-search://results")
+    local lines = {}
+    for _, hit in ipairs(hits) do
+      table.insert(lines, string.format("[M] %s:%d:%d %s", hit.logical_path, hit.line + 1, hit.utf16_column, hit.snippet))
+    end
+    if #lines == 0 then
+      lines = { "No Inex results" }
+    end
+    vim.api.nvim_buf_set_lines(buffer, 0, -1, false, lines)
+    vim.bo[buffer].modifiable = false
+    vim.bo[buffer].modified = false
+    search_buffers[buffer] = hits
+    vim.api.nvim_create_autocmd("BufWipeout", { buffer = buffer, once = true, callback = function()
+      search_buffers[buffer] = nil
+    end })
+    vim.keymap.set("n", "<CR>", function()
+      local line = vim.api.nvim_win_get_cursor(0)[1]
+      local hit = search_buffers[buffer] and search_buffers[buffer][line]
+      if hit then
+        M.open_document(hit.logical_path)
+      end
+    end, { buffer = buffer, silent = true, desc = "Open selected Inex search result" })
+    local opened, split_error = pcall(vim.cmd, "botright vsplit")
+    if not opened then
+      search_buffers[buffer] = nil
+      vim.api.nvim_buf_delete(buffer, { force = true })
+      vim.notify(split_error or "Inex search window could not be opened", vim.log.levels.ERROR)
+      return
+    end
+    vim.api.nvim_set_current_buf(buffer)
+  end)
+end
+
 function M.browse()
   if not session then
     vim.notify("Unlock an Inex Outer vault before browsing", vim.log.levels.ERROR)
@@ -204,13 +313,13 @@ function M.browse()
   end
   local active_session = session
   rpc.request("vault.listTree", { session = active_session }, function(result, error)
-    if error or session ~= active_session or type(result) ~= "table" or type(result.entries) ~= "table" or #result.entries > MAX_TREE_ENTRIES then
+    if error or session ~= active_session or not has_exact_keys(result, { entries = true, count = 1 }) or type(result.entries) ~= "table" or #result.entries > MAX_TREE_ENTRIES then
       vim.notify(error or "Inex vault tree response is invalid", vim.log.levels.ERROR)
       return
     end
     local entries, seen = {}, {}
     for _, entry in ipairs(result.entries) do
-      if type(entry) ~= "table" or type(entry.kind) ~= "string" or type(entry.logicalPath) ~= "string" or (entry.kind ~= "directory" and entry.kind ~= "file" and entry.kind ~= "asset") or not valid_tree_path(entry.logicalPath) then
+      if not has_exact_keys(entry, { kind = true, logicalPath = true, count = 2 }) or type(entry.kind) ~= "string" or type(entry.logicalPath) ~= "string" or (entry.kind ~= "directory" and entry.kind ~= "file" and entry.kind ~= "asset") or not valid_tree_path(entry.logicalPath) then
         vim.notify("Inex vault tree response is invalid", vim.log.levels.ERROR)
         return
       end
@@ -386,6 +495,10 @@ end
 
 function M.is_tree_buffer(buffer)
   return tree_buffers[buffer] ~= nil
+end
+
+function M.is_search_buffer(buffer)
+  return search_buffers[buffer] ~= nil
 end
 
 return M

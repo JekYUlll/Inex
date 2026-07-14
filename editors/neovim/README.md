@@ -24,6 +24,8 @@ Commands currently available:
   unnamed, unlisted buffer with swap/undo persistence disabled and wipe-on-hide.
 - `:InexBrowse` shows authenticated vault entries in a nofile scratch buffer;
   press Enter on a Markdown file to open it. The tree is wiped on lock/stop.
+- `:InexSearch` uses a masked query prompt and displays in-memory sidecar hits
+  in a wipe-on-lock nofile buffer; press Enter on a result to open its document.
 - `:InexNew path/to/note.md` creates an empty ordinary Markdown document through
   daemon `file.write` and opens it with the same buffer restrictions.
 - `:InexSave` (or normal `:write`) persists the active ordinary document through
