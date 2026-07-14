@@ -1077,3 +1077,8 @@
 
 - 新增 `Inex: Toggle Private Annotation`：complete private blocks 复用 remove 的确认；一条 block 内 cursor/selection 复用 edit；无 private 交叉的明确普通多选复用 chooser；partial/mixed private selection 或空普通 cursor 均拒绝，不在客户端推断 slot identity。Linux `Default (Linux).sublime-keymap` 贡献 Ctrl+Alt+/、Ctrl+Alt+Shift+/、Ctrl+Alt+H，用户可在自己的 keymap 重绑。
 - 修正 release source 清单：`inex_annotation.py` 与 Linux keymap 现在会进入 Sublime archive，避免源码可用而安装包缺模块。验证：Sublime 94/94（1 项 pidfd platform skip）。release unittest 为 58/61，3 项 lifecycle 进程门禁因本机缺少 Linux pidfd/subreaper fail closed；未将其计作发布通过。
+
+## 2026-07-15 — Sublime encrypted annotation profile shortcuts
+
+- 新增 `InexApplyPrivateAnnotationProfileCommand(profile_id)`，只接受 stable-ID 形状的 normal Sublime command argument；worker 从已解锁 daemon config 读取 profile，再由 state 校验 kind/tags/Outer 语义。profile 不可用或 catalog 矛盾均在 daemon mutation 前拒绝。
+- drop/placeholder profile 立即发出 authenticated apply；cover 只在本次实例操作中询问公开 cover text。cancel、无效 cover、失效 session 与 worker finally 都清零 captured projection。Linux default keymap 增加 Ctrl+Alt+1/2/3 的 `private-comment`、`relationship-comment`、`family-comment` 示例。验证：Sublime 94/94（1 项 pidfd platform skip）、compile、JSON、diff-check 通过。

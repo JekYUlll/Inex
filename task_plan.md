@@ -127,6 +127,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
     - [x] Sublime `Inex: Remove Private Annotation` 已要求确认、将同一主线程捕获的投影/UTF-8 selections/ETag/RenderMap 交给 daemon `umbra.annotation.remove`，且只安装 daemon 返回投影；不从 UI 推导 slot ID（本轮）
     - [x] Sublime `Inex: Edit Private Annotation` 现仅接受一个 RenderMap 认证的块内 cursor/selection；canonical fence header 只作为 picker 初值，空 cursor 转为 block 内非空 byte proof，daemon edit 仍复核完整 projection/ETag/RenderMap（本轮）
     - [x] Sublime `Inex: Toggle Private Annotation` 已按 authenticated RenderMap 路由 complete block→confirmed remove、单一 block 内 cursor/selection→edit、plain multi-selection→chooser；Linux keymap 以普通贡献绑定 Ctrl+Alt+/、Ctrl+Alt+Shift+/ 与 Ctrl+Alt+H（本轮）
+    - [x] Sublime `Inex: Apply Private Annotation Profile` 已接收 `profile_id` command args，仅从已解锁 encrypted catalog 解析 profile；drop/placeholder 立即 apply、cover 单独请求公开文字，Linux 示例绑定 Ctrl+Alt+1/2/3（本轮）
     - [x] Sublime strict RPC client 已支持 authenticated `umbra.document.open` 与 apply/edit/remove：canonical generation、范围/条目/顺序和 feature-2 response metadata 都在交给 host 前验证；客户端只回传 daemon 返回的完整 projection/ETag/RenderMap（`e93a1a9`、`f788818`、`b027052`，本轮）
     - [x] Sublime strict RPC client 已支持 `umbra.document.convert` 的 ETag CAS feature-2 升级，返回 metadata 必须精确为 flag 2（`91f7d7a`）
     - [x] Sublime `ManagedDocument` 现区分无 normal handle 的 authenticated Umbra projection，投影替换原子更新 ETag/RenderMap，close 清除 projection state（`d5036fc`）
