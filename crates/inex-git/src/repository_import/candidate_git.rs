@@ -56,6 +56,8 @@ const MAX_RAW_OBJECT_BYTES: u64 = 68 * 1024 * 1024;
 const MAX_CANONICAL_ROOT_COMMIT_BYTES: usize = 512;
 const GIT_PREFIX: &str = ".git/";
 const GIT_ROOT: &str = ".git";
+const LOOSE_OBJECT_PATH_PREFIX: &[u8] = b".git/objects/";
+const LOOSE_OBJECT_PATH_BYTES: usize = LOOSE_OBJECT_PATH_PREFIX.len() + 41;
 const IMPORT_MESSAGE: &[u8] = b"Initialize encrypted Inex vault\n";
 const AUTHOR_PREFIX: &[u8] = b"author Inex Repository Import <inex-import@localhost.invalid> ";
 const COMMITTER_PREFIX: &[u8] =
@@ -153,7 +155,9 @@ impl FreshObjectEvidence {
         let record = physical
             .record(self.loose_file)
             .ok_or(CandidateSealError::InvalidRecord)?;
-        let oid = loose_object_oid(record)?;
+        let GitControlClassification::LooseObject(oid) = classify_git_control(record)? else {
+            return Err(CandidateSealError::InvalidRecord);
+        };
         if oid != self.record.oid {
             return Err(CandidateSealError::InvalidRecord);
         }
@@ -189,7 +193,9 @@ impl FreshGitControlEvidence {
             .record(self.physical)
             .ok_or(CandidateSealError::InvalidRecord)?;
         let relative = git_relative_path(record.path)?;
-        require_control_role(relative, record.kind, self.role)?;
+        if classify_git_control(record)?.role() != self.role {
+            return Err(CandidateSealError::InvalidRecord);
+        }
         let kind = match record.kind {
             PhysicalRecordKindRef::Directory(identity) => GitControlRecordKind::Directory(
                 CandidateDirectoryIdentity::from_observed(identity, scheme)?,
@@ -209,6 +215,56 @@ impl FreshGitControlEvidence {
             role: self.role,
             kind,
         })
+    }
+}
+
+/// Opaque proof that one physical manifest contains only the frozen fresh-Git
+/// control shape.
+///
+/// This preflight deliberately proves path shape rather than object reachability:
+/// a later exact scan binds the main-ref body and the complete semantic object
+/// union. The proof implements neither `Clone` nor `Copy`, retains no path or
+/// object body, and remains permanently branded to the exact manifest borrow.
+pub(super) struct FreshGitControlShape<'physical> {
+    physical: &'physical MarkerFreePhysicalManifest,
+    loose_object_count: usize,
+    fanout: [u64; 4],
+}
+
+impl fmt::Debug for FreshGitControlShape<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FreshGitControlShape")
+            .field("physical", &"[BOUND MANIFEST]")
+            .field("loose_objects", &self.loose_object_count)
+            .field("fanout", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl FreshGitControlShape<'_> {
+    /// Prove exact manifest branding using pointer identity, not an equal-
+    /// looking record layout.
+    pub(super) fn is_bound_to(&self, physical: &MarkerFreePhysicalManifest) -> bool {
+        std::ptr::eq(self.physical, physical)
+    }
+
+    /// Require one exact lowercase loose-object file in this same branded
+    /// physical manifest. No record ID or caller-selected manifest escapes.
+    pub(super) fn require_loose_object(&self, oid: [u8; 20]) -> Result<(), CandidateSealError> {
+        if !fanout_contains(&self.fanout, oid[0]) {
+            return Err(CandidateSealError::InvalidRecord);
+        }
+        let mut path = [0_u8; LOOSE_OBJECT_PATH_BYTES];
+        let path = canonical_loose_object_path(oid, &mut path)?;
+        let record = self
+            .physical
+            .find(path)
+            .ok_or(CandidateSealError::InvalidRecord)?;
+        match classify_git_control(record)? {
+            GitControlClassification::LooseObject(observed) if observed == oid => Ok(()),
+            _ => Err(CandidateSealError::InvalidRecord),
+        }
     }
 }
 
@@ -672,6 +728,202 @@ fn collect_fresh_git_evidence_from_records_for_test<'physical>(
     collect_fresh_git_evidence_from_union(physical, &expected, root_commit)
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum GitControlClassification {
+    Head,
+    Config,
+    Index,
+    MainRef,
+    Objects,
+    ObjectsInfo,
+    ObjectsPack,
+    Refs,
+    RefsHeads,
+    RefsTags,
+    EmptyHooks,
+    LooseFanout(u8),
+    LooseObject([u8; 20]),
+}
+
+impl GitControlClassification {
+    const fn role(self) -> GitControlRole {
+        match self {
+            Self::Head => GitControlRole::Head,
+            Self::Config => GitControlRole::Config,
+            Self::Index => GitControlRole::Index,
+            Self::MainRef => GitControlRole::MainRef,
+            Self::Objects
+            | Self::ObjectsInfo
+            | Self::ObjectsPack
+            | Self::Refs
+            | Self::RefsHeads
+            | Self::RefsTags => GitControlRole::StructuralDirectory,
+            Self::EmptyHooks => GitControlRole::EmptyHooks,
+            Self::LooseFanout(_) | Self::LooseObject(_) => GitControlRole::LooseObject,
+        }
+    }
+}
+
+/// Classify the sole frozen allowlist for fresh-target Git control records.
+///
+/// `HEAD` is content-bound here because its body is target-independent. The
+/// main-ref body is intentionally bound later by the exact scan, after a
+/// target-only caller has safely bootstrapped the candidate commit OID.
+fn classify_git_control(
+    record: PhysicalRecordRef<'_>,
+) -> Result<GitControlClassification, CandidateSealError> {
+    let relative = git_relative_path(record.path)?;
+    let classification = match relative {
+        "HEAD" => {
+            require_file_body(record.kind, HEAD_BODY)?;
+            GitControlClassification::Head
+        }
+        "config" => {
+            require_file(record.kind)?;
+            GitControlClassification::Config
+        }
+        "index" => {
+            require_file(record.kind)?;
+            GitControlClassification::Index
+        }
+        "refs/heads/main" => {
+            require_file(record.kind)?;
+            GitControlClassification::MainRef
+        }
+        "objects" => {
+            require_directory(record.kind)?;
+            GitControlClassification::Objects
+        }
+        "objects/info" => {
+            require_directory(record.kind)?;
+            GitControlClassification::ObjectsInfo
+        }
+        "objects/pack" => {
+            require_directory(record.kind)?;
+            GitControlClassification::ObjectsPack
+        }
+        "refs" => {
+            require_directory(record.kind)?;
+            GitControlClassification::Refs
+        }
+        "refs/heads" => {
+            require_directory(record.kind)?;
+            GitControlClassification::RefsHeads
+        }
+        "refs/tags" => {
+            require_directory(record.kind)?;
+            GitControlClassification::RefsTags
+        }
+        "inex-empty-hooks" => {
+            require_directory(record.kind)?;
+            GitControlClassification::EmptyHooks
+        }
+        _ => match loose_fanout(relative, record.kind)? {
+            Some(prefix) => GitControlClassification::LooseFanout(prefix),
+            None => GitControlClassification::LooseObject(loose_object_oid(record)?),
+        },
+    };
+    Ok(classification)
+}
+
+/// Prove the exact fresh-target Git control shape before any commit body or
+/// reachability evidence is trusted.
+///
+/// The allowed graph is four fixed files, six structural directories, one
+/// empty hooks directory, and a lowercase loose-object graph whose two-digit
+/// fanout set exactly equals the prefixes used by its `2/38` object files.
+/// Syntactically valid unreachable loose objects are shape-valid here and are
+/// rejected later by [`scan_exact_git_control`].
+pub(super) fn preflight_fresh_git_control_shape(
+    physical: &MarkerFreePhysicalManifest,
+) -> Result<FreshGitControlShape<'_>, CandidateSealError> {
+    let git_root = physical
+        .find(GIT_ROOT)
+        .ok_or(CandidateSealError::InvalidRecord)?;
+    require_directory(git_root.kind)?;
+
+    let mut fixed_files = 0_u8;
+    let mut structural_directories = 0_u8;
+    let mut hooks = false;
+    let mut observed_fanout = [0_u64; 4];
+    let mut required_fanout = [0_u64; 4];
+    let mut controls = 0_usize;
+    let mut loose_object_count = 0_usize;
+
+    for record in physical.records() {
+        if record.path == GIT_ROOT {
+            continue;
+        }
+        if !record.path.starts_with(GIT_PREFIX) {
+            continue;
+        }
+        controls = controls
+            .checked_add(1)
+            .filter(|count| *count <= MAX_GIT_CONTROL_RECORDS)
+            .ok_or(CandidateSealError::ResourceLimit)?;
+        match classify_git_control(record)? {
+            GitControlClassification::Head => set_once(&mut fixed_files, 0b0001)?,
+            GitControlClassification::Config => set_once(&mut fixed_files, 0b0010)?,
+            GitControlClassification::Index => set_once(&mut fixed_files, 0b0100)?,
+            GitControlClassification::MainRef => set_once(&mut fixed_files, 0b1000)?,
+            GitControlClassification::Objects => {
+                set_once(&mut structural_directories, 0b00_0001)?;
+            }
+            GitControlClassification::ObjectsInfo => {
+                set_once(&mut structural_directories, 0b00_0010)?;
+            }
+            GitControlClassification::ObjectsPack => {
+                set_once(&mut structural_directories, 0b00_0100)?;
+            }
+            GitControlClassification::Refs => {
+                set_once(&mut structural_directories, 0b00_1000)?;
+            }
+            GitControlClassification::RefsHeads => {
+                set_once(&mut structural_directories, 0b01_0000)?;
+            }
+            GitControlClassification::RefsTags => {
+                set_once(&mut structural_directories, 0b10_0000)?;
+            }
+            GitControlClassification::EmptyHooks => {
+                if std::mem::replace(&mut hooks, true) {
+                    return Err(CandidateSealError::InvalidRecord);
+                }
+            }
+            GitControlClassification::LooseFanout(prefix) => {
+                if !insert_fanout(&mut observed_fanout, prefix) {
+                    return Err(CandidateSealError::InvalidRecord);
+                }
+            }
+            GitControlClassification::LooseObject(oid) => {
+                let _ = insert_fanout(&mut required_fanout, oid[0]);
+                loose_object_count = loose_object_count
+                    .checked_add(1)
+                    .filter(|count| *count <= MAX_OBJECT_RECORDS)
+                    .ok_or(CandidateSealError::ResourceLimit)?;
+            }
+        }
+    }
+
+    let expected_controls = 11_usize
+        .checked_add(fanout_count(&observed_fanout))
+        .and_then(|count| count.checked_add(loose_object_count))
+        .ok_or(CandidateSealError::ResourceLimit)?;
+    if fixed_files != 0b1111
+        || structural_directories != 0b11_1111
+        || !hooks
+        || observed_fanout != required_fanout
+        || controls != expected_controls
+    {
+        return Err(CandidateSealError::InvalidRecord);
+    }
+
+    Ok(FreshGitControlShape {
+        physical,
+        loose_object_count,
+        fanout: observed_fanout,
+    })
+}
+
 trait SortedObjectSet {
     fn object_count(&self) -> usize;
     fn object_at(&self, index: usize) -> ObjectRecord;
@@ -697,10 +949,6 @@ impl SortedObjectSet for [FreshObjectEvidence] {
     }
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "one exact graph scan keeps all fixed-role and fanout invariants contiguous"
-)]
 fn scan_exact_git_control<S, F>(
     physical: &MarkerFreePhysicalManifest,
     objects: &S,
@@ -718,130 +966,43 @@ where
     if objects.object_count() > MAX_OBJECT_RECORDS {
         return Err(CandidateSealError::ResourceLimit);
     }
-    let git_root = physical
-        .find(GIT_ROOT)
-        .ok_or(CandidateSealError::InvalidRecord)?;
-    if !matches!(git_root.kind, PhysicalRecordKindRef::Directory(_)) {
-        return Err(CandidateSealError::InvalidRecord);
-    }
+    preflight_fresh_git_control_shape(physical)?;
 
-    let mut expected_fanout = [false; 256];
     for index in 0..objects.object_count() {
         let object = objects.object_at(index);
         validate_object_record(object)?;
         if index > 0 && objects.object_at(index - 1).oid >= object.oid {
             return Err(CandidateSealError::NonCanonicalOrder);
         }
-        expected_fanout[usize::from(object.oid[0])] = true;
     }
-    let mut observed_fanout = [false; 256];
-    let mut fixed_files = 0_u8;
-    let mut structural_directories = 0_u8;
-    let mut hooks = false;
     let mut loose_objects = 0_usize;
-    let mut controls = 0_usize;
 
     for record in physical.records() {
         if record.path == GIT_ROOT {
             continue;
         }
-        let Some(relative) = record.path.strip_prefix(GIT_PREFIX) else {
+        if !record.path.starts_with(GIT_PREFIX) {
             continue;
-        };
-        controls = controls
-            .checked_add(1)
-            .filter(|count| *count <= MAX_GIT_CONTROL_RECORDS)
-            .ok_or(CandidateSealError::ResourceLimit)?;
-        let (role, object) = match relative {
-            "HEAD" => {
-                require_file_body(record.kind, HEAD_BODY)?;
-                set_once(&mut fixed_files, 0b0001)?;
-                (GitControlRole::Head, None)
-            }
-            "config" => {
-                require_file(record.kind)?;
-                set_once(&mut fixed_files, 0b0010)?;
-                (GitControlRole::Config, None)
-            }
-            "index" => {
-                require_file(record.kind)?;
-                set_once(&mut fixed_files, 0b0100)?;
-                (GitControlRole::Index, None)
-            }
-            "refs/heads/main" => {
+        }
+        let classification = classify_git_control(record)?;
+        let object = match classification {
+            GitControlClassification::MainRef => {
                 let body = main_ref_body(commit_oid);
                 require_file_body(record.kind, &body)?;
-                set_once(&mut fixed_files, 0b1000)?;
-                (GitControlRole::MainRef, None)
+                None
             }
-            "objects" => {
-                require_directory(record.kind)?;
-                set_once(&mut structural_directories, 0b00_0001)?;
-                (GitControlRole::StructuralDirectory, None)
+            GitControlClassification::LooseObject(oid) => {
+                let object = find_object(objects, &oid).ok_or(CandidateSealError::InvalidRecord)?;
+                loose_objects = loose_objects
+                    .checked_add(1)
+                    .ok_or(CandidateSealError::ResourceLimit)?;
+                Some(object)
             }
-            "objects/info" => {
-                require_directory(record.kind)?;
-                set_once(&mut structural_directories, 0b00_0010)?;
-                (GitControlRole::StructuralDirectory, None)
-            }
-            "objects/pack" => {
-                require_directory(record.kind)?;
-                set_once(&mut structural_directories, 0b00_0100)?;
-                (GitControlRole::StructuralDirectory, None)
-            }
-            "refs" => {
-                require_directory(record.kind)?;
-                set_once(&mut structural_directories, 0b00_1000)?;
-                (GitControlRole::StructuralDirectory, None)
-            }
-            "refs/heads" => {
-                require_directory(record.kind)?;
-                set_once(&mut structural_directories, 0b01_0000)?;
-                (GitControlRole::StructuralDirectory, None)
-            }
-            "refs/tags" => {
-                require_directory(record.kind)?;
-                set_once(&mut structural_directories, 0b10_0000)?;
-                (GitControlRole::StructuralDirectory, None)
-            }
-            "inex-empty-hooks" => {
-                require_directory(record.kind)?;
-                if std::mem::replace(&mut hooks, true) {
-                    return Err(CandidateSealError::InvalidRecord);
-                }
-                (GitControlRole::EmptyHooks, None)
-            }
-            _ => {
-                if let Some(prefix) = loose_fanout(relative, record.kind)? {
-                    let slot = &mut observed_fanout[usize::from(prefix)];
-                    if std::mem::replace(slot, true) {
-                        return Err(CandidateSealError::InvalidRecord);
-                    }
-                    (GitControlRole::LooseObject, None)
-                } else {
-                    let oid = loose_object_oid(record)?;
-                    let object =
-                        find_object(objects, &oid).ok_or(CandidateSealError::InvalidRecord)?;
-                    loose_objects = loose_objects
-                        .checked_add(1)
-                        .ok_or(CandidateSealError::ResourceLimit)?;
-                    (GitControlRole::LooseObject, Some(object))
-                }
-            }
+            _ => None,
         };
-        visit(record, role, object)?;
+        visit(record, classification.role(), object)?;
     }
-    if fixed_files != 0b1111
-        || structural_directories != 0b11_1111
-        || !hooks
-        || observed_fanout != expected_fanout
-        || loose_objects != objects.object_count()
-        || controls
-            != 11_usize
-                .checked_add(expected_fanout.iter().filter(|present| **present).count())
-                .and_then(|count| count.checked_add(objects.object_count()))
-                .ok_or(CandidateSealError::ResourceLimit)?
-    {
+    if loose_objects != objects.object_count() {
         return Err(CandidateSealError::InvalidRecord);
     }
     Ok(())
@@ -906,6 +1067,47 @@ fn find_object_evidence<'a>(
         .and_then(|index| objects.get(index))
 }
 
+fn insert_fanout(bitmap: &mut [u64; 4], prefix: u8) -> bool {
+    let word = usize::from(prefix / 64);
+    let mask = 1_u64 << u32::from(prefix % 64);
+    let newly_inserted = bitmap[word] & mask == 0;
+    bitmap[word] |= mask;
+    newly_inserted
+}
+
+fn fanout_contains(bitmap: &[u64; 4], prefix: u8) -> bool {
+    let word = usize::from(prefix / 64);
+    let mask = 1_u64 << u32::from(prefix % 64);
+    bitmap[word] & mask != 0
+}
+
+fn fanout_count(bitmap: &[u64; 4]) -> usize {
+    (0_u8..=u8::MAX)
+        .filter(|prefix| fanout_contains(bitmap, *prefix))
+        .count()
+}
+
+fn canonical_loose_object_path(
+    oid: [u8; 20],
+    scratch: &mut [u8; LOOSE_OBJECT_PATH_BYTES],
+) -> Result<&str, CandidateSealError> {
+    scratch[..LOOSE_OBJECT_PATH_PREFIX.len()].copy_from_slice(LOOSE_OBJECT_PATH_PREFIX);
+    let mut cursor = LOOSE_OBJECT_PATH_PREFIX.len();
+    for (index, byte) in oid.into_iter().enumerate() {
+        if index == 1 {
+            scratch[cursor] = b'/';
+            cursor += 1;
+        }
+        scratch[cursor] = lower_hex(byte >> 4);
+        scratch[cursor + 1] = lower_hex(byte & 0x0f);
+        cursor += 2;
+    }
+    if cursor != scratch.len() {
+        return Err(CandidateSealError::InvalidRecord);
+    }
+    std::str::from_utf8(scratch).map_err(|_| CandidateSealError::InvalidRecord)
+}
+
 fn loose_fanout(
     relative: &str,
     kind: PhysicalRecordKindRef<'_>,
@@ -947,50 +1149,6 @@ fn git_relative_path(path: &str) -> Result<&str, CandidateSealError> {
     path.strip_prefix(GIT_PREFIX)
         .filter(|relative| !relative.is_empty())
         .ok_or(CandidateSealError::InvalidRecord)
-}
-
-fn require_control_role(
-    path: &str,
-    kind: PhysicalRecordKindRef<'_>,
-    role: GitControlRole,
-) -> Result<(), CandidateSealError> {
-    let directory = matches!(kind, PhysicalRecordKindRef::Directory(_));
-    let valid = match role {
-        GitControlRole::Head => path == "HEAD" && !directory,
-        GitControlRole::Config => path == "config" && !directory,
-        GitControlRole::Index => path == "index" && !directory,
-        GitControlRole::MainRef => path == "refs/heads/main" && !directory,
-        GitControlRole::StructuralDirectory => {
-            directory
-                && matches!(
-                    path,
-                    "objects"
-                        | "objects/info"
-                        | "objects/pack"
-                        | "refs"
-                        | "refs/heads"
-                        | "refs/tags"
-                )
-        }
-        GitControlRole::EmptyHooks => path == "inex-empty-hooks" && directory,
-        GitControlRole::LooseObject => {
-            if directory {
-                path.strip_prefix("objects/").is_some_and(|hex| {
-                    hex.len() == 2 && !hex.contains('/') && hex.bytes().all(is_lower_hex)
-                })
-            } else {
-                path.strip_prefix("objects/")
-                    .and_then(|encoded| encoded.split_once('/'))
-                    .is_some_and(|(prefix, suffix)| {
-                        prefix.len() == 2
-                            && suffix.len() == 38
-                            && !suffix.contains('/')
-                            && prefix.bytes().chain(suffix.bytes()).all(is_lower_hex)
-                    })
-            }
-        }
-    };
-    valid.then_some(()).ok_or(CandidateSealError::InvalidRecord)
 }
 
 fn require_directory(kind: PhysicalRecordKindRef<'_>) -> Result<(), CandidateSealError> {
@@ -1417,6 +1575,202 @@ mod tests {
         assert!(projection.git_control.iter().all(|record| {
             !record.path.starts_with(GIT_PREFIX) && !record.path.starts_with('/')
         }));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn control_shape_is_manifest_branded_requires_exact_loose_files_and_redacts_debug() {
+        let blob = object(ObjectKind::Blob, b"ciphertext");
+        let tree = object(ObjectKind::Tree, b"");
+        let commit = parse_canonical_root_commit(&canonical_commit(tree.oid, "1784044800"))
+            .expect("commit parses");
+        let records = [blob, tree, commit.object_record()];
+        let first_target = exact_fixture(&records, commit);
+        let first = collect_marker_free_physical_manifest(first_target.path())
+            .expect("first physical manifest collects");
+        let shape =
+            preflight_fresh_git_control_shape(&first).expect("exact control shape preflights");
+        assert!(shape.is_bound_to(&first));
+        for record in records {
+            shape
+                .require_loose_object(record.oid)
+                .expect("exact branded loose file exists");
+        }
+
+        let only_second = object(ObjectKind::Blob, b"second-only");
+        let second_records = [blob, only_second, tree, commit.object_record()];
+        let second_target = exact_fixture(&second_records, commit);
+        let second = collect_marker_free_physical_manifest(second_target.path())
+            .expect("second physical manifest collects");
+        assert!(!shape.is_bound_to(&second));
+        assert_eq!(
+            shape.require_loose_object(only_second.oid),
+            Err(CandidateSealError::InvalidRecord)
+        );
+
+        let debug = format!("{shape:?}");
+        let blob_hex = main_ref_body(blob.oid);
+        let blob_hex = std::str::from_utf8(&blob_hex[..40]).expect("hex is UTF-8");
+        assert!(debug.contains("[BOUND MANIFEST]"));
+        assert!(debug.contains("loose_objects: 3"));
+        assert!(!debug.contains(".git"));
+        assert!(!debug.contains(blob_hex));
+
+        assert_eq!(
+            std::mem::size_of::<FreshGitControlShape<'_>>(),
+            std::mem::size_of::<&MarkerFreePhysicalManifest>()
+                + std::mem::size_of::<usize>()
+                + std::mem::size_of::<[u64; 4]>()
+        );
+        let source = include_str!("candidate_git.rs");
+        let declaration = source
+            .find("pub(super) struct FreshGitControlShape")
+            .expect("shape declaration exists");
+        let previous_item = source[..declaration]
+            .rfind("\n}\n")
+            .expect("preceding item ends");
+        assert!(!source[previous_item..declaration].contains("#[derive("));
+        let declaration_end = source[declaration..]
+            .find("\n}\n")
+            .map(|offset| declaration + offset)
+            .expect("shape declaration ends");
+        assert!(!source[declaration..declaration_end].contains("Vec<"));
+        assert!(!source.contains(&["impl Clone", " for FreshGitControlShape"].concat()));
+        assert!(!source.contains(&["impl Copy", " for FreshGitControlShape"].concat()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shape_preflight_allows_syntactic_extra_loose_but_exact_scan_rejects_it() {
+        let blob = object(ObjectKind::Blob, b"ciphertext");
+        let tree = object(ObjectKind::Tree, b"");
+        let commit =
+            parse_canonical_root_commit(&canonical_commit(tree.oid, "1")).expect("commit parses");
+        let target = exact_fixture(&[blob, tree, commit.object_record()], commit);
+        let unreachable = object(ObjectKind::Blob, b"syntactically-valid-unreachable");
+        add_loose(target.path(), unreachable);
+        let physical = collect_marker_free_physical_manifest(target.path())
+            .expect("physical manifest collects");
+        let shape = preflight_fresh_git_control_shape(&physical)
+            .expect("shape accepts syntactically valid loose object");
+        shape
+            .require_loose_object(unreachable.oid)
+            .expect("preflight retains exact loose location");
+        assert!(matches!(
+            collect_fresh_git_evidence_from_records_for_test(&physical, &[blob], &[tree], commit,),
+            Err(CandidateSealError::InvalidRecord)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shape_preflight_defers_only_main_ref_value_to_exact_scan() {
+        let blob = object(ObjectKind::Blob, b"ciphertext");
+        let tree = object(ObjectKind::Tree, b"");
+        let commit =
+            parse_canonical_root_commit(&canonical_commit(tree.oid, "1")).expect("commit parses");
+        let target = exact_fixture(&[blob, tree, commit.object_record()], commit);
+        write(
+            &target.path().join(".git/refs/heads/main"),
+            b"1111111111111111111111111111111111111111\n",
+        );
+        let physical = collect_marker_free_physical_manifest(target.path())
+            .expect("physical manifest collects");
+        preflight_fresh_git_control_shape(&physical)
+            .expect("main ref is an exact fixed file before value bootstrap");
+        assert!(matches!(
+            collect_fresh_git_evidence_from_records_for_test(&physical, &[blob], &[tree], commit,),
+            Err(CandidateSealError::InvalidRecord)
+        ));
+
+        let target = exact_fixture(&[blob, tree, commit.object_record()], commit);
+        write(&target.path().join(".git/HEAD"), b"ref: refs/heads/other\n");
+        let physical = collect_marker_free_physical_manifest(target.path())
+            .expect("physical manifest collects");
+        assert_eq!(
+            preflight_fresh_git_control_shape(&physical).map(|_| ()),
+            Err(CandidateSealError::InvalidRecord)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shape_preflight_rejects_forbidden_names_uppercase_and_invalid_kinds() {
+        let blob = object(ObjectKind::Blob, b"ciphertext");
+        let tree = object(ObjectKind::Tree, b"");
+        let commit =
+            parse_canonical_root_commit(&canonical_commit(tree.oid, "1")).expect("commit parses");
+        let records = [blob, tree, commit.object_record()];
+        for relative in [
+            ".git/objects/info/alternates",
+            ".git/objects/pack/pack-deadbeef.pack",
+            ".git/commondir",
+            ".git/config.worktree",
+            ".git/packed-refs",
+            ".git/shallow",
+            ".git/info/grafts",
+            ".git/refs/replace/1111111111111111111111111111111111111111",
+            ".git/logs/HEAD",
+            ".git/refs/heads/other",
+            ".git/hooks/pre-commit",
+            ".git/modules/child/config",
+            ".git/inex-empty-hooks/pre-commit",
+        ] {
+            let target = exact_fixture(&records, commit);
+            write(&target.path().join(relative), b"forbidden\n");
+            let physical = collect_marker_free_physical_manifest(target.path())
+                .expect("forbidden fixture remains physically collectable");
+            assert!(
+                preflight_fresh_git_control_shape(&physical).is_err(),
+                "forbidden Git control path passed: {relative}"
+            );
+        }
+
+        let used_prefixes = records.map(|record| record.oid[0]);
+        let uppercase_prefix = (0xa0_u8..=0xff)
+            .find(|candidate| !used_prefixes.contains(candidate))
+            .expect("an alphabetic unused prefix exists");
+        let uppercase_prefix = format!("{uppercase_prefix:02X}");
+        let target = exact_fixture(&records, commit);
+        write(
+            &target.path().join(format!(
+                ".git/objects/{uppercase_prefix}/11111111111111111111111111111111111111"
+            )),
+            b"forbidden\n",
+        );
+        let physical = collect_marker_free_physical_manifest(target.path())
+            .expect("uppercase fixture remains physically collectable");
+        assert!(preflight_fresh_git_control_shape(&physical).is_err());
+
+        let target = exact_fixture(&records, commit);
+        let config = target.path().join(".git/config");
+        fs::remove_file(&config).expect("config file removes");
+        fs::create_dir(&config).expect("wrong-kind config directory creates");
+        let physical = collect_marker_free_physical_manifest(target.path())
+            .expect("wrong-kind fixture remains physically collectable");
+        assert!(preflight_fresh_git_control_shape(&physical).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shape_preflight_requires_fanout_set_to_match_loose_prefixes_exactly() {
+        let blob = object(ObjectKind::Blob, b"ciphertext");
+        let tree = object(ObjectKind::Tree, b"");
+        let commit =
+            parse_canonical_root_commit(&canonical_commit(tree.oid, "1")).expect("commit parses");
+        let records = [blob, tree, commit.object_record()];
+        let unused = (0_u8..=u8::MAX)
+            .find(|candidate| records.iter().all(|record| record.oid[0] != *candidate))
+            .expect("unused fanout exists");
+        let target = exact_fixture(&records, commit);
+        fs::create_dir(target.path().join(format!(".git/objects/{unused:02x}")))
+            .expect("extra empty fanout creates");
+        let physical = collect_marker_free_physical_manifest(target.path())
+            .expect("physical manifest collects");
+        assert_eq!(
+            preflight_fresh_git_control_shape(&physical).map(|_| ()),
+            Err(CandidateSealError::InvalidRecord)
+        );
     }
 
     #[cfg(target_os = "linux")]
