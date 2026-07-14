@@ -12,6 +12,13 @@
 - VS Code sidecar 接入 `loadUmbraAnnotationConfig` 与 exact-shape parser：限制 tag/profile/aliases 数量和字符串大小，验证 stable ID、重复项、canonical tag list、tag/profile 引用及 default profile 引用，拒绝异常 daemon 返回值进入 UI。
 - `pnpm --dir editors/vscode check` 和测试 50/50 通过。下一步仍是 feature-2 现有文档的受控转换/投影生命周期；完成它后才将 QuickPick 与 active verified webview selection 接到真实 apply RPC。
 
+## 2026-07-15 — Existing document conversion to Umbra feature-2
+
+- Vault 新增 `convert_document_to_umbra_outer`：仅 live Umbra session 可将 ordinary committed Markdown 在 ETag 条件写入下替换为空 slot 的 feature-2 Outer container；保留 file ID、created time 与 content flags，普通 `read` 此后继续拒绝该 container。核心回归覆盖锁定、陈旧 ETag、身份保留、Outer 内容一致及重复转换拒绝。
+- daemon 新增 `umbra.document.convert`，使用同一 ETag/metadata/durability 响应契约；服务生命周期覆盖普通文档转换后只能通过 `umbra.document.open` 得到投影。
+- 首次运行发现 `MethodRegistry::all()` 的 `u32` 位图在第 32 个方法左移溢出。已改为带编译期容量上限的 `u64` 表示，并处理 64-bit 满表边界；不是放宽协议解析。
+- 验证：`cargo test -p inex-core --lib` 293/293、`cargo test -p inex-daemon --lib` 71/71，以及两 crate 严格 Clippy、fmt、diff-check 全通过。
+
 ## 2026-07-15 — Vault feature-2 启用事务
 
 - 提交 `538168d`：`Vault::enable_umbra_private_annotations` 只接受 live Umbra session；它调用已认证 core metadata upgrader，并以 vault.json etag CAS 提交，随后重新 parse 确认 exact committed metadata 才更新内存 config。锁定 session 的调用被拒绝。

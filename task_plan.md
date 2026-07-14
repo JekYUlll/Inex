@@ -85,6 +85,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
   - [x] EDRY 现可严格识别 feature-2 Outer container，只有已认证 metadata 声明 `[2]` 才可加密此类文档（`72b639d`）
   - [x] Umbra live session 可原子提交 feature-2 authenticated metadata 升级；锁定状态拒绝升级（`538168d`）
   - [x] 将 v2 document container 接入 Vault 专用读写与 feature-2 协商：常规 Markdown API 拒绝 feature-2 envelope，Outer projection 只经专用 API 读取，创建/保存必须有 live Umbra session（本轮）
+  - [x] 实现普通 Markdown 到空 feature-2 Outer container 的 ETag 条件转换：保留 file ID/created time，要求 live `K_umbra` 与已协商 feature-2，已是 feature-2 或陈旧写入均拒绝（本轮）
   - [ ] 将 Umbra 启用事务与feature-2 document-container协商同时接入，避免未支持的读者误开私密文档
   - [ ] 实现core私密slot、TagId、catalog/profile和RenderMap选择事务，并证明canary不进入磁盘Outer面
     - [x] Vault 已提供 live-session-only 的 private slot insert/read/replace/remove；slot payload 与标签的磁盘 canary 不进入 Outer projection（`3d6d6ef`）
@@ -98,6 +99,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
     - [x] CustomEditor 现仅向命令暴露 active/current-session document 的已验证选区，view-state 或 dispose 不会留下旧 document 引用（`52a9e6a`）
     - [x] VS Code 私密标注选择器状态机已冻结 kind/Outer 单选、tag 多选 canonicalization 与 Cover 公开文本约束（`8aab1d2`）
     - [x] daemon/VS Code 已共享严格的 encrypted catalog/profile 读取模型；仅 Umbra 已解锁可读，extension 在 UI 前验证所有 ID、引用和资源上限（`f697a47`，本轮 VS Code 接线）
+    - [x] daemon 已提供 `umbra.document.convert`，将普通文档以 ETag CAS 升级为 feature-2；方法注册表扩为有容量约束的 64-bit 位图，避免新增 Umbra RPC 时溢出（本轮）
     - [ ] 接入 CustomEditor webview 选区、QuickPick、多标签及配置化命令/keybindings
   - [ ] 扩展Sublime stateful picker、profile命令和keymap示例
   - [ ] 跑通多选、wrap/unwrap/edit、跨编辑器目录、canary/残留及Outer隔离矩阵
