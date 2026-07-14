@@ -352,6 +352,7 @@ export class InexCustomEditorProvider
   private readonly documents = new Set<InexDocument>();
   private readonly lockSubscription: vscode.Disposable;
   private readonly previews: AssetPreviewCoordinator;
+  private activeDocument: InexDocument | undefined;
   private lastBackupUri: vscode.Uri | undefined;
   private failNextMutationCloseForTest = false;
 
@@ -450,7 +451,12 @@ export class InexCustomEditorProvider
         opened.etag,
         opened.metadata,
         session,
-        (disposed) => this.documents.delete(disposed),
+        (disposed) => {
+          this.documents.delete(disposed);
+          if (this.activeDocument === disposed) {
+            this.activeDocument = undefined;
+          }
+        },
         restoredBackup,
         staleBackup,
       );
@@ -461,6 +467,23 @@ export class InexCustomEditorProvider
       await sidecar.closeDocument(opened.handle).catch(() => undefined);
       throw error;
     }
+  }
+
+  public currentVerifiedSelection():
+    | { readonly logicalPath: string; readonly session: VaultSession; readonly range: EditorSelection }
+    | undefined {
+    const document = this.activeDocument;
+    if (
+      document === undefined ||
+      !this.documents.has(document) ||
+      !this.controller.isSessionCurrent(document.session)
+    ) {
+      return undefined;
+    }
+    const range = document.currentSelection();
+    return range === undefined
+      ? undefined
+      : { logicalPath: document.logicalPath, session: document.session, range };
   }
 
   public resolveCustomEditor(
@@ -476,6 +499,11 @@ export class InexCustomEditorProvider
     webviewPanel.webview.options = { enableScripts: true, localResourceRoots: [] };
     webviewPanel.webview.html = editorHtml();
     document.attach(webviewPanel);
+    webviewPanel.onDidChangeViewState((event) => {
+      if (event.webviewPanel.active && this.documents.has(document)) {
+        this.activeDocument = document;
+      }
+    });
     this.previews.attach(document, webviewPanel);
     webviewPanel.webview.onDidReceiveMessage((message: unknown) => {
       if (!isRecord(message)) {
