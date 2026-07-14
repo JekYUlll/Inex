@@ -52,6 +52,10 @@
 - `togglePrivateAnnotation` 不再无条件打开 chooser：CustomEditor 以当前 authenticated RenderMap 的 exact range 判断 active selection 是否覆盖完整 private block。只有该情形才显示确认并调用 remove；普通/空/partial selection 不会据 slot ID 猜测解包。
 - VS Code typecheck 与 50/50 tests 通过。后续仍需实现 cursor-inside metadata edit、multi-cursor adapter、tag/profile management 和 Sublime/Nvim 客户端。
 
+## 2026-07-15 — Documented current annotation MVP boundary
+
+- PRD now distinguishes the shipped VS Code command/profile path from deferred multi-cursor, no-selection expansion, metadata edit, management UI, Outer editing, and draft recovery. This prevents the frozen target specification from being misread as completed behavior.
+
 ## 2026-07-15 — Vault feature-2 启用事务
 
 - 提交 `538168d`：`Vault::enable_umbra_private_annotations` 只接受 live Umbra session；它调用已认证 core metadata upgrader，并以 vault.json etag CAS 提交，随后重新 parse 确认 exact committed metadata 才更新内存 config。锁定 session 的调用被拒绝。
