@@ -590,6 +590,10 @@ function M.remove_private_annotation(selections)
   mutate_private_annotation("umbra.annotation.remove", selections, nil)
 end
 
+function M.edit_private_annotation(selections, spec)
+  mutate_private_annotation("umbra.annotation.edit", selections, spec)
+end
+
 local function visual_selection_range(buffer, selection_mode)
   local start_mark = vim.api.nvim_buf_get_mark(buffer, "<")
   local end_mark = vim.api.nvim_buf_get_mark(buffer, ">")
@@ -634,6 +638,8 @@ local function private_selection_class(document, selection)
   for _, slot in ipairs(document.render_map.privateSlots) do
     if selection.startByte == slot.startByte and selection.endByte == slot.endByte then
       complete = true
+    elseif selection.startByte >= slot.startByte and selection.endByte <= slot.endByte then
+      return "inside"
     elseif selection.startByte < slot.endByte and slot.startByte < selection.endByte then
       return "partial"
     end
@@ -668,6 +674,10 @@ function M.toggle_private_annotation(selection_mode)
       return
     end
     M.remove_private_annotation({ selection })
+    return
+  end
+  if class == "inside" then
+    M.edit_private_annotation({ selection }, { kind = "comment", tagIds = {}, outer = { mode = "drop" } })
     return
   end
   M.apply_private_annotation({ selection }, { kind = "comment", tagIds = {}, outer = { mode = "drop" } })

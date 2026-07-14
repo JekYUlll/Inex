@@ -109,6 +109,14 @@ assert(vim.wait(5000, function()
 end, 10), "Inex private annotation apply timed out")
 local private_ranges = inex.private_slot_ranges(private_buffer)
 assert(table.concat(vim.api.nvim_buf_get_lines(private_buffer, 0, -1, false), "\n"):find(":::inex-private", 1, true), "Inex annotation must use daemon projection")
+inex.edit_private_annotation(
+  {{ startByte = private_ranges[1].startByte + 1, endByte = private_ranges[1].startByte + 2 }},
+  { kind = "block", tagIds = {}, outer = { mode = "placeholder" } }
+)
+assert(vim.wait(5000, function()
+  return table.concat(vim.api.nvim_buf_get_lines(private_buffer, 0, -1, false), "\n"):find("kind: block", 1, true) ~= nil
+end, 10), "Inex private annotation edit timed out")
+private_ranges = inex.private_slot_ranges(private_buffer)
 local function mark_projection_byte(name, byte_offset)
   local consumed = 0
   local lines = vim.api.nvim_buf_get_lines(private_buffer, 0, -1, false)

@@ -70,6 +70,17 @@ vim.api.nvim_create_user_command("InexRemovePrivateAnnotation", function(argumen
   inex.remove_private_annotation({{ startByte = start_byte, endByte = end_byte }})
 end, { nargs = "*", desc = "Remove a private annotation from a complete byte range" })
 
+vim.api.nvim_create_user_command("InexEditPrivateAnnotation", function(arguments)
+  if #arguments.fargs ~= 2 then
+    vim.notify("InexEditPrivateAnnotation requires startByte and endByte", vim.log.levels.ERROR)
+    return
+  end
+  inex.edit_private_annotation(
+    {{ startByte = tonumber(arguments.fargs[1]), endByte = tonumber(arguments.fargs[2]) }},
+    { kind = "comment", tagIds = {}, outer = { mode = "drop" } }
+  )
+end, { nargs = "*", desc = "Edit a private annotation with the default spec" })
+
 vim.api.nvim_create_user_command("InexOpen", function(arguments)
   inex.open_document(arguments.args)
 end, { nargs = 1, desc = "Open an Inex Markdown document" })

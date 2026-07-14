@@ -53,9 +53,11 @@ Commands currently available:
   surface. `:InexTogglePrivateAnnotation` consumes one non-empty visual range:
   ordinary projection text receives the same default annotation, a range that
   exactly equals a RenderMap private block requests confirmation then removes
-  it, and partial private overlap is rejected. It deliberately installs no
-  hard-coded mapping; users may map the command normally. Tag/profile picker
-  and edit command remain the next Neovim MVP slice.
+  it, an in-block range uses the daemon edit route, and partial private overlap
+  is rejected. It deliberately installs no hard-coded mapping; users may map
+  the command normally. `:InexEditPrivateAnnotation startByte endByte` is the
+  equivalent explicit default-spec test surface. Tag/profile picker remains
+  the next Neovim MVP slice.
 - `:InexStop` terminates the local RPC process and drops pending callbacks.
 
 `InexOpen`, `InexNew`, and `InexMkdir` take Inex logical paths (for example,
