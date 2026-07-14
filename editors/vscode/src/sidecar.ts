@@ -418,6 +418,55 @@ export class InexSidecar {
     );
   }
 
+  public async createUmbraTag(tag: Omit<UmbraTagDefinition, "archived">): Promise<void> {
+    this.requireUmbraV1();
+    const result = await this.callRaw("umbra.tag.create", {
+      ...this.protectedParams(),
+      tag: serializeUmbraTagDefinition(tag),
+    });
+    expectAcknowledgement(result);
+  }
+
+  public async renameUmbraTag(tagId: string, label: string): Promise<void> {
+    this.requireUmbraV1();
+    assertUmbraTagId(tagId);
+    assertUmbraText(label, "Umbra tag label");
+    const result = await this.callRaw("umbra.tag.rename", {
+      ...this.protectedParams(),
+      tagId,
+      label,
+    });
+    expectAcknowledgement(result);
+  }
+
+  public async archiveUmbraTag(tagId: string): Promise<void> {
+    this.requireUmbraV1();
+    assertUmbraTagId(tagId);
+    const result = await this.callRaw("umbra.tag.archive", {
+      ...this.protectedParams(),
+      tagId,
+    });
+    expectAcknowledgement(result);
+  }
+
+  public async reorderUmbraTags(tagIds: readonly string[]): Promise<void> {
+    this.requireUmbraV1();
+    if (tagIds.length === 0 || tagIds.length > MAX_UMBRA_TAGS) {
+      throw new RpcProtocolError("Umbra tag order is invalid");
+    }
+    const seen = new Set<string>();
+    for (const tagId of tagIds) {
+      assertUmbraTagId(tagId);
+      if (seen.has(tagId)) throw new RpcProtocolError("Umbra tag order is duplicated");
+      seen.add(tagId);
+    }
+    const result = await this.callRaw("umbra.tag.reorder", {
+      ...this.protectedParams(),
+      tagIds: [...tagIds],
+    });
+    expectAcknowledgement(result);
+  }
+
   public async enableUmbra(): Promise<"synced" | "notSynced"> {
     this.requireUmbraV1();
     const result = expectObject(
@@ -1250,6 +1299,38 @@ function parseUmbraTag(value: JsonValue): UmbraTagDefinition {
     defaultSelected: tag.defaultSelected,
     archived: tag.archived,
   };
+}
+
+function serializeUmbraTagDefinition(tag: Omit<UmbraTagDefinition, "archived">): JsonObject {
+  assertUmbraTagId(tag.id);
+  assertUmbraText(tag.label, "Umbra tag label");
+  if (Buffer.byteLength(tag.description, "utf8") > MAX_UMBRA_TEXT_BYTES) {
+    throw new RpcProtocolError("Umbra tag description is invalid");
+  }
+  if (tag.aliases.length > MAX_UMBRA_TAGS || !Number.isSafeInteger(tag.sortOrder)) {
+    throw new RpcProtocolError("Umbra tag fields are invalid");
+  }
+  for (const alias of tag.aliases) assertUmbraText(alias, "Umbra tag alias");
+  return {
+    id: tag.id,
+    label: tag.label,
+    description: tag.description,
+    aliases: [...tag.aliases],
+    sortOrder: tag.sortOrder,
+    defaultSelected: tag.defaultSelected,
+  };
+}
+
+function assertUmbraTagId(tagId: string): void {
+  if (!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(tagId)) {
+    throw new RpcProtocolError("Umbra tag ID is invalid");
+  }
+}
+
+function assertUmbraText(value: string, field: string): void {
+  if (Buffer.byteLength(value, "utf8") < 1 || Buffer.byteLength(value, "utf8") > MAX_UMBRA_TEXT_BYTES) {
+    throw new RpcProtocolError(`RPC ${field} is invalid`);
+  }
 }
 
 function parseUmbraProfile(
