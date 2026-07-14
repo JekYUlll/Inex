@@ -1,5 +1,11 @@
 # Inex Progress Log
 
+## 2026-07-15 — Neovim masked 内存搜索
+
+- 新增 `InexSearch`：交互搜索词来自 `inputsecret()`，不使用普通 `input()`；最多 4 KiB 的 query 仅作为当前 RPC 参数传给 daemon `search.query`，回调后立即丢弃 Lua 变量。
+- search response、tree response 现都要求 exact object keys；search hit 逐项限制 path、byte range、line、UTF-16 column、snippet 长度与控制字符。结果只存于独立 split 的 nofile、swap/undofile/modeline/buflisted 关闭、lock/stop wipe 的 buffer，Enter 仅打开认证 Markdown path。
+- 更新 lifecycle headless：编辑并保存 Unicode 文档后搜索 Unicode token，验证 result buffer 内容与选项，并证明 lock 同时 wipe search/tree/document。transport smoke、`git diff --check` 通过。
+
 ## 2026-07-15 — Neovim 受控 vault tree 浏览
 
 - 新增 `InexBrowse`：只接受 daemon `vault.listTree` 的有界、无重复且 kind/path 受限条目；tree 进入 `nofile`、swap/undofile/modeline/buflisted 关闭、`bufhidden=wipe` 的 scratch buffer。Enter 仅可打开已验证的 Markdown file entry；目录和附件不会被误作明文文件打开。

@@ -558,3 +558,4 @@
 - Neovim `vim.base64.decode` 接受 canonical unpadded Base64URL 的大多数长度，但会拒绝某些需要尾部填充的合法 payload（例如 `Cg`）。Lua client 必须在协议边界先严格验证 unpadded URL alphabet/长度，再转换 `-_`、补齐至四字节组并 decode；不能要求 daemon 改用 padded/standard Base64，因为 daemon 的 canonical RPC 协议已固定为 unpadded Base64URL。
 - Neovim ordinary buffer 只能用 `buftype=acwrite` 加 buffer-local `BufWriteCmd` 承接 `:write`：`acwrite` 使 `inex://` 名称不会被作为本地文件关联，但仍拒绝静默 abandon；保存回调必须保留 captured ETag、session 和 document identity，只有 daemon 返回同路径且 canonical metadata/durability 后才清除 modified 标志。
 - `bufhidden=wipe` 与单窗口 browse 不可兼容：切换到 tree 会 wipe 原 document，而不是仅隐藏它。不要为便利改为 `hide`；tree 应在独立 split 显示，并与 document 一同由 lock/stop 主动 wipe，才能同时保持使用体验与关闭残留边界。
+- Neovim 内存搜索不能用普通 `input()`，因为 query 可能进入命令行 UI/历史；`inputsecret()` 至少避免明文回显。它仍不消除宿主/OS 内存边界，因此 query/result 都必须只驻留在当前回调或 lock/stop wipe 的 scratch buffer，且 README 不应声称该机制覆盖 shada、第三方插件或内存取证。
