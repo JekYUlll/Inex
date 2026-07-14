@@ -40,6 +40,7 @@
     "onCommand:inex.editPrivateAnnotation",
     "onCommand:inex.managePrivateTags",
     "onCommand:inex.reorderPrivateTags",
+    "onCommand:inex.managePrivateAnnotationProfiles",
     "onCommand:inex.removePrivateAnnotation",
     "onCommand:inex.applyPrivateAnnotationProfile"
   ],
@@ -98,6 +99,11 @@
       {
         "command": "inex.reorderPrivateTags",
         "title": "Inex: Reorder Private Tags",
+        "enablement": "inex.vaultUnlocked"
+      },
+      {
+        "command": "inex.managePrivateAnnotationProfiles",
+        "title": "Inex: Manage Private Annotation Profiles",
         "enablement": "inex.vaultUnlocked"
       },
       {

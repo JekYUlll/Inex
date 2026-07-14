@@ -10,7 +10,12 @@ import {
   type AnnotationPickerState,
   type PrivateTagChoice,
 } from "./privateAnnotation.ts";
-import type { PrivateAnnotationSpec, UmbraAnnotationConfig } from "./sidecar.ts";
+import type {
+  OuterMode,
+  PrivateAnnotationKind,
+  PrivateAnnotationSpec,
+  UmbraAnnotationConfig,
+} from "./sidecar.ts";
 import { showSensitiveInputBox } from "./sensitiveUi.ts";
 
 type ChoiceGroup = "kind" | "tag" | "outer";
@@ -18,6 +23,13 @@ type ChoiceGroup = "kind" | "tag" | "outer";
 interface AnnotationQuickPickItem extends vscode.QuickPickItem {
   readonly group: ChoiceGroup;
   readonly value: string;
+}
+
+/** Profile metadata deliberately excludes an instance-specific public cover. */
+export interface AnnotationProfileDraft {
+  readonly kind: PrivateAnnotationKind;
+  readonly tagIds: readonly string[];
+  readonly outer: OuterMode;
 }
 
 /** Configure one annotation without retaining private labels after lock. */
@@ -56,6 +68,27 @@ export async function choosePrivateAnnotation(
     }
   }
   return annotationSpecFromPicker(state, coverText);
+}
+
+/** Select reusable profile metadata without asking for cover text for a document. */
+export async function chooseAnnotationProfileDraft(
+  config: UmbraAnnotationConfig,
+  onDidInvalidate: vscode.Event<void>,
+  initial?: AnnotationProfileDraft,
+): Promise<AnnotationProfileDraft | undefined> {
+  const tags: PrivateTagChoice[] = config.tags
+    .filter((tag) => !tag.archived || initial?.tagIds.includes(tag.id) === true)
+    .map((tag) => ({ id: tag.id, label: tag.label, defaultSelected: tag.defaultSelected }));
+  const state = initial === undefined
+    ? defaultAnnotationPickerState(tags)
+    : annotationPickerStateFromSpec(
+      { kind: initial.kind, tagIds: initial.tagIds, outer: { mode: initial.outer } },
+      tags,
+    );
+  const accepted = await chooseState(state, tags, onDidInvalidate);
+  return accepted === undefined
+    ? undefined
+    : { kind: accepted.kind, tagIds: accepted.tagIds, outer: accepted.outerMode };
 }
 
 function chooseState(

@@ -6,12 +6,15 @@ import { InexCustomEditorProvider } from "./customEditor.ts";
 import { offerToOpenImportedVault } from "./importCompletion.ts";
 import { RpcRemoteError } from "./rpc.ts";
 import { importMarkdownRepository } from "./repositoryImport.ts";
-import { choosePrivateAnnotation } from "./privateAnnotationPicker.ts";
+import {
+  chooseAnnotationProfileDraft,
+  choosePrivateAnnotation,
+} from "./privateAnnotationPicker.ts";
 import {
   parsePrivateAnnotationPreferences,
   type PrivateAnnotationPreferences,
 } from "./privateAnnotationPreferences.ts";
-import type { PrivateAnnotationSpec } from "./sidecar.ts";
+import type { PrivateAnnotationSpec, UmbraAnnotationProfile } from "./sidecar.ts";
 import { showSensitiveInputBox, showSensitiveQuickPick } from "./sensitiveUi.ts";
 import { InexTreeProvider } from "./tree.ts";
 
@@ -271,6 +274,11 @@ export function activate(
     vscode.commands.registerCommand("inex.reorderPrivateTags", async () => {
       await runUiAction(async () => {
         await reorderPrivateTags(controller);
+      });
+    }),
+    vscode.commands.registerCommand("inex.managePrivateAnnotationProfiles", async () => {
+      await runUiAction(async () => {
+        await managePrivateAnnotationProfiles(controller);
       });
     }),
     vscode.commands.registerCommand("inex.applyPrivateAnnotationProfile", async (args?: unknown) => {
@@ -598,6 +606,116 @@ async function createPrivateTag(
     id = undefined;
     label = undefined;
   }
+}
+
+async function managePrivateAnnotationProfiles(controller: VaultController): Promise<void> {
+  const ready = await ensureUmbraReady(controller);
+  if (ready === undefined) return;
+  const config = await ready.sidecar.loadUmbraAnnotationConfig();
+  const selected = await showSensitiveQuickPick(
+    [
+      { label: "$(add) Create Private Annotation Profile", description: "Add an encrypted reusable annotation" },
+      ...config.profiles.map((profile) => ({
+        label: `$(symbol-method) ${profile.label}`,
+        description: profile.id,
+        detail: `${profile.kind} / ${profile.outer}`,
+      })),
+    ],
+    { title: "Manage Private Annotation Profiles", placeHolder: "Create a profile or select one to edit/remove" },
+    controller.onDidLock,
+  );
+  if (selected === undefined || !controller.isSessionCurrent(ready.session)) return;
+  if (selected.label.startsWith("$(add)")) {
+    await createPrivateAnnotationProfile(controller, ready.session, ready.sidecar, config);
+    return;
+  }
+  const profile = config.profiles.find((candidate) => candidate.id === selected.description);
+  if (profile === undefined) throw new Error("Selected private annotation profile is unavailable");
+  const action = await vscode.window.showQuickPick(["Edit", "Remove"], {
+    title: "Manage selected private annotation profile",
+    ignoreFocusOut: true,
+  });
+  if (action === undefined || !controller.isSessionCurrent(ready.session)) return;
+  if (action === "Remove") {
+    const confirmed = await vscode.window.showWarningMessage(
+      "Remove this private annotation profile? Existing private annotations are unchanged.",
+      { modal: true },
+      "Remove Profile",
+    );
+    if (confirmed !== "Remove Profile" || !controller.isSessionCurrent(ready.session)) return;
+    await ready.sidecar.removeUmbraAnnotationProfile(profile.id);
+    await ready.sidecar.loadUmbraAnnotationConfig();
+    await vscode.window.showInformationMessage("Private annotation profile removed.");
+    return;
+  }
+  await editPrivateAnnotationProfile(controller, ready.session, ready.sidecar, config, profile);
+}
+
+async function createPrivateAnnotationProfile(
+  controller: VaultController,
+  session: VaultSession,
+  sidecar: VaultSession["sidecar"],
+  config: import("./sidecar.ts").UmbraAnnotationConfig,
+): Promise<void> {
+  let label = await showSensitiveInputBox(
+    { title: "Create Private Annotation Profile", prompt: "Private profile label", ignoreFocusOut: true, validateInput: validatePrivateTagText },
+    controller.onDidLock,
+  );
+  let id: string | undefined;
+  try {
+    if (label === undefined || !controller.isSessionCurrent(session)) return;
+    id = await showSensitiveInputBox(
+      { title: "Create Private Annotation Profile", prompt: "Stable machine-readable ID", ignoreFocusOut: true, validateInput: validatePrivateTagId },
+      controller.onDidLock,
+    );
+    if (id === undefined || !controller.isSessionCurrent(session)) return;
+    const draft = await chooseAnnotationProfileDraft(config, controller.onDidLock);
+    if (draft === undefined || !controller.isSessionCurrent(session)) return;
+    await sidecar.createUmbraAnnotationProfile(profileFromDraft(id, label, draft));
+    await sidecar.loadUmbraAnnotationConfig();
+    await vscode.window.showInformationMessage("Private annotation profile created.");
+  } finally {
+    id = undefined;
+    label = undefined;
+  }
+}
+
+async function editPrivateAnnotationProfile(
+  controller: VaultController,
+  session: VaultSession,
+  sidecar: VaultSession["sidecar"],
+  config: import("./sidecar.ts").UmbraAnnotationConfig,
+  profile: UmbraAnnotationProfile,
+): Promise<void> {
+  let label = await showSensitiveInputBox(
+    { title: "Edit Private Annotation Profile", prompt: "Private profile label", value: profile.label, ignoreFocusOut: true, validateInput: validatePrivateTagText },
+    controller.onDidLock,
+  );
+  try {
+    if (label === undefined || !controller.isSessionCurrent(session)) return;
+    const draft = await chooseAnnotationProfileDraft(config, controller.onDidLock, profile);
+    if (draft === undefined || !controller.isSessionCurrent(session)) return;
+    await sidecar.editUmbraAnnotationProfile(profile.id, profileFromDraft(profile.id, label, draft));
+    await sidecar.loadUmbraAnnotationConfig();
+    await vscode.window.showInformationMessage("Private annotation profile updated.");
+  } finally {
+    label = undefined;
+  }
+}
+
+function profileFromDraft(
+  id: string,
+  label: string,
+  draft: import("./privateAnnotationPicker.ts").AnnotationProfileDraft,
+): UmbraAnnotationProfile {
+  return {
+    id,
+    label,
+    kind: draft.kind,
+    tagIds: draft.tagIds,
+    outer: draft.outer,
+    promptForCover: draft.outer === "cover",
+  };
 }
 
 function validatePrivateTagText(value: string): string | undefined {
