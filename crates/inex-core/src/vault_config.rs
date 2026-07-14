@@ -370,6 +370,15 @@ impl VaultConfig {
             .is_ok()
     }
 
+    /// Return whether authenticated metadata declares Umbra private
+    /// annotations v1.
+    #[must_use]
+    pub fn supports_umbra_private_annotations(&self) -> bool {
+        self.required_features
+            .binary_search(&crate::features::UMBRA_PRIVATE_ANNOTATIONS_V1)
+            .is_ok()
+    }
+
     /// Require every slot to satisfy the creation policy.
     ///
     /// # Errors
@@ -763,7 +772,7 @@ mod tests {
     }
 
     #[test]
-    fn required_feature_one_is_negotiated_and_unknown_features_fail_closed() {
+    fn registered_features_are_negotiated_and_unknown_features_fail_closed() {
         let mut asset_capable = config();
         asset_capable.required_features = vec![OPAQUE_ASSETS_V1];
         assert!(
@@ -774,8 +783,18 @@ mod tests {
         assert!(asset_capable.supports_opaque_assets());
         assert!(!config().supports_opaque_assets());
 
+        let mut umbra_capable = config();
+        umbra_capable.required_features = vec![crate::features::UMBRA_PRIVATE_ANNOTATIONS_V1];
+        assert!(
+            umbra_capable
+                .validate_untrusted(KdfPolicy::default())
+                .is_ok()
+        );
+        assert!(umbra_capable.supports_umbra_private_annotations());
+        assert!(!config().supports_umbra_private_annotations());
+
         let mut unknown = config();
-        unknown.required_features = vec![2];
+        unknown.required_features = vec![99];
         assert!(matches!(
             unknown.validate_untrusted(KdfPolicy::default()),
             Err(ConfigError::UnsupportedRequiredFeature)

@@ -629,7 +629,7 @@ pub fn encrypt_document(
 ///
 /// # Errors
 ///
-/// Returns an error unless authenticated metadata declares exactly feature 2,
+/// Returns an error unless authenticated metadata declares feature 2,
 /// or if the usual UTF-8 document encryption checks fail.
 #[allow(clippy::too_many_arguments)]
 pub fn encrypt_umbra_outer_document(
@@ -829,7 +829,7 @@ fn require_opaque_assets(
     master_key: &VaultMasterKey,
 ) -> Result<(), CryptoError> {
     verify_metadata_mac(config, master_key)?;
-    if config.required_features.as_slice() != [OPAQUE_ASSETS_V1] {
+    if !config.supports_opaque_assets() {
         return Err(CryptoError::OpaqueAssetsNotEnabled);
     }
     Ok(())
@@ -840,7 +840,7 @@ fn require_umbra_private_annotations(
     master_key: &VaultMasterKey,
 ) -> Result<(), CryptoError> {
     verify_metadata_mac(config, master_key)?;
-    if config.required_features.as_slice() != [UMBRA_PRIVATE_ANNOTATIONS_V1] {
+    if !config.supports_umbra_private_annotations() {
         return Err(CryptoError::DocumentContextMismatch);
     }
     Ok(())
@@ -1321,6 +1321,33 @@ mod tests {
             vec![UMBRA_PRIVATE_ANNOTATIONS_V1]
         );
         verify_metadata_mac(&updated, &created.master_key).expect("authenticated metadata");
+    }
+
+    #[test]
+    fn umbra_feature_negotiation_preserves_independent_asset_capability() {
+        let created = asset_capable_created();
+        let updated =
+            enable_umbra_private_annotations(&created.config, &created.master_key, test_policy())
+                .expect("enable feature two beside assets");
+        assert_eq!(
+            updated.required_features,
+            vec![OPAQUE_ASSETS_V1, UMBRA_PRIVATE_ANNOTATIONS_V1]
+        );
+        let encrypted = encrypt_umbra_outer_document(
+            &created.master_key,
+            &updated,
+            &path(),
+            None,
+            br#"{\"format\":\"inex-umbra-document\",\"version\":1,\"outerMarkdown\":\"public\",\"slots\":{}}"#,
+            1_783_699_200_000,
+            ContentFlags::NONE,
+            EnvelopeKind::Committed,
+        )
+        .expect("feature two document remains available");
+        assert_eq!(
+            encrypted.header.required_features,
+            vec![UMBRA_PRIVATE_ANNOTATIONS_V1]
+        );
     }
 
     fn path() -> LogicalPath {

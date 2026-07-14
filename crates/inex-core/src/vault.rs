@@ -34,6 +34,7 @@ use crate::tree::{self, TreeEntryKind, TreeError, VaultTree, VaultTreeProfile};
 use crate::umbra_config::{
     EncryptedUmbraConfigV1, UMBRA_CONFIG_PATH, UmbraConfigError, UmbraConfigV1,
 };
+use crate::umbra_document::{UmbraDocumentError, UmbraDocumentV1};
 use crate::umbra_keyslot::{
     UMBRA_DEFAULT_KEYSLOT_PATH, UmbraKey, UmbraKeyslotError, UmbraKeyslotV1,
 };
@@ -201,6 +202,9 @@ pub enum VaultError {
     /// Umbra encrypted catalog/profile processing failed.
     #[error(transparent)]
     UmbraConfig(#[from] UmbraConfigError),
+    /// Umbra Outer container processing failed.
+    #[error(transparent)]
+    UmbraDocument(#[from] UmbraDocumentError),
     /// An operation requires a currently unlocked Umbra session.
     #[error("Umbra is locked")]
     UmbraLocked,
@@ -788,7 +792,137 @@ impl Vault {
     /// envelope exceeds its bound, framing/AAD authentication fails, or the
     /// document belongs to a different vault/path/epoch.
     pub fn read(&self, logical_path: &LogicalPath) -> Result<DecryptedDocument, VaultError> {
-        self.read_kind(logical_path, ExpectedEnvelopeKind::Committed)
+        let document = self.read_kind(logical_path, ExpectedEnvelopeKind::Committed)?;
+        if !document.header.required_features.is_empty() {
+            return Err(CryptoError::DocumentContextMismatch.into());
+        }
+        Ok(document)
+    }
+
+    /// Read one feature-2 Outer projection without decrypting private slots.
+    ///
+    /// This method is intentionally separate from [`Self::read`]: callers
+    /// using the normal Markdown API must never receive an Umbra container in
+    /// an editor buffer by accident. It does not require `K_umbra`, because
+    /// the returned projection contains only public Outer Markdown and slot
+    /// ciphertext.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the committed EDRY header requires exactly
+    /// feature 2 and its decrypted body is a canonical Outer container.
+    pub fn read_umbra_outer_document(
+        &self,
+        logical_path: &LogicalPath,
+    ) -> Result<(DecryptedDocument, UmbraDocumentV1), VaultError> {
+        let document = self.read_kind(logical_path, ExpectedEnvelopeKind::Committed)?;
+        if document.header.required_features.as_slice()
+            != [crate::features::UMBRA_PRIVATE_ANNOTATIONS_V1]
+        {
+            return Err(CryptoError::DocumentContextMismatch.into());
+        }
+        let outer = UmbraDocumentV1::from_json(document.plaintext.as_slice())?;
+        Ok((document, outer))
+    }
+
+    /// Create and atomically commit one feature-2 Umbra Outer document.
+    ///
+    /// A live Umbra session is required even if the initial container has no
+    /// slots, so the feature cannot be enabled or populated from Outer mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError::UmbraLocked`] without `K_umbra`, or an error for
+    /// a missing feature-2 metadata negotiation, invalid container, unsafe
+    /// destination, or failed ciphertext commit.
+    pub fn create_umbra_outer_document(
+        &mut self,
+        logical_path: &LogicalPath,
+        document: &UmbraDocumentV1,
+        modified_at_ms: i64,
+    ) -> Result<DocumentMetadata, VaultError> {
+        if self.umbra.is_none() {
+            return Err(VaultError::UmbraLocked);
+        }
+        let plaintext = Zeroizing::new(document.to_json()?);
+        let encrypted = crypto::encrypt_umbra_outer_document(
+            &self.master_key,
+            &self.config,
+            logical_path,
+            None,
+            plaintext.as_slice(),
+            modified_at_ms,
+            ContentFlags::NONE,
+            EnvelopeKind::Committed,
+        )?;
+        let guard = self.acquire_mutation_guard()?;
+        self.ensure_destination_available_locked(logical_path)?;
+        let target = self.document_target_allow_absent(logical_path)?;
+        let outcome = guard
+            .write(&target, &encrypted.bytes, WriteCondition::IfNoneMatch)
+            .map_err(map_atomic_error)?;
+        drop(guard);
+        self.invalidate_search_index();
+        Ok(document_metadata(encrypted, outcome))
+    }
+
+    /// Save an Umbra Outer projection while retaining its authenticated EDRY
+    /// identity and requiring a live `K_umbra` session.
+    ///
+    /// Private slot ciphertext remains opaque to this method; dedicated
+    /// private-slot mutation APIs will require and use the live key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError::UmbraLocked`] without a live session, or an
+    /// error for an etag conflict, feature mismatch, invalid Outer container,
+    /// unsafe target, or failed atomic ciphertext replacement.
+    pub fn save_umbra_outer_document(
+        &mut self,
+        logical_path: &LogicalPath,
+        document: &UmbraDocumentV1,
+        expected_etag: &str,
+        modified_at_ms: i64,
+    ) -> Result<DocumentMetadata, VaultError> {
+        if self.umbra.is_none() {
+            return Err(VaultError::UmbraLocked);
+        }
+        let expected = decode_etag(expected_etag)?;
+        let current = self.read_kind(logical_path, ExpectedEnvelopeKind::Committed)?;
+        if current.header.required_features.as_slice()
+            != [crate::features::UMBRA_PRIVATE_ANNOTATIONS_V1]
+        {
+            return Err(CryptoError::DocumentContextMismatch.into());
+        }
+        if decode_etag(&current.etag)? != expected {
+            return Err(VaultError::Conflict {
+                current_etag: Some(current.etag),
+            });
+        }
+        let identity = FileIdentity::from_header(&current.header);
+        let flags = current.header.content_flags;
+        drop(current);
+
+        let plaintext = Zeroizing::new(document.to_json()?);
+        let encrypted = crypto::encrypt_umbra_outer_document(
+            &self.master_key,
+            &self.config,
+            logical_path,
+            Some(identity),
+            plaintext.as_slice(),
+            modified_at_ms,
+            flags,
+            EnvelopeKind::Committed,
+        )?;
+        let guard = self.acquire_mutation_guard()?;
+        let target = self.document_target(logical_path)?;
+        ensure_regular_file_bounded(&target, MAX_EDRY_ENVELOPE_BYTES)?;
+        let outcome = guard
+            .write(&target, &encrypted.bytes, WriteCondition::IfMatch(expected))
+            .map_err(map_atomic_error)?;
+        drop(guard);
+        self.invalidate_search_index();
+        Ok(document_metadata(encrypted, outcome))
     }
 
     /// Read and fully authenticate one committed opaque asset.
@@ -2533,6 +2667,60 @@ mod tests {
             .enable_umbra_private_annotations(test_policy())
             .expect("enable feature two");
         assert_eq!(vault.config().required_features, vec![2]);
+    }
+
+    #[test]
+    fn feature_two_outer_projection_has_a_dedicated_safe_read_write_path() {
+        let directory = TestDirectory::new();
+        let mut vault = create_test_vault(&directory);
+        let path = logical("2026-07-umbra.md");
+        let outer = UmbraDocumentV1::new("# public outer projection\n".to_owned());
+
+        assert!(matches!(
+            vault.create_umbra_outer_document(&path, &outer, 1_783_699_201_000),
+            Err(VaultError::UmbraLocked)
+        ));
+        vault
+            .initialize_umbra(b"outer projection password")
+            .expect("initialize Umbra");
+        vault
+            .enable_umbra_private_annotations(test_policy())
+            .expect("enable feature two");
+        let created = vault
+            .create_umbra_outer_document(&path, &outer, 1_783_699_201_000)
+            .expect("create feature two container");
+        assert_eq!(
+            created.header.required_features,
+            vec![crate::features::UMBRA_PRIVATE_ANNOTATIONS_V1]
+        );
+        assert!(matches!(
+            vault.read(&path),
+            Err(VaultError::Crypto(CryptoError::DocumentContextMismatch))
+        ));
+
+        vault.lock_umbra();
+        let (read, projection) = vault
+            .read_umbra_outer_document(&path)
+            .expect("Outer projection never needs K_umbra");
+        assert_eq!(projection, outer);
+        assert!(matches!(
+            vault.save_umbra_outer_document(&path, &projection, &read.etag, 1_783_699_202_000),
+            Err(VaultError::UmbraLocked)
+        ));
+
+        vault
+            .unlock_umbra(b"outer projection password")
+            .expect("unlock Umbra");
+        let updated = UmbraDocumentV1::new("# updated public projection\n".to_owned());
+        let saved = vault
+            .save_umbra_outer_document(&path, &updated, &read.etag, 1_783_699_202_000)
+            .expect("save outer container");
+        assert_eq!(saved.header.file_id, created.header.file_id);
+        assert_ne!(saved.etag, created.etag);
+        let (_, reopened) = vault
+            .read_umbra_outer_document(&path)
+            .expect("reopen feature two container");
+        assert_eq!(reopened, updated);
     }
 
     #[test]
