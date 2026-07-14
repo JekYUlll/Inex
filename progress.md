@@ -1,10 +1,15 @@
 # Inex Progress Log
 
+## 2026-07-15 — Restore strict all-target Clippy baseline
+
+- 提交 `6d3ea0c`：将两个超过 Clippy 100-line 限制的 Umbra regression test 拆为命名辅助断言，保持私密 slot lock、canary 非泄漏、多选原子性、陈旧 ETag 与 private-range 拒绝的原测试语义；没有使用 lint `allow`。
+- 验证：`cargo clippy -p inex-core -p inex-daemon --all-targets -- -D warnings` 通过，core 297/297、daemon 71/71、fmt 和 diff-check 通过。此前记录的 test-only Clippy 基线告警已解决。
+
 ## 2026-07-15 — Encrypted default annotation profile
 
 - 提交 `3b9f5c5`：新增 `UmbraConfigV1::set_default_profile`、Vault wrapper、`umbra.profile.setDefault` RPC 与 VS Code sidecar/client UI。Profile management 可 Set as Default/Clear Default；ID 始终在 encrypted config 中验证、保存，不能由普通 editor setting 注入。
 - core profile test 与 daemon lifecycle 现在验证设置 default、`config.get` 读回以及 remove profile 自动清除 default。core 全量 297/297、daemon 全量 71/71、core/daemon lib Clippy、VS Code check/57 tests/build/fmt/diff-check 均通过。
-- `cargo clippy -p inex-core -p inex-daemon --all-targets -- -D warnings` 仍因 `vault.rs` 两个既有测试函数超过 100 行而失败；本次新增 code 的 `assigning_clones` 已修复，未放宽 lint。该 test-only 基线问题留作质量门修复项。
+- 初次全目标 Clippy 曾定位出 `vault.rs` 两个超过 100 行的既有测试函数；后续已在 `6d3ea0c` 通过提取命名辅助断言解决，未放宽 lint。
 
 ## 2026-07-15 — VS Code heading-section annotation target
 
