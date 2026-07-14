@@ -127,7 +127,7 @@ fn audit_fresh_marker_candidate_impl(
         .revalidate_at(&root)
         .map_err(|_| RepositoryImportError::TargetAuditFailed)?;
     let marker = held_marker.marker();
-    if marker.domain().as_bytes() != DOMAIN {
+    if marker.domain() != DOMAIN {
         return Err(RepositoryImportError::TargetAuditFailed);
     }
     let context = CandidateSealContext {
@@ -704,9 +704,7 @@ mod tests {
     }
 
     fn domain() -> String {
-        std::str::from_utf8(DOMAIN)
-            .expect("frozen domain is UTF-8")
-            .to_owned()
+        DOMAIN.to_owned()
     }
 
     fn hex(bytes: &[u8]) -> String {

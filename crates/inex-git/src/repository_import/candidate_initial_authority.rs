@@ -23,12 +23,25 @@
 
 use std::fmt;
 use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
 
 use inex_core::atomic::ExistingVaultMutationLockError;
+#[cfg(target_os = "linux")]
+use inex_core::atomic::{
+    FilesystemDirectoryIdentity, HeldPublicationMarkerV2, HeldPublicationMarkerV2CreateInput,
+    HeldPublicationMarkerV2Error, IMPORT_STAGING_PREFIX,
+};
 use inex_core::crypto::VaultContentProfile;
+#[cfg(target_os = "linux")]
+use inex_core::path::raw_portable_case_fold_key;
 use inex_core::vault::Vault;
 use thiserror::Error;
 
+#[cfg(target_os = "linux")]
+use super::candidate_fresh_audit::{FreshMarkerCandidateAudit, audit_fresh_marker_candidate};
+#[cfg(target_os = "linux")]
+use super::candidate_seal::DOMAIN;
 use super::candidate_seal::{CandidateSealContext, CandidateSealError};
 use super::{RepositoryImportError, TargetRepository};
 
@@ -72,6 +85,10 @@ pub(super) struct InitialCandidateAuthority {
     context: CandidateSealContext,
     root_commit: super::candidate_git::FreshRootCommitEvidence,
     content_seal: super::candidate_seal::CandidateContentSeal,
+    worktree_files: u32,
+    encrypted_markdown: u32,
+    encrypted_assets: u32,
+    git_objects: u32,
     mutation_lock: inex_core::atomic::ExistingVaultMutationLock,
 }
 
@@ -81,6 +98,7 @@ pub(super) struct InitialCandidateAuthority {
     _unsupported: (),
 }
 
+#[cfg(target_os = "linux")]
 impl fmt::Debug for InitialCandidateAuthority {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -91,8 +109,219 @@ impl fmt::Debug for InitialCandidateAuthority {
             .field("context", &"[REDACTED]")
             .field("root_commit", &"[REDACTED]")
             .field("content_seal", &"[REDACTED]")
+            .field("worktree_files", &self.worktree_files)
+            .field("encrypted_markdown", &self.encrypted_markdown)
+            .field("encrypted_assets", &self.encrypted_assets)
+            .field("git_objects", &self.git_objects)
             .field("mutation_lock", &"[HELD]")
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl fmt::Debug for InitialCandidateAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("InitialCandidateAuthority { unsupported: true }")
+    }
+}
+
+/// Caller-owned sibling publication coordinates for one initial claim.
+///
+/// The claim transition derives the staging name, domain, publication id,
+/// identity scheme, and candidate seal from the held authority itself. The
+/// caller supplies only the already-audited common-parent identity and exact
+/// destination child selected by the outer transaction.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+pub(super) struct InitialCandidateClaimInput<'a> {
+    pub(super) common_parent_identity: &'a FilesystemDirectoryIdentity,
+    pub(super) destination_child_name: &'a str,
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for InitialCandidateClaimInput<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InitialCandidateClaimInput")
+            .field("common_parent_identity", &"[REDACTED]")
+            .field("destination_child_name", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Failure before a publication marker was created.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(super) enum InitialCandidateClaimPreflightError {
+    #[error("initial repository candidate staging name is invalid")]
+    InvalidStagingName,
+    #[error("initial repository candidate destination uses the reserved staging prefix")]
+    ReservedDestinationName,
+    #[error("initial repository candidate changed before marker creation")]
+    CandidateChanged,
+}
+
+/// Fixed post-marker failure category retained beside the live marker owner.
+#[cfg(target_os = "linux")]
+pub(super) enum InitialCandidatePostMarkerFailure {
+    FreshAudit(RepositoryImportError),
+    ContextMismatch,
+    ContentSealMismatch,
+    RootCommitMismatch,
+    WorktreeCountMismatch,
+    MarkdownCountMismatch,
+    AssetCountMismatch,
+    GitObjectCountMismatch,
+    DestinationObservation(HeldPublicationMarkerV2Error),
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for InitialCandidatePostMarkerFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::FreshAudit(_) => "InitialCandidatePostMarkerFailure::FreshAudit(..)",
+            Self::ContextMismatch => "InitialCandidatePostMarkerFailure::ContextMismatch",
+            Self::ContentSealMismatch => "InitialCandidatePostMarkerFailure::ContentSealMismatch",
+            Self::RootCommitMismatch => "InitialCandidatePostMarkerFailure::RootCommitMismatch",
+            Self::WorktreeCountMismatch => {
+                "InitialCandidatePostMarkerFailure::WorktreeCountMismatch"
+            }
+            Self::MarkdownCountMismatch => {
+                "InitialCandidatePostMarkerFailure::MarkdownCountMismatch"
+            }
+            Self::AssetCountMismatch => "InitialCandidatePostMarkerFailure::AssetCountMismatch",
+            Self::GitObjectCountMismatch => {
+                "InitialCandidatePostMarkerFailure::GitObjectCountMismatch"
+            }
+            Self::DestinationObservation(_) => {
+                "InitialCandidatePostMarkerFailure::DestinationObservation(..)"
+            }
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Display for InitialCandidatePostMarkerFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::FreshAudit(_) => "fresh marker-aware candidate audit failed",
+            Self::ContextMismatch => "candidate claim context changed",
+            Self::ContentSealMismatch => "candidate content seal changed",
+            Self::RootCommitMismatch => "candidate root commit changed",
+            Self::WorktreeCountMismatch => "candidate worktree count changed",
+            Self::MarkdownCountMismatch => "candidate Markdown count changed",
+            Self::AssetCountMismatch => "candidate asset count changed",
+            Self::GitObjectCountMismatch => "candidate Git object count changed",
+            Self::DestinationObservation(_) => "candidate destination absence became indeterminate",
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::error::Error for InitialCandidatePostMarkerFailure {}
+
+/// Terminal owner for an initial claim that failed after marker creation.
+///
+/// No API exposes the marker for cleanup, reconstruction, or publication. The
+/// exact held marker and its existing-only mutation lock remain alive until
+/// this value is dropped; `held_marker` is deliberately the last field.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub(super) struct FailedHeldInitialClaim {
+    failure: InitialCandidatePostMarkerFailure,
+    held_marker: HeldPublicationMarkerV2,
+}
+
+#[cfg(target_os = "linux")]
+impl FailedHeldInitialClaim {
+    pub(super) const fn failure(&self) -> &InitialCandidatePostMarkerFailure {
+        &self.failure
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for FailedHeldInitialClaim {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FailedHeldInitialClaim")
+            .field("failure", &self.failure)
+            .field("held_marker", &"[HELD]")
+            .finish()
+    }
+}
+
+/// Failure while consuming initial authority into a staging claim.
+#[cfg(target_os = "linux")]
+pub(super) enum InitialCandidateClaimError {
+    PreMarker(InitialCandidateClaimPreflightError),
+    MarkerCreation(HeldPublicationMarkerV2Error),
+    PostMarker(Box<FailedHeldInitialClaim>),
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for InitialCandidateClaimError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PreMarker(error) => formatter.debug_tuple("PreMarker").field(error).finish(),
+            Self::MarkerCreation(_) => formatter.write_str("MarkerCreation(..)"),
+            Self::PostMarker(owner) => formatter.debug_tuple("PostMarker").field(owner).finish(),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Display for InitialCandidateClaimError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::PreMarker(_) => "initial candidate claim failed before marker creation",
+            Self::MarkerCreation(_) => "initial candidate marker creation failed",
+            Self::PostMarker(_) => "initial candidate claim failed after marker creation",
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::error::Error for InitialCandidateClaimError {}
+
+/// Complete marker-aware staging claim eligible for a later no-replace move.
+///
+/// This type is intentionally neither `Clone` nor `Copy`. The fixed-size fresh
+/// audit is bound to the marker's exact context and seal, while the held marker
+/// retains all directory handles and the same mutation lock. Absence was only
+/// observed, never reserved; the publication transition must revalidate and
+/// use a no-replace whole-root move.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub(super) struct StagingAuditedClaim {
+    root: PathBuf,
+    audit: FreshMarkerCandidateAudit,
+    held_marker: HeldPublicationMarkerV2,
+}
+
+#[cfg(target_os = "linux")]
+impl StagingAuditedClaim {
+    pub(super) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub(super) const fn audit(&self) -> &FreshMarkerCandidateAudit {
+        &self.audit
+    }
+
+    pub(super) const fn held_marker(&self) -> &HeldPublicationMarkerV2 {
+        &self.held_marker
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for StagingAuditedClaim {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StagingAuditedClaim")
+            .field("root", &"[REDACTED]")
+            .field("audit", &self.audit)
+            .field("held_marker", &"[HELD]")
+            .finish()
     }
 }
 
@@ -123,6 +352,173 @@ pub(super) fn acquire_initial_candidate_authority(
         |_, _| {},
         |_, _| {},
     )
+}
+
+/// Consume one marker-free initial authority into a complete staging claim.
+///
+/// The marker-free manifest is revalidated and then explicitly released before
+/// the marker-aware fresh audit, bounding peak retained manifest memory. Once
+/// the core returns a held marker, every later failure owns that exact marker
+/// and the same mutation lock until the caller emits its terminal result.
+#[cfg(target_os = "linux")]
+pub(super) fn claim_initial_candidate(
+    authority: InitialCandidateAuthority,
+    input: InitialCandidateClaimInput<'_>,
+) -> Result<StagingAuditedClaim, InitialCandidateClaimError> {
+    claim_initial_candidate_impl(authority, input, |_, _| {}, |_, _, _| {})
+}
+
+#[cfg(target_os = "linux")]
+fn claim_initial_candidate_impl<AfterMarker, AfterAudit>(
+    authority: InitialCandidateAuthority,
+    input: InitialCandidateClaimInput<'_>,
+    after_marker: AfterMarker,
+    after_audit: AfterAudit,
+) -> Result<StagingAuditedClaim, InitialCandidateClaimError>
+where
+    AfterMarker: FnOnce(&Path, &HeldPublicationMarkerV2),
+    AfterAudit: FnOnce(&Path, &HeldPublicationMarkerV2, &FreshMarkerCandidateAudit),
+{
+    let InitialCandidateAuthority {
+        root,
+        physical,
+        held_root,
+        context,
+        root_commit,
+        content_seal,
+        worktree_files,
+        encrypted_markdown,
+        encrypted_assets,
+        git_objects,
+        mutation_lock,
+    } = authority;
+
+    let staging_child_name = repository_staging_child_name(&root)?;
+    require_unreserved_destination(input.destination_child_name)?;
+    physical.require_current_exact(&root).map_err(|_| {
+        InitialCandidateClaimError::PreMarker(InitialCandidateClaimPreflightError::CandidateChanged)
+    })?;
+    held_root.verify_no_alternate_data_streams().map_err(|_| {
+        InitialCandidateClaimError::PreMarker(InitialCandidateClaimPreflightError::CandidateChanged)
+    })?;
+    mutation_lock.revalidate(&root).map_err(|_| {
+        InitialCandidateClaimError::PreMarker(InitialCandidateClaimPreflightError::CandidateChanged)
+    })?;
+
+    let expected_content_seal = content_seal.into_digest();
+    let expected_root_commit = root_commit.commit_oid();
+    // The fresh collector owns the only large manifest after this point.
+    drop(physical);
+
+    let held_marker = mutation_lock
+        .create_held_publication_marker_v2(
+            &root,
+            held_root,
+            HeldPublicationMarkerV2CreateInput {
+                scheme: context.scheme,
+                publication_id: context.publication_id,
+                common_parent_identity: input.common_parent_identity,
+                staging_child_name: &staging_child_name,
+                destination_child_name: input.destination_child_name,
+                domain: DOMAIN,
+                candidate_seal: &expected_content_seal,
+            },
+        )
+        .map_err(InitialCandidateClaimError::MarkerCreation)?;
+
+    after_marker(&root, &held_marker);
+    let audit = match audit_fresh_marker_candidate(&root, &held_marker) {
+        Ok(audit) => audit,
+        Err(error) => {
+            return Err(failed_post_marker_claim(
+                InitialCandidatePostMarkerFailure::FreshAudit(error),
+                held_marker,
+            ));
+        }
+    };
+
+    let mismatch = if audit.context() != context {
+        Some(InitialCandidatePostMarkerFailure::ContextMismatch)
+    } else if audit.content_seal() != expected_content_seal {
+        Some(InitialCandidatePostMarkerFailure::ContentSealMismatch)
+    } else if audit.root_commit_oid() != expected_root_commit {
+        Some(InitialCandidatePostMarkerFailure::RootCommitMismatch)
+    } else if audit.worktree_files() != worktree_files {
+        Some(InitialCandidatePostMarkerFailure::WorktreeCountMismatch)
+    } else if audit.encrypted_markdown() != encrypted_markdown {
+        Some(InitialCandidatePostMarkerFailure::MarkdownCountMismatch)
+    } else if audit.encrypted_assets() != encrypted_assets {
+        Some(InitialCandidatePostMarkerFailure::AssetCountMismatch)
+    } else if audit.git_objects() != git_objects {
+        Some(InitialCandidatePostMarkerFailure::GitObjectCountMismatch)
+    } else {
+        None
+    };
+    if let Some(failure) = mismatch {
+        return Err(failed_post_marker_claim(failure, held_marker));
+    }
+
+    after_audit(&root, &held_marker, &audit);
+    if let Err(error) = held_marker.require_destination_absent_at(&root) {
+        return Err(failed_post_marker_claim(
+            InitialCandidatePostMarkerFailure::DestinationObservation(error),
+            held_marker,
+        ));
+    }
+
+    Ok(StagingAuditedClaim {
+        root,
+        audit,
+        held_marker,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn repository_staging_child_name(root: &Path) -> Result<String, InitialCandidateClaimError> {
+    let name = root.file_name().and_then(std::ffi::OsStr::to_str).ok_or(
+        InitialCandidateClaimError::PreMarker(
+            InitialCandidateClaimPreflightError::InvalidStagingName,
+        ),
+    )?;
+    let suffix = name
+        .strip_prefix(IMPORT_STAGING_PREFIX)
+        .filter(|suffix| {
+            suffix.len() == 32
+                && suffix
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .ok_or(InitialCandidateClaimError::PreMarker(
+            InitialCandidateClaimPreflightError::InvalidStagingName,
+        ))?;
+    debug_assert_eq!(suffix.len(), 32);
+    Ok(name.to_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn require_unreserved_destination(
+    destination_child_name: &str,
+) -> Result<(), InitialCandidateClaimError> {
+    let destination = raw_portable_case_fold_key(destination_child_name);
+    let reserved = raw_portable_case_fold_key(IMPORT_STAGING_PREFIX);
+    if destination.as_str().starts_with(reserved.as_str()) {
+        Err(InitialCandidateClaimError::PreMarker(
+            InitialCandidateClaimPreflightError::ReservedDestinationName,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn failed_post_marker_claim(
+    failure: InitialCandidatePostMarkerFailure,
+    held_marker: HeldPublicationMarkerV2,
+) -> InitialCandidateClaimError {
+    InitialCandidateClaimError::PostMarker(Box::new(FailedHeldInitialClaim {
+        failure,
+        held_marker,
+    }))
 }
 
 /// Fail closed before touching a target on platforms whose held traversal and
@@ -213,7 +609,14 @@ where
     physical.require_current_exact(&root)?;
     after_lock(&root, &physical);
 
-    let (content_seal, root_commit) = {
+    let (
+        content_seal,
+        root_commit,
+        worktree_files,
+        encrypted_markdown,
+        encrypted_assets,
+        git_objects,
+    ) = {
         let executable = discover_git_executable()
             .map_err(|_| RepositoryImportError::GitExecutableUnavailable)?;
         let runner = GitRunner::target(executable, root.clone())?;
@@ -230,8 +633,17 @@ where
         let runtime = prove_fresh_runtime_objects(&git, &tracked, &trees, &runner)?;
         let content_seal =
             aggregate_candidate_content_seal_v1(context, &physical, &tracked, &trees, &runtime)?;
+        let (worktree_files, encrypted_markdown, encrypted_assets) = tracked.checked_counts()?;
+        let git_objects = runtime.checked_object_count()?;
         after_runtime(&root, &physical);
-        (content_seal, root_commit)
+        (
+            content_seal,
+            root_commit,
+            worktree_files,
+            encrypted_markdown,
+            encrypted_assets,
+            git_objects,
+        )
     };
 
     // These are the last endpoint checks before the final whole-tree exact
@@ -250,6 +662,10 @@ where
         context,
         root_commit,
         content_seal,
+        worktree_files,
+        encrypted_markdown,
+        encrypted_assets,
+        git_objects,
         mutation_lock,
     })
 }
@@ -259,11 +675,11 @@ mod tests {
     use std::fmt::Write as _;
     use std::fs::{self, File};
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     use inex_core::atomic::{
-        ExistingVaultMutationLock, ExistingVaultMutationLockError, IMPORT_PUBLISH_MARKER_V1,
-        IMPORT_PUBLISH_MARKER_V2, PublicationIdentityScheme, VAULT_LOCAL_DIRECTORY,
+        ExistingVaultMutationLock, ExistingVaultMutationLockError, FilesystemDirectoryIdentity,
+        FilesystemFileIdentity, IMPORT_PUBLISH_MARKER_V1, IMPORT_PUBLISH_MARKER_V2,
+        IMPORT_STAGING_PREFIX, PublicationIdentityScheme, VAULT_LOCAL_DIRECTORY,
         VAULT_MUTATION_LOCK_FILE, filesystem_directory_identity, filesystem_file_identity,
     };
     use inex_core::crypto::VaultContentProfile;
@@ -277,22 +693,23 @@ mod tests {
     use super::super::candidate_seal::{CandidateSealContext, CandidateSealError};
     use super::super::{RepositoryImportError, TargetRepository, initialize_and_audit_target};
     use super::{
-        InitialCandidateAuthority, InitialCandidateAuthorityError, InitialCandidateInputs,
-        acquire_initial_candidate_authority, acquire_initial_candidate_authority_impl,
+        InitialCandidateAuthority, InitialCandidateAuthorityError, InitialCandidateClaimError,
+        InitialCandidateClaimInput, InitialCandidateClaimPreflightError, InitialCandidateInputs,
+        InitialCandidatePostMarkerFailure, acquire_initial_candidate_authority,
+        acquire_initial_candidate_authority_impl, claim_initial_candidate,
+        claim_initial_candidate_impl,
     };
 
-    static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
     const PASSWORD: &[u8] = b"initial candidate authority test password";
     const CREATED_AT_MS: i64 = 1_784_044_800_000;
 
     struct TestDirectory(PathBuf);
 
     impl TestDirectory {
-        fn new(label: &str) -> Self {
-            let nonce = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        fn new(_label: &str) -> Self {
             let path = std::env::temp_dir().join(format!(
-                "inex-initial-candidate-authority-{label}-{}-{nonce}",
-                std::process::id()
+                "{IMPORT_STAGING_PREFIX}{}",
+                uuid::Uuid::new_v4().simple()
             ));
             fs::create_dir(&path).expect("test directory creates");
             Self(path)
@@ -362,6 +779,52 @@ mod tests {
             scheme: PublicationIdentityScheme::LinuxDevInodeV1,
             publication_id: [0x5a; 16],
         }
+    }
+
+    fn acquire_fixture_authority(fixture: &Fixture) -> InitialCandidateAuthority {
+        acquire_initial_candidate_authority(
+            fixture.root.path(),
+            &fixture.target,
+            &fixture.vault,
+            VaultContentProfile::DocumentsOnly,
+            context(),
+        )
+        .expect("fixture initial authority constructs")
+    }
+
+    fn authority_baseline(
+        authority: &InitialCandidateAuthority,
+    ) -> (
+        FilesystemDirectoryIdentity,
+        FilesystemDirectoryIdentity,
+        FilesystemFileIdentity,
+    ) {
+        (
+            authority.physical.root_identity().clone(),
+            authority.physical.local_identity().clone(),
+            authority.physical.lock_identity().clone(),
+        )
+    }
+
+    fn assert_baseline_lock_busy(
+        root: &Path,
+        baseline: &(
+            FilesystemDirectoryIdentity,
+            FilesystemDirectoryIdentity,
+            FilesystemFileIdentity,
+        ),
+    ) {
+        assert!(matches!(
+            ExistingVaultMutationLock::acquire(root, &baseline.0, &baseline.1, &baseline.2),
+            Err(ExistingVaultMutationLockError::Busy)
+        ));
+    }
+
+    fn destination_name(label: &str) -> String {
+        format!(
+            "inex-initial-claim-{label}-{}",
+            uuid::Uuid::new_v4().simple()
+        )
     }
 
     fn lock_path(root: &Path) -> PathBuf {
@@ -769,6 +1232,379 @@ mod tests {
             )
             .expect("initial collector did not acquire or mutate the lock"),
         );
+    }
+
+    #[test]
+    fn initial_authority_consumes_into_exact_marker_aware_staging_claim() {
+        let fixture = fixture("claim-happy");
+        let authority = acquire_fixture_authority(&fixture);
+        let baseline = authority_baseline(&authority);
+        let expected_context = authority.context;
+        let expected_seal = authority.content_seal.into_digest();
+        let expected_root_commit = authority.root_commit.commit_oid();
+        let expected_counts = (
+            authority.worktree_files,
+            authority.encrypted_markdown,
+            authority.encrypted_assets,
+            authority.git_objects,
+        );
+        let parent = fixture
+            .root
+            .path()
+            .parent()
+            .expect("staging root has a parent");
+        let parent_identity = filesystem_directory_identity(parent).expect("parent identity");
+        let destination_name = destination_name("happy");
+        let destination = parent.join(&destination_name);
+
+        let claim = claim_initial_candidate(
+            authority,
+            InitialCandidateClaimInput {
+                common_parent_identity: &parent_identity,
+                destination_child_name: &destination_name,
+            },
+        )
+        .expect("initial authority becomes staging claim");
+
+        assert_eq!(claim.root(), fixture.root.path());
+        assert_eq!(claim.audit().context(), expected_context);
+        assert_eq!(claim.audit().content_seal(), expected_seal);
+        assert_eq!(claim.audit().root_commit_oid(), expected_root_commit);
+        assert_eq!(
+            (
+                claim.audit().worktree_files(),
+                claim.audit().encrypted_markdown(),
+                claim.audit().encrypted_assets(),
+                claim.audit().git_objects(),
+            ),
+            expected_counts
+        );
+        assert_eq!(claim.held_marker().marker().domain(), super::DOMAIN);
+        assert_eq!(
+            claim.held_marker().marker().destination_child_name(),
+            destination_name
+        );
+        assert!(
+            claim
+                .held_marker()
+                .marker()
+                .candidate_seal_matches(&expected_seal)
+        );
+        assert!(!destination.exists());
+        assert!(
+            fixture
+                .root
+                .path()
+                .join(VAULT_LOCAL_DIRECTORY)
+                .join(IMPORT_PUBLISH_MARKER_V2)
+                .is_file()
+        );
+        assert_baseline_lock_busy(fixture.root.path(), &baseline);
+        let debug = format!("{claim:?}");
+        assert!(!debug.contains(fixture.root.path().to_string_lossy().as_ref()));
+        assert!(!debug.contains(&lower_hex(&expected_seal)));
+
+        drop(claim);
+        drop(
+            ExistingVaultMutationLock::acquire(
+                fixture.root.path(),
+                &baseline.0,
+                &baseline.1,
+                &baseline.2,
+            )
+            .expect("claim drop releases lock"),
+        );
+    }
+
+    #[test]
+    fn post_marker_fresh_failure_retains_marker_and_lock_owner() {
+        let fixture = fixture("claim-post-marker-failure");
+        let authority = acquire_fixture_authority(&fixture);
+        let baseline = authority_baseline(&authority);
+        let parent_identity = filesystem_directory_identity(
+            fixture
+                .root
+                .path()
+                .parent()
+                .expect("staging root has a parent"),
+        )
+        .expect("parent identity");
+        let destination_name = destination_name("post-marker-failure");
+        let marker_path = fixture
+            .root
+            .path()
+            .join(VAULT_LOCAL_DIRECTORY)
+            .join(IMPORT_PUBLISH_MARKER_V2);
+
+        let result = claim_initial_candidate_impl(
+            authority,
+            InitialCandidateClaimInput {
+                common_parent_identity: &parent_identity,
+                destination_child_name: &destination_name,
+            },
+            |root, _| {
+                fs::write(root.join(".gitattributes"), b"post-marker tamper\n")
+                    .expect("candidate tampers");
+            },
+            |_, _, _| {},
+        );
+        let owner = match result {
+            Err(InitialCandidateClaimError::PostMarker(owner)) => owner,
+            other => panic!("expected owning post-marker error, got {other:?}"),
+        };
+        assert!(matches!(
+            owner.failure(),
+            InitialCandidatePostMarkerFailure::FreshAudit(_)
+        ));
+        assert!(marker_path.is_file());
+        assert_baseline_lock_busy(fixture.root.path(), &baseline);
+        let debug = format!("{owner:?}");
+        assert!(!debug.contains(fixture.root.path().to_string_lossy().as_ref()));
+
+        drop(owner);
+        drop(
+            ExistingVaultMutationLock::acquire(
+                fixture.root.path(),
+                &baseline.0,
+                &baseline.1,
+                &baseline.2,
+            )
+            .expect("failed owner drop releases lock"),
+        );
+    }
+
+    #[test]
+    fn post_audit_destination_appearance_is_preserved_with_live_owner() {
+        let fixture = fixture("claim-destination-appeared");
+        let authority = acquire_fixture_authority(&fixture);
+        let baseline = authority_baseline(&authority);
+        let parent = fixture
+            .root
+            .path()
+            .parent()
+            .expect("staging root has a parent");
+        let parent_identity = filesystem_directory_identity(parent).expect("parent identity");
+        let destination_name = destination_name("appeared");
+        let destination = parent.join(&destination_name);
+
+        let result = claim_initial_candidate_impl(
+            authority,
+            InitialCandidateClaimInput {
+                common_parent_identity: &parent_identity,
+                destination_child_name: &destination_name,
+            },
+            |_, _| {},
+            |_, _, _| {
+                fs::write(&destination, b"foreign-destination-canary")
+                    .expect("foreign destination appears");
+            },
+        );
+        let owner = match result {
+            Err(InitialCandidateClaimError::PostMarker(owner)) => owner,
+            other => panic!("expected owning destination error, got {other:?}"),
+        };
+        assert!(matches!(
+            owner.failure(),
+            InitialCandidatePostMarkerFailure::DestinationObservation(_)
+        ));
+        assert_eq!(
+            fs::read(&destination).expect("foreign destination reads"),
+            b"foreign-destination-canary"
+        );
+        assert_baseline_lock_busy(fixture.root.path(), &baseline);
+        assert!(
+            fixture
+                .root
+                .path()
+                .join(VAULT_LOCAL_DIRECTORY)
+                .join(IMPORT_PUBLISH_MARKER_V2)
+                .is_file()
+        );
+
+        fs::remove_file(&destination).expect("foreign destination test cleanup");
+        drop(owner);
+        drop(
+            ExistingVaultMutationLock::acquire(
+                fixture.root.path(),
+                &baseline.0,
+                &baseline.1,
+                &baseline.2,
+            )
+            .expect("failed owner drop releases lock"),
+        );
+    }
+
+    #[test]
+    fn initial_and_fresh_count_mismatch_fails_with_live_owner() {
+        let fixture = fixture("claim-count-mismatch");
+        let mut authority = acquire_fixture_authority(&fixture);
+        let baseline = authority_baseline(&authority);
+        authority.git_objects = authority
+            .git_objects
+            .checked_add(1)
+            .expect("fixture object count has headroom");
+        let parent_identity = filesystem_directory_identity(
+            fixture
+                .root
+                .path()
+                .parent()
+                .expect("staging root has a parent"),
+        )
+        .expect("parent identity");
+        let destination_name = destination_name("count-mismatch");
+        let result = claim_initial_candidate(
+            authority,
+            InitialCandidateClaimInput {
+                common_parent_identity: &parent_identity,
+                destination_child_name: &destination_name,
+            },
+        );
+        let owner = match result {
+            Err(InitialCandidateClaimError::PostMarker(owner)) => owner,
+            other => panic!("expected owning count mismatch, got {other:?}"),
+        };
+        assert!(matches!(
+            owner.failure(),
+            InitialCandidatePostMarkerFailure::GitObjectCountMismatch
+        ));
+        assert_baseline_lock_busy(fixture.root.path(), &baseline);
+        drop(owner);
+    }
+
+    #[test]
+    fn pre_marker_destination_conflicts_and_reserved_prefixes_create_nothing() {
+        let occupied = fixture("claim-preexisting-destination");
+        let authority = acquire_fixture_authority(&occupied);
+        let baseline = authority_baseline(&authority);
+        let parent = occupied
+            .root
+            .path()
+            .parent()
+            .expect("staging root has a parent");
+        let parent_identity = filesystem_directory_identity(parent).expect("parent identity");
+        let destination_name = destination_name("occupied");
+        let destination = parent.join(&destination_name);
+        fs::write(&destination, b"foreign-destination-canary")
+            .expect("foreign destination creates");
+        let result = claim_initial_candidate(
+            authority,
+            InitialCandidateClaimInput {
+                common_parent_identity: &parent_identity,
+                destination_child_name: &destination_name,
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(InitialCandidateClaimError::MarkerCreation(
+                inex_core::atomic::HeldPublicationMarkerV2Error::NamespaceConflict
+            ))
+        ));
+        assert_eq!(
+            fs::read(&destination).expect("foreign destination reads"),
+            b"foreign-destination-canary"
+        );
+        assert_no_marker(occupied.root.path());
+        drop(
+            ExistingVaultMutationLock::acquire(
+                occupied.root.path(),
+                &baseline.0,
+                &baseline.1,
+                &baseline.2,
+            )
+            .expect("pre-marker conflict releases lock"),
+        );
+        fs::remove_file(&destination).expect("foreign destination test cleanup");
+
+        let reserved = fixture("claim-reserved-destination");
+        let authority = acquire_fixture_authority(&reserved);
+        let baseline = authority_baseline(&authority);
+        let parent_identity = filesystem_directory_identity(
+            reserved
+                .root
+                .path()
+                .parent()
+                .expect("staging root has a parent"),
+        )
+        .expect("parent identity");
+        let result = claim_initial_candidate(
+            authority,
+            InitialCandidateClaimInput {
+                common_parent_identity: &parent_identity,
+                destination_child_name: ".INEX-IMPORT-STAGING-foreign",
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(InitialCandidateClaimError::PreMarker(
+                InitialCandidateClaimPreflightError::ReservedDestinationName
+            ))
+        ));
+        assert_no_marker(reserved.root.path());
+        drop(
+            ExistingVaultMutationLock::acquire(
+                reserved.root.path(),
+                &baseline.0,
+                &baseline.1,
+                &baseline.2,
+            )
+            .expect("reserved preflight releases lock"),
+        );
+    }
+
+    #[test]
+    fn staging_claim_api_is_linear_and_drops_large_manifest_before_fresh_audit() {
+        let source = include_str!("candidate_initial_authority.rs");
+        let claim = source
+            .split("pub(super) struct StagingAuditedClaim")
+            .nth(1)
+            .and_then(|tail| tail.split("impl StagingAuditedClaim").next())
+            .expect("claim source exists");
+        assert!(!claim.contains("derive(Clone"));
+        assert!(!claim.contains("derive(Copy"));
+        assert!(
+            claim.find("audit:").expect("audit field")
+                < claim.find("held_marker:").expect("marker field")
+        );
+        let claim_drop = ["impl Drop for ", "StagingAuditedClaim"].concat();
+        let failed_drop = ["impl Drop for ", "FailedHeldInitialClaim"].concat();
+        assert!(!source.contains(&claim_drop));
+        assert!(!source.contains(&failed_drop));
+        let transition = source
+            .split("fn claim_initial_candidate_impl")
+            .nth(1)
+            .and_then(|tail| tail.split("fn repository_staging_child_name").next())
+            .expect("claim transition source exists");
+        assert!(
+            transition.find("drop(physical);").expect("physical drops")
+                < transition
+                    .find("create_held_publication_marker_v2")
+                    .expect("marker creates")
+        );
+        assert!(!transition.contains("drop(held_marker)"));
+    }
+
+    #[test]
+    fn repository_staging_name_requires_exact_lowercase_32_hex_suffix() {
+        let valid_name = format!("{IMPORT_STAGING_PREFIX}0123456789abcdef0123456789abcdef");
+        let valid = Path::new("/tmp").join(&valid_name);
+        assert_eq!(
+            super::repository_staging_child_name(&valid).expect("exact staging name validates"),
+            valid_name
+        );
+
+        for invalid in [
+            format!("{IMPORT_STAGING_PREFIX}0123456789abcdef0123456789abcde"),
+            format!("{IMPORT_STAGING_PREFIX}0123456789abcdef0123456789abcdef0"),
+            format!("{IMPORT_STAGING_PREFIX}0123456789abcdef0123456789abcdeF"),
+            ".INEX-IMPORT-STAGING-0123456789abcdef0123456789abcdef".to_owned(),
+        ] {
+            assert!(matches!(
+                super::repository_staging_child_name(&Path::new("/tmp").join(invalid)),
+                Err(InitialCandidateClaimError::PreMarker(
+                    InitialCandidateClaimPreflightError::InvalidStagingName
+                ))
+            ));
+        }
     }
 
     #[test]

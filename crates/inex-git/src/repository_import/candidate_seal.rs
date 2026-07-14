@@ -26,7 +26,7 @@ pub(super) use aggregate::{CandidateContentSeal, aggregate_candidate_content_sea
 
 const MAGIC: [u8; 8] = *b"INEXCS1\0";
 const VERSION: u16 = 1;
-pub(super) const DOMAIN: &[u8; 25] = b"inex.repository-import.v1";
+pub(super) const DOMAIN: &str = "inex.repository-import.v1";
 const TERMINATOR: [u8; 5] = [0xff, 0, 0, 0, 0];
 
 const MAX_PHYSICAL_RECORDS: usize = 1_000_000;
@@ -402,7 +402,7 @@ fn encode_stream(
         sink,
         u16::try_from(DOMAIN.len()).map_err(|_| CandidateSealError::InvalidContext)?,
     );
-    sink.put(DOMAIN);
+    sink.put(DOMAIN.as_bytes());
     sink.put(&context.publication_id);
 
     encode_physical(sink, manifest.physical)?;
@@ -1134,7 +1134,7 @@ mod tests {
         let bytes = stream(fixture()).expect("canonical fixture encodes");
         assert_eq!(&bytes[..8], b"INEXCS1\0");
         assert_eq!(&bytes[8..14], &[0, 1, 0, 1, 0, 25]);
-        assert_eq!(&bytes[14..39], DOMAIN);
+        assert_eq!(&bytes[14..39], DOMAIN.as_bytes());
         assert_eq!(&bytes[39..55], &[0x77; 16]);
         assert_eq!(DIRECTORY.0.bytes, DIRECTORY_WIRE);
         assert_eq!(&bytes[67..91], &DIRECTORY_WIRE);
