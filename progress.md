@@ -1,5 +1,10 @@
 # Inex Progress Log
 
+## 2026-07-15 — Feature-2 Outer EDRY profile
+
+- 提交 `72b639d`：feature registry 与 EDRY header 现在识别 `[2]`，但只允许它和 UTF-8 Markdown logical-path profile 精确组合；新增 `encrypt_umbra_outer_document` 会先认证 `vault.json` metadata，再写入带 feature-2 的 Outer container header。
+- 该 API 尚未由 Vault 对外暴露，也尚未提供启用 feature-2 的 metadata 事务；因此普通 existing vault 不会无意生成 Umbra 文档。测试覆盖 feature-2 header 绑定，Clippy 通过。
+
 ## 2026-07-15 — Outer 容器严格解码边界
 
 - 提交 `4973257`：`UmbraDocumentV1` 现可在不解密 private slots 的情况下严格解析 Outer container，拒绝未知版本、非法 slot ID、非 canonical ciphertext 与错误算法；round-trip 回归与私密 canary/Outer 策略篡改回归均通过。
