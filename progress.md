@@ -1082,3 +1082,8 @@
 
 - 新增 `InexApplyPrivateAnnotationProfileCommand(profile_id)`，只接受 stable-ID 形状的 normal Sublime command argument；worker 从已解锁 daemon config 读取 profile，再由 state 校验 kind/tags/Outer 语义。profile 不可用或 catalog 矛盾均在 daemon mutation 前拒绝。
 - drop/placeholder profile 立即发出 authenticated apply；cover 只在本次实例操作中询问公开 cover text。cancel、无效 cover、失效 session 与 worker finally 都清零 captured projection。Linux default keymap 增加 Ctrl+Alt+1/2/3 的 `private-comment`、`relationship-comment`、`family-comment` 示例。验证：Sublime 94/94（1 项 pidfd platform skip）、compile、JSON、diff-check 通过。
+
+## 2026-07-15 — Sublime encrypted tag/profile mutation RPC
+
+- strict client 新增 `umbra.tag.create/rename/archive/reorder` 和 `umbra.profile.create/edit/remove/setDefault` 的 authenticated wrappers；stable IDs、UTF-8 限额、sort order、tag sequence canonicalization、cover prompt 语义与 exact `{ok:true}` acknowledgement 都在 host 前验证，异常协议结果终止 sidecar session。
+- 管理 UI 尚未接线，因而插件仍不会直接读取或写入 `.inex/config.umbra.inex`。验证：Sublime 95/95（1 项 pidfd platform skip）、Python compile 与 diff-check 通过。
