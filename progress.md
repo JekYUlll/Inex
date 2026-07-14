@@ -25,6 +25,12 @@
 - CustomEditor 将 normal daemon document handle 与 Umbra projection 建模为互斥状态。普通打开失败时仅在 Umbra 已解锁的同一 session 尝试 feature-2 projection；转换命令预先同步/保存普通 buffer，关闭 normal handle，执行 CAS conversion，再原子替换为只读投影。
 - feature-2 projection 暂不允许直接 Outer 编辑或 draft recovery，避免用普通 `file.write`/draft 路径错误持久化容器。锁定、dispose、投影替换都会清零 Markdown buffer 与 RenderMap generation。下一步将使用现有 verified webview selection 和多选 QuickPick 调用 `umbra.annotation.apply`。
 
+## 2026-07-15 — VS Code private annotation command MVP
+
+- 新增 `inex.togglePrivateAnnotation` 与 `inex.choosePrivateAnnotation`；它们先独立初始化/解锁 Umbra（首次明确显示不可恢复警告），确保 feature-2 metadata 已启用，再转换 active ordinary CustomEditor 为 Umbra projection。
+- `QuickPick.canSelectMany` 实现 kind/Outer 单选与 tag 多选，所有标签和 profile 数据仅从已解锁 daemon catalog 取得；Cover 文本单独提示为明确公开数据。选择完成后 CustomEditor 将完整当前 projection、RenderMap 和已验证 UTF-8 selection 交给 `umbra.annotation.apply`，并仅采用 daemon 返回的新投影。
+- package 贡献默认 `Ctrl+Alt+/` 与 `Ctrl+Alt+Shift+/`，不处理原始按键事件。Outer projection 编辑/draft recovery、toggle unwrap/edit、profile shortcut 与管理命令仍待下一切片，当前保持 fail-closed。
+
 ## 2026-07-15 — Vault feature-2 启用事务
 
 - 提交 `538168d`：`Vault::enable_umbra_private_annotations` 只接受 live Umbra session；它调用已认证 core metadata upgrader，并以 vault.json etag CAS 提交，随后重新 parse 确认 exact committed metadata 才更新内存 config。锁定 session 的调用被拒绝。
