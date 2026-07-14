@@ -96,6 +96,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
     - [x] VS Code sidecar client 已协商/验证 Umbra capability、独立状态/锁定/启用/projection/apply RPC 与严格 RenderMap 响应；异常协议形状不会交给编辑器（`b58bffd`）
     - [x] CustomEditor webview 已将完整内容和 UTF-8 byte 选区回传到受会话保护的 document；无效范围、锁定和 dispose 会拒绝/清理选区（`058fb61`）
     - [x] CustomEditor 现仅向命令暴露 active/current-session document 的已验证选区，view-state 或 dispose 不会留下旧 document 引用（`52a9e6a`）
+    - [x] VS Code 私密标注选择器状态机已冻结 kind/Outer 单选、tag 多选 canonicalization 与 Cover 公开文本约束（`8aab1d2`）
     - [ ] 接入 CustomEditor webview 选区、QuickPick、多标签及配置化命令/keybindings
   - [ ] 扩展Sublime stateful picker、profile命令和keymap示例
   - [ ] 跑通多选、wrap/unwrap/edit、跨编辑器目录、canary/残留及Outer隔离矩阵

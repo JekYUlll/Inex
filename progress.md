@@ -812,3 +812,8 @@
 
 - 提交 `52a9e6a`（`feat(vscode): expose active verified editor selection`）：CustomEditor 通过 webview view-state 维护 active document，只在 document 仍属当前 Vault session、仍被 provider 持有且有已验证选区时向命令返回 selection authority；dispose 自动清理 active 引用。
 - `pnpm --dir editors/vscode check` 通过。下一步实现 QuickPick 规格选择与将该 authority 接到 Umbra projection/apply 路径；当前 feature-2 文档尚不能用普通 open/save 路径编辑，保持 fail-closed。
+
+## 2026-07-15 — VS Code 私密标注选择器状态
+
+- 提交 `8aab1d2`（`feat(vscode): add private annotation picker state`）：纯 TypeScript picker state 明确 kind/Outer 为单选、tag ID 只接受 catalog 中值并排序、Cover 只在 cover mode 有且不能为空。该模块直接产生 sidecar 的 `PrivateAnnotationSpec`，不会把 tag label 当作稳定 ID。
+- 新增 2 项状态/cover 回归；`pnpm --dir editors/vscode check` 和 49/49 测试通过。下一步将 encrypted Umbra catalog 暴露给 daemon/extension，再用 VS Code multi-select QuickPick 驱动此状态并把已有 webview selection 应用于 feature-2 投影。
