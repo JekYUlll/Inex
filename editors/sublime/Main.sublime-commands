@@ -68,6 +68,10 @@
     "command": "inex_remove_private_annotation"
   },
   {
+    "caption": "Inex: Manage Private Tags",
+    "command": "inex_manage_private_tags"
+  },
+  {
     "caption": "Inex: Show Security Status",
     "command": "inex_show_security_status"
   }

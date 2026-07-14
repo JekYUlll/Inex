@@ -1743,6 +1743,124 @@ def _lock_umbra(window: sublime.Window) -> None:
     sublime.set_timeout_async(worker, 0)
 
 
+def _with_umbra_catalog(
+    window: sublime.Window,
+    callback: Callable[[InexRpcClient, int, int, Dict[str, Any]], None],
+) -> None:
+    """Load encrypted catalog only for a live Umbra-generation callback."""
+    session = _command_session(window)
+    if session is None:
+        return
+    client, _vault_id, generation = session
+    umbra_generation = _umbra_generation
+
+    def worker() -> None:
+        try:
+            if not client.umbra_status()["unlocked"]:
+                raise RpcLifecycleError("Unlock Umbra private mode first")
+            config = client.load_umbra_annotation_config()
+            sublime.set_timeout(lambda: present(config), 0)
+        except Exception as error:
+            sublime.set_timeout(lambda error=error: _show_error(error), 0)
+
+    def present(config: Dict[str, Any]) -> None:
+        if (
+            _runtime_snapshot()[0] is not client
+            or _runtime_snapshot()[2] != generation
+            or _umbra_generation != umbra_generation
+        ):
+            return
+        callback(client, generation, umbra_generation, config)
+
+    sublime.set_timeout_async(worker, 0)
+
+
+def _manage_private_tags(window: sublime.Window) -> None:
+    """Manage encrypted tags through daemon RPC; never write config locally."""
+    def present(client: InexRpcClient, generation: int, umbra_generation: int, config: Dict[str, Any]) -> None:
+        tags = config["tags"]
+        actions = ["Create private tag", "Rename private tag", "Archive private tag", "Reorder private tags"]
+
+        def selected(index: int) -> None:
+            if index < 0:
+                return
+            if index == 0:
+                def label_done(label: str) -> None:
+                    if not label:
+                        return
+
+                    def id_done(tag_id: str) -> None:
+                        if not tag_id:
+                            return
+                        sort_order = max([tag["sortOrder"] for tag in tags] or [0]) + 10
+                        mutate(lambda: client.create_private_tag({
+                            "id": tag_id, "label": label, "description": "", "aliases": [],
+                            "sortOrder": sort_order, "defaultSelected": False,
+                        }))
+
+                    window.show_input_panel("Private tag stable ID", "", id_done, None, None)
+
+                window.show_input_panel("Private tag label", "", label_done, None, None)
+                return
+            if not tags:
+                _show_error(ModelError("No private tags are available"))
+                return
+            choices = [tag["label"] for tag in tags]
+
+            def tag_selected(tag_index: int) -> None:
+                if tag_index < 0:
+                    return
+                tag = tags[tag_index]
+                if index == 1:
+                    window.show_input_panel(
+                        "Private tag label", tag["label"],
+                        lambda label: mutate(lambda: client.rename_private_tag(tag["id"], label)) if label else None,
+                        None, None,
+                    )
+                elif index == 2:
+                    if sublime.ok_cancel_dialog("Archive this private tag? Existing annotations remain readable.", "Archive Private Tag"):
+                        mutate(lambda: client.archive_private_tag(tag["id"]))
+                else:
+                    order_actions = ["Move first", "Move previous", "Move next", "Move last"]
+
+                    def move_selected(move: int) -> None:
+                        if move < 0:
+                            return
+                        ids = [item["id"] for item in tags]
+                        current = ids.index(tag["id"])
+                        ids.pop(current)
+                        destination = (0, max(0, current - 1), min(len(ids), current + 1), len(ids))[move]
+                        ids.insert(destination, tag["id"])
+                        mutate(lambda: client.reorder_private_tags(ids))
+
+                    window.show_quick_panel(order_actions, move_selected, placeholder="Reorder private tag")
+
+            window.show_quick_panel(choices, tag_selected, placeholder="Select private tag")
+
+        def mutate(operation: Callable[[], None]) -> None:
+            def worker() -> None:
+                try:
+                    operation()
+                    sublime.set_timeout(done, 0)
+                except Exception as error:
+                    sublime.set_timeout(lambda error=error: _show_error(error), 0)
+
+            def done() -> None:
+                if (
+                    _runtime_snapshot()[0] is client
+                    and _runtime_snapshot()[2] == generation
+                    and _umbra_generation == umbra_generation
+                ):
+                    window.status_message("Inex private tag catalog updated")
+                    _manage_private_tags(window)
+
+            sublime.set_timeout_async(worker, 0)
+
+        window.show_quick_panel(actions, selected, placeholder="Manage private tags")
+
+    _with_umbra_catalog(window, present)
+
+
 def _enter_active_umbra(window: sublime.Window) -> None:
     """Upgrade a clean active buffer, then replace it with daemon projection."""
     view = window.active_view()
@@ -2919,6 +3037,11 @@ class InexApplyPrivateAnnotationProfileCommand(sublime_plugin.WindowCommand):
             _show_error(ModelError("Private annotation profile ID is invalid"))
             return
         _apply_private_annotation_from_active_view(self.window, profile_id)
+
+
+class InexManagePrivateTagsCommand(sublime_plugin.WindowCommand):
+    def run(self) -> None:
+        _manage_private_tags(self.window)
 
 
 class InexEditPrivateAnnotationCommand(sublime_plugin.WindowCommand):
