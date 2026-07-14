@@ -99,10 +99,35 @@ class AnnotationPickerState:
             outer["coverText"] = cover_text
         return {"kind": self.kind, "tagIds": sorted(self.tag_ids), "outer": outer}
 
+    def apply_profile(self, profile: Dict[str, Any]) -> None:
+        """Apply encrypted profile metadata, never an instance cover string."""
+        if not isinstance(profile, dict) or set(profile) != {
+            "id", "label", "kind", "tagIds", "outer", "promptForCover"
+        }:
+            raise AnnotationPickerError("Umbra annotation profile is invalid")
+        kind = profile.get("kind")
+        outer = profile.get("outer")
+        tag_ids = profile.get("tagIds")
+        prompt_for_cover = profile.get("promptForCover")
+        if (
+            not isinstance(profile.get("id"), str)
+            or not profile.get("id")
+            or not isinstance(profile.get("label"), str)
+            or kind not in ("block", "comment")
+            or outer not in ("drop", "cover", "placeholder")
+            or not isinstance(tag_ids, list)
+            or not isinstance(prompt_for_cover, bool)
+            or (outer == "cover") != prompt_for_cover
+            or any(not isinstance(tag_id, str) or tag_id not in self._tag_ids for tag_id in tag_ids)
+        ):
+            raise AnnotationPickerError("Umbra annotation profile is invalid")
+        self.kind = kind
+        self.outer = outer
+        self.tag_ids = set(tag_ids)
+
     def clear(self) -> None:
         self.tag_ids.clear()
         for tag in self._tags:
             tag["label"] = ""
         self._tags = []
         self._tag_ids = set()
-
