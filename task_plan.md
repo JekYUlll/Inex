@@ -131,6 +131,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
     - [x] Sublime strict RPC client 已封装 tag create/rename/archive/reorder 与 profile create/edit/remove/set-default；参数和返回 acknowledgement 均在插件边界严格验证（本轮）；管理 UI 待接线
     - [x] Sublime `umbra.config.get` 现验证所有 tag/profile/default fields、ID 唯一性、canonical tag sequences、Outer cover 语义与跨引用；认证正确但 schema 矛盾的 catalog 不会进入 host UI（本轮）
     - [x] Sublime `Inex: Manage Private Tags` 已提供 create/rename/archive/reorder repeated panel；每次 mutation 只调用 daemon RPC 并重新读取 encrypted catalog，Umbra lock 关闭 overlay（本轮）
+    - [x] Sublime `Inex: Manage Private Annotation Profiles` 已提供 create/edit/remove/set-default repeated panel；profile picker 只保存 kind/tag/Outer/prompt metadata，不收集实例 cover 文本（本轮）
     - [x] Sublime strict RPC client 已支持 authenticated `umbra.document.open` 与 apply/edit/remove：canonical generation、范围/条目/顺序和 feature-2 response metadata 都在交给 host 前验证；客户端只回传 daemon 返回的完整 projection/ETag/RenderMap（`e93a1a9`、`f788818`、`b027052`，本轮）
     - [x] Sublime strict RPC client 已支持 `umbra.document.convert` 的 ETag CAS feature-2 升级，返回 metadata 必须精确为 flag 2（`91f7d7a`）
     - [x] Sublime `ManagedDocument` 现区分无 normal handle 的 authenticated Umbra projection，投影替换原子更新 ETag/RenderMap，close 清除 projection state（`d5036fc`）

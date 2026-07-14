@@ -1097,3 +1097,8 @@
 
 - 新增 `Inex: Manage Private Tags` repeated Quick Panel：create 依次采集 label/stable ID，rename 与 archive 选择 encrypted catalog tag，reorder 以 first/previous/next/last 生成完整 ID permutation。每个操作调用 strict daemon RPC，成功后重新 load catalog；插件不合成或写入 config ciphertext。
 - UI 只在 live Umbra generation 中呈现；Umbra lock 的既有 `hide_overlay` 关闭面板，旧 generation 回调不会继续 mutation。验证：Sublime 96/96（1 项 pidfd platform skip）、Python compile、commands JSON、diff-check 通过。
+
+## 2026-07-15 — Sublime annotation profile management UI
+
+- 新增 `Inex: Manage Private Annotation Profiles` repeated panel：create 采集 label/stable ID，edit 保留 ID 但可更新 label/kind/tags/Outer，remove 经确认，set default 可选择 profile 或明确清空。所有动作经 strict daemon profile RPC，成功后重新 load encrypted catalog。
+- profile 专用 picker 复用多标签 state，但只传 kind/tag IDs/Outer/`promptForCover` metadata；不会向用户索取、缓存或写入一次性公开 cover text。验证：Sublime 96/96（1 项 pidfd platform skip）、compile、commands JSON、diff-check 通过。

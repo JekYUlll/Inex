@@ -549,3 +549,4 @@
 - Sublime tag/profile 管理必须经 daemon mutation RPC；client 要在请求前限制 ID、文本、排序和 canonical tag sequence，并把任何 malformed acknowledgement 当作 terminal protocol violation。这样 UI 后续只拥有 transient catalog data，永远不直接操作 `.inex/config.umbra.inex`。
 - 加密 catalog 的 AEAD 认证不足以保证安全可用：客户端还必须完整验证 tag/profile/default schema 与所有 cross-reference，特别是 default/profile 的 canonical tag order 和 cover/prompt pairing。否则一个已认证但语义矛盾的 sync 冲突可能把 private labels 送进 UI 后才失败，或者生成不可持久化的 annotation spec。
 - Sublime tag management 只能以 transient repeated panel 表现 encrypted label；每次 mutation 成功后必须丢弃旧 config 并重新经 daemon `config.get` 读取，而不是在 host 端修改 cache。lock 时调用 `hide_overlay`，并以 Umbra generation 阻止旧 panel/worker 完成后继续写入。
+- Annotation profile 管理与 annotation apply 必须分开：profile picker 只能保存 kind/tag IDs/Outer/prompt metadata，不能复用需要 `coverText` 的 instance picker。编辑 profile 时 stable ID 不能变化，但 label 可改变；remove 后 daemon 在同一加密 config transaction 中处理 default reference。
