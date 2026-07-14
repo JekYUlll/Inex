@@ -4261,6 +4261,63 @@ impl HeldPublicationMarkerV2 {
     pub const fn held_root(&self) -> &SecureSourceDirectory {
         &self.root
     }
+
+    /// Duplicate the same held root descriptor into a read-only traversal
+    /// view whose namespace binding is `current_root`.
+    ///
+    /// This is the narrow bridge required after an authorized whole-root
+    /// rename: the returned [`SecureSourceDirectory`] still opens descendants
+    /// from a duplicate of this authority's held root descriptor, while its
+    /// binding checks use the already-revalidated current pathname. No raw
+    /// descriptor or caller-provided identity is accepted or exposed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a scrubbed error unless the complete held authority validates
+    /// both before and after duplicating and checking the current-bound view.
+    pub fn held_root_view_at(
+        &self,
+        current_root: &Path,
+    ) -> Result<SecureSourceDirectory, HeldPublicationMarkerV2Error> {
+        self.revalidate_at(current_root)?;
+        let view = SecureSourceDirectory {
+            file: self
+                .root
+                .file
+                .try_clone()
+                .map_err(HeldPublicationMarkerV2Error::Io)?,
+            identity: self.root.identity.clone(),
+            binding: SecureSourceDirectoryBinding::Root(current_root.to_path_buf()),
+        };
+        view.verify_no_alternate_data_streams()
+            .map_err(HeldPublicationMarkerV2Error::Io)?;
+        if view.identity() != self.root.identity() {
+            return Err(HeldPublicationMarkerV2Error::AuthorityChanged);
+        }
+        self.revalidate_at(current_root)?;
+        Ok(view)
+    }
+
+    /// Match one freshly collected physical baseline against every held
+    /// root/private-directory/lock role without exposing the held lock file.
+    ///
+    /// This predicate is intended for marker-aware collectors which receive
+    /// this complete authority value. It does not replace [`Self::revalidate_at`]:
+    /// callers must still revalidate the pathname and held handles before and
+    /// after their complete inventory.
+    #[must_use]
+    pub fn matches_physical_baseline(
+        &self,
+        root_identity: &FilesystemDirectoryIdentity,
+        local_identity: &FilesystemDirectoryIdentity,
+        lock_identity: &FilesystemFileIdentity,
+    ) -> bool {
+        self.root.identity() == root_identity
+            && self.marker_parent.identity() == local_identity
+            && self.mutation_lock.root_identity() == root_identity
+            && self.mutation_lock.local_identity() == local_identity
+            && self.mutation_lock.lock_identity() == lock_identity
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -7255,6 +7312,16 @@ mod tests {
                 super::filesystem_file_identity(&file)?
             },
         };
+        assert!(held.matches_physical_baseline(
+            &current_identities.root,
+            &current_identities.local,
+            &current_identities.lock,
+        ));
+        assert!(!held.matches_physical_baseline(
+            &current_identities.root,
+            &current_identities.local,
+            held.marker_file_identity(),
+        ));
         assert!(matches!(
             ExistingVaultMutationLock::acquire(
                 fixture.root(),
@@ -7541,6 +7608,12 @@ mod tests {
         fs::rename(fixture.root(), &destination)?;
         assert!(held.revalidate_at(fixture.root()).is_err());
         held.revalidate_at(&destination).map_err(io::Error::other)?;
+        let current_root = held
+            .held_root_view_at(&destination)
+            .map_err(io::Error::other)?;
+        assert_eq!(current_root.identity(), held.root_identity());
+        current_root.verify_no_alternate_data_streams()?;
+        drop(current_root);
         fs::rename(&destination, fixture.root())?;
         held.revalidate_at(fixture.root())
             .map_err(io::Error::other)?;

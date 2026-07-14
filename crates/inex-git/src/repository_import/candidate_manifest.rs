@@ -1,9 +1,10 @@
-//! Marker-free physical evidence for repository-candidate-seal-v1.
+//! Physical evidence for repository-candidate-seal-v1.
 //!
-//! This slice inventories one complete target root and proves the only
-//! private state is the empty mutation lock. It deliberately neither accepts
-//! nor writes a publication marker. Marker-aware collection belongs to the
-//! later publication transaction, while the mutation lock is held.
+//! The retained manifest is always the marker-free section-1/section-9
+//! projection. Initial collection rejects every publication marker. A later
+//! Linux-only collector may borrow one complete held v2-marker authority and
+//! omit only that exact descriptor-bound marker from an otherwise complete
+//! physical inventory. Neither collector writes or removes filesystem state.
 
 use std::fmt;
 use std::path::Path;
@@ -13,8 +14,9 @@ use inex_core::atomic::{
 };
 #[cfg(target_os = "linux")]
 use inex_core::atomic::{
-    SecureSourceChild, SecureSourceDirectory, VAULT_LOCAL_DIRECTORY, VAULT_MUTATION_LOCK_FILE,
-    open_secure_source_root, path_is_supported_local_filesystem,
+    HeldPublicationMarkerV2, IMPORT_PUBLISH_MARKER_V2, SecureSourceChild, SecureSourceDirectory,
+    VAULT_LOCAL_DIRECTORY, VAULT_MUTATION_LOCK_FILE, open_secure_source_root,
+    path_is_supported_local_filesystem,
 };
 #[cfg(target_os = "linux")]
 use inex_core::path::{PortableCaseFoldFingerprint, raw_portable_case_fold_fingerprint};
@@ -132,6 +134,76 @@ pub(super) struct MarkerFreePhysicalManifest {
     owned_path_high_water: usize,
 }
 
+/// Marker-free seal projection whose collection remains lifetime-bound to the
+/// exact held v2 publication authority that justified one physical omission.
+///
+/// The owned manifest cannot be extracted. Later fresh-evidence collectors may
+/// only borrow it together with the same held root descriptor authority.
+#[cfg(target_os = "linux")]
+pub(super) struct HeldMarkerPhysicalManifest<'marker> {
+    physical: MarkerFreePhysicalManifest,
+    held_root: SecureSourceDirectory,
+    held_marker: &'marker HeldPublicationMarkerV2,
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for HeldMarkerPhysicalManifest<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HeldMarkerPhysicalManifest")
+            .field("physical", &self.physical)
+            .field("held_marker", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl HeldMarkerPhysicalManifest<'_> {
+    pub(super) const fn physical(&self) -> &MarkerFreePhysicalManifest {
+        &self.physical
+    }
+
+    pub(super) const fn held_root(&self) -> &SecureSourceDirectory {
+        &self.held_root
+    }
+
+    /// Revalidate the complete current tree through this same branded
+    /// physical/marker/root authority after downstream fresh evidence work.
+    pub(super) fn require_current_exact(
+        &self,
+        current_root: &Path,
+    ) -> Result<(), RepositoryImportError> {
+        self.physical.require_current_exact_with_held_marker(
+            current_root,
+            self.held_marker,
+            &self.held_root,
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+enum PhysicalMarkerPolicy<'marker> {
+    Forbidden,
+    ExactHeld(&'marker HeldPublicationMarkerV2),
+}
+
+#[cfg(target_os = "linux")]
+impl PhysicalMarkerPolicy<'_> {
+    fn work_ceiling(self, retained_records: usize) -> Result<usize, RepositoryImportError> {
+        match self {
+            Self::Forbidden => Ok(retained_records),
+            Self::ExactHeld(_) => retained_records
+                .checked_add(1)
+                .ok_or(RepositoryImportError::ResourceLimit),
+        }
+    }
+
+    const fn requires_marker(self) -> bool {
+        matches!(self, Self::ExactHeld(_))
+    }
+}
+
 impl fmt::Debug for MarkerFreePhysicalManifest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -246,6 +318,57 @@ impl MarkerFreePhysicalManifest {
         }
         let directory =
             open_secure_source_root(&root).map_err(|_| RepositoryImportError::TargetAuditFailed)?;
+        self.require_current_exact_from_held(&directory, PhysicalMarkerPolicy::Forbidden)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn require_current_exact_with_held_marker(
+        &self,
+        root: &Path,
+        held_marker: &HeldPublicationMarkerV2,
+        held_root: &SecureSourceDirectory,
+    ) -> Result<(), RepositoryImportError> {
+        let root = canonical_normal_directory(root, RepositoryImportError::TargetAuditFailed)?;
+        if !path_is_supported_local_filesystem(&root)
+            .map_err(|_| RepositoryImportError::TargetAuditFailed)?
+        {
+            return Err(RepositoryImportError::TargetAuditFailed);
+        }
+        held_marker
+            .revalidate_at(&root)
+            .map_err(|_| RepositoryImportError::TargetAuditFailed)?;
+        if !held_marker.matches_physical_baseline(
+            &self.root_identity,
+            &self.local_identity,
+            &self.lock_identity,
+        ) || held_root.identity() != &self.root_identity
+        {
+            return Err(RepositoryImportError::TargetAuditFailed);
+        }
+        self.require_current_exact_from_held(
+            held_root,
+            PhysicalMarkerPolicy::ExactHeld(held_marker),
+        )?;
+        held_marker
+            .revalidate_at(&root)
+            .map_err(|_| RepositoryImportError::TargetAuditFailed)?;
+        if !held_marker.matches_physical_baseline(
+            &self.root_identity,
+            &self.local_identity,
+            &self.lock_identity,
+        ) || held_root.identity() != &self.root_identity
+        {
+            return Err(RepositoryImportError::TargetAuditFailed);
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn require_current_exact_from_held(
+        &self,
+        directory: &SecureSourceDirectory,
+        marker_policy: PhysicalMarkerPolicy<'_>,
+    ) -> Result<(), RepositoryImportError> {
         if directory.identity() != &self.root_identity {
             return Err(RepositoryImportError::TargetAuditFailed);
         }
@@ -262,22 +385,29 @@ impl MarkerFreePhysicalManifest {
         seen.resize(bit_words, 0_u64);
         mark_physical_record_seen(&mut seen, PhysicalRecordId(0))?;
         let mut observed_records = 1_usize;
+        let mut observed_entries = 1_usize;
         let mut observed_path_bytes = 0_usize;
+        let mut observed_marker = false;
 
         walk_current_physical_directory(
             self,
-            &directory,
+            directory,
             PhysicalRecordId(0),
             0,
+            marker_policy,
             &mut seen,
             &mut observed_records,
+            &mut observed_entries,
             &mut observed_path_bytes,
+            &mut observed_marker,
         )?;
         directory
             .verify_no_alternate_data_streams()
             .map_err(|_| RepositoryImportError::TargetAuditFailed)?;
 
         if observed_records != self.records.len()
+            || observed_entries != marker_policy.work_ceiling(self.records.len())?
+            || observed_marker != marker_policy.requires_marker()
             || observed_path_bytes != self.retained_path_bytes()
             || seen.iter().enumerate().any(|(word_index, word)| {
                 let first = word_index * u64::BITS as usize;
@@ -358,17 +488,24 @@ fn physical_record_ref(
 }
 
 #[cfg(target_os = "linux")]
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Keep one exact walk state machine.
 fn walk_current_physical_directory(
     baseline: &MarkerFreePhysicalManifest,
     directory: &SecureSourceDirectory,
     parent_id: PhysicalRecordId,
     depth: usize,
+    marker_policy: PhysicalMarkerPolicy<'_>,
     seen: &mut [u64],
     observed_records: &mut usize,
+    observed_entries: &mut usize,
     observed_path_bytes: &mut usize,
+    observed_marker: &mut bool,
 ) -> Result<(), RepositoryImportError> {
-    if depth > MAX_PHYSICAL_DEPTH || *observed_records > baseline.records.len() {
+    let work_ceiling = marker_policy.work_ceiling(baseline.records.len())?;
+    if depth > MAX_PHYSICAL_DEPTH
+        || *observed_records > baseline.records.len()
+        || *observed_entries > work_ceiling
+    {
         return Err(RepositoryImportError::ResourceLimit);
     }
     let parent = baseline
@@ -390,6 +527,17 @@ fn walk_current_physical_directory(
         let name_text = name
             .to_str()
             .ok_or(RepositoryImportError::TargetAuditFailed)?;
+        *observed_entries = observed_entries
+            .checked_add(1)
+            .filter(|count| *count <= work_ceiling)
+            .ok_or(RepositoryImportError::TargetAuditFailed)?;
+        if parent.path == VAULT_LOCAL_DIRECTORY
+            && name_text == IMPORT_PUBLISH_MARKER_V2
+            && let PhysicalMarkerPolicy::ExactHeld(held_marker) = marker_policy
+        {
+            require_exact_held_marker_child(directory, &name, held_marker, observed_marker)?;
+            continue;
+        }
         let index = baseline
             .records
             .binary_search_by(|record| {
@@ -426,9 +574,12 @@ fn walk_current_physical_directory(
                     &child,
                     id,
                     depth.saturating_add(1),
+                    marker_policy,
                     seen,
                     observed_records,
+                    observed_entries,
                     observed_path_bytes,
+                    observed_marker,
                 )?;
                 child
                     .verify_no_alternate_data_streams()
@@ -461,6 +612,38 @@ fn walk_current_physical_directory(
     }
     directory
         .verify_no_alternate_data_streams()
+        .map_err(|_| RepositoryImportError::TargetAuditFailed)
+}
+
+#[cfg(target_os = "linux")]
+fn require_exact_held_marker_child(
+    marker_parent: &SecureSourceDirectory,
+    name: &std::ffi::OsStr,
+    held_marker: &HeldPublicationMarkerV2,
+    observed_marker: &mut bool,
+) -> Result<(), RepositoryImportError> {
+    if std::mem::replace(observed_marker, true) {
+        return Err(RepositoryImportError::TargetAuditFailed);
+    }
+    let file = match marker_parent
+        .open_child(name)
+        .map_err(|_| RepositoryImportError::TargetAuditFailed)?
+    {
+        SecureSourceChild::File(file) => file,
+        SecureSourceChild::Directory(_) | SecureSourceChild::Other => {
+            return Err(RepositoryImportError::TargetAuditFailed);
+        }
+    };
+    file.verify_no_alternate_data_streams()
+        .map_err(|_| RepositoryImportError::TargetAuditFailed)?;
+    if &file
+        .identity()
+        .map_err(|_| RepositoryImportError::TargetAuditFailed)?
+        != held_marker.marker_file_identity()
+    {
+        return Err(RepositoryImportError::TargetAuditFailed);
+    }
+    file.verify_no_alternate_data_streams()
         .map_err(|_| RepositoryImportError::TargetAuditFailed)
 }
 
@@ -501,6 +684,35 @@ pub(super) fn collect_marker_free_physical_manifest(
     collect_marker_free_physical_manifest_with_limits(root, V1_LIMITS)
 }
 
+/// Collect a marker-free section-1/section-9 projection while one exact v2
+/// publication marker is physically present and retained by `held_marker`.
+///
+/// The complete authority is borrowed for the returned wrapper's lifetime;
+/// callers cannot authorize omission with a path, boolean, or bare identity.
+/// Only Linux exposes this API because its proof depends on held
+/// descriptor-relative traversal.
+#[cfg(target_os = "linux")]
+pub(super) fn collect_held_marker_physical_manifest<'marker>(
+    root: &Path,
+    held_marker: &'marker HeldPublicationMarkerV2,
+) -> Result<HeldMarkerPhysicalManifest<'marker>, RepositoryImportError> {
+    collect_held_marker_physical_manifest_with_limits(root, held_marker, V1_LIMITS)
+}
+
+#[cfg(target_os = "linux")]
+fn collect_held_marker_physical_manifest_with_limits<'marker>(
+    root: &Path,
+    held_marker: &'marker HeldPublicationMarkerV2,
+    limits: PhysicalManifestLimits,
+) -> Result<HeldMarkerPhysicalManifest<'marker>, RepositoryImportError> {
+    collect_held_marker_physical_manifest_with_fingerprint(
+        root,
+        held_marker,
+        limits,
+        raw_portable_case_fold_fingerprint,
+    )
+}
+
 fn collect_marker_free_physical_manifest_with_limits(
     root: &Path,
     limits: PhysicalManifestLimits,
@@ -524,8 +736,11 @@ fn collect_marker_free_physical_manifest_with_limits(
 struct DirectPhysicalCollector<'a, F> {
     limits: PhysicalManifestLimits,
     fingerprint: &'a F,
+    marker_policy: PhysicalMarkerPolicy<'a>,
     records: Vec<AuditedPhysicalRecord>,
     fingerprints: Vec<PortableCaseFoldFingerprint>,
+    observed_entries: usize,
+    observed_marker: bool,
     retained_path_bytes: usize,
     owned_path_high_water: usize,
     git_fingerprint: PortableCaseFoldFingerprint,
@@ -560,11 +775,28 @@ where
             let name_text = name
                 .to_str()
                 .ok_or(RepositoryImportError::TargetAuditFailed)?;
-            self.reserve_record_and_fingerprint()?;
+            self.reserve_observed_entry()?;
             let child_depth = depth
                 .checked_add(1)
                 .filter(|child_depth| *child_depth <= self.limits.depth)
                 .ok_or(RepositoryImportError::ResourceLimit)?;
+            let parent_is_local = self
+                .records
+                .get(parent_id.0)
+                .is_some_and(|parent| parent.path == VAULT_LOCAL_DIRECTORY);
+            if parent_is_local
+                && name_text == IMPORT_PUBLISH_MARKER_V2
+                && let PhysicalMarkerPolicy::ExactHeld(held_marker) = self.marker_policy
+            {
+                require_exact_held_marker_child(
+                    directory,
+                    &name,
+                    held_marker,
+                    &mut self.observed_marker,
+                )?;
+                continue;
+            }
+            self.reserve_record_and_fingerprint()?;
             let path = self.build_canonical_child(parent_id, name_text, child_depth)?;
             self.require_portable_path_uniqueness(&path)?;
 
@@ -674,6 +906,16 @@ where
             .map_err(|_| RepositoryImportError::ResourceLimit)
     }
 
+    fn reserve_observed_entry(&mut self) -> Result<(), RepositoryImportError> {
+        let work_ceiling = self.marker_policy.work_ceiling(self.limits.records)?;
+        self.observed_entries = self
+            .observed_entries
+            .checked_add(1)
+            .filter(|entries| *entries <= work_ceiling)
+            .ok_or(RepositoryImportError::ResourceLimit)?;
+        Ok(())
+    }
+
     fn require_portable_path_uniqueness(
         &mut self,
         path: &str,
@@ -770,6 +1012,78 @@ where
     }
     let directory =
         open_secure_source_root(&root).map_err(|_| RepositoryImportError::TargetAuditFailed)?;
+    let manifest = collect_physical_manifest_from_held_root(
+        &directory,
+        limits,
+        &fingerprint,
+        PhysicalMarkerPolicy::Forbidden,
+    )?;
+    manifest.require_current_exact(&root)?;
+    Ok(manifest)
+}
+
+#[cfg(target_os = "linux")]
+fn collect_held_marker_physical_manifest_with_fingerprint<'marker, F>(
+    root: &Path,
+    held_marker: &'marker HeldPublicationMarkerV2,
+    limits: PhysicalManifestLimits,
+    fingerprint: F,
+) -> Result<HeldMarkerPhysicalManifest<'marker>, RepositoryImportError>
+where
+    F: Fn(&str) -> PortableCaseFoldFingerprint,
+{
+    let root = canonical_normal_directory(root, RepositoryImportError::TargetAuditFailed)?;
+    if !path_is_supported_local_filesystem(&root)
+        .map_err(|_| RepositoryImportError::TargetAuditFailed)?
+    {
+        return Err(RepositoryImportError::TargetAuditFailed);
+    }
+    held_marker
+        .revalidate_at(&root)
+        .map_err(|_| RepositoryImportError::TargetAuditFailed)?;
+    let held_root = held_marker
+        .held_root_view_at(&root)
+        .map_err(|_| RepositoryImportError::TargetAuditFailed)?;
+    if held_root.identity() != held_marker.root_identity() {
+        return Err(RepositoryImportError::TargetAuditFailed);
+    }
+    let physical = collect_physical_manifest_from_held_root(
+        &held_root,
+        limits,
+        &fingerprint,
+        PhysicalMarkerPolicy::ExactHeld(held_marker),
+    )?;
+    held_marker
+        .revalidate_at(&root)
+        .map_err(|_| RepositoryImportError::TargetAuditFailed)?;
+    if !held_marker.matches_physical_baseline(
+        physical.root_identity(),
+        physical.local_identity(),
+        physical.lock_identity(),
+    ) {
+        return Err(RepositoryImportError::TargetAuditFailed);
+    }
+    physical.require_current_exact_with_held_marker(&root, held_marker, &held_root)?;
+    Ok(HeldMarkerPhysicalManifest {
+        physical,
+        held_root,
+        held_marker,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn collect_physical_manifest_from_held_root<'authority, F>(
+    directory: &SecureSourceDirectory,
+    limits: PhysicalManifestLimits,
+    fingerprint: &'authority F,
+    marker_policy: PhysicalMarkerPolicy<'authority>,
+) -> Result<MarkerFreePhysicalManifest, RepositoryImportError>
+where
+    F: Fn(&str) -> PortableCaseFoldFingerprint,
+{
+    if limits.records == 0 {
+        return Err(RepositoryImportError::ResourceLimit);
+    }
     directory
         .verify_no_alternate_data_streams()
         .map_err(|_| RepositoryImportError::TargetAuditFailed)?;
@@ -784,20 +1098,28 @@ where
     });
     let mut collector = DirectPhysicalCollector {
         limits,
-        fingerprint: &fingerprint,
+        fingerprint,
+        marker_policy,
         records,
         fingerprints: Vec::new(),
+        observed_entries: 1,
+        observed_marker: false,
         retained_path_bytes: 0,
         owned_path_high_water: 0,
-        git_fingerprint: fingerprint(".git"),
-        local_fingerprint: fingerprint(VAULT_LOCAL_DIRECTORY),
+        git_fingerprint: (fingerprint)(".git"),
+        local_fingerprint: (fingerprint)(VAULT_LOCAL_DIRECTORY),
         local_identity: None,
         lock_identity: None,
     };
-    collector.collect_directory(&directory, PhysicalRecordId(0), 0)?;
+    collector.collect_directory(directory, PhysicalRecordId(0), 0)?;
     directory
         .verify_no_alternate_data_streams()
         .map_err(|_| RepositoryImportError::TargetAuditFailed)?;
+    if collector.observed_entries != marker_policy.work_ceiling(collector.records.len())?
+        || collector.observed_marker != marker_policy.requires_marker()
+    {
+        return Err(RepositoryImportError::TargetAuditFailed);
+    }
 
     collector.fingerprints.sort_unstable();
     if collector
@@ -838,7 +1160,6 @@ where
         records: collector.records,
         owned_path_high_water: collector.owned_path_high_water,
     };
-    manifest.require_current_exact(&root)?;
     Ok(manifest)
 }
 
@@ -904,8 +1225,9 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use inex_core::atomic::{
+        ExistingVaultMutationLock, HeldPublicationMarkerV2, HeldPublicationMarkerV2CreateInput,
         IMPORT_PUBLISH_MARKER_V1, IMPORT_PUBLISH_MARKER_V2, PublicationIdentityScheme,
-        filesystem_directory_identity, filesystem_file_identity,
+        filesystem_directory_identity, filesystem_file_identity, open_secure_source_root,
     };
     use sha2::{Digest, Sha256};
 
@@ -944,6 +1266,46 @@ mod tests {
         fs::create_dir(&local).expect("private directory creates");
         fs::write(local.join(VAULT_MUTATION_LOCK_FILE), []).expect("empty lock creates");
         target
+    }
+
+    fn create_held_marker(
+        target: &TestDirectory,
+        destination_child_name: &str,
+    ) -> HeldPublicationMarkerV2 {
+        let physical = collect_marker_free_physical_manifest(target.path())
+            .expect("marker-free fixture collects");
+        let held_root = open_secure_source_root(target.path()).expect("fixture root holds");
+        let mutation_lock = ExistingVaultMutationLock::acquire(
+            target.path(),
+            physical.root_identity(),
+            physical.local_identity(),
+            physical.lock_identity(),
+        )
+        .expect("existing mutation lock holds");
+        let common_parent_identity = filesystem_directory_identity(
+            target.path().parent().expect("fixture root has a parent"),
+        )
+        .expect("common-parent identity captures");
+        let staging_child_name = target
+            .path()
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .expect("fixture root has a portable child name");
+        mutation_lock
+            .create_held_publication_marker_v2(
+                target.path(),
+                held_root,
+                HeldPublicationMarkerV2CreateInput {
+                    scheme: PublicationIdentityScheme::LinuxDevInodeV1,
+                    publication_id: [0x6d; 16],
+                    common_parent_identity: &common_parent_identity,
+                    staging_child_name,
+                    destination_child_name,
+                    domain: "inex.repository-import.v1",
+                    candidate_seal: &[0xa7; 32],
+                },
+            )
+            .expect("held v2 publication marker creates")
     }
 
     fn assert_resource_limit(result: &Result<MarkerFreePhysicalManifest, RepositoryImportError>) {
@@ -988,6 +1350,269 @@ mod tests {
                 .max()
                 .expect("lock file exists"),
         }
+    }
+
+    #[test]
+    fn held_marker_collection_omits_only_exact_private_v2_and_borrows_same_authority() {
+        let target = minimal_target("held-marker-positive");
+        fs::create_dir(target.path().join("nested")).expect("nested directory creates");
+        let same_basename = target.path().join("nested").join(IMPORT_PUBLISH_MARKER_V2);
+        fs::write(&same_basename, b"ordinary non-private content")
+            .expect("ordinary same-basename file writes");
+        let baseline = collect_marker_free_physical_manifest(target.path())
+            .expect("pre-marker baseline collects");
+        let held = create_held_marker(&target, "held-marker-positive-destination");
+
+        let marker_present = collect_held_marker_physical_manifest(target.path(), &held)
+            .expect("held-marker physical projection collects");
+        assert_eq!(marker_present.physical(), &baseline);
+        assert_eq!(
+            marker_present.held_root().identity(),
+            held.held_root().identity()
+        );
+        marker_present
+            .held_root()
+            .verify_no_alternate_data_streams()
+            .expect("current-bound held root remains traversable");
+        marker_present
+            .require_current_exact(target.path())
+            .expect("returned held-marker manifest revalidates unchanged content");
+        assert!(
+            marker_present
+                .physical()
+                .find(&format!(
+                    "{VAULT_LOCAL_DIRECTORY}/{IMPORT_PUBLISH_MARKER_V2}"
+                ))
+                .is_none()
+        );
+        assert!(
+            marker_present
+                .physical()
+                .find(&format!("nested/{IMPORT_PUBLISH_MARKER_V2}"))
+                .is_some()
+        );
+        assert_eq!(
+            marker_present.physical().retained_path_bytes(),
+            baseline.retained_path_bytes()
+        );
+        let debug = format!("{marker_present:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains(IMPORT_PUBLISH_MARKER_V2));
+    }
+
+    #[test]
+    fn held_marker_is_one_extra_work_item_not_a_retained_record_or_path() {
+        let target = minimal_target("held-marker-limits");
+        let baseline = collect_marker_free_physical_manifest(target.path())
+            .expect("pre-marker baseline collects");
+        let exact = exact_observed_limits(&baseline);
+        let held = create_held_marker(&target, "held-marker-limits-destination");
+
+        let marker_present =
+            collect_held_marker_physical_manifest_with_limits(target.path(), &held, exact)
+                .expect("exact retained baseline plus one marker work item collects");
+        assert_eq!(marker_present.physical(), &baseline);
+        drop(marker_present);
+
+        fs::create_dir(target.path().join("extra-directory"))
+            .expect("post-baseline directory creates");
+        let records_only = PhysicalManifestLimits {
+            records: exact.records,
+            path_bytes: V1_LIMITS.path_bytes,
+            depth: V1_LIMITS.depth,
+            path_budget: V1_LIMITS.path_budget,
+            file_bytes: V1_LIMITS.file_bytes,
+        };
+        assert!(matches!(
+            collect_held_marker_physical_manifest_with_limits(target.path(), &held, records_only,),
+            Err(RepositoryImportError::ResourceLimit)
+        ));
+    }
+
+    #[test]
+    fn returned_held_marker_manifest_rejects_later_content_and_marker_drift() {
+        let content = minimal_target("held-marker-returned-content-drift");
+        fs::write(content.path().join("payload.bin"), b"payload").expect("baseline payload writes");
+        let content_held = create_held_marker(&content, "held-marker-returned-content-destination");
+        let content_manifest = collect_held_marker_physical_manifest(content.path(), &content_held)
+            .expect("returned content fixture collects");
+        fs::write(content.path().join("payload.bin"), b"changed")
+            .expect("same-length payload drift writes");
+        assert!(matches!(
+            content_manifest.require_current_exact(content.path()),
+            Err(RepositoryImportError::TargetAuditFailed)
+        ));
+
+        let marker = minimal_target("held-marker-returned-marker-drift");
+        let marker_held = create_held_marker(&marker, "held-marker-returned-marker-destination");
+        let marker_manifest = collect_held_marker_physical_manifest(marker.path(), &marker_held)
+            .expect("returned marker fixture collects");
+        fs::write(
+            marker
+                .path()
+                .join(VAULT_LOCAL_DIRECTORY)
+                .join(IMPORT_PUBLISH_MARKER_V2),
+            b"later noncanonical marker body",
+        )
+        .expect("later marker body drift writes");
+        assert!(matches!(
+            marker_manifest.require_current_exact(marker.path()),
+            Err(RepositoryImportError::TargetAuditFailed)
+        ));
+    }
+
+    #[test]
+    fn held_marker_collection_rejects_body_and_same_name_identity_drift() {
+        let body = minimal_target("held-marker-body-drift");
+        let body_held = create_held_marker(&body, "held-marker-body-destination");
+        fs::write(
+            body.path()
+                .join(VAULT_LOCAL_DIRECTORY)
+                .join(IMPORT_PUBLISH_MARKER_V2),
+            b"not the canonical held body",
+        )
+        .expect("held marker body tampers");
+        assert!(matches!(
+            collect_held_marker_physical_manifest(body.path(), &body_held),
+            Err(RepositoryImportError::TargetAuditFailed)
+        ));
+
+        let rebound = minimal_target("held-marker-identity-drift");
+        let rebound_held = create_held_marker(&rebound, "held-marker-identity-destination");
+        let marker_path = rebound
+            .path()
+            .join(VAULT_LOCAL_DIRECTORY)
+            .join(IMPORT_PUBLISH_MARKER_V2);
+        let canonical = rebound_held.marker().to_bytes();
+        fs::rename(&marker_path, rebound.path().join("retired-marker-canary"))
+            .expect("held marker retires without unlink");
+        fs::write(&marker_path, canonical).expect("same-name replacement writes");
+        assert!(matches!(
+            collect_held_marker_physical_manifest(rebound.path(), &rebound_held),
+            Err(RepositoryImportError::TargetAuditFailed)
+        ));
+    }
+
+    #[test]
+    fn held_marker_collection_rejects_hardlink_and_extra_reserved_claims() {
+        let linked = minimal_target("held-marker-hardlink");
+        let linked_held = create_held_marker(&linked, "held-marker-hardlink-destination");
+        fs::hard_link(
+            linked
+                .path()
+                .join(VAULT_LOCAL_DIRECTORY)
+                .join(IMPORT_PUBLISH_MARKER_V2),
+            linked.path().join("marker-hardlink-canary"),
+        )
+        .expect("marker hardlink creates");
+        assert!(matches!(
+            collect_held_marker_physical_manifest(linked.path(), &linked_held),
+            Err(RepositoryImportError::TargetAuditFailed)
+        ));
+
+        let reserved = minimal_target("held-marker-extra-reserved");
+        let reserved_held = create_held_marker(&reserved, "held-marker-reserved-destination");
+        let extra = reserved
+            .path()
+            .join(VAULT_LOCAL_DIRECTORY)
+            .join("import-publish-marker-foreign");
+        fs::write(&extra, b"foreign reserved claim").expect("extra reserved claim writes");
+        assert!(matches!(
+            collect_held_marker_physical_manifest(reserved.path(), &reserved_held),
+            Err(RepositoryImportError::TargetAuditFailed)
+        ));
+        assert_eq!(
+            fs::read(extra).expect("foreign claim remains"),
+            b"foreign reserved claim"
+        );
+
+        let legacy = minimal_target("held-marker-legacy-claim");
+        let legacy_held = create_held_marker(&legacy, "held-marker-legacy-destination");
+        let v1 = legacy
+            .path()
+            .join(VAULT_LOCAL_DIRECTORY)
+            .join(IMPORT_PUBLISH_MARKER_V1);
+        fs::write(&v1, [0x71; 16]).expect("legacy claim writes");
+        assert!(matches!(
+            collect_held_marker_physical_manifest(legacy.path(), &legacy_held),
+            Err(RepositoryImportError::TargetAuditFailed)
+        ));
+        assert_eq!(fs::read(v1).expect("legacy claim remains"), [0x71; 16]);
+    }
+
+    #[test]
+    fn held_marker_collection_follows_the_authorized_whole_root_rename() {
+        let target = minimal_target("held-marker-root-rename");
+        fs::write(target.path().join("payload.bin"), b"payload").expect("payload writes");
+        let baseline = collect_marker_free_physical_manifest(target.path())
+            .expect("pre-marker baseline collects");
+        let destination_name = format!(
+            "inex-candidate-manifest-published-{}-{}",
+            std::process::id(),
+            NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+        );
+        let destination = target
+            .path()
+            .parent()
+            .expect("fixture root has parent")
+            .join(&destination_name);
+        let held = create_held_marker(&target, &destination_name);
+
+        fs::rename(target.path(), &destination).expect("whole root renames to destination");
+        held.revalidate_at(&destination)
+            .expect("held authority accepts its destination child name");
+        let marker_present = collect_held_marker_physical_manifest(&destination, &held)
+            .expect("renamed held root collects");
+        assert_eq!(marker_present.physical(), &baseline);
+        marker_present
+            .held_root()
+            .verify_no_alternate_data_streams()
+            .expect("destination-bound held root traverses");
+        marker_present
+            .require_current_exact(&destination)
+            .expect("returned manifest revalidates at the authorized destination");
+        drop(marker_present);
+        fs::rename(&destination, target.path()).expect("whole root restores for cleanup");
+        held.revalidate_at(target.path())
+            .expect("held authority remains valid after restoration");
+    }
+
+    #[test]
+    fn held_marker_collection_rejects_unrelated_and_replaced_root_paths() {
+        let target = minimal_target("held-marker-wrong-root");
+        let held = create_held_marker(&target, "held-marker-wrong-root-destination");
+        let unrelated = minimal_target("held-marker-unrelated-root");
+        assert!(matches!(
+            collect_held_marker_physical_manifest(unrelated.path(), &held),
+            Err(RepositoryImportError::TargetAuditFailed)
+        ));
+
+        let retired = target
+            .path()
+            .parent()
+            .expect("fixture root has parent")
+            .join(format!(
+                "inex-candidate-manifest-retired-{}-{}",
+                std::process::id(),
+                NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+            ));
+        fs::rename(target.path(), &retired).expect("held root retires without removal");
+        fs::create_dir(target.path()).expect("replacement root creates");
+        fs::write(target.path().join("replacement-canary"), b"preserve me")
+            .expect("replacement canary writes");
+        let rejected = matches!(
+            collect_held_marker_physical_manifest(target.path(), &held),
+            Err(RepositoryImportError::TargetAuditFailed)
+        );
+        assert_eq!(
+            fs::read(target.path().join("replacement-canary")).expect("replacement canary remains"),
+            b"preserve me"
+        );
+        fs::remove_dir_all(target.path()).expect("test replacement removes for restoration");
+        fs::rename(&retired, target.path()).expect("held root restores for cleanup");
+        assert!(rejected);
+        held.revalidate_at(target.path())
+            .expect("restored held root remains authoritative");
     }
 
     #[test]
@@ -1189,6 +1814,30 @@ mod tests {
             !preceding_derive(source, "pub(super) struct MarkerFreePhysicalManifest")
                 .contains("Clone")
         );
+        assert!(
+            !preceding_derive(source, "pub(super) struct HeldMarkerPhysicalManifest")
+                .contains("Clone")
+        );
+        assert!(!source.contains(&["fn", " into_physical"].concat()));
+    }
+
+    #[test]
+    fn held_marker_collector_signature_requires_the_complete_linux_authority() {
+        let source = include_str!("candidate_manifest.rs");
+        let declaration = source
+            .find("pub(super) fn collect_held_marker_physical_manifest<'marker>")
+            .expect("typed marker-aware collector declaration exists");
+        let preceding = &source[declaration.saturating_sub(96)..declaration];
+        assert!(preceding.contains("#[cfg(target_os = \"linux\")]"));
+        let signature_end = source[declaration..]
+            .find(" {\n")
+            .map(|offset| declaration + offset)
+            .expect("collector signature ends");
+        let signature = &source[declaration..signature_end];
+        assert!(signature.contains("held_marker: &'marker HeldPublicationMarkerV2"));
+        assert!(!signature.contains("bool"));
+        assert!(!signature.contains("FilesystemFileIdentity"));
+        assert!(!signature.contains("Option<"));
     }
 
     #[test]
