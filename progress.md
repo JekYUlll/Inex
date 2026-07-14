@@ -1046,3 +1046,8 @@
 
 - 提交 `d5036fc`（`feat(sublime): model authenticated Umbra projections`）：`ManagedDocument` 显式支持无 ordinary RPC handle 的 Umbra projection；普通 document 仍必须有 handle，Umbra document 反而拒绝 normal handle，避免 close/lock 路径误发 `document.close`。
 - `replace_umbra_projection` 在 daemon mutation 成功后一次性替换 plaintext、ETag 和 RenderMap，更新 model 保存版本并清零旧 projection；close 丢弃 RenderMap。验证：model 19/19、compile、diff-check 通过。
+
+## 2026-07-15 — Sublime normal-to-Umbra model transition
+
+- 提交 `bdf365b`（`feat(sublime): transition clean documents into Umbra`）：仅 clean、open、normal managed document 可 transition 到 Umbra；方法先从 model 取出 normal handle，再以 authenticated projection 安装 Umbra identity，调用方随后才可关闭旧 normal handle。
+- dirty、locked、closed 或已 Umbra document 一律拒绝并 wipe incoming projection，避免用户未保存的普通修改被 conversion 覆盖。验证：model 20/20、diff-check 通过；下一步是 UI worker 的 convert→open→transition→close-handle sequencing。

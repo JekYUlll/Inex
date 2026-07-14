@@ -538,3 +538,4 @@
 - Sublime standard Quick Panel 没有可保存的 multi-select handle；stateful picker 必须在每次选择后重开，并在 lock 时同时 clear in-memory state 和 `hide_overlay`。仅 clear state 而让旧 overlay 保留会使锁后仍可见私密标签。
 - 进入 Umbra container 不是客户端 buffer 标记：普通 document 必须先用 current ciphertext ETag 调用 `umbra.document.convert`，然后放弃 normal document identity并重新读取 canonical Umbra projection。转换 response 的 feature flag 不是可选提示，必须精确为 2。
 - Umbra projection 不能伪装为 `document.open` handle：普通 close RPC 只对 daemon-issued normal handles 有效。Sublime model 必须以空 handle + authenticated RenderMap 表达 Umbra document，并在 mutation 成功时整体替换 projection identity。
+- normal→Umbra transition 的安全顺序是 daemon CAS convert、daemon authenticated projection open、main-thread identity recheck、model transition、再关闭旧 normal handle。任何 dirty/locked/stale model 都要在 transition 前拒绝，且传入 projection 必须 wipe。
