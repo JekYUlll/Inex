@@ -511,3 +511,4 @@
 - daemon 不能把 Umbra 复用成普通 `document.open`：后者会调用普通 EDRY 读取路径并按设计拒绝 feature-2。独立 `umbra.document.open` 仅在同一 Outer capability session 已持有 `K_umbra` 时渲染 projection，锁定后统一映射为认证失败；RPC capability `umbraV1` 让客户端在发送密码或私密投影请求前先协商支持。
 - `umbra.annotation.apply` 必须接收完整、由同一 `umbra.document.open` 返回的 RenderMap，而不是仅接受 client 的 range：handler 逐项限定 map/selection/spec 的结构与资源上限后，核心仍以传入投影 hash、RenderMap 等值和 ciphertext ETag 重新认证。响应只在成功提交后附带新 ETag、投影和 RenderMap，客户端不得自行推演 slot ID 或 marker。
 - RenderMap 不仅要记录私密 fenced block 范围，还必须记录普通 projection 段到 Outer Markdown 的一对一坐标；否则多选 wrap 无法在已有私密块周围安全地回写 Outer 容器。跨段或跨私密块的普通选区统一按 mixed/partial 拒绝。
+- Neovim 已被纳入正式交付目标，但优先级固定最后。它必须以 Lua 客户端复用 `inexd` 的已验证 Umbra RPC，绝不能绕过 `K_umbra` 会话或直接解析 feature-2 容器；因此先完成 daemon/VS Code 共享协议与隔离回归，再进入其骨架实现。

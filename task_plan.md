@@ -2,7 +2,7 @@
 
 ## Goal
 
-按照 `.agent/init_plan.md` 的架构与安全边界，优先交付“现有 Markdown Git 仓库 → 全新 Inex 密文仓库”的可安装迁移闭环：从干净且固定的 source HEAD 只读导入当前 tracked snapshot，完整加密 Markdown 与图片/附件，在同一隐藏 sibling staging root 内建立并审计全新密文 Git 根提交，再以一次 verified no-replace 整根发布暴露目标；使相对图片可在 VS Code 受控内存界面中读取，且原明文 Git 历史保持在源仓库、绝不进入目标 object database。随后交付 Umbra 私密标注系统：私密slot、标签、profile和元数据均经K_umbra加密，Outer投影、索引、设置与日志不泄漏它们。交付优先级固定为 CLI/daemon、VS Code、Sublime experimental、最后 Neovim；所有客户端复用同一 RPC 与安全边界。持续维护可安装编辑器体验、验证与发布准备，使磁盘仓库始终只保存密文而不产生临时明文 Markdown/附件。
+按照 `.agent/init_plan.md` 的架构与安全边界，优先交付“现有 Markdown Git 仓库 → 全新 Inex 密文仓库”的可安装迁移闭环：从干净且固定的 source HEAD 只读导入当前 tracked snapshot，完整加密 Markdown 与图片/附件，在同一隐藏 sibling staging root 内建立并审计全新密文 Git 根提交，再以一次 verified no-replace 整根发布暴露目标；使相对图片可在 VS Code 受控内存界面中读取，且原明文 Git 历史保持在源仓库、绝不进入目标 object database。随后交付 Umbra 私密标注系统：私密slot、标签、profile和元数据均经K_umbra加密，Outer投影、索引、设置与日志不泄漏它们。交付优先级固定为 CLI/daemon、VS Code、Sublime experimental、最后 Neovim；Neovim 必须作为正式的 Lua 插件 MVP 交付，但只能复用已验证的 `inexd` JSON-RPC 与同一 Outer/Umbra 隔离边界。持续维护可安装编辑器体验、验证与发布准备，使磁盘仓库始终只保存密文而不产生临时明文 Markdown/附件。
 
 ## Current Phase
 
@@ -64,13 +64,13 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
 - [x] 添加 61 项 Python 测试与独立 data-dir Build 4200 canary/CRUD/宿主崩溃边界矩阵；记录 Safe Mode 不加载第三方包的限制
 - **Status:** complete（experimental；宿主崩溃后需重启 Sublime 的平台边界不宣称已消除）
 
-### Phase 5.5: Neovim 轻量客户端（最后优先级）
+### Phase 5.5: Neovim Lua 插件 MVP（最后优先级）
 
 - [ ] 在 CLI/daemon、VS Code Umbra MVP 与核心隔离验证完成后，建立 Lua 插件骨架与安装说明
 - [ ] 复用 `inexd` JSON-RPC：vault 解锁/锁定、树浏览、受控 Markdown buffer、保存与搜索
 - [ ] 实现 Umbra 最小命令：解锁、私密标注、标签/profile 选择与锁定清理；不得绕过 Outer/Umbra 隔离
 - [ ] 使用 headless Neovim 回归验证，并对 swap、shada、undo、LSP 等宿主明文残留执行显式门控
-- **Status:** pending（不阻塞当前 CLI/daemon 与 VS Code Umbra MVP）
+- **Status:** pending（正式 goal；不阻塞当前 CLI/daemon 与 VS Code Umbra MVP，且不得创建第二套协议/密码学实现）
 
 ### Phase 6: Git 合并、迁移与恢复工具
 

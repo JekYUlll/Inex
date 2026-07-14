@@ -1,5 +1,11 @@
 # Inex Progress Log
 
+## 2026-07-15 — Goal update: Neovim last-priority MVP
+
+- 用户将 Neovim Lua 插件纳入正式目标；优先级仍为 CLI/daemon、VS Code、Sublime experimental、Neovim。
+- 更新活动计划：Nvim 仅可复用 `inexd` JSON-RPC 与现有 Outer/Umbra 会话隔离，禁止新建独立协议或密码学路径。
+- 当前进行中：补全 daemon `umbra.config.get`，使 VS Code 与后续 Nvim 能在仅 Umbra 已解锁时读取加密的 tags、profiles 与 defaults。
+
 ## 2026-07-15 — Vault feature-2 启用事务
 
 - 提交 `538168d`：`Vault::enable_umbra_private_annotations` 只接受 live Umbra session；它调用已认证 core metadata upgrader，并以 vault.json etag CAS 提交，随后重新 parse 确认 exact committed metadata 才更新内存 config。锁定 session 的调用被拒绝。
