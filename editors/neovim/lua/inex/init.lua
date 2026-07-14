@@ -485,6 +485,25 @@ function M.create_document(logical_path)
   end)
 end
 
+function M.create_directory(logical_path)
+  if not session then
+    vim.notify("Unlock an Inex Outer vault before creating a directory", vim.log.levels.ERROR)
+    return
+  end
+  if not valid_tree_path(logical_path) then
+    vim.notify("Inex logical directory path is invalid", vim.log.levels.ERROR)
+    return
+  end
+  local active_session = session
+  rpc.request("file.mkdir", { session = active_session, logicalPath = logical_path }, function(result, error)
+    if error or session ~= active_session or not has_exact_keys(result, { ok = true, count = 1 }) or result.ok ~= true then
+      vim.notify(error or "Inex directory creation failed", vim.log.levels.ERROR)
+      return
+    end
+    vim.notify("Inex directory created", vim.log.levels.INFO)
+  end)
+end
+
 function M.is_unlocked()
   return session ~= nil
 end

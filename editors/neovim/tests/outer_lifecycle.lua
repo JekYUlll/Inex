@@ -56,6 +56,15 @@ assert(vim.bo[search_buffer].swapfile == false and vim.bo[search_buffer].undofil
 assert(vim.api.nvim_buf_get_lines(search_buffer, 0, -1, false)[1]:find("秘密 Markdown", 1, true), "Inex search must show the authenticated result")
 vim.api.nvim_set_current_win(document_window)
 
+inex.create_directory("notes")
+inex.browse()
+assert(vim.wait(5000, function()
+  return inex.is_tree_buffer(vim.api.nvim_get_current_buf())
+end, 10), "Inex updated tree browse timed out")
+tree_buffer = vim.api.nvim_get_current_buf()
+assert(table.concat(vim.api.nvim_buf_get_lines(tree_buffer, 0, -1, false), "\n"):find("[D] notes", 1, true), "Inex tree must show the created directory")
+vim.api.nvim_set_current_win(document_window)
+
 inex.lock()
 assert(not inex.is_unlocked(), "Inex lock must clear the active session before RPC completion")
 assert(vim.wait(5000, function()

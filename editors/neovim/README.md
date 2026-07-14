@@ -28,6 +28,8 @@ Commands currently available:
   in a wipe-on-lock nofile buffer; press Enter on a result to open its document.
 - `:InexNew path/to/note.md` creates an empty ordinary Markdown document through
   daemon `file.write` and opens it with the same buffer restrictions.
+- `:InexMkdir path/to/directory` creates one authenticated Inex directory through
+  daemon `file.mkdir`; create parent directories explicitly before using `InexNew`.
 - `:InexSave` (or normal `:write`) persists the active ordinary document through
   an ETag-conditional `file.write`; the `inex://` buffer is `acwrite`, not a
   local plaintext file.
@@ -35,7 +37,7 @@ Commands currently available:
   the Outer session.
 - `:InexStop` terminates the local RPC process and drops pending callbacks.
 
-`InexOpen` and `InexNew` take an Inex logical Markdown path (for example,
+`InexOpen`, `InexNew`, and `InexMkdir` take Inex logical paths (for example,
 `entry.md`), not a local plaintext filesystem path. `InexNew` currently expects
 an existing parent directory; directory browsing/creation is a later MVP
 command. These commands intentionally do not offer ordinary filesystem
