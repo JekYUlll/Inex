@@ -6,6 +6,12 @@
 - 更新活动计划：Nvim 仅可复用 `inexd` JSON-RPC 与现有 Outer/Umbra 会话隔离，禁止新建独立协议或密码学路径。
 - 当前进行中：补全 daemon `umbra.config.get`，使 VS Code 与后续 Nvim 能在仅 Umbra 已解锁时读取加密的 tags、profiles 与 defaults。
 
+## 2026-07-15 — Encrypted annotation catalog RPC and VS Code contract
+
+- 提交 `f697a47`：daemon 新增 `umbra.config.get`，只在有效 Umbra session 读取 encrypted tag catalog、profiles 与 defaults；锁定后返回统一认证失败。完整 daemon 回归 71/71、严格 Clippy、fmt 和 diff-check 通过。
+- VS Code sidecar 接入 `loadUmbraAnnotationConfig` 与 exact-shape parser：限制 tag/profile/aliases 数量和字符串大小，验证 stable ID、重复项、canonical tag list、tag/profile 引用及 default profile 引用，拒绝异常 daemon 返回值进入 UI。
+- `pnpm --dir editors/vscode check` 和测试 50/50 通过。下一步仍是 feature-2 现有文档的受控转换/投影生命周期；完成它后才将 QuickPick 与 active verified webview selection 接到真实 apply RPC。
+
 ## 2026-07-15 — Vault feature-2 启用事务
 
 - 提交 `538168d`：`Vault::enable_umbra_private_annotations` 只接受 live Umbra session；它调用已认证 core metadata upgrader，并以 vault.json etag CAS 提交，随后重新 parse 确认 exact committed metadata 才更新内存 config。锁定 session 的调用被拒绝。
