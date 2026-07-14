@@ -177,6 +177,30 @@ impl UmbraDocumentV1 {
         }
         serde_json::to_vec(self).map_err(|_| UmbraDocumentError::InvalidOuterDocument)
     }
+
+    /// Parse and validate one complete Outer container without decrypting slots.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported metadata, invalid public slot IDs, or
+    /// non-canonical ciphertext encodings.
+    pub fn from_json(bytes: &[u8]) -> Result<Self, UmbraDocumentError> {
+        let value: Self =
+            serde_json::from_slice(bytes).map_err(|_| UmbraDocumentError::InvalidOuterDocument)?;
+        if value.format != DOCUMENT_FORMAT
+            || value.version != 1
+            || value.slots.keys().any(|id| !valid_slot_id(id))
+        {
+            return Err(UmbraDocumentError::InvalidOuterDocument);
+        }
+        for entry in value.slots.values() {
+            if entry.umbra_cipher.alg != "xchacha20-poly1305" {
+                return Err(UmbraDocumentError::InvalidOuterDocument);
+            }
+            let _ = decode_canonical(&entry.umbra_cipher.ciphertext)?;
+        }
+        Ok(value)
+    }
 }
 
 fn encrypt_slot(
@@ -344,6 +368,11 @@ mod tests {
                 .decrypt_private_slot(vault, "note.md", key_id, &key, "p_01")
                 .expect("decrypt"),
             payload
+        );
+        let encoded = document.to_json().expect("outer encode");
+        assert_eq!(
+            UmbraDocumentV1::from_json(&encoded).expect("outer decode"),
+            document
         );
         document.slots.get_mut("p_01").expect("slot").outer.mode = OuterMode::Placeholder;
         assert!(matches!(
