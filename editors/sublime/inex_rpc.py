@@ -602,9 +602,14 @@ class InexRpcClient:
             for slot in render_map["privateSlots"]:
                 if not isinstance(slot, dict) or set(slot) != {"slotId", "startByte", "endByte"} or not isinstance(slot.get("slotId"), str):
                     raise RpcProtocolError("RPC Umbra private slot is invalid")
+                if any(isinstance(slot[key], bool) or not isinstance(slot[key], int) for key in ("startByte", "endByte")) or slot["startByte"] >= slot["endByte"] or slot["endByte"] > len(content):
+                    raise RpcProtocolError("RPC Umbra private slot range is invalid")
             for segment in render_map["outerSegments"]:
                 if not isinstance(segment, dict) or set(segment) != {"projectionStartByte", "projectionEndByte", "outerStartByte", "outerEndByte"}:
                     raise RpcProtocolError("RPC Umbra outer segment is invalid")
+                values = [segment[key] for key in ("projectionStartByte", "projectionEndByte", "outerStartByte", "outerEndByte")]
+                if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in values) or values[0] >= values[1] or values[1] > len(content) or values[2] > values[3]:
+                    raise RpcProtocolError("RPC Umbra outer segment range is invalid")
             return content, etag, render_map
         except RpcProtocolError as error:
             wipe(content)
