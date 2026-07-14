@@ -910,3 +910,8 @@
 - 提交 `57487c4`（`feat(vscode): edit private annotations in place`）：新增 `inex.editPrivateAnnotation`、sidecar `umbra.annotation.edit` client 与 canonical private-block parser。命令只以当前 active Umbra projection 的 RenderMap 确定单一 slot；零长度 cursor 规范为 block 开头的安全 ASCII marker byte，非空 selection 必须完整位于 block 内且不能是 complete block。
 - Picker 会预选当前 kind、catalog 中可解析的 tag IDs（含当前引用的 archived tag）和 Outer mode；Cover 仍重新要求公开文字。客户端不推导或传入 slot ID，daemon 保留 ID/private Markdown 并重新认证所有提交输入。
 - 验证：`git diff --check`、`pnpm --dir editors/vscode check`、tests 55/55、build 通过。PRD 已同步。
+
+## 2026-07-15 — VS Code chooser 快捷键别名
+
+- 提交 `175d865`（`feat(vscode): add private annotation chooser alias`）：通过 package keybinding contribution 新增 `Ctrl+Alt+H` → `inex.choosePrivateAnnotation`，与 Ctrl+Alt+/、Ctrl+Alt+Shift+/ 一样可由用户普通 keybindings 覆盖；没有加入任何 raw key handling。
+- `Ctrl+Alt+O` 尚未贡献：它需要一个独立的 Quick Redact/保存/退出 Umbra 事务，不能错误复用“锁定整个 Vault”。验证：JSON parse、VS Code check、55/55 测试通过。
