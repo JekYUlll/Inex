@@ -21,6 +21,18 @@ vim.api.nvim_create_user_command("InexLock", function()
   inex.lock()
 end, { desc = "Lock Inex Outer vault and wipe managed buffers" })
 
+vim.api.nvim_create_user_command("InexUmbraStatus", function()
+  inex.umbra_status()
+end, { desc = "Show Inex Umbra lock status" })
+
+vim.api.nvim_create_user_command("InexUnlockUmbra", function()
+  inex.unlock_umbra()
+end, { desc = "Initialize or unlock the independent Inex Umbra keyslot" })
+
+vim.api.nvim_create_user_command("InexLockUmbra", function()
+  inex.lock_umbra()
+end, { desc = "Lock Inex Umbra while keeping the Outer vault unlocked" })
+
 vim.api.nvim_create_user_command("InexOpen", function(arguments)
   inex.open_document(arguments.args)
 end, { nargs = 1, desc = "Open an Inex Markdown document" })

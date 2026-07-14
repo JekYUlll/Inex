@@ -12,6 +12,12 @@ inex.unlock(password)
 password = ""
 
 assert(vim.wait(5000, inex.is_unlocked, 10), "Inex Outer vault unlock timed out")
+inex.unlock_umbra(vim.env.INEX_TEST_UMBRA_PASSWORD, true)
+assert(vim.wait(5000, inex.is_umbra_unlocked, 10), "Inex Umbra initialization/unlock timed out")
+assert(inex.is_unlocked(), "Umbra unlock must retain Outer session")
+inex.lock_umbra()
+assert(not inex.is_umbra_unlocked(), "Umbra lock must clear local Umbra state before RPC completion")
+assert(inex.is_unlocked(), "Umbra lock must retain Outer session")
 inex.create_document("first.md")
 
 assert(vim.wait(5000, function()
@@ -74,6 +80,7 @@ assert(not vim.api.nvim_buf_is_valid(tree_buffer), "Inex lock must wipe the tree
 assert(not vim.api.nvim_buf_is_valid(search_buffer), "Inex lock must wipe the search buffer")
 inex.unlock(vim.env.INEX_TEST_PASSWORD)
 assert(vim.wait(5000, inex.is_unlocked, 10), "Inex Outer vault re-unlock timed out")
+assert(not inex.is_umbra_unlocked(), "Outer lock must clear local Umbra state")
 inex.open_document("first.md")
 assert(vim.wait(5000, function()
   return inex.is_managed_buffer(vim.api.nvim_get_current_buf())

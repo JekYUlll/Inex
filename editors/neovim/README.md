@@ -35,6 +35,9 @@ Commands currently available:
   local plaintext file.
 - `:InexLock` closes daemon document handles, wipes managed buffers, then locks
   the Outer session.
+- `:InexUmbraStatus`, `:InexUnlockUmbra`, and `:InexLockUmbra` manage the
+  independent Umbra keyslot. First initialization displays the unrecoverable
+  password warning; Umbra lock leaves the Outer session available.
 - `:InexStop` terminates the local RPC process and drops pending callbacks.
 
 `InexOpen`, `InexNew`, and `InexMkdir` take Inex logical paths (for example,
@@ -43,8 +46,9 @@ an existing parent directory; directory browsing/creation is a later MVP
 command. These commands intentionally do not offer ordinary filesystem
 completion.
 
-The current MVP intentionally rejects feature-2/Umbra documents. Umbra and
-search follow only through the same authenticated session
+The current MVP intentionally rejects feature-2/Umbra documents. These commands
+only manage the independent key lifecycle; Umbra documents and annotation UI
+follow only through the same authenticated session
 and RenderMap boundaries already used by the CLI and VS Code clients. Neovim's
 cmdline, undo, shada, LSP, plugins, terminal, and OS memory remain separate
 residue boundaries; do not enable other plugins on an Inex buffer until the

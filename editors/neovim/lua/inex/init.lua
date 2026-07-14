@@ -3,6 +3,7 @@ local rpc = require("inex.rpc")
 local M = {}
 local configuration = { sidecar_path = "", vault_path = "" }
 local session = nil
+local umbra_unlocked = false
 local documents = {}
 local tree_buffers = {}
 local search_buffers = {}
@@ -115,6 +116,13 @@ local function has_exact_keys(value, expected)
   return count == expected.count
 end
 
+local function valid_umbra_status(value)
+  return has_exact_keys(value, { initialized = true, unlocked = true, count = 2 })
+    and type(value.initialized) == "boolean"
+    and type(value.unlocked) == "boolean"
+    and (value.initialized or not value.unlocked)
+end
+
 local function tree_entry_label(kind, logical_path)
   if kind == "directory" then
     return "[D] " .. logical_path
@@ -181,6 +189,7 @@ function M.stop()
   wipe_search_buffers()
   wipe_tree_buffers()
   wipe_documents()
+  umbra_unlocked = false
   session = nil
   rpc.stop()
 end
@@ -218,6 +227,7 @@ function M.lock()
   wipe_search_buffers()
   wipe_tree_buffers()
   wipe_documents()
+  umbra_unlocked = false
   local active_session = session
   session = nil
   if active_session and rpc.started() then
@@ -225,6 +235,75 @@ function M.lock()
       vim.notify(error or "Inex Outer vault locked", error and vim.log.levels.ERROR or vim.log.levels.INFO)
     end)
   end
+end
+
+function M.umbra_status()
+  if not session then
+    vim.notify("Unlock an Inex Outer vault before checking Umbra", vim.log.levels.ERROR)
+    return
+  end
+  local active_session = session
+  rpc.request("umbra.status", { session = active_session }, function(result, error)
+    if error or session ~= active_session or not valid_umbra_status(result) then
+      vim.notify(error or "Inex Umbra status is invalid", vim.log.levels.ERROR)
+      return
+    end
+    umbra_unlocked = result.unlocked
+    vim.notify(result.unlocked and "Inex Umbra is unlocked" or (result.initialized and "Inex Umbra is locked" or "Inex Umbra is not initialized"), vim.log.levels.INFO)
+  end)
+end
+
+function M.unlock_umbra(password, initialization_confirmed)
+  if not session then
+    vim.notify("Unlock an Inex Outer vault before unlocking Umbra", vim.log.levels.ERROR)
+    return
+  end
+  local active_session = session
+  rpc.request("umbra.status", { session = active_session }, function(status, status_error)
+    if status_error or session ~= active_session or not valid_umbra_status(status) then
+      vim.notify(status_error or "Inex Umbra status is invalid", vim.log.levels.ERROR)
+      return
+    end
+    if status.unlocked then
+      umbra_unlocked = true
+      vim.notify("Inex Umbra is already unlocked", vim.log.levels.INFO)
+      return
+    end
+    local initializing = not status.initialized
+    if initializing and not initialization_confirmed and vim.fn.confirm("Umbra 密码无法恢复。遗忘该密码将永久失去所有 Umbra 私密内容。", "&Continue\n&Cancel", 2) ~= 1 then
+      return
+    end
+    password = password or vim.fn.inputsecret(initializing and "Create Inex Umbra password: " or "Inex Umbra password: ")
+    if password == "" then
+      return
+    end
+    local method = initializing and "umbra.initialize" or "umbra.unlock"
+    rpc.request(method, { session = active_session, password = password }, function(result, error)
+      password = ""
+      if error or session ~= active_session or not valid_umbra_status(result) or not result.initialized or not result.unlocked then
+        vim.notify(error or "Inex Umbra unlock failed", vim.log.levels.ERROR)
+        return
+      end
+      umbra_unlocked = true
+      vim.notify("Inex Umbra unlocked", vim.log.levels.INFO)
+    end)
+  end)
+end
+
+function M.lock_umbra()
+  if not session then
+    umbra_unlocked = false
+    return
+  end
+  local active_session = session
+  umbra_unlocked = false
+  rpc.request("umbra.lock", { session = active_session }, function(result, error)
+    if error or session ~= active_session or not has_exact_keys(result, { ok = true, unlocked = true, count = 2 }) or result.ok ~= true or result.unlocked ~= false then
+      vim.notify(error or "Inex Umbra lock failed", vim.log.levels.ERROR)
+      return
+    end
+    vim.notify("Inex Umbra locked", vim.log.levels.INFO)
+  end)
 end
 
 function M.search(query)
@@ -506,6 +585,10 @@ end
 
 function M.is_unlocked()
   return session ~= nil
+end
+
+function M.is_umbra_unlocked()
+  return umbra_unlocked
 end
 
 function M.is_managed_buffer(buffer)
