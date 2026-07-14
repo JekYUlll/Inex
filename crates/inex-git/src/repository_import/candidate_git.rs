@@ -25,6 +25,7 @@ use super::candidate_seal::{
     GitControlRecordKind, GitControlRole, HeadRefsRecord, ObjectKind, ObjectRecord,
     RootCommitRecord,
 };
+use super::candidate_worktree::{FreshTrackedManifest, FreshTreeManifest};
 
 const MAX_OBJECT_RECORDS: usize = 1_000_000;
 const MAX_GIT_CONTROL_RECORDS: usize = 1_000_000;
@@ -229,7 +230,13 @@ impl fmt::Debug for CandidateGitProjection<'_> {
 }
 
 impl<'physical> FreshGitManifest<'physical> {
-    pub(super) fn project(
+    /// Prove exact physical-manifest identity using pointer identity, not an
+    /// equal-looking record layout.
+    pub(super) fn is_bound_to(&self, physical: &MarkerFreePhysicalManifest) -> bool {
+        std::ptr::eq(self.physical, physical)
+    }
+
+    fn project(
         &self,
         scheme: PublicationIdentityScheme,
     ) -> Result<CandidateGitProjection<'physical>, CandidateSealError> {
@@ -255,6 +262,37 @@ impl<'physical> FreshGitManifest<'physical> {
             objects,
             git_control,
         })
+    }
+
+    /// Project sections 3/6/7/8 only after re-deriving the complete object
+    /// union from the opaque tracked/tree views used by the aggregate.
+    pub(super) fn project_for_seal<'content>(
+        &self,
+        scheme: PublicationIdentityScheme,
+        tracked: &FreshTrackedManifest<'content>,
+        trees: &FreshTreeManifest<'content>,
+    ) -> Result<CandidateGitProjection<'physical>, CandidateSealError> {
+        if !tracked.is_bound_to(self.physical) || !trees.is_bound_to(self.physical) {
+            return Err(CandidateSealError::InvalidRecord);
+        }
+        let expected =
+            canonical_object_union_from_views(self.physical, tracked, trees, self.root_commit)?;
+        if expected.len() != self.objects.len()
+            || expected
+                .iter()
+                .zip(&self.objects)
+                .any(|(expected, observed)| *expected != observed.record)
+        {
+            return Err(CandidateSealError::InvalidRecord);
+        }
+        self.project(scheme)
+    }
+
+    #[cfg(test)]
+    pub(super) fn forge_object_union_for_test(&mut self) {
+        if let Some(object) = self.objects.first_mut() {
+            object.record.raw_sha256[0] ^= 0xff;
+        }
     }
 }
 
@@ -297,20 +335,29 @@ pub(super) fn parse_canonical_root_commit(
     })
 }
 
-/// Construct exact sections 7/8 evidence from already-verified raw objects.
+/// Construct exact sections 7/8 evidence from opaque tracked/tree views.
 ///
-/// `blob_objects` and `tree_objects` must contain the complete semantic object
-/// references from sections 2 and 5. Exact duplicate records collapse; an OID
-/// collision with different kind, size, or digest fails closed. The physical
-/// manifest must contain exactly one matching loose file for every unique
-/// object and no other `.git` entry outside the frozen control graph.
+/// The complete semantic object union is derived internally from sections 2
+/// and 5 plus the parser-only root commit. There is no production entry point
+/// accepting arbitrary `ObjectRecord` arrays. Exact duplicate records collapse;
+/// an OID collision with different kind, size, or digest fails closed. The
+/// physical manifest must contain exactly one matching loose file for every
+/// unique object and no other `.git` entry outside the frozen control graph.
 pub(super) fn collect_fresh_git_evidence<'physical>(
     physical: &'physical MarkerFreePhysicalManifest,
-    blob_objects: &[ObjectRecord],
-    tree_objects: &[ObjectRecord],
+    tracked: &FreshTrackedManifest<'physical>,
+    trees: &FreshTreeManifest<'physical>,
     root_commit: FreshRootCommitEvidence,
 ) -> Result<FreshGitManifest<'physical>, CandidateSealError> {
-    let expected = canonical_object_union(blob_objects, tree_objects, root_commit)?;
+    let expected = canonical_object_union_from_views(physical, tracked, trees, root_commit)?;
+    collect_fresh_git_evidence_from_union(physical, &expected, root_commit)
+}
+
+fn collect_fresh_git_evidence_from_union<'physical>(
+    physical: &'physical MarkerFreePhysicalManifest,
+    expected: &[ObjectRecord],
+    root_commit: FreshRootCommitEvidence,
+) -> Result<FreshGitManifest<'physical>, CandidateSealError> {
     let mut objects = Vec::new();
     objects
         .try_reserve_exact(expected.len())
@@ -318,7 +365,7 @@ pub(super) fn collect_fresh_git_evidence<'physical>(
     let mut git_control = Vec::new();
     scan_exact_git_control(
         physical,
-        expected.as_slice(),
+        expected,
         root_commit.commit_oid,
         |record, role, object| {
             git_control
@@ -344,7 +391,7 @@ pub(super) fn collect_fresh_git_evidence<'physical>(
     if objects.len() != expected.len()
         || objects
             .iter()
-            .zip(&expected)
+            .zip(expected)
             .any(|(observed, expected)| observed.record != *expected)
     {
         return Err(CandidateSealError::InvalidRecord);
@@ -357,6 +404,34 @@ pub(super) fn collect_fresh_git_evidence<'physical>(
     };
     validate_fresh_git_manifest(&evidence)?;
     Ok(evidence)
+}
+
+fn canonical_object_union_from_views(
+    physical: &MarkerFreePhysicalManifest,
+    tracked: &FreshTrackedManifest<'_>,
+    trees: &FreshTreeManifest<'_>,
+    root_commit: FreshRootCommitEvidence,
+) -> Result<Vec<ObjectRecord>, CandidateSealError> {
+    if !tracked.is_bound_to(physical) || !trees.is_bound_to(physical) {
+        return Err(CandidateSealError::InvalidRecord);
+    }
+    let mut blobs = Vec::new();
+    tracked.visit_blob_objects(|record| {
+        blobs
+            .try_reserve(1)
+            .map_err(|_| CandidateSealError::ResourceLimit)?;
+        blobs.push(record);
+        Ok(())
+    })?;
+    let mut tree_objects = Vec::new();
+    trees.visit_tree_objects(|record| {
+        tree_objects
+            .try_reserve(1)
+            .map_err(|_| CandidateSealError::ResourceLimit)?;
+        tree_objects.push(record);
+        Ok(())
+    })?;
+    canonical_object_union(&blobs, &tree_objects, root_commit)
 }
 
 /// Revalidate pure manifest-ID evidence without reading the filesystem.
@@ -552,6 +627,17 @@ fn canonical_object_union(
         }
     }
     Ok(unique)
+}
+
+#[cfg(test)]
+fn collect_fresh_git_evidence_from_records_for_test<'physical>(
+    physical: &'physical MarkerFreePhysicalManifest,
+    blob_objects: &[ObjectRecord],
+    tree_objects: &[ObjectRecord],
+    root_commit: FreshRootCommitEvidence,
+) -> Result<FreshGitManifest<'physical>, CandidateSealError> {
+    let expected = canonical_object_union(blob_objects, tree_objects, root_commit)?;
+    collect_fresh_git_evidence_from_union(physical, &expected, root_commit)
 }
 
 trait SortedObjectSet {
@@ -1268,8 +1354,13 @@ mod tests {
         let target = exact_fixture(&[blob, tree, commit_record], commit);
         let physical = collect_marker_free_physical_manifest(target.path())
             .expect("physical manifest collects");
-        let evidence = collect_fresh_git_evidence(&physical, &[blob, blob], &[tree], commit)
-            .expect("exact Git evidence collects");
+        let evidence = collect_fresh_git_evidence_from_records_for_test(
+            &physical,
+            &[blob, blob],
+            &[tree],
+            commit,
+        )
+        .expect("exact Git evidence collects");
         assert_eq!(evidence.objects.len(), 3);
         assert!(
             evidence
@@ -1311,8 +1402,9 @@ mod tests {
         let second = collect_marker_free_physical_manifest(second_target.path())
             .expect("second physical manifest collects");
 
-        let bound = collect_fresh_git_evidence(&first, &[blob], &[tree], commit)
-            .expect("Git evidence binds first manifest");
+        let bound =
+            collect_fresh_git_evidence_from_records_for_test(&first, &[blob], &[tree], commit)
+                .expect("Git evidence binds first manifest");
         // There is intentionally no physical-manifest argument here: a caller
         // cannot ask this evidence to project against `second`.
         let projection = bound
@@ -1386,7 +1478,7 @@ mod tests {
         let physical = collect_marker_free_physical_manifest(target.path())
             .expect("physical manifest collects");
         assert!(matches!(
-            collect_fresh_git_evidence(&physical, &[blob], &[tree], commit),
+            collect_fresh_git_evidence_from_records_for_test(&physical, &[blob], &[tree], commit,),
             Err(CandidateSealError::InvalidRecord)
         ));
     }
@@ -1403,7 +1495,7 @@ mod tests {
         let physical = collect_marker_free_physical_manifest(target.path())
             .expect("physical manifest collects");
         assert!(matches!(
-            collect_fresh_git_evidence(&physical, &[blob], &[tree], commit),
+            collect_fresh_git_evidence_from_records_for_test(&physical, &[blob], &[tree], commit,),
             Err(CandidateSealError::InvalidRecord)
         ));
 
@@ -1415,7 +1507,7 @@ mod tests {
         let physical = collect_marker_free_physical_manifest(target.path())
             .expect("physical manifest collects");
         assert!(matches!(
-            collect_fresh_git_evidence(&physical, &[blob], &[tree], commit),
+            collect_fresh_git_evidence_from_records_for_test(&physical, &[blob], &[tree], commit,),
             Err(CandidateSealError::InvalidRecord)
         ));
     }
@@ -1437,7 +1529,12 @@ mod tests {
             let physical = collect_marker_free_physical_manifest(target.path())
                 .expect("physical manifest collects");
             assert!(matches!(
-                collect_fresh_git_evidence(&physical, &[blob], &[tree], commit),
+                collect_fresh_git_evidence_from_records_for_test(
+                    &physical,
+                    &[blob],
+                    &[tree],
+                    commit,
+                ),
                 Err(CandidateSealError::InvalidRecord)
             ));
         }
@@ -1455,7 +1552,7 @@ mod tests {
         let physical = collect_marker_free_physical_manifest(target.path())
             .expect("physical manifest collects");
         assert!(matches!(
-            collect_fresh_git_evidence(&physical, &[blob], &[tree], commit),
+            collect_fresh_git_evidence_from_records_for_test(&physical, &[blob], &[tree], commit,),
             Err(CandidateSealError::InvalidRecord)
         ));
 
@@ -1467,7 +1564,7 @@ mod tests {
         let physical = collect_marker_free_physical_manifest(target.path())
             .expect("physical manifest collects");
         assert!(matches!(
-            collect_fresh_git_evidence(&physical, &[blob], &[tree], commit),
+            collect_fresh_git_evidence_from_records_for_test(&physical, &[blob], &[tree], commit,),
             Err(CandidateSealError::InvalidRecord)
         ));
     }

@@ -41,8 +41,8 @@ use super::candidate_manifest::{
     MarkerFreePhysicalManifest, PhysicalRecordId, PhysicalRecordKindRef,
 };
 use super::candidate_seal::{
-    CandidateFileIdentity, CandidateSealError, IndexRecord, TreeRecord, WorktreeClass,
-    WorktreeRecord,
+    CandidateFileIdentity, CandidateSealError, IndexRecord, ObjectKind, ObjectRecord, TreeRecord,
+    WorktreeClass, WorktreeRecord,
 };
 use super::{TARGET_ATTRIBUTES, TARGET_IGNORE};
 
@@ -183,6 +183,12 @@ impl fmt::Debug for FreshTrackedManifest<'_> {
 }
 
 impl<'a> FreshTrackedManifest<'a> {
+    /// Prove that this opaque evidence borrows the exact manifest selected by
+    /// the aggregate, rather than a different manifest with the same paths.
+    pub(super) fn is_bound_to(&self, physical: &MarkerFreePhysicalManifest) -> bool {
+        std::ptr::eq(self.physical, physical)
+    }
+
     /// Project the bound evidence without allowing record IDs or OIDs to be
     /// substituted against a different physical manifest.
     pub(super) fn project(
@@ -205,6 +211,32 @@ impl<'a> FreshTrackedManifest<'a> {
         }
         Ok((worktree, index))
     }
+
+    /// Visit the complete blob-object view derived from the bound tracked
+    /// evidence. Callers cannot substitute an independently assembled object
+    /// array because the view is reconstructed from record IDs in `self`.
+    pub(super) fn visit_blob_objects(
+        &self,
+        mut visit: impl FnMut(ObjectRecord) -> Result<(), CandidateSealError>,
+    ) -> Result<(), CandidateSealError> {
+        validate_fresh_tracked_evidence(self.physical, &self.records)?;
+        for evidence in &self.records {
+            let physical = self
+                .physical
+                .record(evidence.physical)
+                .ok_or(CandidateSealError::InvalidRecord)?;
+            let PhysicalRecordKindRef::File { size, sha256, .. } = physical.kind else {
+                return Err(CandidateSealError::InvalidRecord);
+            };
+            visit(ObjectRecord {
+                oid: evidence.blob_oid,
+                kind: ObjectKind::Blob,
+                raw_size: size,
+                raw_sha256: *sha256,
+            })?;
+        }
+        Ok(())
+    }
 }
 
 /// Opaque section-5 evidence tied to the same physical manifest.
@@ -223,6 +255,12 @@ impl fmt::Debug for FreshTreeManifest<'_> {
 }
 
 impl<'a> FreshTreeManifest<'a> {
+    /// Prove exact physical-manifest identity using pointer identity, not
+    /// path/record equality.
+    pub(super) fn is_bound_to(&self, physical: &MarkerFreePhysicalManifest) -> bool {
+        std::ptr::eq(self.physical, physical)
+    }
+
     /// Project root-first canonical section-5 records from the bound manifest.
     pub(super) fn project(&self) -> Result<Vec<TreeRecord<'a>>, CandidateSealError> {
         let mut trees = Vec::new();
@@ -233,6 +271,24 @@ impl<'a> FreshTreeManifest<'a> {
             trees.push(record.project(self.physical)?);
         }
         Ok(trees)
+    }
+
+    /// Visit the complete tree-object view reconstructed from this opaque
+    /// manifest. No raw `ObjectRecord` input is accepted.
+    pub(super) fn visit_tree_objects(
+        &self,
+        mut visit: impl FnMut(ObjectRecord) -> Result<(), CandidateSealError>,
+    ) -> Result<(), CandidateSealError> {
+        for evidence in &self.records {
+            let projected = evidence.project(self.physical)?;
+            visit(ObjectRecord {
+                oid: projected.tree_oid,
+                kind: ObjectKind::Tree,
+                raw_size: projected.raw_size,
+                raw_sha256: projected.raw_sha256,
+            })?;
+        }
+        Ok(())
     }
 }
 

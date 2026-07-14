@@ -16,6 +16,14 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use unicode_normalization::is_nfc;
 
+mod aggregate;
+
+#[allow(
+    unused_imports,
+    reason = "the publication transaction consumes the pure-content aggregate in the next slice"
+)]
+pub(super) use aggregate::{CandidateContentSeal, aggregate_candidate_content_seal_v1};
+
 const MAGIC: [u8; 8] = *b"INEXCS1\0";
 const VERSION: u16 = 1;
 const DOMAIN: &[u8; 25] = b"inex.repository-import.v1";
@@ -337,26 +345,26 @@ pub(super) struct PrivateBaselineRecord {
     pub(super) identity: CandidateFileIdentity,
 }
 
-/// Borrowed, already-audited role records for all nine v1 sections.
+/// Private, ephemeral role records for all nine v1 sections.
 ///
-/// This container does not prove exact inventory or complete semantic
-/// consistency across sections. The next collector slice must establish those
-/// properties before constructing it; encoder checks are only defense in depth.
-#[derive(Clone, Copy, Debug)]
-pub(super) struct CandidateSealManifest<'a> {
-    pub(super) physical: &'a [PhysicalRecord<'a>],
-    pub(super) worktree: &'a [WorktreeRecord<'a>],
-    pub(super) head_refs: HeadRefsRecord,
-    pub(super) index: &'a [IndexRecord<'a>],
-    pub(super) trees: &'a [TreeRecord<'a>],
-    pub(super) root_commit: RootCommitRecord,
-    pub(super) objects: &'a [ObjectRecord],
-    pub(super) git_control: &'a [GitControlRecord<'a>],
-    pub(super) private_baseline: PrivateBaselineRecord,
+/// Only the child aggregate can construct this container. It never implements
+/// `Debug`, because its borrowed paths and fixed evidence must not be emitted
+/// by diagnostics. Encoder checks remain defense in depth.
+#[derive(Clone, Copy)]
+struct CandidateSealManifest<'a> {
+    physical: &'a [PhysicalRecord<'a>],
+    worktree: &'a [WorktreeRecord<'a>],
+    head_refs: HeadRefsRecord,
+    index: &'a [IndexRecord<'a>],
+    trees: &'a [TreeRecord<'a>],
+    root_commit: RootCommitRecord,
+    objects: &'a [ObjectRecord],
+    git_control: &'a [GitControlRecord<'a>],
+    private_baseline: PrivateBaselineRecord,
 }
 
 /// Incrementally encode and hash one canonical repository candidate seal.
-pub(super) fn encode_candidate_seal_v1(
+fn encode_candidate_seal_v1(
     context: CandidateSealContext,
     manifest: CandidateSealManifest<'_>,
 ) -> Result<[u8; 32], CandidateSealError> {
