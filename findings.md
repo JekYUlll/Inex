@@ -518,3 +518,4 @@
 - Cursor-inside-private 编辑不能把零长度 cursor 直接作为 RPC `TextRange`：core 的 canonical range type 故意拒绝空范围。客户端应由 authenticated RenderMap 确认 slot 后选择该 canonical fenced block 开头的一个 ASCII marker byte，作为严格 `InsidePrivateSlot` 的非空证明；绝不能由 slot ID 或未认证 UI 坐标直接编辑。
 - VS Code 的 edit picker 可从已解锁、canonical projection 的 fence header 预选 kind/tag/Outer，但这只是 UX 初值：被解析的 tag IDs 必须仍属于加载后的 encrypted catalog，实际 edit 绝不能信任 header/slot ID 而跳过 daemon 的 projection+RenderMap+ETag 复核。Cover text 只作为明确公开字段重新询问，不从私密 payload 猜测。
 - Tag catalog 的加密不等于只加密 JSON：schema 还必须验证 stable-ID 唯一性、catalog 排序、profile/default 的所有引用和 Cover prompt 语义。否则一个认证正确却相互矛盾的 catalog 会在跨编辑器同步后造成无法选择/保存的 annotation；所有管理操作应走 Vault 的 authenticated load→mutate→CAS save，而非编辑器直接写密文文件。
+- VS Code sidecar 的 tag mutator 也需要在 client 边界限制 canonical ID、UTF-8 文本与完整 reorder permutation；这不是替代 daemon 验证，而是防止 UI/extension bug 将超限或重复私密元数据送入本地 RPC。每次 mutation 后 UI 应重新从 daemon 加载 catalog，而不能合成持久状态。

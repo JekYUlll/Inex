@@ -117,6 +117,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
   - [ ] 扩展Sublime stateful picker、profile命令和keymap示例
   - [x] 加密 tag catalog 现支持 stable-ID create/rename/archive/reorder：配置验证唯一性、canonical order、profile/default 引用与 Cover profile 语义；Vault 通过 load→mutate→CAS encrypted save 原子提交（`1298641`）
   - [x] daemon 已提供 `umbra.tag.create/rename/archive/reorder`：所有 tag 文本经 zeroizing 参数层读取，生命周期回归验证 create→rename→archive→reorder 后只有 Umbra 已解锁才能读回（`f46d2ff`）
+  - [x] VS Code sidecar 已增加对应 typed tag RPC client，并在发出请求前验证 ID/文本/别名/排序资源约束（`ea6d44a`）；管理交互 UI 待接线
   - [ ] 跑通多选、wrap/unwrap/edit、跨编辑器目录、canary/残留及Outer隔离矩阵
 
 - [x] 实现 `.gitattributes`、locked-safe `inex merge-driver` 与已解锁 CLI 三方合并

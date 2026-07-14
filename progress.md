@@ -926,3 +926,8 @@
 
 - 提交 `f46d2ff`（`feat(daemon): manage encrypted private tags over RPC`）：新增 `umbra.tag.create`、`rename`、`archive`、`reorder`。tag ID、label、description、aliases 和排序列表均由 zeroizing 参数提取器受限读取；handler 不构造 config 文件，只委托 Vault 的 authenticated catalog transaction。
 - daemon 生命周期回归覆盖创建→重命名→归档→重排→仅 Umbra 已解锁的 config 读取；全量 daemon 71/71 与严格 Clippy/fmt/diff-check 通过。下一步在 VS Code 增加管理命令，并为 Sublime 复用相同 RPC。
+
+## 2026-07-15 — VS Code 加密标签 RPC Client
+
+- 提交 `ea6d44a`（`feat(vscode): add encrypted tag management RPC client`）：sidecar 提供 create/rename/archive/reorder typed methods。调用前验证 canonical stable ID、UTF-8 文本长度、alias 数量、safe sort order 和完整无重复 reorder 列表；RPC acknowledgement 仍走严格 parser。
+- VS Code check 与 55/55 tests 通过。下一步抽取 Umbra session 准备逻辑后接入 `Inex: Manage Private Tags` UI；客户端不缓存、也不直接写加密 catalog。
