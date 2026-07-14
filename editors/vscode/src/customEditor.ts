@@ -6,6 +6,7 @@ import * as vscode from "vscode";
 import { AssetPreviewCoordinator } from "./assetPreviewCoordinator.ts";
 import { readBoundedRegularFile } from "./boundedFile.ts";
 import type { VaultController, VaultSession } from "./controller.ts";
+import { markdownParagraphRange } from "./privateAnnotation.ts";
 import {
   headingForFragment,
   linkAtUtf16,
@@ -1005,7 +1006,7 @@ export class InexCustomEditorProvider
     if (selection.startByte === selection.endByte) {
       const selectionSnapshot = document.snapshot();
       try {
-        resolvedSelection = paragraphRange(selectionSnapshot.content, selection.startByte);
+        resolvedSelection = markdownParagraphRange(selectionSnapshot.content, selection.startByte);
       } finally {
         selectionSnapshot.content.fill(0);
       }
@@ -1572,16 +1573,6 @@ export class InexCustomEditorProvider
       snapshot.content.fill(0);
     }
   }
-}
-
-function paragraphRange(content: Buffer, offset: number): EditorSelection | undefined {
-  if (offset < 0 || offset > content.byteLength) return undefined;
-  let start = offset;
-  while (start > 0 && content[start - 1] !== 0x0a) start -= 1;
-  let end = offset;
-  while (end < content.byteLength && content[end] !== 0x0a) end += 1;
-  if (start === end) return undefined;
-  return { startByte: start, endByte: end };
 }
 
 function editorHtml(): string {

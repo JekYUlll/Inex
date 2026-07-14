@@ -117,8 +117,8 @@ keybindings file:
 ```
 
 The MVP supports one textarea selection; with an empty selection it applies to
-the current non-empty line (the current paragraph approximation). Multi-cursor
-adapters, heading-section expansion, cursor-inside metadata edit, and
+the current Markdown paragraph (the contiguous nonblank lines containing the
+cursor). Multi-cursor adapters, heading-section expansion, cursor-inside metadata edit, and
 tag/profile management commands remain pending. Outer projection editing
 and Umbra draft recovery are deliberately fail-closed until their dedicated
 authenticated save paths are implemented.

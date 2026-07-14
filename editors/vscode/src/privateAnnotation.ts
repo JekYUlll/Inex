@@ -12,6 +12,36 @@ export interface AnnotationPickerState {
   readonly outerMode: OuterMode;
 }
 
+export interface ByteRange {
+  readonly startByte: number;
+  readonly endByte: number;
+}
+
+/** Returns contiguous nonblank UTF-8 lines containing `offset`, excluding line endings. */
+export function markdownParagraphRange(content: Buffer, offset: number): ByteRange | undefined {
+  if (offset < 0 || offset > content.byteLength) return undefined;
+  const currentStart = lineStart(content, offset);
+  const currentEnd = lineEnd(content, offset);
+  if (lineIsBlank(content, currentStart, currentEnd)) return undefined;
+
+  let start = currentStart;
+  while (start > 0) {
+    const previousEnd = start - 1;
+    const previousStart = lineStart(content, previousEnd);
+    if (lineIsBlank(content, previousStart, previousEnd)) break;
+    start = previousStart;
+  }
+
+  let end = currentEnd;
+  while (end < content.byteLength) {
+    const nextStart = end + 1;
+    const nextEnd = lineEnd(content, nextStart);
+    if (lineIsBlank(content, nextStart, nextEnd)) break;
+    end = nextEnd;
+  }
+  return { startByte: start, endByte: end };
+}
+
 export function defaultAnnotationPickerState(
   tags: readonly PrivateTagChoice[],
 ): AnnotationPickerState {
@@ -68,4 +98,24 @@ export function annotationSpecFromPicker(
     tagIds: [...state.tagIds],
     outer: { mode: state.outerMode, ...(coverText === undefined ? {} : { coverText }) },
   };
+}
+
+function lineStart(content: Buffer, offset: number): number {
+  let start = Math.min(offset, content.byteLength);
+  while (start > 0 && content[start - 1] !== 0x0a) start -= 1;
+  return start;
+}
+
+function lineEnd(content: Buffer, offset: number): number {
+  let end = Math.min(offset, content.byteLength);
+  while (end < content.byteLength && content[end] !== 0x0a) end += 1;
+  return end;
+}
+
+function lineIsBlank(content: Buffer, start: number, end: number): boolean {
+  for (let index = start; index < end; index += 1) {
+    const byte = content[index];
+    if (byte !== 0x20 && byte !== 0x09 && byte !== 0x0d) return false;
+  }
+  return true;
 }

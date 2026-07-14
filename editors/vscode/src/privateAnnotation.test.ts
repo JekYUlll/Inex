@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   annotationSpecFromPicker,
   defaultAnnotationPickerState,
+  markdownParagraphRange,
   selectAnnotationKind,
   selectOuterMode,
   toggleAnnotationTag,
@@ -34,4 +35,11 @@ test("annotation picker requires public cover text only for cover mode", () => {
     tagIds: ["comment-content"],
     outer: { mode: "cover", coverText: "private note omitted" },
   });
+});
+
+test("empty selection expands to its Markdown paragraph, not merely one line", () => {
+  const content = Buffer.from("first line\nsecond line\n\nthird line\n", "utf8");
+  assert.deepEqual(markdownParagraphRange(content, 13), { startByte: 0, endByte: 22 });
+  assert.deepEqual(markdownParagraphRange(content, 25), { startByte: 24, endByte: 34 });
+  assert.equal(markdownParagraphRange(content, 23), undefined);
 });
