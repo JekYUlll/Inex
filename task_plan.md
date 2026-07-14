@@ -83,6 +83,7 @@ Phase 6 extension — 现有 Markdown Git 仓库与加密附件迁移（Phase 7 
   - [x] 将完整历史加密重写保留为独立experimental后续；当前产品与文档只承诺单个加密快照，不宣称“保留历史”
   - [ ] 完成VS Code locked首次交互的最终发布门禁
     - [x] 提供Import/Unlock welcome、锁定CRUD gate、绝对CLI任务、成功后Open New Vault，并由真实Extension Host覆盖底层import→密文workspace→asset/CRUD流程
+    - [x] 提供当前单工作区默认source、Explorer文件夹右键初始化、fresh HEAD快照/历史不复制确认、existing exact-v2显式对账入口与不丢快速退出事件的Task状态机（`14b4f18`）
     - [ ] 在最终VSIX上人工驱动Linux真实folder picker、任务终端双口令与Open New Vault鼠标路径，并纳入persistent-profile残留证据
   - [ ] 完成冻结GA对象证明与生产接线
     - [x] 实现strict SHA-1 raw index v2/v3/v4 parser，校验entry/extension/trailer、排序、canonical v4 varint与资源边界（`62fa0aa`）
@@ -262,6 +263,9 @@ Phase 6 extension — 现有 Markdown Git 仓库与加密附件迁移（Phase 7 
 
 | Error | Attempt | Resolution |
 |-------|---------|------------|
+| VS Code首次`pnpm check`发现`Uri.isUri`不存在、command参数仍为`unknown`，且`exactOptionalPropertyTypes`拒绝显式`defaultUri: undefined` | 1 | 使用真实`Uri`实例守卫，并仅在默认工作区存在时展开`defaultUri`；随后TypeScript与Node测试通过 |
+| release artifact测试在production依赖图新增`unicode-normalization`后仍冻结77组件/147份license text，连续暴露78与149两个新精确值 | 2 | 只同步锁图绑定断言为78/149并提交`d784009`；完整release artifact测试30/30通过 |
+| 独立复审发现Task在`executeTask`返回后才订阅结束事件、同步启动异常会泄漏订阅，且existing-target按一次`lstat`跳过password-env gate存在模式切换竞态 | 2 | 抽出start前订阅process-start/process-end/task-end的可单测状态机，所有终态析构订阅；恢复无条件拒绝`INEX_PASSWORD_STDIN`并在existing路径明确“出现口令即取消” |
 | CLI path-first接线后两次production源码契约测试因函数切片边界与临时test wrapper误截断而失败 | 2 | 删除test-only wrapper，让fixture直接走真实`dispatch`；分别以`execute_reconcile`/`build_staging_vault`固定函数边界，产品断言保持不变 |
 | strict Clippy发现large enum、冻结表长度、boxed fixture类型及Windows非Linux常量dead-code | 4 | 只box大型linear owner/plan，对纯冻结表使用窄理由，fixture显式解box并cfg Linux资源常量；Linux与Windows GNU/MSVC门禁复绿 |
 | 独立审查发现canonicalize身份换绑、预存bind alias及non-v2同分类目录替换 | 3 | 增加前后identity采样、held directory-only source identity walk与终态parent/root/namespace复验；真实canary测试证明零mutation，hostile same-UID ABA仍保留为GA门禁 |

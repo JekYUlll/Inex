@@ -494,3 +494,6 @@
 - Reserved namespace的分类值不是可长期缓存的terminal proof。即使namespace枚举前后同为`absent`，目标目录本身也可能已被另一个同分类目录替换；non-v2终态输出前必须重新证明parent identity、destination identity和namespace class三者均未漂移，否则只能报告`reserved-inspection-indeterminate`。
 - Reconcile acknowledgement的authority生命周期因模式不同而不同：preview在返回固定摘要前释放read-only guard；real success与所有post-claim failure必须让opaque owner跨完整有界stdout block的write+flush存活，随后才消费/drop authority并输出scrubbed stderr诊断。
 - `resolve_verified_directory`的前后identity采样和held walker能关闭稳定alias及普通canonicalize换绑，但不是抵抗hostile same-UID inode ABA的内核CAS；分类后把非目录换成目录的竞态同样仍在threat gate。计划与文档必须继续把这两项列为GA未完成，不能因`d9dc345`而升级承诺。
+- VS Code Task不能先`executeTask`再注册结束监听：非Git小目录、快速失败或target-only reconcile都可能在Promise返回前结束。可靠组合是在start前同时监听process-start/process-end/task-end，按同一`TaskExecution`缓存早到事件；观察到process-start后即使TaskEnd先到也必须等待process-end，未启动底层进程的TaskEnd才映射为unknown exit，并在同步throw/async reject/全部终态释放所有订阅。
+- UI的一次`lstat`不能绑定CLI最终dispatch模式。existing target在spawn前消失会转入fresh creation，因此不能据UI分类放宽`INEX_PASSWORD_STDIN`保护；扩展始终拒绝该环境注入口，并明确exact reconcile不会询问口令、若出现口令必须取消。该提示不取代后端的physical identity/fail-closed审计，hostile same-UID变化仍属trusted-local preview边界。
+- 长期多提交仓库的“初始化”必须在交互层显式说明语义：fresh路径只复制clean tracked HEAD（Markdown和普通附件）到一个新的parentless密文提交，原仓库/明文历史保持不变；existing exact-v2路径又完全不做source Git planning。因此统一完成提示只能声明selected target通过初始化或对账审计，不能声称reconcile使用了当前选中的source HEAD。
