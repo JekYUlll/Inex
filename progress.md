@@ -1,5 +1,11 @@
 # Inex Progress Log
 
+## 2026-07-15 — Vault 加密 catalog/profile 存储
+
+- 提交 `2f607ff`：新增 `Vault::load_umbra_config` 和 `save_umbra_config`。两者都先要求 live Umbra session；Outer 状态下直接返回 `UmbraLocked`，不会读取 config 路径或密文。
+- 保存采用 vault mutation guard + etag CAS，随后从磁盘重新安全读取、比较完整密文字节并用当前 K_umbra 再次认证/解密后才更新 session etag。`.inex/config.umbra.inex` 受 atomic allowlist、大小/挂载/symlink/reparse/大小写别名门控。
+- 测试证明：Outer 无法 load，保存后的 config canary 不出现于磁盘，解锁状态可往返读取，锁定后再次 load 被拒绝。
+
 ## 2026-07-15 — 加密 Umbra catalog/profile 信封
 
 - 提交 `d0b6b13`：新增 `UmbraConfigV1`、tag/profile/defaults 模型和 `.inex/config.umbra.inex` 的 AEAD envelope。配置专用 subkey 从 live `K_umbra` domain-separated 派生，AAD 绑定 vault ID、key ID、canonical internal path 与版本。
