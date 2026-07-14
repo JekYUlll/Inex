@@ -191,6 +191,32 @@ impl<'a> FreshTrackedManifest<'a> {
         std::ptr::eq(self.physical, physical)
     }
 
+    /// Revalidate the complete tracked view and return only bounded summary
+    /// counts. No record ID, path, object ID, or borrowed view escapes.
+    pub(super) fn checked_counts(&self) -> Result<(u32, u32, u32), CandidateSealError> {
+        validate_fresh_tracked_evidence(self.physical, &self.records)?;
+        let worktree_files =
+            u32::try_from(self.records.len()).map_err(|_| CandidateSealError::ResourceLimit)?;
+        let mut encrypted_markdown = 0_u32;
+        let mut encrypted_assets = 0_u32;
+        for record in &self.records {
+            match record.class {
+                WorktreeClass::ManagedMetadata => {}
+                WorktreeClass::MarkdownEnvelope => {
+                    encrypted_markdown = encrypted_markdown
+                        .checked_add(1)
+                        .ok_or(CandidateSealError::ResourceLimit)?;
+                }
+                WorktreeClass::AssetEnvelope => {
+                    encrypted_assets = encrypted_assets
+                        .checked_add(1)
+                        .ok_or(CandidateSealError::ResourceLimit)?;
+                }
+            }
+        }
+        Ok((worktree_files, encrypted_markdown, encrypted_assets))
+    }
+
     /// Project the bound evidence without allowing record IDs or OIDs to be
     /// substituted against a different physical manifest.
     pub(super) fn project(

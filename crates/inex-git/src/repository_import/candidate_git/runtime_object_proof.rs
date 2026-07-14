@@ -19,10 +19,9 @@ use std::fmt;
 #[cfg(target_os = "linux")]
 use inex_core::atomic::open_secure_source_root;
 
-#[cfg(any(target_os = "linux", test))]
-use super::validate_fresh_git_manifest;
 use super::{
-    CandidateGitProjection, FreshGitManifest, ObjectKind, ObjectRecord, validate_object_record,
+    CandidateGitProjection, FreshGitManifest, ObjectKind, ObjectRecord,
+    validate_fresh_git_manifest, validate_object_record,
 };
 #[cfg(any(target_os = "linux", test))]
 use crate::repository_import::TargetObjectExpectation;
@@ -59,6 +58,18 @@ impl<'physical> FreshRuntimeObjectProof<'_, 'physical> {
         physical: &MarkerFreePhysicalManifest,
     ) -> bool {
         self.git.is_bound_to(physical)
+    }
+
+    /// Revalidate the complete Git evidence and return only its bounded
+    /// object count. No manifest borrow or object record escapes.
+    pub(in crate::repository_import) fn checked_object_count(
+        &self,
+    ) -> Result<u32, CandidateSealError> {
+        validate_fresh_git_manifest(self.git)?;
+        if self.verified_objects != self.git.objects.len() {
+            return Err(CandidateSealError::InvalidRecord);
+        }
+        u32::try_from(self.verified_objects).map_err(|_| CandidateSealError::ResourceLimit)
     }
 
     /// Project Git seal sections only through this completed runtime proof.

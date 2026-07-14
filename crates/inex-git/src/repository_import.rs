@@ -78,6 +78,12 @@ mod candidate_vault_authority;
 )]
 mod candidate_initial_authority;
 
+#[allow(
+    dead_code,
+    reason = "the held-marker fresh audit is consumed by the publication owner in the next slice"
+)]
+mod candidate_fresh_audit;
+
 #[cfg(target_os = "linux")]
 use super::raw_index::{RawIndex, parse_sha1_index};
 use super::raw_index::{RawIndexError, TargetRawIndexSummary, validate_target_sha1_index_paths};

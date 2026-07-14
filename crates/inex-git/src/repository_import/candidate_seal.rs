@@ -26,7 +26,7 @@ pub(super) use aggregate::{CandidateContentSeal, aggregate_candidate_content_sea
 
 const MAGIC: [u8; 8] = *b"INEXCS1\0";
 const VERSION: u16 = 1;
-const DOMAIN: &[u8; 25] = b"inex.repository-import.v1";
+pub(super) const DOMAIN: &[u8; 25] = b"inex.repository-import.v1";
 const TERMINATOR: [u8; 5] = [0xff, 0, 0, 0, 0];
 
 const MAX_PHYSICAL_RECORDS: usize = 1_000_000;
