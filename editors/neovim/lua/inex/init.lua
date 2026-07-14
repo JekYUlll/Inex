@@ -61,6 +61,17 @@ local function valid_logical_path(logical_path)
     and not logical_path:find("..", 1, true)
 end
 
+local function encode_base64url(value)
+  if type(value) ~= "string" or #value > MAX_DOCUMENT_BYTES then
+    return nil
+  end
+  local ok, encoded = pcall(vim.base64.encode, value)
+  if not ok or type(encoded) ~= "string" then
+    return nil
+  end
+  return encoded:gsub("%+", "-"):gsub("/", "_"):gsub("=+$", "")
+end
+
 local function decode_base64url(value)
   if type(value) ~= "string" or #value > MAX_DOCUMENT_BASE64_BYTES or not value:match("^[A-Za-z0-9_-]*$") or #value % 4 == 1 then
     return nil
@@ -72,6 +83,9 @@ local function decode_base64url(value)
   end
   local ok, decoded = pcall(vim.base64.decode, padded)
   if not ok or type(decoded) ~= "string" or #decoded > MAX_DOCUMENT_BYTES then
+    return nil
+  end
+  if encode_base64url(decoded) ~= value then
     return nil
   end
   return decoded
@@ -170,6 +184,7 @@ function M.open_document(logical_path)
       return
     end
     local buffer = vim.api.nvim_create_buf(false, true)
+    vim.bo[buffer].buftype = "acwrite"
     vim.bo[buffer].swapfile = false
     vim.bo[buffer].undofile = false
     vim.bo[buffer].bufhidden = "wipe"
@@ -178,13 +193,58 @@ function M.open_document(logical_path)
     vim.bo[buffer].modifiable = true
     vim.api.nvim_buf_set_name(buffer, "inex://" .. logical_path)
     vim.api.nvim_buf_set_lines(buffer, 0, -1, false, vim.split(content, "\n", { plain = true }))
-    vim.bo[buffer].modifiable = false
     vim.bo[buffer].modified = false
     documents[buffer] = { handle = result.handle, etag = result.etag, logical_path = logical_path }
+    vim.api.nvim_create_autocmd("BufWriteCmd", { buffer = buffer, callback = function()
+      M.save_buffer(buffer)
+    end })
     vim.api.nvim_create_autocmd("BufWipeout", { buffer = buffer, once = true, callback = function()
       clear_document(buffer)
     end })
     vim.api.nvim_set_current_buf(buffer)
+  end)
+end
+
+function M.save_buffer(buffer)
+  buffer = buffer or vim.api.nvim_get_current_buf()
+  local document = documents[buffer]
+  if not document or not session or document.saving then
+    if not document then
+      vim.notify("Current buffer is not an Inex document", vim.log.levels.ERROR)
+    end
+    return
+  end
+  if not vim.api.nvim_buf_is_valid(buffer) then
+    return
+  end
+  local content = table.concat(vim.api.nvim_buf_get_lines(buffer, 0, -1, false), "\n")
+  local content_base64 = encode_base64url(content)
+  content = ""
+  if not content_base64 then
+    vim.notify("Inex document content exceeds its limit", vim.log.levels.ERROR)
+    return
+  end
+  document.saving = true
+  local active_session, expected_etag = session, document.etag
+  rpc.request("file.write", {
+    session = active_session,
+    logicalPath = document.logical_path,
+    contentBase64 = content_base64,
+    ifMatch = expected_etag,
+  }, function(result, error)
+    content_base64 = ""
+    if document then
+      document.saving = false
+    end
+    if error or session ~= active_session or documents[buffer] ~= document or type(result) ~= "table" or type(result.etag) ~= "string" or not result.etag:match(ETAG_RE) or type(result.metadata) ~= "table" or result.metadata.logicalPath ~= document.logical_path or (result.metadata.flags ~= 0 and result.metadata.flags ~= 1) or (result.durability ~= "synced" and result.durability ~= "notSynced") then
+      vim.notify(error or "Inex document save failed", vim.log.levels.ERROR)
+      return
+    end
+    document.etag = result.etag
+    if vim.api.nvim_buf_is_valid(buffer) then
+      vim.bo[buffer].modified = false
+    end
+    vim.notify("Inex document saved", vim.log.levels.INFO)
   end)
 end
 
@@ -201,9 +261,7 @@ function M.create_document(logical_path)
   rpc.request("file.write", {
     session = active_session,
     logicalPath = logical_path,
-    -- The daemon accepts canonical non-empty base64url only. A newline renders
-    -- as an empty Markdown buffer while preserving that protocol invariant.
-    contentBase64 = "Cg",
+    contentBase64 = "",
     ifNoneMatch = "*",
   }, function(result, error)
     if error or session ~= active_session or type(result) ~= "table" or type(result.etag) ~= "string" or not result.etag:match(ETAG_RE) or type(result.metadata) ~= "table" or result.metadata.logicalPath ~= logical_path or (result.metadata.flags ~= 0 and result.metadata.flags ~= 1) or (result.durability ~= "synced" and result.durability ~= "notSynced") then

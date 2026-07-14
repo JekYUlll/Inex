@@ -29,6 +29,10 @@ vim.api.nvim_create_user_command("InexNew", function(arguments)
   inex.create_document(arguments.args)
 end, { nargs = 1, desc = "Create and open an empty Inex Markdown document" })
 
+vim.api.nvim_create_user_command("InexSave", function()
+  inex.save_buffer()
+end, { desc = "Save the current Inex document through the local sidecar" })
+
 vim.api.nvim_create_user_command("InexStop", function()
   inex.stop()
 end, { desc = "Stop and clear the Inex local sidecar" })
