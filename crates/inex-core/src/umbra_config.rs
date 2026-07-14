@@ -1,5 +1,7 @@
 //! Encrypted Umbra tag catalog and annotation-profile configuration.
 
+use std::collections::BTreeSet;
+
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
@@ -103,23 +105,116 @@ impl UmbraConfigV1 {
         if self.format != CONFIG_FORMAT || self.version != 1 {
             return Err(UmbraConfigError::InvalidConfig);
         }
+        let mut tag_ids = BTreeSet::new();
         for tag in &self.tag_catalog {
-            if !valid_id(&tag.id) || tag.label.is_empty() {
+            if !valid_id(&tag.id) || tag.label.is_empty() || !tag_ids.insert(&tag.id) {
                 return Err(UmbraConfigError::InvalidConfig);
             }
         }
+        if !self
+            .tag_catalog
+            .windows(2)
+            .all(|pair| (pair[0].sort_order, &pair[0].id) < (pair[1].sort_order, &pair[1].id))
+        {
+            return Err(UmbraConfigError::InvalidConfig);
+        }
+        let mut profile_ids = BTreeSet::new();
         for profile in &self.annotation_profiles {
             if !valid_id(&profile.id)
                 || profile.label.is_empty()
                 || !valid_tag_list(&profile.tag_ids)
+                || !profile.tag_ids.iter().all(|id| tag_ids.contains(id))
+                || !profile_ids.insert(&profile.id)
+                || matches!(profile.outer, OuterMode::Cover) != profile.prompt_for_cover
             {
                 return Err(UmbraConfigError::InvalidConfig);
             }
         }
-        if !valid_tag_list(&self.defaults.tag_ids) {
+        if !valid_tag_list(&self.defaults.tag_ids)
+            || !self.defaults.tag_ids.iter().all(|id| tag_ids.contains(id))
+            || (!self.defaults.default_profile_id.is_empty()
+                && !profile_ids.contains(&self.defaults.default_profile_id))
+        {
             return Err(UmbraConfigError::InvalidConfig);
         }
         Ok(())
+    }
+
+    /// Create a new stable private tag and retain canonical catalog order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-config error for duplicate IDs or invalid fields.
+    pub fn create_tag(&mut self, tag: PrivateTagDefinition) -> Result<(), UmbraConfigError> {
+        if self
+            .tag_catalog
+            .iter()
+            .any(|existing| existing.id == tag.id)
+        {
+            return Err(UmbraConfigError::InvalidConfig);
+        }
+        self.tag_catalog.push(tag);
+        self.sort_tags();
+        self.validate()
+    }
+
+    /// Change only a private tag's display label without changing references.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-config error for an absent tag or empty label.
+    pub fn rename_tag(&mut self, tag_id: &str, label: String) -> Result<(), UmbraConfigError> {
+        if label.is_empty() {
+            return Err(UmbraConfigError::InvalidConfig);
+        }
+        let Some(tag) = self.tag_catalog.iter_mut().find(|tag| tag.id == tag_id) else {
+            return Err(UmbraConfigError::InvalidConfig);
+        };
+        tag.label = label;
+        self.validate()
+    }
+
+    /// Hide a private tag from default pickers while retaining old references.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-config error for an absent tag.
+    pub fn archive_tag(&mut self, tag_id: &str) -> Result<(), UmbraConfigError> {
+        let Some(tag) = self.tag_catalog.iter_mut().find(|tag| tag.id == tag_id) else {
+            return Err(UmbraConfigError::InvalidConfig);
+        };
+        tag.archived = true;
+        self.validate()
+    }
+
+    /// Apply an exact complete order to private tag definitions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-config error when IDs are missing, repeated, or
+    /// unknown. Stable IDs and existing document references never change.
+    pub fn reorder_tags(&mut self, tag_ids: &[String]) -> Result<(), UmbraConfigError> {
+        if tag_ids.len() != self.tag_catalog.len()
+            || tag_ids.iter().collect::<BTreeSet<_>>().len() != tag_ids.len()
+            || !tag_ids
+                .iter()
+                .all(|id| self.tag_catalog.iter().any(|tag| &tag.id == id))
+        {
+            return Err(UmbraConfigError::InvalidConfig);
+        }
+        for (order, id) in tag_ids.iter().enumerate() {
+            let Some(tag) = self.tag_catalog.iter_mut().find(|tag| &tag.id == id) else {
+                return Err(UmbraConfigError::InvalidConfig);
+            };
+            tag.sort_order = i32::try_from(order).map_err(|_| UmbraConfigError::InvalidConfig)?;
+        }
+        self.sort_tags();
+        self.validate()
+    }
+
+    fn sort_tags(&mut self) {
+        self.tag_catalog
+            .sort_by(|left, right| (left.sort_order, &left.id).cmp(&(right.sort_order, &right.id)));
     }
 }
 
@@ -346,5 +441,49 @@ mod tests {
             envelope.decrypt(Uuid::from_bytes([3_u8; 16]), key_id, &key),
             Err(UmbraConfigError::AuthenticationFailed)
         ));
+    }
+
+    #[test]
+    fn tag_catalog_mutations_preserve_ids_and_validate_references() {
+        let mut config = UmbraConfigV1::empty();
+        config
+            .create_tag(PrivateTagDefinition {
+                id: "relationship".to_owned(),
+                label: "Relationship".to_owned(),
+                description: String::new(),
+                aliases: Vec::new(),
+                sort_order: 20,
+                default_selected: false,
+                archived: false,
+            })
+            .expect("create relationship");
+        config
+            .create_tag(PrivateTagDefinition {
+                id: "family".to_owned(),
+                label: "Family".to_owned(),
+                description: String::new(),
+                aliases: Vec::new(),
+                sort_order: 10,
+                default_selected: true,
+                archived: false,
+            })
+            .expect("create family");
+        assert_eq!(config.tag_catalog[0].id, "family");
+        config
+            .rename_tag("relationship", "Personal relationships".to_owned())
+            .expect("rename without changing stable id");
+        config.archive_tag("family").expect("archive tag");
+        config
+            .reorder_tags(&["relationship".to_owned(), "family".to_owned()])
+            .expect("reorder exact catalog");
+        assert_eq!(config.tag_catalog[0].id, "relationship");
+        assert_eq!(config.tag_catalog[1].id, "family");
+        assert!(config.tag_catalog[1].archived);
+        assert_eq!(config.tag_catalog[0].label, "Personal relationships");
+        assert!(config.create_tag(config.tag_catalog[0].clone()).is_err());
+        assert!(config.reorder_tags(&["relationship".to_owned()]).is_err());
+
+        config.defaults.tag_ids = vec!["missing".to_owned()];
+        assert!(config.validate().is_err());
     }
 }

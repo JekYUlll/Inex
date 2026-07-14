@@ -32,7 +32,8 @@ use crate::search::{
 use crate::sodium::Argon2idParams;
 use crate::tree::{self, TreeEntryKind, TreeError, VaultTree, VaultTreeProfile};
 use crate::umbra_config::{
-    EncryptedUmbraConfigV1, UMBRA_CONFIG_PATH, UmbraConfigError, UmbraConfigV1,
+    EncryptedUmbraConfigV1, PrivateTagDefinition, UMBRA_CONFIG_PATH, UmbraConfigError,
+    UmbraConfigV1,
 };
 use crate::umbra_document::{
     OuterSlotStrategy, PrivateAnnotationSpec, PrivateSlotPayloadV1, UmbraDocumentError,
@@ -794,6 +795,52 @@ impl Vault {
         }
         session.config_etag = Some(outcome.etag);
         Ok(())
+    }
+
+    /// Add one encrypted private-tag definition to the shared Umbra catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError::UmbraLocked`] without a live session. The entire
+    /// catalog is authenticated and atomically re-encrypted on success.
+    pub fn create_private_tag(&mut self, tag: PrivateTagDefinition) -> Result<(), VaultError> {
+        let mut config = self.load_umbra_config()?;
+        config.create_tag(tag)?;
+        self.save_umbra_config(&config)
+    }
+
+    /// Rename one private tag's label without changing its stable ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns a private config error for an unknown tag or invalid label.
+    pub fn rename_private_tag(&mut self, tag_id: &str, label: String) -> Result<(), VaultError> {
+        let mut config = self.load_umbra_config()?;
+        config.rename_tag(tag_id, label)?;
+        self.save_umbra_config(&config)
+    }
+
+    /// Archive one private tag while preserving document/profile references.
+    ///
+    /// # Errors
+    ///
+    /// Returns a private config error for an unknown tag.
+    pub fn archive_private_tag(&mut self, tag_id: &str) -> Result<(), VaultError> {
+        let mut config = self.load_umbra_config()?;
+        config.archive_tag(tag_id)?;
+        self.save_umbra_config(&config)
+    }
+
+    /// Reorder the full encrypted private-tag catalog by stable IDs.
+    ///
+    /// # Errors
+    ///
+    /// Returns a private config error unless `tag_ids` is an exact permutation
+    /// of the current catalog.
+    pub fn reorder_private_tags(&mut self, tag_ids: &[String]) -> Result<(), VaultError> {
+        let mut config = self.load_umbra_config()?;
+        config.reorder_tags(tag_ids)?;
+        self.save_umbra_config(&config)
     }
 
     /// Discover a deterministic logical tree without opening document bytes.
@@ -3167,10 +3214,8 @@ mod tests {
         vault
             .initialize_umbra(b"Umbra config password")
             .expect("initialize Umbra");
-        let mut config = UmbraConfigV1::empty();
-        config
-            .tag_catalog
-            .push(crate::umbra_config::PrivateTagDefinition {
+        vault
+            .create_private_tag(crate::umbra_config::PrivateTagDefinition {
                 id: "secret-tag".to_owned(),
                 label: "INEX_SECRET_TAG_CANARY".to_owned(),
                 description: String::new(),
@@ -3178,11 +3223,23 @@ mod tests {
                 sort_order: 1,
                 default_selected: false,
                 archived: false,
-            });
-        vault.save_umbra_config(&config).expect("save config");
+            })
+            .expect("create encrypted tag");
+        vault
+            .rename_private_tag("secret-tag", "INEX_SECRET_TAG_RENAMED".to_owned())
+            .expect("rename encrypted tag");
+        vault
+            .archive_private_tag("secret-tag")
+            .expect("archive encrypted tag");
+        vault
+            .reorder_private_tags(&["secret-tag".to_owned()])
+            .expect("reorder encrypted tag");
         let disk = fs::read(directory.path().join(UMBRA_CONFIG_PATH)).expect("read ciphertext");
         assert!(!String::from_utf8_lossy(&disk).contains("INEX_SECRET_TAG_CANARY"));
-        assert_eq!(vault.load_umbra_config().expect("load config"), config);
+        let config = vault.load_umbra_config().expect("load config");
+        assert_eq!(config.tag_catalog[0].id, "secret-tag");
+        assert_eq!(config.tag_catalog[0].label, "INEX_SECRET_TAG_RENAMED");
+        assert!(config.tag_catalog[0].archived);
         vault.lock_umbra();
         assert!(matches!(
             vault.load_umbra_config(),
