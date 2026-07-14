@@ -575,6 +575,31 @@ class InexRpcClient:
         except RpcProtocolError as error:
             self._terminate_protocol(error)
 
+    def open_umbra_document(self, logical_path: str) -> Tuple[bytearray, str, Dict[str, Any]]:
+        """Read an authenticated Umbra projection; never synthesize its render map."""
+        content = bytearray()
+        try:
+            result = _expect_exact_object(
+                self._call_raw(
+                    "umbra.document.open",
+                    dict(self._protected_params(), logicalPath=logical_path),
+                ),
+                {"contentBase64", "etag", "metadata", "renderMap"},
+                "Umbra document result",
+            )
+            content = decode_base64url(result.get("contentBase64"), MAX_DOCUMENT_BYTES)
+            etag = _expect_etag(result.get("etag"))
+            _validate_metadata(result.get("metadata"), logical_path, (2,))
+            render_map = result.get("renderMap")
+            if not isinstance(render_map, dict) or set(render_map) != {"generationBase64", "projectionBytes", "privateSlots", "outerSegments"}:
+                raise RpcProtocolError("RPC Umbra render map is invalid")
+            if not isinstance(render_map["privateSlots"], list) or not isinstance(render_map["outerSegments"], list):
+                raise RpcProtocolError("RPC Umbra render map is invalid")
+            return content, etag, render_map
+        except RpcProtocolError as error:
+            wipe(content)
+            self._terminate_protocol(error)
+
     def write_document(
         self, logical_path: str, content: bytearray, etag: str
     ) -> Tuple[str, str]:
