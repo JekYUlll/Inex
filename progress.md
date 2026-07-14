@@ -1,5 +1,11 @@
 # Inex Progress Log
 
+## 2026-07-15 — 可追踪全仓主线回归
+
+- 以单一可追踪 session 重跑 `cargo test --workspace --locked` 并获得 exit 0：365 passed、12 ignored，耗时 225.49s；包含 core 的 Umbra/Outer 隔离、daemon/CLI、repository-import、v5 publication/recovery 以及代表性 native force-kill 边界。12 个 ignored 项是明确要求分片并行运行的完整 native force-kill matrix child/full-shard tests，不被计作已执行证据。
+- 同一工作树中 VS Code 继续通过 `pnpm check && pnpm test && pnpm build`（57/57）；Sublime 继续通过 `PYTHONPATH=editors/sublime python3 -W error::ResourceWarning -m unittest discover -s editors/sublime/tests -v`（96/96，1 个 Linux pidfd/subreaper 条件 skip）。
+- 这些门禁证明当前源码回归基线，不替代最终 VSIX 的人工 locked-first-use/persistent-profile 测试、原生 Windows/arm64、签名、hosted CI 或发布批准。
+
 ## 2026-07-15 — 主线 Umbra 实施状态校正与全仓回归
 
 - 计划审计确认 Umbra 设计/实现、daemon+VS Code 交互层、Sublime picker/profile/keymap 三个父项的所有实现子项均已完成；将父项校正为完成，避免把真实代码与计划状态割裂。跨编辑器目录、canary/残留及 Outer 隔离的聚合矩阵仍保持未完成，不能由单客户端单元测试替代。
