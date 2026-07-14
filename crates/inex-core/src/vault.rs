@@ -1254,6 +1254,84 @@ impl Vault {
         })
     }
 
+    /// Atomically replace metadata for the one private slot containing the
+    /// supplied Umbra cursor/selection while preserving its ID and Markdown.
+    ///
+    /// The projection/map/etag triple is re-authenticated before the existing
+    /// payload is decrypted. A selection must be wholly inside exactly one
+    /// private block; complete blocks, plain text, and mixed selections are
+    /// rejected without writing. Only the new public Outer strategy and the
+    /// encrypted payload metadata change.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError::UmbraLocked`] without live `K_umbra`, a conflict
+    /// for stale state, and a secret-free render error for an invalid target.
+    #[allow(clippy::too_many_arguments)] // editor consistency inputs are an explicit security boundary
+    pub fn edit_private_annotation(
+        &mut self,
+        logical_path: &LogicalPath,
+        expected_etag: &str,
+        supplied_projection: &str,
+        supplied_render_map: &OwnedRenderMap,
+        selections: &[TextRange],
+        spec: &PrivateAnnotationSpec,
+        merge_adjacent: bool,
+        modified_at_ms: i64,
+    ) -> Result<AppliedPrivateAnnotation, VaultError> {
+        spec.validate()?;
+        let (read, mut document) = self.read_umbra_outer_document(logical_path)?;
+        require_matching_etag(&read, expected_etag)?;
+        let current_projection = self.render_umbra_projection(logical_path)?;
+        if supplied_projection != current_projection.markdown
+            || supplied_render_map != &current_projection.render_map
+        {
+            return Err(UmbraRenderError::StaleRenderMap.into());
+        }
+        let SelectionClass::InsidePrivateSlot(slot_id) = normalize_and_classify_selections(
+            &current_projection.markdown,
+            &current_projection.render_map,
+            selections,
+            merge_adjacent,
+        )?
+        else {
+            return Err(UmbraRenderError::AnnotationSelectionNotPlain.into());
+        };
+        let mut payload = {
+            let session = self.umbra.as_ref().ok_or(VaultError::UmbraLocked)?;
+            document.decrypt_private_slot(
+                self.config.vault_id,
+                logical_path.as_str(),
+                session.slot.key_id(),
+                &session.key,
+                &slot_id,
+            )?
+        };
+        payload.kind = spec.kind;
+        payload.tag_ids.clone_from(&spec.tag_ids);
+        payload.updated_at_ms = modified_at_ms;
+        {
+            let session = self.umbra.as_ref().ok_or(VaultError::UmbraLocked)?;
+            document.replace_private_slot(
+                self.config.vault_id,
+                logical_path.as_str(),
+                session.slot.key_id(),
+                &session.key,
+                &slot_id,
+                spec.outer.clone(),
+                &payload,
+            )?;
+        }
+        validate_outer_marker_slots(&document)?;
+        let metadata =
+            self.save_umbra_outer_document(logical_path, &document, expected_etag, modified_at_ms)?;
+        let projection = self.render_umbra_projection(logical_path)?;
+        Ok(AppliedPrivateAnnotation {
+            document: metadata,
+            projection,
+        })
+    }
+
     /// Insert one fresh encrypted private slot and atomically persist the
     /// changed feature-2 Outer projection. `outer_markdown` must contain the
     /// new canonical marker and retain exactly one marker for every existing
@@ -3549,6 +3627,108 @@ mod tests {
             .expect("read re-encrypted container");
         assert!(!String::from_utf8_lossy(&disk).contains("INEX_UNWRAP_CANARY"));
         assert!(!String::from_utf8_lossy(&disk).contains("relationship"));
+    }
+
+    #[test]
+    fn private_annotation_edit_preserves_slot_markdown_and_id() {
+        let directory = TestDirectory::new();
+        let mut vault = create_test_vault(&directory);
+        let path = logical("2026-07-edit-annotation.md");
+        vault
+            .initialize_umbra(b"edit annotation password")
+            .expect("initialize Umbra");
+        vault
+            .enable_umbra_private_annotations(test_policy())
+            .expect("enable feature two");
+        let created = vault
+            .create_umbra_outer_document(
+                &path,
+                &UmbraDocumentV1::new("INEX_EDIT_CANARY\n".to_owned()),
+                1_783_699_201_000,
+            )
+            .expect("create outer document");
+        let before = vault.render_umbra_projection(&path).expect("render plain");
+        let applied = vault
+            .apply_private_annotation(
+                &path,
+                &created.etag,
+                &before.markdown,
+                &before.render_map,
+                &[TextRange::new(0, "INEX_EDIT_CANARY".len()).expect("range")],
+                &PrivateAnnotationSpec {
+                    kind: crate::umbra_config::PrivateAnnotationKind::Comment,
+                    tag_ids: vec!["relationship".to_owned()],
+                    outer: OuterSlotStrategy {
+                        mode: crate::umbra_config::OuterMode::Drop,
+                        cover_text: None,
+                    },
+                },
+                false,
+                1_783_699_202_000,
+            )
+            .expect("wrap annotation");
+        let slot = &applied.projection.render_map.private_slots[0];
+        let edited = vault
+            .edit_private_annotation(
+                &path,
+                &applied.document.etag,
+                &applied.projection.markdown,
+                &applied.projection.render_map,
+                &[TextRange::new(
+                    slot.projection_range.start + 1,
+                    slot.projection_range.start + 2,
+                )
+                .expect("cursor inside private block")],
+                &PrivateAnnotationSpec {
+                    kind: crate::umbra_config::PrivateAnnotationKind::Block,
+                    tag_ids: vec!["family".to_owned(), "relationship".to_owned()],
+                    outer: OuterSlotStrategy {
+                        mode: crate::umbra_config::OuterMode::Cover,
+                        cover_text: Some("public cover".to_owned()),
+                    },
+                },
+                false,
+                1_783_699_203_000,
+            )
+            .expect("edit annotation metadata");
+        assert!(edited.projection.markdown.contains("INEX_EDIT_CANARY"));
+        assert!(edited.projection.markdown.contains("kind: block"));
+        assert!(
+            edited
+                .projection
+                .markdown
+                .contains("tags: [family, relationship]")
+        );
+        assert_eq!(
+            edited.projection.render_map.private_slots[0].slot_id,
+            slot.slot_id
+        );
+        let (_, outer) = vault.read_umbra_outer_document(&path).expect("read Outer");
+        assert_eq!(
+            outer.slots[&slot.slot_id].outer.mode,
+            crate::umbra_config::OuterMode::Cover
+        );
+        assert_eq!(
+            outer.slots[&slot.slot_id].outer.cover_text.as_deref(),
+            Some("public cover")
+        );
+        let payload = vault
+            .read_umbra_private_slot(&path, &slot.slot_id)
+            .expect("read edited payload");
+        assert_eq!(payload.markdown, "INEX_EDIT_CANARY");
+        assert_eq!(
+            payload.kind,
+            crate::umbra_config::PrivateAnnotationKind::Block
+        );
+        assert_eq!(payload.tag_ids, ["family", "relationship"]);
+        assert_eq!(payload.created_at_ms, 1_783_699_202_000);
+        assert_eq!(payload.updated_at_ms, 1_783_699_203_000);
+        let disk = fs::read(directory.path().join("2026-07-edit-annotation.md.enc"))
+            .expect("read encrypted document");
+        let disk = String::from_utf8_lossy(&disk);
+        assert!(!disk.contains("INEX_EDIT_CANARY"));
+        assert!(!disk.contains("relationship"));
+        assert!(!disk.contains("family"));
     }
 
     #[test]
