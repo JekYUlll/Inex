@@ -498,3 +498,5 @@
 - UI的一次`lstat`不能绑定CLI最终dispatch模式。existing target在spawn前消失会转入fresh creation，因此不能据UI分类放宽`INEX_PASSWORD_STDIN`保护；扩展始终拒绝该环境注入口，并明确exact reconcile不会询问口令、若出现口令必须取消。该提示不取代后端的physical identity/fail-closed审计，hostile same-UID变化仍属trusted-local preview边界。
 - 长期多提交仓库的“初始化”必须在交互层显式说明语义：fresh路径只复制clean tracked HEAD（Markdown和普通附件）到一个新的parentless密文提交，原仓库/明文历史保持不变；existing exact-v2路径又完全不做source Git planning。因此统一完成提示只能声明selected target通过初始化或对账审计，不能声称reconcile使用了当前选中的source HEAD。
 - Umbra不能仅靠现有vault master key或把标签放入Markdown前言实现：普通vault解锁/Outer Mode本来可以读取EDRY正文，因而kind/tag/profile必须由独立随机K_umbra再次加密。安全v1需要feature-2协商、authenticated metadata中的独立Umbra key-slot、reserved encrypted config和包含public marker/outer entry加nested slot cipher的canonical document container；否则Outer搜索、普通编辑或配置同步都会泄漏私密分类。
+- Umbra v1 的 keyslot 不能复用 `vault.json` password slot：它须具有独立的 salt、KEK、随机数据密钥与 slot-file AAD。Outer master key 不参与 `K_umbra` 派生或解包；因此 feature-2 不能在 private container 支持之前提前标记为 reader-supported。
+- 已解锁会话的 Umbra 密码重置安全地以 live `K_umbra` 为唯一授权：重新生成 salt/nonce/KEK、原子替换 slot 文件即可；绝不能要求或保留旧 Umbra 密码，也绝不能逐 slot 重加密作为密码修改的副作用。

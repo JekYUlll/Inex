@@ -719,3 +719,10 @@
 - 2026-07-14 VS Code最终门禁：TypeScript、45/45 Node tests、production/integration bundle、真实本机Extension Host feature-1 import→asset preview→CRUD→backup/recovery→residue audit全部PASS；release artifact工具30/30、JSON、CLI help、diff-check通过。两路独立终审均GO。真实folder picker、双口令TTY、Open New Vault鼠标链与persistent-profile残留仍须在本次最终VSIX上人工执行，未以底层CLI integration冒充UI自动化。
 - 2026-07-14 release锁图自`5aae576`后实际为78个Cargo组件/149份license text，旧测试仍固定77/147；仅同步精确断言并以独立提交`d784009`（`test(release): sync locked license graph counts`）落地，30/30复绿。下一步必须从clean当前提交重建release CLI/daemon/VSIX，旧`7fb83ec` demo与旧`target/release`不可复用或重标。
 - 2026-07-15 用户新增Umbra私密标注系统设计。仓库此前不存在`docs/prd-umbra-mode.md`或任何Umbra/私密slot实现，故新建PRD并把它加入active Goal/Phase 6：标签、profile、kind、私密正文和时间必须在K_umbra内；Outer投影、Outer索引、editor设置、日志和异常均不得泄漏。下一实现顺序先冻结storage/RPC/兼容契约，再进入core与两个编辑器，不能直接只做QuickPick界面。
+## 2026-07-15 — Umbra 独立密码槽核心起步
+
+- 已按用户冻结的 v1 语义提交 `f96f656`：新增 `umbra_keyslot`，随机 256-bit `K_umbra` 不由密码直接充当数据密钥；唯一 `.inex/keyslots/umbra-default.inex-keyslot` JSON 使用固定 Argon2id 3/256 MiB/parallelism 1 与 XChaCha20-Poly1305 包装。
+- slot AAD 绑定 vault ID、canonical slot path、slot ID、key ID 和版本；错误口令、跨 vault 移植和被改写 slot 均统一失败，不返回私密数据。`UmbraKey` 使用现有 libsodium protected allocation，drop 即清理。
+- 已实现“已解锁会话中重设密码”：新 salt/nonce/KEK 仅重新包装同一个内存 `K_umbra`，无须旧密码、不会重加密私密内容；真实 256 MiB KDF 测试确认旧密码失效、新密码解包得到同一数据密钥。
+- `.inex` 已成为 tree 的 root 保留目录，atomic writer 只允许该单一 canonical keyslot 作为额外受控目标。feature 2 目前仅保留编号，尚未对现有 EDRY reader 宣称支持，待 v2 document container 同步接入。
+- 验证：`cargo clippy -p inex-core --all-targets -- -D warnings` 与 `cargo test -p inex-core --lib`（279/279）通过。

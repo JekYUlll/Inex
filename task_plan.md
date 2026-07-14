@@ -6,7 +6,7 @@
 
 ## Current Phase
 
-Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私密标注设计冻结（Phase 7 发布收尾暂停但不撤销）
+Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私密标注核心实现（Phase 7 发布收尾暂停但不撤销）
 
 ## Scope and Acceptance Baseline
 
@@ -68,7 +68,9 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
 
   - [ ] 设计并实现 Umbra 私密标注系统（`docs/prd-umbra-mode.md`）
   - [x] 冻结产品交互、私密标签/profile加密边界、Outer隔离、selection原子性及MVP/延期范围
-  - [x] 冻结K_umbra密钥层级、slot/config v1 envelope、logical `.inex/config.umbra.inex` 映射与兼容/迁移契约（`docs/spec/umbra-v1.md`；初始Umbra password lifecycle仍需实现前复审）
+  - [x] 冻结独立K_umbra层级、唯一`umbra-default`密码槽、不可恢复语义与`.inex/config.umbra.inex`边界（`docs/spec/umbra-v1.md`）
+  - [x] 实现随机K_umbra、Argon2id KEK 包装/解包、vault/path-bound AEAD、受保护内存清理，以及已解锁会话密码重包装基础（`f96f656`）
+  - [ ] 将密码槽初始化/替换接入Vault会话、受控`.inex`目录创建与feature-2启用事务
   - [ ] 实现core私密slot、TagId、catalog/profile和RenderMap选择事务，并证明canary不进入磁盘Outer面
   - [ ] 扩展daemon session/RPC及VS Code QuickPick/命令/可配置keybindings
   - [ ] 扩展Sublime stateful picker、profile命令和keymap示例
