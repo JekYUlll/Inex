@@ -30,11 +30,9 @@ use inex_core::atomic::ExistingVaultMutationLockError;
 #[cfg(target_os = "linux")]
 use inex_core::atomic::{
     FilesystemDirectoryIdentity, HeldPublicationMarkerV2, HeldPublicationMarkerV2CreateInput,
-    HeldPublicationMarkerV2Error, IMPORT_STAGING_PREFIX,
+    HeldPublicationMarkerV2Error,
 };
 use inex_core::crypto::VaultContentProfile;
-#[cfg(target_os = "linux")]
-use inex_core::path::raw_portable_case_fold_key;
 use inex_core::vault::Vault;
 use thiserror::Error;
 
@@ -475,39 +473,27 @@ where
 
 #[cfg(target_os = "linux")]
 fn repository_staging_child_name(root: &Path) -> Result<String, InitialCandidateClaimError> {
-    let name = root.file_name().and_then(std::ffi::OsStr::to_str).ok_or(
-        InitialCandidateClaimError::PreMarker(
-            InitialCandidateClaimPreflightError::InvalidStagingName,
-        ),
-    )?;
-    let suffix = name
-        .strip_prefix(IMPORT_STAGING_PREFIX)
-        .filter(|suffix| {
-            suffix.len() == 32
-                && suffix
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        })
-        .ok_or(InitialCandidateClaimError::PreMarker(
-            InitialCandidateClaimPreflightError::InvalidStagingName,
-        ))?;
-    debug_assert_eq!(suffix.len(), 32);
-    Ok(name.to_owned())
+    super::candidate_publication_authority::validated_staging_child_name_from_root(root).map_err(
+        |_| {
+            InitialCandidateClaimError::PreMarker(
+                InitialCandidateClaimPreflightError::InvalidStagingName,
+            )
+        },
+    )
 }
 
 #[cfg(target_os = "linux")]
 fn require_unreserved_destination(
     destination_child_name: &str,
 ) -> Result<(), InitialCandidateClaimError> {
-    let destination = raw_portable_case_fold_key(destination_child_name);
-    let reserved = raw_portable_case_fold_key(IMPORT_STAGING_PREFIX);
-    if destination.as_str().starts_with(reserved.as_str()) {
-        Err(InitialCandidateClaimError::PreMarker(
+    super::candidate_publication_authority::require_unreserved_destination_child_name(
+        destination_child_name,
+    )
+    .map_err(|_| {
+        InitialCandidateClaimError::PreMarker(
             InitialCandidateClaimPreflightError::ReservedDestinationName,
-        ))
-    } else {
-        Ok(())
-    }
+        )
+    })
 }
 
 #[cfg(target_os = "linux")]

@@ -84,6 +84,12 @@ mod candidate_initial_authority;
 )]
 mod candidate_fresh_audit;
 
+#[allow(
+    dead_code,
+    reason = "the fresh existing-only claim is consumed by reconciliation in the next slice"
+)]
+mod candidate_publication_authority;
+
 #[cfg(target_os = "linux")]
 use super::raw_index::{RawIndex, parse_sha1_index};
 use super::raw_index::{RawIndexError, TargetRawIndexSummary, validate_target_sha1_index_paths};
