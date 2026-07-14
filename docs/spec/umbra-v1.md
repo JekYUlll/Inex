@@ -1,8 +1,8 @@
 # Inex Umbra v1 Storage and RPC Contract
 
-Status: **proposed and intentionally not implemented.** This document freezes
-the decisions that must be reviewed before any K_umbra, slot, RPC, or editor
-code lands.
+Status: **Umbra v1 core key model is frozen.** Implementation begins with the
+independent `K_umbra` and its single password slot; later document, projection,
+and editor milestones must preserve the invariants in this document.
 
 ## Scope
 
@@ -35,21 +35,37 @@ Umbra password  -> Argon2id KEK -> wrapped random 256-bit K_umbra
 K_umbra         -> domain-separated AEAD keys for slots/config
 ```
 
-Enabling Umbra prompts for and confirms a distinct Umbra password. It creates a
-random 256-bit K_umbra and one or more password-wrapped Umbra key slots in
-authenticated `vault.json` metadata. The exact canonical metadata fields,
-Argon2id bounds, slot-ID grammar, wrapping nonce/AAD, and password-change/add/
-remove APIs must match the normal password-slot discipline but use separate
-`inex-umbra-*` domain labels. A vault master-key password must never derive or
-substitute for K_umbra.
+Enabling Umbra prompts for and confirms a distinct Umbra password, after
+displaying the non-recovery warning: **“Umbra 密码无法恢复。遗忘该密码将永久失去
+所有 Umbra 私密内容。”** It creates a random 256-bit `K_umbra`; the password is
+never used directly as a data-encryption key. Argon2id (`opslimit = 3`,
+`memlimit = 268435456`, `parallelism = 1`) derives a fresh KEK that wraps the
+random key with XChaCha20-Poly1305.
 
-The ordinary vault master key authenticates the public Umbra slot metadata in
-`vault.json`; the Umbra password is still required to unwrap K_umbra. The
-sidecar owns K_umbra only while Umbra Mode is unlocked, stores it in protected
-memory, zeroizes it on Umbra lock/session lock/EOF/shutdown, and never sends it
-to editor clients. Change, recovery, and multiple-Umbra-password-slot behavior
-are deferred until their exact v1 API is approved; initial implementation must
-not silently create a nonrecoverable key lifecycle.
+Umbra v1 has exactly one password slot, stored separately at
+`.inex/keyslots/umbra-default.inex-keyslot`. Its canonical JSON has the public
+fields `format`, `version`, `slotId`, `keyId`, `purpose`, `kdf`, and `wrap`.
+`slotId` is `umbra-default`, `purpose` is `umbra`, and all salts, nonces, KEKs,
+and wrapped data keys are independent from the Outer vault password slots. The
+slot AEAD AAD binds the vault ID, canonical slot path, slot ID, key ID, and
+schema/domain so it cannot be transplanted between vaults or slot names.
+
+The sidecar owns `K_umbra` only while Umbra Mode is unlocked, stores it in
+protected memory, zeroizes it on Umbra lock/session lock/EOF/shutdown, and
+never sends it to editor clients. Outer unlock alone must not load or decrypt
+the slot's payload, catalog, profiles, private slots, or Umbra indexes.
+
+While an Umbra session is unlocked, password change (including a reset when
+the user no longer remembers the old password) asks for and confirms a new
+password, derives a new salt/KEK, and atomically replaces the password-slot
+file after wrapping the *same* in-memory `K_umbra`. It does not re-encrypt
+private slots or configuration. The old password/KEK are cleared after the
+replacement. There is no recovery password, Outer-password bypass, security
+question, plaintext recovery key, administrator backdoor, cloud recovery, or
+additional Umbra slot in v1. Losing the password after all unlocked sessions
+are gone makes private data unrecoverable. `keyId` and `slotId` are retained
+only as forward-compatible identifiers; rotation and multiple slots are out of
+scope.
 
 ## Physical encrypted config
 

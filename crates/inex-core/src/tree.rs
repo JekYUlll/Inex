@@ -2,7 +2,7 @@
 //!
 //! Discovery reads directory entries and link-aware metadata only. It never
 //! opens an EDRY file and therefore cannot place ciphertext or plaintext file
-//! contents in an error. Reserved implementation entries (`.git`,
+//! contents in an error. Reserved implementation entries (`.git`, `.inex`,
 //! `.vault-local`, and root `vault.json`) are omitted. Documents-only scans
 //! preserve the legacy behavior of ignoring portable unrelated regular files.
 //! Asset-enabled scans instead fail closed on unrelated regular files so a
@@ -346,7 +346,7 @@ pub fn scan_vault_tree_with_profile(
 /// Discover a vault tree with explicit resource limits.
 ///
 /// `max_entries` limits all entries inspected, not only entries returned in the
-/// tree. The scan excludes exact root `.git`, `.vault-local`, and `vault.json`;
+/// tree. The scan excludes exact root `.git`, `.inex`, `.vault-local`, and `vault.json`;
 /// any root ASCII-case alias is rejected, and nested reserved components are
 /// invalid, so they cannot be
 /// hidden on Linux and later collide on a case-insensitive checkout.
@@ -976,6 +976,8 @@ fn reserved_entry_kind(parent: &Path, file_name: &std::ffi::OsStr) -> ReservedEn
     }
     let expected = if name.eq_ignore_ascii_case(".git") {
         Some(".git")
+    } else if name.eq_ignore_ascii_case(".inex") {
+        Some(".inex")
     } else if name.eq_ignore_ascii_case(".vault-local") {
         Some(".vault-local")
     } else if name.eq_ignore_ascii_case("vault.json") {

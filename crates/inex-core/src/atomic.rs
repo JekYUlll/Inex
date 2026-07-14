@@ -6581,6 +6581,7 @@ fn ensure_write_target_in_root(vault_root: &Path, target: &Path) -> Result<(), A
     if relative == Path::new("vault.json")
         || relative == Path::new(GIT_ATTRIBUTES_FILE)
         || relative == Path::new(GIT_IGNORE_FILE)
+        || relative == Path::new(".inex/keyslots/umbra-default.inex-keyslot")
     {
         if case_alias_exists(target)
             .map_err(|source| AtomicWriteError::io(AtomicWriteStage::ReadCurrent, source))?
