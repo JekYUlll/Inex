@@ -5,29 +5,31 @@
 //! nor writes a publication marker. Marker-aware collection belongs to the
 //! later publication transaction, while the mutation lock is held.
 
-use std::collections::BTreeSet;
 use std::fmt;
 use std::path::Path;
 
 use inex_core::atomic::{
     FilesystemDirectoryIdentity, FilesystemFileIdentity, PublicationIdentityScheme,
-    VAULT_LOCAL_DIRECTORY, VAULT_MUTATION_LOCK_FILE, filesystem_directory_identity,
-    path_is_supported_local_filesystem, verify_directory_has_no_alternate_data_streams,
 };
 #[cfg(target_os = "linux")]
-use inex_core::atomic::{SecureSourceChild, SecureSourceDirectory, open_secure_source_root};
-use inex_core::path::{CaseFoldKey, raw_portable_case_fold_key};
+use inex_core::atomic::{
+    SecureSourceChild, SecureSourceDirectory, VAULT_LOCAL_DIRECTORY, VAULT_MUTATION_LOCK_FILE,
+    open_secure_source_root, path_is_supported_local_filesystem,
+};
+#[cfg(target_os = "linux")]
+use inex_core::path::{PortableCaseFoldFingerprint, raw_portable_case_fold_fingerprint};
 
+use super::RepositoryImportError;
+#[cfg(target_os = "linux")]
+use super::candidate_seal::validate_physical_record_path;
 use super::candidate_seal::{
     CandidateDirectoryIdentity, CandidateFileIdentity, CandidateSealError, PhysicalRecord,
-    PhysicalRecordKind, PrivateBaselineRecord, validate_physical_record_path,
+    PhysicalRecordKind, PrivateBaselineRecord,
 };
 #[cfg(target_os = "linux")]
+use super::canonical_normal_directory;
+#[cfg(target_os = "linux")]
 use super::hash_secure_file;
-use super::{
-    NamespaceKind, NamespacePolicy, NamespaceSeal, RepositoryImportError,
-    canonical_normal_directory, inventory_namespace_with_file_limit,
-};
 
 const MAX_PHYSICAL_RECORDS: usize = 1_000_000;
 const MAX_PHYSICAL_PATH_BYTES: usize = 1_034;
@@ -56,7 +58,7 @@ const V1_LIMITS: PhysicalManifestLimits = PhysicalManifestLimits {
     file_bytes: MAX_PHYSICAL_FILE_BYTES,
 };
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Eq, PartialEq)]
 enum AuditedPhysicalKind {
     Directory(FilesystemDirectoryIdentity),
     File {
@@ -66,7 +68,7 @@ enum AuditedPhysicalKind {
     },
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Eq, PartialEq)]
 struct AuditedPhysicalRecord {
     path: String,
     kind: AuditedPhysicalKind,
@@ -121,12 +123,13 @@ impl fmt::Debug for PhysicalRecordRef<'_> {
 }
 
 /// Owned target-only evidence collected before any publication marker exists.
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Eq, PartialEq)]
 pub(super) struct MarkerFreePhysicalManifest {
     root_identity: FilesystemDirectoryIdentity,
     local_identity: FilesystemDirectoryIdentity,
     lock_identity: FilesystemFileIdentity,
     records: Vec<AuditedPhysicalRecord>,
+    owned_path_high_water: usize,
 }
 
 impl fmt::Debug for MarkerFreePhysicalManifest {
@@ -137,6 +140,7 @@ impl fmt::Debug for MarkerFreePhysicalManifest {
             .field("local_identity", &"[REDACTED]")
             .field("lock_identity", &"[REDACTED]")
             .field("records", &self.records.len())
+            .field("owned_path_high_water", &self.owned_path_high_water)
             .finish()
     }
 }
@@ -187,6 +191,14 @@ impl MarkerFreePhysicalManifest {
             .map(|record| physical_record_ref(id, record))
     }
 
+    /// Borrow one canonical record by exact byte spelling.
+    pub(super) fn find(&self, path: &str) -> Option<PhysicalRecordRef<'_>> {
+        self.records
+            .binary_search_by(|record| record.path.as_bytes().cmp(path.as_bytes()))
+            .ok()
+            .and_then(|index| self.record(PhysicalRecordId(index)))
+    }
+
     /// Number of directory records, including the target root.
     pub(super) fn directory_count(&self) -> usize {
         self.records
@@ -200,13 +212,18 @@ impl MarkerFreePhysicalManifest {
         self.records.iter().map(|record| record.path.len()).sum()
     }
 
+    #[cfg(test)]
+    fn owned_path_high_water(&self) -> usize {
+        self.owned_path_high_water
+    }
+
     /// Revalidate the complete target against this exact baseline.
     ///
     /// Linux walks through held descriptor-relative children and retains only
     /// one record-ID bitset plus the bounded recursion stack. It deliberately
-    /// does not rebuild a `Vec<NamespaceSeal>` or any second owned path
-    /// manifest. Other platforms remain fail closed until their native
-    /// held-handle traversal is implemented and tested.
+    /// does not rebuild any second owned namespace or path manifest. Other
+    /// platforms remain fail closed until their native held-handle traversal
+    /// is implemented and tested.
     pub(super) fn require_current_exact(&self, root: &Path) -> Result<(), RepositoryImportError> {
         #[cfg(target_os = "linux")]
         {
@@ -488,223 +505,373 @@ fn collect_marker_free_physical_manifest_with_limits(
     root: &Path,
     limits: PhysicalManifestLimits,
 ) -> Result<MarkerFreePhysicalManifest, RepositoryImportError> {
+    #[cfg(target_os = "linux")]
+    {
+        collect_marker_free_physical_manifest_with_fingerprint(
+            root,
+            limits,
+            raw_portable_case_fold_fingerprint,
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (root, limits);
+        Err(RepositoryImportError::TargetAuditFailed)
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct DirectPhysicalCollector<'a, F> {
+    limits: PhysicalManifestLimits,
+    fingerprint: &'a F,
+    records: Vec<AuditedPhysicalRecord>,
+    fingerprints: Vec<PortableCaseFoldFingerprint>,
+    retained_path_bytes: usize,
+    owned_path_high_water: usize,
+    git_fingerprint: PortableCaseFoldFingerprint,
+    local_fingerprint: PortableCaseFoldFingerprint,
+    local_identity: Option<FilesystemDirectoryIdentity>,
+    lock_identity: Option<FilesystemFileIdentity>,
+}
+
+#[cfg(target_os = "linux")]
+impl<F> DirectPhysicalCollector<'_, F>
+where
+    F: Fn(&str) -> PortableCaseFoldFingerprint,
+{
+    fn collect_directory(
+        &mut self,
+        directory: &SecureSourceDirectory,
+        parent_id: PhysicalRecordId,
+        depth: usize,
+    ) -> Result<(), RepositoryImportError> {
+        if depth > self.limits.depth {
+            return Err(RepositoryImportError::ResourceLimit);
+        }
+        directory
+            .verify_no_alternate_data_streams()
+            .map_err(|_| RepositoryImportError::TargetAuditFailed)?;
+        for entry in directory
+            .read_dir()
+            .map_err(|_| RepositoryImportError::TargetAuditFailed)?
+        {
+            let entry = entry.map_err(|_| RepositoryImportError::TargetAuditFailed)?;
+            let name = entry.file_name();
+            let name_text = name
+                .to_str()
+                .ok_or(RepositoryImportError::TargetAuditFailed)?;
+            self.reserve_record_and_fingerprint()?;
+            let child_depth = depth
+                .checked_add(1)
+                .filter(|child_depth| *child_depth <= self.limits.depth)
+                .ok_or(RepositoryImportError::ResourceLimit)?;
+            let path = self.build_canonical_child(parent_id, name_text, child_depth)?;
+            self.require_portable_path_uniqueness(&path)?;
+
+            match directory
+                .open_child(&name)
+                .map_err(|_| RepositoryImportError::TargetAuditFailed)?
+            {
+                SecureSourceChild::Directory(child) => {
+                    let identity = child.identity().clone();
+                    self.require_private_directory(&path, &identity)?;
+                    let id = PhysicalRecordId(self.records.len());
+                    self.records.push(AuditedPhysicalRecord {
+                        path,
+                        kind: AuditedPhysicalKind::Directory(identity),
+                    });
+                    self.collect_directory(&child, id, child_depth)?;
+                    child
+                        .verify_no_alternate_data_streams()
+                        .map_err(|_| RepositoryImportError::TargetAuditFailed)?;
+                }
+                SecureSourceChild::File(file) => {
+                    file.verify_no_alternate_data_streams()
+                        .map_err(|_| RepositoryImportError::TargetAuditFailed)?;
+                    if file
+                        .observed_len()
+                        .map_err(|_| RepositoryImportError::TargetAuditFailed)?
+                        > self.limits.file_bytes
+                    {
+                        return Err(RepositoryImportError::ResourceLimit);
+                    }
+                    let (identity, size, sha256) = hash_secure_file(
+                        file,
+                        RepositoryImportError::TargetAuditFailed,
+                        Some(self.limits.file_bytes),
+                    )?;
+                    self.require_private_file(&path, &identity, size, sha256)?;
+                    self.records.push(AuditedPhysicalRecord {
+                        path,
+                        kind: AuditedPhysicalKind::File {
+                            identity,
+                            size,
+                            sha256,
+                        },
+                    });
+                }
+                SecureSourceChild::Other => {
+                    return Err(RepositoryImportError::TargetAuditFailed);
+                }
+            }
+        }
+        directory
+            .verify_no_alternate_data_streams()
+            .map_err(|_| RepositoryImportError::TargetAuditFailed)
+    }
+
+    fn build_canonical_child(
+        &mut self,
+        parent_id: PhysicalRecordId,
+        name: &str,
+        depth: usize,
+    ) -> Result<String, RepositoryImportError> {
+        let parent = self
+            .records
+            .get(parent_id.0)
+            .ok_or(RepositoryImportError::TargetAuditFailed)?;
+        if !matches!(parent.kind, AuditedPhysicalKind::Directory(_)) {
+            return Err(RepositoryImportError::TargetAuditFailed);
+        }
+        let separator = usize::from(!parent.path.is_empty());
+        let path_length = parent
+            .path
+            .len()
+            .checked_add(separator)
+            .and_then(|length| length.checked_add(name.len()))
+            .ok_or(RepositoryImportError::ResourceLimit)?;
+        if path_length > self.limits.path_bytes || depth > self.limits.depth {
+            return Err(RepositoryImportError::ResourceLimit);
+        }
+        let retained_path_bytes = advance_owned_path_budget(
+            self.retained_path_bytes,
+            path_length,
+            self.limits.path_budget,
+        )?;
+        let mut path = String::new();
+        path.try_reserve_exact(path_length)
+            .map_err(|_| RepositoryImportError::ResourceLimit)?;
+        path.push_str(&parent.path);
+        if separator != 0 {
+            path.push('/');
+        }
+        path.push_str(name);
+        validate_physical_record_path(&path).map_err(map_candidate_path_error)?;
+        self.retained_path_bytes = retained_path_bytes;
+        self.owned_path_high_water = self.owned_path_high_water.max(retained_path_bytes);
+        Ok(path)
+    }
+
+    fn reserve_record_and_fingerprint(&mut self) -> Result<(), RepositoryImportError> {
+        if self.records.len() >= self.limits.records {
+            return Err(RepositoryImportError::ResourceLimit);
+        }
+        self.records
+            .try_reserve(1)
+            .map_err(|_| RepositoryImportError::ResourceLimit)?;
+        self.fingerprints
+            .try_reserve(1)
+            .map_err(|_| RepositoryImportError::ResourceLimit)
+    }
+
+    fn require_portable_path_uniqueness(
+        &mut self,
+        path: &str,
+    ) -> Result<(), RepositoryImportError> {
+        let top_level = path.split('/').next().unwrap_or_default();
+        let top_fingerprint = (self.fingerprint)(top_level);
+        if (top_fingerprint == self.git_fingerprint && top_level != ".git")
+            || (top_fingerprint == self.local_fingerprint && top_level != VAULT_LOCAL_DIRECTORY)
+        {
+            return Err(RepositoryImportError::TargetAuditFailed);
+        }
+        self.fingerprints.push((self.fingerprint)(path));
+        Ok(())
+    }
+
+    fn require_private_directory(
+        &mut self,
+        path: &str,
+        identity: &FilesystemDirectoryIdentity,
+    ) -> Result<(), RepositoryImportError> {
+        if path == VAULT_LOCAL_DIRECTORY {
+            if self.local_identity.replace(identity.clone()).is_some() {
+                return Err(RepositoryImportError::TargetAuditFailed);
+            }
+        } else if path
+            .strip_prefix(VAULT_LOCAL_DIRECTORY)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+        {
+            return Err(RepositoryImportError::TargetAuditFailed);
+        }
+        Ok(())
+    }
+
+    fn require_private_file(
+        &mut self,
+        path: &str,
+        identity: &FilesystemFileIdentity,
+        size: u64,
+        sha256: [u8; 32],
+    ) -> Result<(), RepositoryImportError> {
+        if path == VAULT_LOCAL_DIRECTORY {
+            return Err(RepositoryImportError::TargetAuditFailed);
+        }
+        if let Some(private_child) = path.strip_prefix(VAULT_LOCAL_DIRECTORY).and_then(|suffix| {
+            suffix
+                .strip_prefix('/')
+                .filter(|child| !child.contains('/'))
+        }) {
+            if private_child != VAULT_MUTATION_LOCK_FILE
+                || size != 0
+                || sha256 != EMPTY_SHA256
+                || self.lock_identity.replace(identity.clone()).is_some()
+            {
+                return Err(RepositoryImportError::TargetAuditFailed);
+            }
+        } else if path
+            .strip_prefix(VAULT_LOCAL_DIRECTORY)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+        {
+            return Err(RepositoryImportError::TargetAuditFailed);
+        }
+        Ok(())
+    }
+}
+
+fn advance_owned_path_budget(
+    retained: usize,
+    added: usize,
+    maximum: usize,
+) -> Result<usize, RepositoryImportError> {
+    retained
+        .checked_add(added)
+        .filter(|bytes| *bytes <= maximum)
+        .ok_or(RepositoryImportError::ResourceLimit)
+}
+
+#[cfg(target_os = "linux")]
+fn collect_marker_free_physical_manifest_with_fingerprint<F>(
+    root: &Path,
+    limits: PhysicalManifestLimits,
+    fingerprint: F,
+) -> Result<MarkerFreePhysicalManifest, RepositoryImportError>
+where
+    F: Fn(&str) -> PortableCaseFoldFingerprint,
+{
     let root = canonical_normal_directory(root, RepositoryImportError::TargetAuditFailed)?;
     if !path_is_supported_local_filesystem(&root)
         .map_err(|_| RepositoryImportError::TargetAuditFailed)?
     {
         return Err(RepositoryImportError::TargetAuditFailed);
     }
-    let root_identity = filesystem_directory_identity(&root)
+    if limits.records == 0 {
+        return Err(RepositoryImportError::ResourceLimit);
+    }
+    let directory =
+        open_secure_source_root(&root).map_err(|_| RepositoryImportError::TargetAuditFailed)?;
+    directory
+        .verify_no_alternate_data_streams()
         .map_err(|_| RepositoryImportError::TargetAuditFailed)?;
-    let seals = inventory_namespace_with_file_limit(
-        &root,
-        NamespacePolicy::TargetPrivate,
-        Some(limits.file_bytes),
-    )?;
-    if filesystem_directory_identity(&root).ok().as_ref() != Some(&root_identity) {
-        return Err(RepositoryImportError::TargetAuditFailed);
-    }
-
-    let (records, local_identity, lock_identity) =
-        audit_physical_seals(&root_identity, seals, limits)?;
-    verify_current_private_state(
-        &root,
-        &root_identity,
-        &local_identity,
-        &lock_identity,
-        limits,
-    )?;
-    verify_current_directory_state(&root, &records)?;
-
-    Ok(MarkerFreePhysicalManifest {
-        root_identity,
-        local_identity,
-        lock_identity,
-        records,
-    })
-}
-
-fn verify_current_directory_state(
-    root: &Path,
-    records: &[AuditedPhysicalRecord],
-) -> Result<(), RepositoryImportError> {
-    for record in records {
-        let AuditedPhysicalKind::Directory(expected_identity) = &record.kind else {
-            continue;
-        };
-        let path = if record.path.is_empty() {
-            root.to_path_buf()
-        } else {
-            root.join(&record.path)
-        };
-        verify_directory_has_no_alternate_data_streams(&path, expected_identity)
-            .map_err(|_| RepositoryImportError::TargetAuditFailed)?;
-    }
-    Ok(())
-}
-
-fn audit_physical_seals(
-    root_identity: &FilesystemDirectoryIdentity,
-    seals: Vec<NamespaceSeal>,
-    limits: PhysicalManifestLimits,
-) -> Result<
-    (
-        Vec<AuditedPhysicalRecord>,
-        FilesystemDirectoryIdentity,
-        FilesystemFileIdentity,
-    ),
-    RepositoryImportError,
-> {
-    let record_count = seals
-        .len()
-        .checked_add(1)
-        .filter(|count| *count <= limits.records)
-        .ok_or(RepositoryImportError::ResourceLimit)?;
+    let root_identity = directory.identity().clone();
     let mut records = Vec::new();
     records
-        .try_reserve_exact(record_count)
+        .try_reserve(1)
         .map_err(|_| RepositoryImportError::ResourceLimit)?;
     records.push(AuditedPhysicalRecord {
         path: String::new(),
-        kind: AuditedPhysicalKind::Directory((*root_identity).clone()),
+        kind: AuditedPhysicalKind::Directory(root_identity.clone()),
     });
+    let mut collector = DirectPhysicalCollector {
+        limits,
+        fingerprint: &fingerprint,
+        records,
+        fingerprints: Vec::new(),
+        retained_path_bytes: 0,
+        owned_path_high_water: 0,
+        git_fingerprint: fingerprint(".git"),
+        local_fingerprint: fingerprint(VAULT_LOCAL_DIRECTORY),
+        local_identity: None,
+        lock_identity: None,
+    };
+    collector.collect_directory(&directory, PhysicalRecordId(0), 0)?;
+    directory
+        .verify_no_alternate_data_streams()
+        .map_err(|_| RepositoryImportError::TargetAuditFailed)?;
 
-    let private_key = raw_portable_case_fold_key(VAULT_LOCAL_DIRECTORY);
-    let private_prefix = format!("{VAULT_LOCAL_DIRECTORY}/");
-    let lock_path = format!("{VAULT_LOCAL_DIRECTORY}/{VAULT_MUTATION_LOCK_FILE}");
-    let mut folded_paths = BTreeSet::new();
-    let mut path_budget = 0_usize;
-    let mut local_identity = None;
-    let mut lock_identity = None;
-
-    for seal in seals {
-        let NamespaceSeal {
-            relative_path: path,
-            kind,
-            size,
-            sha256,
-        } = seal;
-        validate_audited_physical_path(
-            &path,
-            records.last().map(|record| record.path.as_str()),
-            &mut path_budget,
-            &mut folded_paths,
-            &private_key,
-            limits,
-        )?;
-        let kind = match kind {
-            NamespaceKind::Directory(identity) => {
-                if size != 0 || sha256.is_some() {
-                    return Err(RepositoryImportError::TargetAuditFailed);
-                }
-                if path == VAULT_LOCAL_DIRECTORY {
-                    if local_identity.replace(identity.clone()).is_some() {
-                        return Err(RepositoryImportError::TargetAuditFailed);
-                    }
-                } else if path.starts_with(&private_prefix) {
-                    return Err(RepositoryImportError::TargetAuditFailed);
-                }
-                AuditedPhysicalKind::Directory(identity)
-            }
-            NamespaceKind::File(identity) => {
-                let sha256 = sha256.ok_or(RepositoryImportError::TargetAuditFailed)?;
-                if size > limits.file_bytes {
-                    return Err(RepositoryImportError::ResourceLimit);
-                }
-                if path == VAULT_LOCAL_DIRECTORY {
-                    return Err(RepositoryImportError::TargetAuditFailed);
-                }
-                if path == lock_path {
-                    if size != 0
-                        || sha256 != EMPTY_SHA256
-                        || lock_identity.replace(identity.clone()).is_some()
-                    {
-                        return Err(RepositoryImportError::TargetAuditFailed);
-                    }
-                } else if path.starts_with(&private_prefix) {
-                    return Err(RepositoryImportError::TargetAuditFailed);
-                }
-                AuditedPhysicalKind::File {
-                    identity,
-                    size,
-                    sha256,
-                }
-            }
-        };
-        records.push(AuditedPhysicalRecord { path, kind });
-    }
-
-    let local_identity = local_identity.ok_or(RepositoryImportError::TargetAuditFailed)?;
-    let lock_identity = lock_identity.ok_or(RepositoryImportError::TargetAuditFailed)?;
-    Ok((records, local_identity, lock_identity))
-}
-
-fn validate_audited_physical_path(
-    path: &str,
-    previous: Option<&str>,
-    path_budget: &mut usize,
-    folded_paths: &mut BTreeSet<CaseFoldKey>,
-    private_key: &CaseFoldKey,
-    limits: PhysicalManifestLimits,
-) -> Result<(), RepositoryImportError> {
-    if path.len() > limits.path_bytes {
-        return Err(RepositoryImportError::ResourceLimit);
-    }
-    validate_physical_record_path(path).map_err(map_candidate_path_error)?;
-    path.split('/').try_fold(0_usize, |depth, _| {
-        depth
-            .checked_add(1)
-            .filter(|depth| *depth <= limits.depth)
-            .ok_or(RepositoryImportError::ResourceLimit)
-    })?;
-    if previous.is_some_and(|previous| previous.as_bytes() >= path.as_bytes()) {
-        return Err(RepositoryImportError::TargetAuditFailed);
-    }
-    *path_budget = path_budget
-        .checked_add(path.len())
-        .filter(|budget| *budget <= limits.path_budget)
-        .ok_or(RepositoryImportError::ResourceLimit)?;
-    if !folded_paths.insert(raw_portable_case_fold_key(path)) {
-        return Err(RepositoryImportError::TargetAuditFailed);
-    }
-    let top_level = path.split('/').next().unwrap_or_default();
-    if &raw_portable_case_fold_key(top_level) == private_key && top_level != VAULT_LOCAL_DIRECTORY {
-        return Err(RepositoryImportError::TargetAuditFailed);
-    }
-    Ok(())
-}
-
-fn verify_current_private_state(
-    root: &Path,
-    root_identity: &FilesystemDirectoryIdentity,
-    local_identity: &FilesystemDirectoryIdentity,
-    lock_identity: &FilesystemFileIdentity,
-    limits: PhysicalManifestLimits,
-) -> Result<(), RepositoryImportError> {
-    let local = root.join(VAULT_LOCAL_DIRECTORY);
-    if filesystem_directory_identity(root).ok().as_ref() != Some(root_identity)
-        || filesystem_directory_identity(&local).ok().as_ref() != Some(local_identity)
+    collector.fingerprints.sort_unstable();
+    if collector
+        .fingerprints
+        .windows(2)
+        .any(|pair| pair[0] == pair[1])
     {
         return Err(RepositoryImportError::TargetAuditFailed);
     }
-    let final_private = inventory_namespace_with_file_limit(
-        &local,
-        NamespacePolicy::TargetPrivate,
-        Some(limits.file_bytes),
-    )?;
-    let [final_lock] = final_private.as_slice() else {
+    drop(std::mem::take(&mut collector.fingerprints));
+    collector
+        .records
+        .sort_unstable_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
+    require_complete_physical_parent_graph(&collector.records)?;
+    let retained_path_bytes = collector
+        .records
+        .iter()
+        .try_fold(0_usize, |total, record| {
+            total
+                .checked_add(record.path.len())
+                .ok_or(RepositoryImportError::ResourceLimit)
+        })?;
+    if retained_path_bytes != collector.retained_path_bytes
+        || collector.owned_path_high_water != retained_path_bytes
+    {
+        return Err(RepositoryImportError::TargetAuditFailed);
+    }
+    let local_identity = collector
+        .local_identity
+        .ok_or(RepositoryImportError::TargetAuditFailed)?;
+    let lock_identity = collector
+        .lock_identity
+        .ok_or(RepositoryImportError::TargetAuditFailed)?;
+    let manifest = MarkerFreePhysicalManifest {
+        root_identity,
+        local_identity,
+        lock_identity,
+        records: collector.records,
+        owned_path_high_water: collector.owned_path_high_water,
+    };
+    manifest.require_current_exact(&root)?;
+    Ok(manifest)
+}
+
+#[cfg(target_os = "linux")]
+fn require_complete_physical_parent_graph(
+    records: &[AuditedPhysicalRecord],
+) -> Result<(), RepositoryImportError> {
+    let Some(root) = records.first() else {
         return Err(RepositoryImportError::TargetAuditFailed);
     };
-    if final_lock.relative_path != VAULT_MUTATION_LOCK_FILE
-        || final_lock.size != 0
-        || final_lock.sha256 != Some(EMPTY_SHA256)
-        || !matches!(&final_lock.kind, NamespaceKind::File(identity) if identity == lock_identity)
-        || filesystem_directory_identity(root).ok().as_ref() != Some(root_identity)
-        || filesystem_directory_identity(&local).ok().as_ref() != Some(local_identity)
+    if !root.path.is_empty() || !matches!(root.kind, AuditedPhysicalKind::Directory(_)) {
+        return Err(RepositoryImportError::TargetAuditFailed);
+    }
+    if records
+        .windows(2)
+        .any(|pair| pair[0].path.as_bytes() >= pair[1].path.as_bytes())
     {
         return Err(RepositoryImportError::TargetAuditFailed);
     }
-
+    for record in &records[1..] {
+        let parent_path = record
+            .path
+            .rfind('/')
+            .map_or("", |separator| &record.path[..separator]);
+        let parent = records
+            .binary_search_by(|candidate| candidate.path.as_bytes().cmp(parent_path.as_bytes()))
+            .ok()
+            .and_then(|index| records.get(index))
+            .ok_or(RepositoryImportError::TargetAuditFailed)?;
+        if !matches!(parent.kind, AuditedPhysicalKind::Directory(_)) {
+            return Err(RepositoryImportError::TargetAuditFailed);
+        }
+    }
     Ok(())
 }
 
@@ -714,6 +881,19 @@ fn map_candidate_path_error(error: CandidateSealError) -> RepositoryImportError 
         CandidateSealError::InvalidContext
         | CandidateSealError::InvalidRecord
         | CandidateSealError::NonCanonicalOrder => RepositoryImportError::TargetAuditFailed,
+    }
+}
+
+#[cfg(all(test, not(target_os = "linux")))]
+mod unsupported_platform_tests {
+    use super::*;
+
+    #[test]
+    fn marker_free_physical_collection_fails_closed() {
+        assert!(matches!(
+            collect_marker_free_physical_manifest(Path::new(".")),
+            Err(RepositoryImportError::TargetAuditFailed)
+        ));
     }
 }
 
@@ -967,12 +1147,19 @@ mod tests {
                 .sum::<usize>()
         );
         assert_eq!(manifest.directory_count(), 4);
+        assert_eq!(
+            manifest.owned_path_high_water(),
+            manifest.retained_path_bytes()
+        );
         assert_eq!(manifest.records().len(), manifest.records.len());
         for borrowed in manifest.records() {
             let owned = &manifest.records[borrowed.id.0];
             assert_eq!(borrowed.path.as_ptr(), owned.path.as_ptr());
             assert_eq!(borrowed.path.len(), owned.path.len());
             assert_eq!(manifest.record(borrowed.id), Some(borrowed));
+            let found = manifest.find(borrowed.path).expect("exact path finds");
+            assert_eq!(found, borrowed);
+            assert_eq!(found.path.as_ptr(), owned.path.as_ptr());
         }
         assert!(
             manifest
@@ -982,6 +1169,26 @@ mod tests {
         let debug = format!("{:?}", manifest.records().last().expect("record exists"));
         assert!(debug.contains("[REDACTED]"));
         assert!(!debug.contains("payload.bin"));
+    }
+
+    #[test]
+    fn path_owners_are_structurally_non_clone() {
+        fn preceding_derive<'a>(source: &'a str, declaration: &str) -> &'a str {
+            let declaration = source.find(declaration).expect("declaration exists");
+            source[..declaration]
+                .lines()
+                .rev()
+                .find(|line| line.starts_with("#[derive("))
+                .expect("derive exists")
+        }
+
+        let source = include_str!("candidate_manifest.rs");
+        assert!(!preceding_derive(source, "enum AuditedPhysicalKind").contains("Clone"));
+        assert!(!preceding_derive(source, "struct AuditedPhysicalRecord").contains("Clone"));
+        assert!(
+            !preceding_derive(source, "pub(super) struct MarkerFreePhysicalManifest")
+                .contains("Clone")
+        );
     }
 
     #[test]
@@ -1009,6 +1216,27 @@ mod tests {
                 .map(|index| manifest.records[index].path.as_str()),
             Ok("d00/d01/d02")
         );
+    }
+
+    #[test]
+    fn sorted_parent_graph_requires_each_borrowed_prefix_to_be_a_directory() {
+        let target = minimal_target("parent-graph");
+        fs::write(target.path().join("payload.bin"), b"payload").expect("payload writes");
+        let mut manifest =
+            collect_marker_free_physical_manifest(target.path()).expect("baseline collects");
+        let payload = manifest
+            .records
+            .iter_mut()
+            .find(|record| record.path == "payload.bin")
+            .expect("payload record exists");
+        payload.path = "missing/payload.bin".to_owned();
+        manifest
+            .records
+            .sort_unstable_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
+        assert!(matches!(
+            require_complete_physical_parent_graph(&manifest.records),
+            Err(RepositoryImportError::TargetAuditFailed)
+        ));
     }
 
     #[test]
@@ -1167,6 +1395,60 @@ mod tests {
     }
 
     #[test]
+    fn portable_fingerprints_reject_full_path_and_parent_prefix_aliases() {
+        let full = minimal_target("fold-full");
+        fs::create_dir(full.path().join("Straße")).expect("first folded directory creates");
+        fs::create_dir(full.path().join("STRASSE")).expect("second folded directory creates");
+        assert!(matches!(
+            collect_marker_free_physical_manifest(full.path()),
+            Err(RepositoryImportError::TargetAuditFailed)
+        ));
+
+        let prefix = minimal_target("fold-prefix");
+        fs::write(prefix.path().join("Foo"), b"file").expect("folded file creates");
+        fs::create_dir(prefix.path().join("foo")).expect("folded parent creates");
+        fs::write(prefix.path().join("foo/child"), b"child").expect("folded child creates");
+        assert!(matches!(
+            collect_marker_free_physical_manifest(prefix.path()),
+            Err(RepositoryImportError::TargetAuditFailed)
+        ));
+    }
+
+    #[test]
+    fn reserved_git_and_private_top_level_aliases_fail_closed() {
+        for alias in [".GIT", ".VAULT-LOCAL"] {
+            let target = minimal_target("reserved-fold-alias");
+            fs::create_dir(target.path().join(alias)).expect("reserved alias creates");
+            assert!(matches!(
+                collect_marker_free_physical_manifest(target.path()),
+                Err(RepositoryImportError::TargetAuditFailed)
+            ));
+        }
+    }
+
+    #[test]
+    fn injected_fingerprint_collision_fails_closed() {
+        let target = minimal_target("fingerprint-collision");
+        fs::write(target.path().join("alpha"), b"alpha").expect("alpha writes");
+        fs::write(target.path().join("beta"), b"beta").expect("beta writes");
+        let result = collect_marker_free_physical_manifest_with_fingerprint(
+            target.path(),
+            V1_LIMITS,
+            |path| {
+                if matches!(path, "alpha" | "beta") {
+                    raw_portable_case_fold_fingerprint("forced-collision")
+                } else {
+                    raw_portable_case_fold_fingerprint(path)
+                }
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(RepositoryImportError::TargetAuditFailed)
+        ));
+    }
+
+    #[test]
     fn every_marker_alias_and_extra_private_entry_fails_without_modification() {
         let target = minimal_target("private-extra");
         let local = target.path().join(VAULT_LOCAL_DIRECTORY);
@@ -1264,6 +1546,22 @@ mod tests {
 
     #[test]
     fn injected_limits_accept_exact_boundaries_and_reject_one_less() {
+        assert!(matches!(
+            advance_owned_path_budget(
+                MAX_PHYSICAL_PATH_BUDGET - 1,
+                1,
+                MAX_PHYSICAL_PATH_BUDGET,
+            ),
+            Ok(bytes) if bytes == MAX_PHYSICAL_PATH_BUDGET
+        ));
+        assert!(matches!(
+            advance_owned_path_budget(MAX_PHYSICAL_PATH_BUDGET, 1, MAX_PHYSICAL_PATH_BUDGET,),
+            Err(RepositoryImportError::ResourceLimit)
+        ));
+        assert!(matches!(
+            advance_owned_path_budget(usize::MAX, 1, usize::MAX),
+            Err(RepositoryImportError::ResourceLimit)
+        ));
         let mut streamed = 0_u64;
         super::super::advance_bounded_stream_observation(&mut streamed, 1, Some(1))
             .expect("exact streamed byte limit passes");
@@ -1285,9 +1583,15 @@ mod tests {
         fs::write(target.path().join("payload.bin"), [0x5a]).expect("bounded payload writes");
         let manifest = collect_marker_free_physical_manifest(target.path())
             .expect("fixture collects under v1 limits");
+        assert_eq!(
+            manifest.owned_path_high_water(),
+            manifest.retained_path_bytes()
+        );
         let exact = exact_observed_limits(&manifest);
-        collect_marker_free_physical_manifest_with_limits(target.path(), exact)
-            .expect("all exact observed boundaries pass");
+        let exact_manifest =
+            collect_marker_free_physical_manifest_with_limits(target.path(), exact)
+                .expect("all exact observed boundaries pass");
+        assert_eq!(exact_manifest.owned_path_high_water(), exact.path_budget);
 
         assert_resource_limit(&collect_marker_free_physical_manifest_with_limits(
             target.path(),
