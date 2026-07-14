@@ -502,3 +502,4 @@
 - 已解锁会话的 Umbra 密码重置安全地以 live `K_umbra` 为唯一授权：重新生成 salt/nonce/KEK、原子替换 slot 文件即可；绝不能要求或保留旧 Umbra 密码，也绝不能逐 slot 重加密作为密码修改的副作用。
 - Vault 层的 Umbra session 必须持有 slot 的 ciphertext etag，以在已解锁会话中用 CAS 原子替换 password slot；不能在外层 mutation guard 内再次调用独立 atomic writer，否则会造成重入锁风险。内部目录须在同一 guard 下创建并验证类型、挂载和大小写别名。
 - 配置 envelope 必须把 vault ID、`K_umbra` 的 key ID、canonical `.inex/config.umbra.inex` 路径和 schema version 作为 AAD/derivation context；只用单一 Umbra key 而不做 domain separation 会让 config 与 private-slot 密文跨用途替换缺少明确边界。
+- Private slot ciphertext 的 AAD 必须覆盖公开 Outer strategy；否则攻击者可把 `drop`、`placeholder`、cover text 等公开语义替换而仍让私密正文解密成功。slot key 还须绑定 logical document path 与 slot ID，禁止 slot 在文档间移植。

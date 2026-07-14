@@ -1,5 +1,11 @@
 # Inex Progress Log
 
+## 2026-07-15 — 加密 private slot 与 Outer 容器基础
+
+- 提交 `f20d2b6`：新增 `UmbraDocumentV1`、公开 `OuterSlotEntry` 与加密 `PrivateSlotPayloadV1`。私密 kind、tag IDs、Markdown 与 timestamps 仅序列化到 K_umbra slot ciphertext；Outer 容器仅有 marker/Outer strategy/cover 与 nonce/ciphertext。
+- 每 slot 子密钥与 AAD 同时绑定 vault ID、logical path、key ID、slot ID 和 canonical Outer strategy。测试证明 private canary 不进入 Outer JSON，并且修改 Outer strategy 后 slot 无法认证解密。
+- 尚未接入 EDRY/Vault 文档读写与 feature-2 negotiation，故当前不能向客户端暴露 Umbra 投影。
+
 ## 2026-07-15 — Vault 加密 catalog/profile 存储
 
 - 提交 `2f607ff`：新增 `Vault::load_umbra_config` 和 `save_umbra_config`。两者都先要求 live Umbra session；Outer 状态下直接返回 `UmbraLocked`，不会读取 config 路径或密文。
