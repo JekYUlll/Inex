@@ -51,6 +51,7 @@ pub enum Method {
     UmbraLock,
     UmbraEnable,
     UmbraDocumentOpen,
+    UmbraDocumentConvert,
     UmbraAnnotationApply,
     UmbraConfigGet,
     VaultListTree,
@@ -72,7 +73,7 @@ pub enum Method {
 }
 
 impl Method {
-    const ALL: [Self; 31] = [
+    const ALL: [Self; 32] = [
         Self::SystemHello,
         Self::SystemPing,
         Self::SystemShutdown,
@@ -86,6 +87,7 @@ impl Method {
         Self::UmbraLock,
         Self::UmbraEnable,
         Self::UmbraDocumentOpen,
+        Self::UmbraDocumentConvert,
         Self::UmbraAnnotationApply,
         Self::UmbraConfigGet,
         Self::VaultListTree,
@@ -123,6 +125,7 @@ impl Method {
             Self::UmbraLock => "umbra.lock",
             Self::UmbraEnable => "umbra.enable",
             Self::UmbraDocumentOpen => "umbra.document.open",
+            Self::UmbraDocumentConvert => "umbra.document.convert",
             Self::UmbraAnnotationApply => "umbra.annotation.apply",
             Self::UmbraConfigGet => "umbra.config.get",
             Self::VaultListTree => "vault.listTree",
@@ -150,10 +153,12 @@ impl Method {
             .find(|method| method.as_str() == value)
     }
 
-    const fn bit(self) -> u32 {
-        1_u32 << self as u8
+    const fn bit(self) -> u64 {
+        1_u64 << self as u8
     }
 }
+
+const _: () = assert!(Method::ALL.len() <= u64::BITS as usize);
 
 /// Set of known methods for which a dispatcher currently has handlers.
 ///
@@ -161,7 +166,7 @@ impl Method {
 /// `METHOD_NOT_FOUND` response.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MethodRegistry {
-    bits: u32,
+    bits: u64,
 }
 
 impl MethodRegistry {
@@ -175,7 +180,11 @@ impl MethodRegistry {
     #[must_use]
     pub const fn all() -> Self {
         Self {
-            bits: (1_u32 << Method::ALL.len()) - 1,
+            bits: if Method::ALL.len() == u64::BITS as usize {
+                u64::MAX
+            } else {
+                (1_u64 << Method::ALL.len()) - 1
+            },
         }
     }
 

@@ -152,6 +152,7 @@ impl<C: MonotonicClock> RpcService<C> {
             Method::UmbraLock => self.umbra_lock(params),
             Method::UmbraEnable => self.umbra_enable(params),
             Method::UmbraDocumentOpen => self.umbra_document_open(params),
+            Method::UmbraDocumentConvert => self.umbra_document_convert(params),
             Method::UmbraAnnotationApply => self.umbra_annotation_apply(params),
             Method::UmbraConfigGet => self.umbra_config_get(params),
             Method::VaultListTree => self.vault_list_tree(params),
@@ -451,6 +452,21 @@ impl<C: MonotonicClock> RpcService<C> {
             "etag": metadata.etag,
             "renderMap": render_map_value(&projection.render_map),
         }))
+    }
+
+    fn umbra_document_convert(&mut self, params: Params) -> RpcResult {
+        let mut params = ParamObject::new(params);
+        let session = required_session(&mut params)?;
+        let logical_path = params.required_logical_path("logicalPath")?;
+        let expected_etag = params.required_etag("ifMatch")?;
+        params.finish()?;
+        let metadata = self
+            .sessions
+            .vault_mut(session.as_str())
+            .map_err(map_session_error)?
+            .convert_document_to_umbra_outer(&logical_path, expected_etag.as_str(), unix_time_ms()?)
+            .map_err(|error| map_vault_error(error, ErrorContext::Document))?;
+        Ok(document_metadata_value(&metadata))
     }
 
     fn umbra_annotation_apply(&mut self, params: Params) -> RpcResult {
@@ -1984,6 +2000,43 @@ mod tests {
         );
         assert_eq!(enabled["result"]["ok"], true);
         scrub_object(&mut enabled);
+
+        let ordinary_path = LogicalPath::parse_canonical("ordinary.md")
+            .unwrap_or_else(|error| panic!("ordinary logical path failed: {error}"));
+        let ordinary = service
+            .sessions
+            .vault_mut(session.as_str())
+            .unwrap_or_else(|error| panic!("session vault failed: {error}"))
+            .create_document(&ordinary_path, b"ordinary public text\n", 1_783_699_201_000)
+            .unwrap_or_else(|error| panic!("create ordinary document failed: {error}"));
+        let ordinary_etag = ordinary.etag.clone();
+        let mut converted = response(
+            &mut service,
+            51,
+            "umbra.document.convert",
+            json!({
+                "session": session.as_str(),
+                "logicalPath": "ordinary.md",
+                "ifMatch": ordinary_etag.as_str(),
+            }),
+        );
+        assert_eq!(
+            converted["result"]["metadata"]["logicalPath"],
+            "ordinary.md"
+        );
+        assert_ne!(converted["result"]["etag"], ordinary_etag);
+        scrub_object(&mut converted);
+        let mut ordinary_opened = response(
+            &mut service,
+            52,
+            "umbra.document.open",
+            json!({"session": session.as_str(), "logicalPath": "ordinary.md"}),
+        );
+        assert_eq!(
+            ordinary_opened["result"]["contentBase64"],
+            encode_base64url(b"ordinary public text\n").as_str()
+        );
+        scrub_object(&mut ordinary_opened);
 
         let logical_path = LogicalPath::parse_canonical("private.md")
             .unwrap_or_else(|error| panic!("logical path failed: {error}"));

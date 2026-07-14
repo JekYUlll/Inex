@@ -890,6 +890,69 @@ impl Vault {
         Ok(document_metadata(encrypted, outcome))
     }
 
+    /// Atomically upgrade one ordinary committed Markdown document into a
+    /// feature-2 Umbra Outer container with the same public Markdown.
+    ///
+    /// The operation preserves the authenticated file identity and content
+    /// flags, but changes the EDRY required-feature set only after a live
+    /// Umbra session, feature-2 metadata negotiation, and the caller's
+    /// current ciphertext etag have all been verified. It never decrypts or
+    /// materializes any private slot because the initial container is empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError::UmbraLocked`] without `K_umbra`, a conflict for a
+    /// stale etag, or a context error when the document is already feature-2
+    /// (or otherwise not an ordinary Markdown envelope).
+    pub fn convert_document_to_umbra_outer(
+        &mut self,
+        logical_path: &LogicalPath,
+        expected_etag: &str,
+        modified_at_ms: i64,
+    ) -> Result<DocumentMetadata, VaultError> {
+        if self.umbra.is_none() {
+            return Err(VaultError::UmbraLocked);
+        }
+        let mut current = self.read_kind(logical_path, ExpectedEnvelopeKind::Committed)?;
+        if !current.header.required_features.is_empty() {
+            return Err(CryptoError::DocumentContextMismatch.into());
+        }
+        require_matching_etag(&current, expected_etag)?;
+        let identity = FileIdentity::from_header(&current.header);
+        let flags = current.header.content_flags;
+        let bytes = std::mem::take(&mut *current.plaintext);
+        let markdown = match String::from_utf8(bytes) {
+            Ok(markdown) => markdown,
+            Err(error) => {
+                let mut invalid = error.into_bytes();
+                invalid.zeroize();
+                return Err(CryptoError::InvalidMarkdownUtf8.into());
+            }
+        };
+        let outer = UmbraDocumentV1::new(markdown);
+        let plaintext = Zeroizing::new(outer.to_json()?);
+        let encrypted = crypto::encrypt_umbra_outer_document(
+            &self.master_key,
+            &self.config,
+            logical_path,
+            Some(identity),
+            plaintext.as_slice(),
+            modified_at_ms,
+            flags,
+            EnvelopeKind::Committed,
+        )?;
+        let expected = decode_etag(expected_etag)?;
+        let guard = self.acquire_mutation_guard()?;
+        let target = self.document_target(logical_path)?;
+        ensure_regular_file_bounded(&target, MAX_EDRY_ENVELOPE_BYTES)?;
+        let outcome = guard
+            .write(&target, &encrypted.bytes, WriteCondition::IfMatch(expected))
+            .map_err(map_atomic_error)?;
+        drop(guard);
+        self.invalidate_search_index();
+        Ok(document_metadata(encrypted, outcome))
+    }
+
     /// Save an Umbra Outer projection while retaining its authenticated EDRY
     /// identity and requiring a live `K_umbra` session.
     ///
@@ -3039,6 +3102,61 @@ mod tests {
             .read_umbra_outer_document(&path)
             .expect("reopen feature two container");
         assert_eq!(reopened, updated);
+    }
+
+    #[test]
+    fn ordinary_document_upgrade_to_umbra_is_live_session_etag_bound_and_preserves_identity() {
+        let directory = TestDirectory::new();
+        let mut vault = create_test_vault(&directory);
+        let path = logical("2026-07-upgrade.md");
+        let created = vault
+            .create_document(&path, b"# existing public Markdown\n", 1_783_699_201_000)
+            .expect("create ordinary document");
+        assert!(matches!(
+            vault.convert_document_to_umbra_outer(&path, &created.etag, 1_783_699_202_000),
+            Err(VaultError::UmbraLocked)
+        ));
+        vault
+            .initialize_umbra(b"upgrade Umbra password")
+            .expect("initialize Umbra");
+        vault
+            .enable_umbra_private_annotations(test_policy())
+            .expect("enable feature two");
+        let stale = format!("sha256:{}", "0".repeat(64));
+        assert!(matches!(
+            vault.convert_document_to_umbra_outer(&path, &stale, 1_783_699_202_000),
+            Err(VaultError::Conflict { .. })
+        ));
+        assert_eq!(
+            vault
+                .read(&path)
+                .expect("stale conversion keeps normal document")
+                .plaintext
+                .as_slice(),
+            b"# existing public Markdown\n"
+        );
+
+        let upgraded = vault
+            .convert_document_to_umbra_outer(&path, &created.etag, 1_783_699_202_000)
+            .expect("upgrade ordinary document");
+        assert_eq!(upgraded.header.file_id, created.header.file_id);
+        assert_eq!(upgraded.header.created_at_ms, created.header.created_at_ms);
+        assert_eq!(
+            upgraded.header.required_features,
+            vec![crate::features::UMBRA_PRIVATE_ANNOTATIONS_V1]
+        );
+        assert!(matches!(
+            vault.read(&path),
+            Err(VaultError::Crypto(CryptoError::DocumentContextMismatch))
+        ));
+        let (_, outer) = vault
+            .read_umbra_outer_document(&path)
+            .expect("read upgraded outer projection");
+        assert_eq!(outer.outer_markdown, "# existing public Markdown\n");
+        assert!(matches!(
+            vault.convert_document_to_umbra_outer(&path, &upgraded.etag, 1_783_699_203_000),
+            Err(VaultError::Crypto(CryptoError::DocumentContextMismatch))
+        ));
     }
 
     #[test]
