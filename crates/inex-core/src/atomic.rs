@@ -541,6 +541,17 @@ pub enum HeldPublicationMarkerV2Error {
     Io(#[source] io::Error),
 }
 
+/// Shared immutable claim, held-directory, and mutation-lock authority.
+#[cfg(target_os = "linux")]
+struct PublicationMarkerV2Authority {
+    marker: PublicationMarkerV2,
+    marker_file_identity: FilesystemFileIdentity,
+    common_parent: SecureSourceDirectory,
+    root: SecureSourceDirectory,
+    marker_parent: SecureSourceDirectory,
+    mutation_lock: ExistingVaultMutationLock,
+}
+
 /// Linear Linux authority for one canonical publication-marker v2 claim.
 ///
 /// The value owns the exact marker/root/private-directory handles and the
@@ -556,13 +567,28 @@ pub enum HeldPublicationMarkerV2Error {
 /// ```
 #[cfg(target_os = "linux")]
 pub struct HeldPublicationMarkerV2 {
-    marker: PublicationMarkerV2,
-    marker_file_identity: FilesystemFileIdentity,
-    common_parent: SecureSourceDirectory,
-    root: SecureSourceDirectory,
-    marker_parent: SecureSourceDirectory,
     marker_file: SecureSourceFile,
-    mutation_lock: ExistingVaultMutationLock,
+    authority: PublicationMarkerV2Authority,
+}
+
+#[cfg(target_os = "linux")]
+struct FormerPublicationMarkerFile {
+    file: File,
+}
+
+#[cfg(target_os = "linux")]
+impl FormerPublicationMarkerFile {
+    fn is_unlinked(&self) -> bool {
+        linux_regular_file_handle_is_unlinked(&self.file)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_regular_file_handle_is_unlinked(file: &File) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    file.metadata()
+        .is_ok_and(|metadata| metadata.file_type().is_file() && metadata.nlink() == 0)
 }
 
 #[cfg(target_os = "linux")]
@@ -570,6 +596,154 @@ impl fmt::Debug for HeldPublicationMarkerV2 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("HeldPublicationMarkerV2 { .. }")
     }
+}
+
+/// Live Linux authority after the exact held v2 marker was removed but its
+/// parent-directory synchronization was not confirmed.
+///
+/// This value is intentionally neither `Clone` nor `Copy`. Its only mutating
+/// operation retries the held marker-parent synchronization and associated
+/// read-only revalidation; it cannot unlink or recreate a marker.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub struct UnsyncedPostUnlinkPublicationMarkerV2 {
+    former_marker_file: FormerPublicationMarkerFile,
+    authority: PublicationMarkerV2Authority,
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for UnsyncedPostUnlinkPublicationMarkerV2 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("UnsyncedPostUnlinkPublicationMarkerV2 { .. }")
+    }
+}
+
+/// Live Linux authority after exact marker removal and marker-parent sync.
+///
+/// The in-memory immutable claim, former marker identity, held root/private
+/// directories, and original mutation lock remain owned until the caller's
+/// clean audit and terminal result complete. The marker cannot be recreated.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub struct SyncedPostUnlinkPublicationMarkerV2 {
+    former_marker_file: FormerPublicationMarkerFile,
+    authority: PublicationMarkerV2Authority,
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for SyncedPostUnlinkPublicationMarkerV2 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SyncedPostUnlinkPublicationMarkerV2 { .. }")
+    }
+}
+
+/// Opaque terminal owner for a replacement or indeterminate unlink state.
+///
+/// It exposes no retry, cleanup, handle, or lock API. Retaining this value lets
+/// the caller keep the same mutation lock through emission of a scrubbed
+/// terminal result; dropping it releases that lock last.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub struct TerminalPublicationMarkerV2Authority {
+    _former_marker_file: FormerPublicationMarkerFile,
+    _authority: PublicationMarkerV2Authority,
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for TerminalPublicationMarkerV2Authority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("TerminalPublicationMarkerV2Authority { .. }")
+    }
+}
+
+/// Physical result of consuming one exact held publication marker.
+///
+/// Every variant retains the same mutation-lock lifetime. Its discriminant,
+/// debug output, and errors expose no raw I/O error, path, marker byte,
+/// identity, publication id, or candidate seal. Authority payloads expose
+/// marker and identity data only through their explicit read-only getters.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub enum HeldPublicationMarkerV2UnlinkOutcome {
+    /// The exact canonical marker remains and may be retried only by the
+    /// caller's still-valid durable-with-marker typestate.
+    NotRemoved(HeldPublicationMarkerV2),
+    /// The exact marker is absent and its held parent was synchronized.
+    RemovedAndParentSynced(SyncedPostUnlinkPublicationMarkerV2),
+    /// The exact marker is absent, but parent synchronization was not proved.
+    RemovedButParentSyncIndeterminate(UnsyncedPostUnlinkPublicationMarkerV2),
+    /// A foreign entry occupies the exact marker pathname and was retained.
+    ReplacementRetained(TerminalPublicationMarkerV2Authority),
+    /// No exact old-present, absent, or replacement result could be proved.
+    PostStateIndeterminate(TerminalPublicationMarkerV2Authority),
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for HeldPublicationMarkerV2UnlinkOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::NotRemoved(_) => "HeldPublicationMarkerV2UnlinkOutcome::NotRemoved(..)",
+            Self::RemovedAndParentSynced(_) => {
+                "HeldPublicationMarkerV2UnlinkOutcome::RemovedAndParentSynced(..)"
+            }
+            Self::RemovedButParentSyncIndeterminate(_) => {
+                "HeldPublicationMarkerV2UnlinkOutcome::RemovedButParentSyncIndeterminate(..)"
+            }
+            Self::ReplacementRetained(_) => {
+                "HeldPublicationMarkerV2UnlinkOutcome::ReplacementRetained(..)"
+            }
+            Self::PostStateIndeterminate(_) => {
+                "HeldPublicationMarkerV2UnlinkOutcome::PostStateIndeterminate(..)"
+            }
+        })
+    }
+}
+
+/// Result of retrying only post-unlink marker-parent synchronization.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub enum PostUnlinkMarkerParentSyncOutcome {
+    /// The exact absent state and held parent synchronization are proved.
+    Synced(SyncedPostUnlinkPublicationMarkerV2),
+    /// Exact absence remains proved, but synchronization is still unconfirmed.
+    StillIndeterminate(UnsyncedPostUnlinkPublicationMarkerV2),
+    /// A replacement appeared and was retained without another unlink.
+    ReplacementRetained(TerminalPublicationMarkerV2Authority),
+    /// Post-unlink authority or namespace state became indeterminate.
+    PostStateIndeterminate(TerminalPublicationMarkerV2Authority),
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for PostUnlinkMarkerParentSyncOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Synced(_) => "PostUnlinkMarkerParentSyncOutcome::Synced(..)",
+            Self::StillIndeterminate(_) => {
+                "PostUnlinkMarkerParentSyncOutcome::StillIndeterminate(..)"
+            }
+            Self::ReplacementRetained(_) => {
+                "PostUnlinkMarkerParentSyncOutcome::ReplacementRetained(..)"
+            }
+            Self::PostStateIndeterminate(_) => {
+                "PostUnlinkMarkerParentSyncOutcome::PostStateIndeterminate(..)"
+            }
+        })
+    }
+}
+
+/// Scrubbed read-only failure from a synchronized post-unlink owner.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum PostUnlinkPublicationMarkerV2Error {
+    /// A held directory, mutation lock, current root, or recorded role drifted.
+    #[error("post-unlink publication authority changed")]
+    AuthorityChanged,
+    /// The reserved publication-marker namespace is not exact absent state.
+    #[error("post-unlink publication marker namespace conflicts")]
+    NamespaceConflict,
+    /// A scrubbed filesystem observation was inconclusive.
+    #[error("post-unlink publication state is indeterminate")]
+    Indeterminate,
 }
 
 enum ReservedMarkerInspection {
@@ -2662,6 +2836,7 @@ pub fn atomic_remove_verified_file(
         |_| Ok(()),
         |_| Ok(()),
         VerifiedRemoveFault::None,
+        true,
     )
 }
 
@@ -2716,7 +2891,7 @@ where
     F: FnOnce(&Path) -> io::Result<()>,
     G: FnOnce(&Path) -> io::Result<()>,
 {
-    atomic_remove_verified_file_impl(path, held_file, before_remove, after_remove, fault)
+    atomic_remove_verified_file_impl(path, held_file, before_remove, after_remove, fault, true)
 }
 
 fn atomic_remove_verified_file_impl<F, G>(
@@ -2725,6 +2900,7 @@ fn atomic_remove_verified_file_impl<F, G>(
     before_remove: F,
     after_remove: G,
     fault: VerifiedRemoveFault,
+    sync_parent_by_path: bool,
 ) -> Result<AtomicDeleteOutcome, AtomicVerifiedRemoveError>
 where
     F: FnOnce(&Path) -> io::Result<()>,
@@ -2756,7 +2932,7 @@ where
 
     match verified.file_state(&expected_identity) {
         VerifiedRemoveState::Absent if verified.parent_matches() => Ok(AtomicDeleteOutcome {
-            parent_sync: verified.parent_sync(fault),
+            parent_sync: verified.parent_sync(fault, sync_parent_by_path),
         }),
         VerifiedRemoveState::Exact if verified.parent_matches() && remove_result.is_err() => {
             Err(AtomicVerifiedRemoveError::NotRemoved)
@@ -2825,7 +3001,7 @@ where
 
     match verified.directory_state(expected_identity) {
         VerifiedRemoveState::Absent if verified.parent_matches() => Ok(AtomicDeleteOutcome {
-            parent_sync: verified.parent_sync(fault),
+            parent_sync: verified.parent_sync(fault, true),
         }),
         VerifiedRemoveState::Exact if verified.parent_matches() && remove_result.is_err() => {
             Err(AtomicVerifiedRemoveError::NotRemoved)
@@ -2959,8 +3135,12 @@ impl VerifiedRemovePath {
         }
     }
 
-    fn parent_sync(&self, fault: VerifiedRemoveFault) -> ParentSyncStatus {
-        if fault == VerifiedRemoveFault::ParentSync {
+    fn parent_sync(
+        &self,
+        fault: VerifiedRemoveFault,
+        sync_parent_by_path: bool,
+    ) -> ParentSyncStatus {
+        if !sync_parent_by_path || fault == VerifiedRemoveFault::ParentSync {
             ParentSyncStatus::NotSynced
         } else if platform::sync_directory(&self.parent).is_ok() {
             ParentSyncStatus::Synced
@@ -4070,13 +4250,15 @@ impl HeldPublicationMarkerV2 {
             .map_err(HeldPublicationMarkerV2Error::Io)?;
 
         let held = Self {
-            marker,
-            marker_file_identity,
-            common_parent,
-            root,
-            marker_parent,
             marker_file,
-            mutation_lock,
+            authority: PublicationMarkerV2Authority {
+                marker,
+                marker_file_identity,
+                common_parent,
+                root,
+                marker_parent,
+                mutation_lock,
+            },
         };
         held.revalidate_at(staging_root_path)?;
         Ok(held)
@@ -4118,13 +4300,15 @@ impl HeldPublicationMarkerV2 {
         let marker =
             read_canonical_held_publication_marker(&mut marker_file, &marker_file_identity)?;
         let held = Self {
-            marker,
-            marker_file_identity,
-            common_parent,
-            root,
-            marker_parent,
             marker_file,
-            mutation_lock,
+            authority: PublicationMarkerV2Authority {
+                marker,
+                marker_file_identity,
+                common_parent,
+                root,
+                marker_parent,
+                mutation_lock,
+            },
         };
         held.revalidate_at(current_root_path)?;
         Ok(held)
@@ -4143,39 +4327,43 @@ impl HeldPublicationMarkerV2 {
     /// Returns a scrubbed error if any held or current binding, marker role,
     /// body byte, hard-link count, stream state, or reserved alias differs.
     pub fn revalidate_at(&self, current_root: &Path) -> Result<(), HeldPublicationMarkerV2Error> {
-        self.mutation_lock
+        self.authority
+            .mutation_lock
             .revalidate(current_root)
             .map_err(|_| HeldPublicationMarkerV2Error::AuthorityChanged)?;
-        if self.root.identity() != self.mutation_lock.root_identity()
-            || self.marker_parent.identity() != self.mutation_lock.local_identity()
+        if self.authority.root.identity() != self.authority.mutation_lock.root_identity()
+            || self.authority.marker_parent.identity()
+                != self.authority.mutation_lock.local_identity()
             || self
                 .marker_file
                 .identity()
                 .map_err(HeldPublicationMarkerV2Error::Io)?
-                != self.marker_file_identity
+                != self.authority.marker_file_identity
         {
             return Err(HeldPublicationMarkerV2Error::AuthorityChanged);
         }
         revalidate_current_publication_root(
             current_root,
-            &self.common_parent,
-            &self.root,
-            &self.marker,
+            &self.authority.common_parent,
+            &self.authority.root,
+            &self.authority.marker,
         )?;
-        platform::verify_directory_handle_has_no_alternate_data_streams(&self.root.file)
+        platform::verify_directory_handle_has_no_alternate_data_streams(&self.authority.root.file)
             .map_err(HeldPublicationMarkerV2Error::Io)?;
-        self.marker_parent
+        self.authority
+            .marker_parent
             .verify_no_alternate_data_streams()
             .map_err(HeldPublicationMarkerV2Error::Io)?;
         self.marker_file
             .verify_no_alternate_data_streams()
             .map_err(HeldPublicationMarkerV2Error::Io)?;
         require_held_reserved_inventory(
-            &self.marker_parent,
+            &self.authority.marker_parent,
             HeldReservedPublicationInventory::ExactV2,
         )?;
 
         let mut observed_file = match self
+            .authority
             .marker_parent
             .open_child(std::ffi::OsStr::new(IMPORT_PUBLISH_MARKER_V2))
             .map_err(HeldPublicationMarkerV2Error::Io)?
@@ -4188,42 +4376,54 @@ impl HeldPublicationMarkerV2 {
         if observed_file
             .identity()
             .map_err(HeldPublicationMarkerV2Error::Io)?
-            != self.marker_file_identity
+            != self.authority.marker_file_identity
         {
             return Err(HeldPublicationMarkerV2Error::AuthorityChanged);
         }
-        let observed =
-            read_canonical_held_publication_marker(&mut observed_file, &self.marker_file_identity)?;
-        if observed != self.marker
+        let observed = read_canonical_held_publication_marker(
+            &mut observed_file,
+            &self.authority.marker_file_identity,
+        )?;
+        if observed != self.authority.marker
             || !self
+                .authority
                 .marker
-                .common_parent_matches(self.common_parent.identity())
-            || !self.marker.staging_root_matches(self.root.identity())
+                .common_parent_matches(self.authority.common_parent.identity())
             || !self
+                .authority
                 .marker
-                .marker_parent_matches(self.marker_parent.identity())
-            || !self.marker.marker_file_matches(&self.marker_file_identity)
+                .staging_root_matches(self.authority.root.identity())
+            || !self
+                .authority
+                .marker
+                .marker_parent_matches(self.authority.marker_parent.identity())
+            || !self
+                .authority
+                .marker
+                .marker_file_matches(&self.authority.marker_file_identity)
         {
             return Err(HeldPublicationMarkerV2Error::AuthorityChanged);
         }
 
         require_held_reserved_inventory(
-            &self.marker_parent,
+            &self.authority.marker_parent,
             HeldReservedPublicationInventory::ExactV2,
         )?;
         revalidate_current_publication_root(
             current_root,
-            &self.common_parent,
-            &self.root,
-            &self.marker,
+            &self.authority.common_parent,
+            &self.authority.root,
+            &self.authority.marker,
         )?;
-        self.marker_parent
+        self.authority
+            .marker_parent
             .verify_binding()
             .map_err(HeldPublicationMarkerV2Error::Io)?;
         self.marker_file
             .verify_binding()
             .map_err(HeldPublicationMarkerV2Error::Io)?;
-        self.mutation_lock
+        self.authority
+            .mutation_lock
             .revalidate(current_root)
             .map_err(|_| HeldPublicationMarkerV2Error::AuthorityChanged)
     }
@@ -4231,25 +4431,25 @@ impl HeldPublicationMarkerV2 {
     /// Borrow the validated canonical marker value without exposing its file.
     #[must_use]
     pub const fn marker(&self) -> &PublicationMarkerV2 {
-        &self.marker
+        &self.authority.marker
     }
 
     /// Borrow the exact held marker-file identity for marker-aware audits.
     #[must_use]
     pub const fn marker_file_identity(&self) -> &FilesystemFileIdentity {
-        &self.marker_file_identity
+        &self.authority.marker_file_identity
     }
 
     /// Borrow the exact root identity retained by the held mutation lock.
     #[must_use]
     pub const fn root_identity(&self) -> &FilesystemDirectoryIdentity {
-        self.mutation_lock.root_identity()
+        self.authority.mutation_lock.root_identity()
     }
 
     /// Borrow the exact `.vault-local` identity retained by the held lock.
     #[must_use]
     pub const fn marker_parent_identity(&self) -> &FilesystemDirectoryIdentity {
-        self.mutation_lock.local_identity()
+        self.authority.mutation_lock.local_identity()
     }
 
     /// Borrow the exact held root descriptor authority for marker-aware
@@ -4259,7 +4459,7 @@ impl HeldPublicationMarkerV2 {
     /// binding checks without exposing its raw file descriptor.
     #[must_use]
     pub const fn held_root(&self) -> &SecureSourceDirectory {
-        &self.root
+        &self.authority.root
     }
 
     /// Duplicate the same held root descriptor into a read-only traversal
@@ -4282,16 +4482,17 @@ impl HeldPublicationMarkerV2 {
         self.revalidate_at(current_root)?;
         let view = SecureSourceDirectory {
             file: self
+                .authority
                 .root
                 .file
                 .try_clone()
                 .map_err(HeldPublicationMarkerV2Error::Io)?,
-            identity: self.root.identity.clone(),
+            identity: self.authority.root.identity.clone(),
             binding: SecureSourceDirectoryBinding::Root(current_root.to_path_buf()),
         };
         view.verify_no_alternate_data_streams()
             .map_err(HeldPublicationMarkerV2Error::Io)?;
-        if view.identity() != self.root.identity() {
+        if view.identity() != self.authority.root.identity() {
             return Err(HeldPublicationMarkerV2Error::AuthorityChanged);
         }
         self.revalidate_at(current_root)?;
@@ -4312,11 +4513,670 @@ impl HeldPublicationMarkerV2 {
         local_identity: &FilesystemDirectoryIdentity,
         lock_identity: &FilesystemFileIdentity,
     ) -> bool {
+        self.authority.root.identity() == root_identity
+            && self.authority.marker_parent.identity() == local_identity
+            && self.authority.mutation_lock.root_identity() == root_identity
+            && self.authority.mutation_lock.local_identity() == local_identity
+            && self.authority.mutation_lock.lock_identity() == lock_identity
+    }
+
+    /// Consume this exact held marker and classify one destination-only unlink.
+    ///
+    /// The current root must be the marker's recorded destination child and
+    /// the recorded staging child must be absent. The exact canonical marker
+    /// is revalidated immediately before the pathname unlink. The original
+    /// marker handle remains held while a duplicate is consumed by the
+    /// verified-remove primitive, so an errored call can distinguish exact
+    /// old-present, exact absent, replacement, and indeterminate post-states.
+    ///
+    /// Every returned variant retains the same mutation-lock lifetime. Once
+    /// exact absence is proved, no returned type can regain write, deletion,
+    /// or reconstruction authority over the old claim; only marker-parent
+    /// synchronization and read-only classification or audit remain available.
+    ///
+    /// The final namespace operation is pathname based, not a kernel-level
+    /// identity compare-and-exchange. The complete checks before and after it
+    /// preserve replacements observed under the cooperative Inex lock
+    /// protocol, but a noncooperating process with the same OS identity can
+    /// still race the last check-to-unlink window.
+    pub fn unlink_exact_published_marker_at(
+        self,
+        current_root: &Path,
+    ) -> HeldPublicationMarkerV2UnlinkOutcome {
+        self.unlink_exact_published_marker_at_impl(
+            current_root,
+            |_| Ok(()),
+            |_| Ok(()),
+            VerifiedRemoveFault::None,
+        )
+    }
+
+    #[cfg(test)]
+    fn unlink_exact_published_marker_at_with_faults<BeforeRemove, AfterRemove>(
+        self,
+        current_root: &Path,
+        before_remove: BeforeRemove,
+        after_remove: AfterRemove,
+        fault: VerifiedRemoveFault,
+    ) -> HeldPublicationMarkerV2UnlinkOutcome
+    where
+        BeforeRemove: FnOnce(&Path) -> io::Result<()>,
+        AfterRemove: FnOnce(&Path) -> io::Result<()>,
+    {
+        self.unlink_exact_published_marker_at_impl(current_root, before_remove, after_remove, fault)
+    }
+
+    fn unlink_exact_published_marker_at_impl<BeforeRemove, AfterRemove>(
+        self,
+        current_root: &Path,
+        before_remove: BeforeRemove,
+        after_remove: AfterRemove,
+        fault: VerifiedRemoveFault,
+    ) -> HeldPublicationMarkerV2UnlinkOutcome
+    where
+        BeforeRemove: FnOnce(&Path) -> io::Result<()>,
+        AfterRemove: FnOnce(&Path) -> io::Result<()>,
+    {
+        if self
+            .revalidate_exact_published_marker_at(current_root)
+            .is_err()
+        {
+            return self
+                .into_terminal_unlink_outcome(HeldPublicationMarkerPostState::Indeterminate);
+        }
+
+        let Ok(marker_file) = self.marker_file.file.try_clone() else {
+            return if self
+                .revalidate_exact_published_marker_at(current_root)
+                .is_ok()
+            {
+                HeldPublicationMarkerV2UnlinkOutcome::NotRemoved(self)
+            } else {
+                self.into_terminal_unlink_outcome(HeldPublicationMarkerPostState::Indeterminate)
+            };
+        };
+        let marker_path = current_root
+            .join(VAULT_LOCAL_DIRECTORY)
+            .join(IMPORT_PUBLISH_MARKER_V2);
+        let effect_attempted = std::cell::Cell::new(false);
+        let remove_result = atomic_remove_verified_file_impl(
+            &marker_path,
+            marker_file,
+            |path| {
+                self.revalidate_exact_published_marker_at(current_root)
+                    .map_err(|_| io::Error::other("held publication marker changed"))?;
+                before_remove(path)?;
+                self.revalidate_exact_published_marker_at(current_root)
+                    .map_err(|_| io::Error::other("held publication marker changed"))
+            },
+            |path| {
+                if fault != VerifiedRemoveFault::ErrorBeforeRemove {
+                    effect_attempted.set(true);
+                }
+                after_remove(path)
+            },
+            fault,
+            PUBLICATION_MARKER_SYNC_PARENT_BY_PATH,
+        );
+
+        if matches!(remove_result, Err(AtomicVerifiedRemoveError::NotRemoved))
+            && self
+                .revalidate_exact_published_marker_at(current_root)
+                .is_ok()
+        {
+            return HeldPublicationMarkerV2UnlinkOutcome::NotRemoved(self);
+        }
+
+        let state = self.classify_marker_post_state(current_root);
+        match state {
+            HeldPublicationMarkerPostState::ExactHeld => {
+                HeldPublicationMarkerV2UnlinkOutcome::NotRemoved(self)
+            }
+            HeldPublicationMarkerPostState::Absent
+                if effect_attempted.get() && self.marker_file_is_unlinked() =>
+            {
+                self.finish_removed_marker(current_root, fault == VerifiedRemoveFault::ParentSync)
+            }
+            HeldPublicationMarkerPostState::Replacement => {
+                self.into_terminal_unlink_outcome(HeldPublicationMarkerPostState::Replacement)
+            }
+            HeldPublicationMarkerPostState::Absent
+            | HeldPublicationMarkerPostState::Indeterminate => {
+                self.into_terminal_unlink_outcome(HeldPublicationMarkerPostState::Indeterminate)
+            }
+        }
+    }
+
+    fn revalidate_exact_published_marker_at(
+        &self,
+        current_root: &Path,
+    ) -> Result<(), HeldPublicationMarkerV2Error> {
+        self.revalidate_at(current_root)?;
+        self.authority
+            .revalidate_published_base_at(current_root)
+            .map_err(map_post_unlink_error_to_held)?;
+        self.revalidate_at(current_root)
+    }
+
+    fn classify_marker_post_state(&self, current_root: &Path) -> HeldPublicationMarkerPostState {
+        if self
+            .revalidate_exact_published_marker_at(current_root)
+            .is_ok()
+        {
+            return HeldPublicationMarkerPostState::ExactHeld;
+        }
+        if self
+            .authority
+            .revalidate_published_base_at(current_root)
+            .is_err()
+        {
+            return HeldPublicationMarkerPostState::Indeterminate;
+        }
+
+        match classify_exact_marker_namespace(&self.authority) {
+            ExactMarkerNamespaceState::Absent => HeldPublicationMarkerPostState::Absent,
+            ExactMarkerNamespaceState::PresentFile(identity)
+                if identity != self.authority.marker_file_identity =>
+            {
+                HeldPublicationMarkerPostState::Replacement
+            }
+            ExactMarkerNamespaceState::PresentOther => HeldPublicationMarkerPostState::Replacement,
+            ExactMarkerNamespaceState::PresentFile(_)
+            | ExactMarkerNamespaceState::Indeterminate => {
+                HeldPublicationMarkerPostState::Indeterminate
+            }
+        }
+    }
+
+    fn marker_file_is_unlinked(&self) -> bool {
+        linux_regular_file_handle_is_unlinked(&self.marker_file.file)
+    }
+
+    fn finish_removed_marker(
+        self,
+        current_root: &Path,
+        inject_sync_failure: bool,
+    ) -> HeldPublicationMarkerV2UnlinkOutcome {
+        let (former_marker_file, authority) = self.into_post_unlink_parts();
+        let post = UnsyncedPostUnlinkPublicationMarkerV2 {
+            former_marker_file,
+            authority,
+        };
+        match post.retry_marker_parent_sync_at_impl(current_root, inject_sync_failure) {
+            PostUnlinkMarkerParentSyncOutcome::Synced(owner) => {
+                HeldPublicationMarkerV2UnlinkOutcome::RemovedAndParentSynced(owner)
+            }
+            PostUnlinkMarkerParentSyncOutcome::StillIndeterminate(owner) => {
+                HeldPublicationMarkerV2UnlinkOutcome::RemovedButParentSyncIndeterminate(owner)
+            }
+            PostUnlinkMarkerParentSyncOutcome::ReplacementRetained(owner) => {
+                HeldPublicationMarkerV2UnlinkOutcome::ReplacementRetained(owner)
+            }
+            PostUnlinkMarkerParentSyncOutcome::PostStateIndeterminate(owner) => {
+                HeldPublicationMarkerV2UnlinkOutcome::PostStateIndeterminate(owner)
+            }
+        }
+    }
+
+    fn into_post_unlink_parts(self) -> (FormerPublicationMarkerFile, PublicationMarkerV2Authority) {
+        let Self {
+            marker_file,
+            authority,
+        } = self;
+        let SecureSourceFile { file, parent, name } = marker_file;
+        drop(parent);
+        drop(name);
+        (FormerPublicationMarkerFile { file }, authority)
+    }
+
+    fn into_terminal_unlink_outcome(
+        self,
+        state: HeldPublicationMarkerPostState,
+    ) -> HeldPublicationMarkerV2UnlinkOutcome {
+        let (former_marker_file, authority) = self.into_post_unlink_parts();
+        let owner = TerminalPublicationMarkerV2Authority {
+            _former_marker_file: former_marker_file,
+            _authority: authority,
+        };
+        match state {
+            HeldPublicationMarkerPostState::Replacement => {
+                HeldPublicationMarkerV2UnlinkOutcome::ReplacementRetained(owner)
+            }
+            HeldPublicationMarkerPostState::ExactHeld
+            | HeldPublicationMarkerPostState::Absent
+            | HeldPublicationMarkerPostState::Indeterminate => {
+                HeldPublicationMarkerV2UnlinkOutcome::PostStateIndeterminate(owner)
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+const PUBLICATION_MARKER_SYNC_PARENT_BY_PATH: bool = false;
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HeldPublicationMarkerPostState {
+    ExactHeld,
+    Absent,
+    Replacement,
+    Indeterminate,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+enum ExactMarkerNamespaceState {
+    Absent,
+    PresentFile(FilesystemFileIdentity),
+    PresentOther,
+    Indeterminate,
+}
+
+#[cfg(target_os = "linux")]
+fn classify_exact_marker_namespace(
+    authority: &PublicationMarkerV2Authority,
+) -> ExactMarkerNamespaceState {
+    let Ok(first_inventory) = held_reserved_publication_inventory(&authority.marker_parent) else {
+        return ExactMarkerNamespaceState::Indeterminate;
+    };
+    let first = match authority
+        .marker_parent
+        .open_child(std::ffi::OsStr::new(IMPORT_PUBLISH_MARKER_V2))
+    {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => ExactMarkerNamespaceState::Absent,
+        Ok(SecureSourceChild::File(file)) => match file.identity() {
+            Ok(identity) => ExactMarkerNamespaceState::PresentFile(identity),
+            Err(_) => ExactMarkerNamespaceState::Indeterminate,
+        },
+        Ok(SecureSourceChild::Directory(_) | SecureSourceChild::Other) => {
+            ExactMarkerNamespaceState::PresentOther
+        }
+        Err(_) if first_inventory == HeldReservedPublicationInventory::ExactV2 => {
+            ExactMarkerNamespaceState::Indeterminate
+        }
+        Err(_) => ExactMarkerNamespaceState::Indeterminate,
+    };
+
+    let Ok(second_inventory) = held_reserved_publication_inventory(&authority.marker_parent) else {
+        return ExactMarkerNamespaceState::Indeterminate;
+    };
+    match first {
+        ExactMarkerNamespaceState::Absent
+            if first_inventory == HeldReservedPublicationInventory::Absent
+                && second_inventory == HeldReservedPublicationInventory::Absent =>
+        {
+            match authority
+                .marker_parent
+                .open_child(std::ffi::OsStr::new(IMPORT_PUBLISH_MARKER_V2))
+            {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    ExactMarkerNamespaceState::Absent
+                }
+                Ok(SecureSourceChild::File(file)) => match file.identity() {
+                    Ok(identity) => ExactMarkerNamespaceState::PresentFile(identity),
+                    Err(_) => ExactMarkerNamespaceState::Indeterminate,
+                },
+                Ok(SecureSourceChild::Directory(_) | SecureSourceChild::Other) => {
+                    ExactMarkerNamespaceState::PresentOther
+                }
+                Err(_) => ExactMarkerNamespaceState::Indeterminate,
+            }
+        }
+        ExactMarkerNamespaceState::PresentFile(identity)
+            if first_inventory == HeldReservedPublicationInventory::ExactV2
+                && second_inventory == HeldReservedPublicationInventory::ExactV2 =>
+        {
+            ExactMarkerNamespaceState::PresentFile(identity)
+        }
+        ExactMarkerNamespaceState::PresentOther
+            if matches!(
+                (first_inventory, second_inventory),
+                (
+                    HeldReservedPublicationInventory::ExactV2,
+                    HeldReservedPublicationInventory::ExactV2
+                )
+            ) =>
+        {
+            ExactMarkerNamespaceState::PresentOther
+        }
+        ExactMarkerNamespaceState::Absent
+        | ExactMarkerNamespaceState::PresentFile(_)
+        | ExactMarkerNamespaceState::PresentOther
+        | ExactMarkerNamespaceState::Indeterminate => ExactMarkerNamespaceState::Indeterminate,
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl PublicationMarkerV2Authority {
+    fn revalidate_published_base_at(
+        &self,
+        current_root: &Path,
+    ) -> Result<(), PostUnlinkPublicationMarkerV2Error> {
+        let current_name = current_root
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .ok_or(PostUnlinkPublicationMarkerV2Error::AuthorityChanged)?;
+        if current_name != self.marker.destination_child_name() {
+            return Err(PostUnlinkPublicationMarkerV2Error::AuthorityChanged);
+        }
+        self.mutation_lock
+            .revalidate(current_root)
+            .map_err(|_| PostUnlinkPublicationMarkerV2Error::AuthorityChanged)?;
+        if self.root.identity() != self.mutation_lock.root_identity()
+            || self.marker_parent.identity() != self.mutation_lock.local_identity()
+            || !self
+                .marker
+                .common_parent_matches(self.common_parent.identity())
+            || !self.marker.staging_root_matches(self.root.identity())
+            || !self
+                .marker
+                .marker_parent_matches(self.marker_parent.identity())
+            || !self.marker.marker_file_matches(&self.marker_file_identity)
+        {
+            return Err(PostUnlinkPublicationMarkerV2Error::AuthorityChanged);
+        }
+        revalidate_current_publication_root(
+            current_root,
+            &self.common_parent,
+            &self.root,
+            &self.marker,
+        )
+        .map_err(|error| map_held_error_to_post_unlink(&error))?;
+        platform::verify_directory_handle_has_no_alternate_data_streams(&self.root.file)
+            .map_err(|_| PostUnlinkPublicationMarkerV2Error::Indeterminate)?;
+        self.marker_parent
+            .verify_no_alternate_data_streams()
+            .map_err(|_| PostUnlinkPublicationMarkerV2Error::Indeterminate)?;
+        require_held_publication_staging_absent(self)?;
+        self.marker_parent
+            .verify_binding()
+            .map_err(|_| PostUnlinkPublicationMarkerV2Error::Indeterminate)?;
+        revalidate_current_publication_root(
+            current_root,
+            &self.common_parent,
+            &self.root,
+            &self.marker,
+        )
+        .map_err(|error| map_held_error_to_post_unlink(&error))?;
+        require_held_publication_staging_absent(self)?;
+        self.mutation_lock
+            .revalidate(current_root)
+            .map_err(|_| PostUnlinkPublicationMarkerV2Error::AuthorityChanged)
+    }
+
+    fn revalidate_post_unlink_absent_at(
+        &self,
+        current_root: &Path,
+    ) -> Result<(), PostUnlinkPublicationMarkerV2Error> {
+        self.revalidate_published_base_at(current_root)?;
+        match classify_exact_marker_namespace(self) {
+            ExactMarkerNamespaceState::Absent => {}
+            ExactMarkerNamespaceState::PresentFile(_) | ExactMarkerNamespaceState::PresentOther => {
+                return Err(PostUnlinkPublicationMarkerV2Error::NamespaceConflict);
+            }
+            ExactMarkerNamespaceState::Indeterminate => {
+                return Err(PostUnlinkPublicationMarkerV2Error::Indeterminate);
+            }
+        }
+        self.revalidate_published_base_at(current_root)
+    }
+
+    fn classify_post_unlink_absence(&self, current_root: &Path) -> PostUnlinkAbsenceState {
+        if self.revalidate_published_base_at(current_root).is_err() {
+            return PostUnlinkAbsenceState::Indeterminate;
+        }
+        match classify_exact_marker_namespace(self) {
+            ExactMarkerNamespaceState::Absent
+                if self.revalidate_published_base_at(current_root).is_ok() =>
+            {
+                PostUnlinkAbsenceState::Absent
+            }
+            ExactMarkerNamespaceState::PresentFile(_) | ExactMarkerNamespaceState::PresentOther => {
+                PostUnlinkAbsenceState::Replacement
+            }
+            ExactMarkerNamespaceState::Absent | ExactMarkerNamespaceState::Indeterminate => {
+                PostUnlinkAbsenceState::Indeterminate
+            }
+        }
+    }
+
+    fn matches_physical_baseline(
+        &self,
+        root_identity: &FilesystemDirectoryIdentity,
+        local_identity: &FilesystemDirectoryIdentity,
+        lock_identity: &FilesystemFileIdentity,
+    ) -> bool {
         self.root.identity() == root_identity
             && self.marker_parent.identity() == local_identity
             && self.mutation_lock.root_identity() == root_identity
             && self.mutation_lock.local_identity() == local_identity
             && self.mutation_lock.lock_identity() == lock_identity
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PostUnlinkAbsenceState {
+    Absent,
+    Replacement,
+    Indeterminate,
+}
+
+#[cfg(target_os = "linux")]
+fn require_held_publication_staging_absent(
+    authority: &PublicationMarkerV2Authority,
+) -> Result<(), PostUnlinkPublicationMarkerV2Error> {
+    match authority
+        .common_parent
+        .open_child(std::ffi::OsStr::new(authority.marker.staging_child_name()))
+    {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(PostUnlinkPublicationMarkerV2Error::AuthorityChanged),
+        Err(_) => Err(PostUnlinkPublicationMarkerV2Error::Indeterminate),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn map_held_error_to_post_unlink(
+    error: &HeldPublicationMarkerV2Error,
+) -> PostUnlinkPublicationMarkerV2Error {
+    match error {
+        HeldPublicationMarkerV2Error::NamespaceConflict => {
+            PostUnlinkPublicationMarkerV2Error::NamespaceConflict
+        }
+        HeldPublicationMarkerV2Error::InvalidInput
+        | HeldPublicationMarkerV2Error::AuthorityChanged => {
+            PostUnlinkPublicationMarkerV2Error::AuthorityChanged
+        }
+        HeldPublicationMarkerV2Error::Io(_) => PostUnlinkPublicationMarkerV2Error::Indeterminate,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn map_post_unlink_error_to_held(
+    error: PostUnlinkPublicationMarkerV2Error,
+) -> HeldPublicationMarkerV2Error {
+    match error {
+        PostUnlinkPublicationMarkerV2Error::NamespaceConflict => {
+            HeldPublicationMarkerV2Error::NamespaceConflict
+        }
+        PostUnlinkPublicationMarkerV2Error::AuthorityChanged
+        | PostUnlinkPublicationMarkerV2Error::Indeterminate => {
+            HeldPublicationMarkerV2Error::AuthorityChanged
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl UnsyncedPostUnlinkPublicationMarkerV2 {
+    /// Retry only exact-absence revalidation and held marker-parent sync.
+    pub fn retry_marker_parent_sync_at(
+        self,
+        current_root: &Path,
+    ) -> PostUnlinkMarkerParentSyncOutcome {
+        self.retry_marker_parent_sync_at_impl(current_root, false)
+    }
+
+    fn retry_marker_parent_sync_at_impl(
+        self,
+        current_root: &Path,
+        inject_sync_failure: bool,
+    ) -> PostUnlinkMarkerParentSyncOutcome {
+        if !self.former_marker_file.is_unlinked() {
+            return PostUnlinkMarkerParentSyncOutcome::PostStateIndeterminate(self.into_terminal());
+        }
+        match self.authority.classify_post_unlink_absence(current_root) {
+            PostUnlinkAbsenceState::Absent => {}
+            PostUnlinkAbsenceState::Replacement => {
+                return PostUnlinkMarkerParentSyncOutcome::ReplacementRetained(
+                    self.into_terminal(),
+                );
+            }
+            PostUnlinkAbsenceState::Indeterminate => {
+                return PostUnlinkMarkerParentSyncOutcome::PostStateIndeterminate(
+                    self.into_terminal(),
+                );
+            }
+        }
+
+        if self.authority.marker_parent.verify_binding().is_err() {
+            return PostUnlinkMarkerParentSyncOutcome::PostStateIndeterminate(self.into_terminal());
+        }
+        let sync_succeeded = !inject_sync_failure
+            && platform::sync_directory_handle(&self.authority.marker_parent.file).is_ok();
+        if self.authority.marker_parent.verify_binding().is_err()
+            || !self.former_marker_file.is_unlinked()
+        {
+            return PostUnlinkMarkerParentSyncOutcome::PostStateIndeterminate(self.into_terminal());
+        }
+        match self.authority.classify_post_unlink_absence(current_root) {
+            PostUnlinkAbsenceState::Absent if sync_succeeded => {
+                let Self {
+                    former_marker_file,
+                    authority,
+                } = self;
+                PostUnlinkMarkerParentSyncOutcome::Synced(SyncedPostUnlinkPublicationMarkerV2 {
+                    former_marker_file,
+                    authority,
+                })
+            }
+            PostUnlinkAbsenceState::Absent => {
+                PostUnlinkMarkerParentSyncOutcome::StillIndeterminate(self)
+            }
+            PostUnlinkAbsenceState::Replacement => {
+                PostUnlinkMarkerParentSyncOutcome::ReplacementRetained(self.into_terminal())
+            }
+            PostUnlinkAbsenceState::Indeterminate => {
+                PostUnlinkMarkerParentSyncOutcome::PostStateIndeterminate(self.into_terminal())
+            }
+        }
+    }
+
+    fn into_terminal(self) -> TerminalPublicationMarkerV2Authority {
+        let Self {
+            former_marker_file,
+            authority,
+        } = self;
+        TerminalPublicationMarkerV2Authority {
+            _former_marker_file: former_marker_file,
+            _authority: authority,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl SyncedPostUnlinkPublicationMarkerV2 {
+    /// Revalidate the exact published root, absent marker namespace, held
+    /// directories, former marker identity, and original mutation lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns a scrubbed error if the retained authority, absent marker
+    /// namespace, former marker inode, or published-root binding has drifted.
+    pub fn revalidate_absent_at(
+        &self,
+        current_root: &Path,
+    ) -> Result<(), PostUnlinkPublicationMarkerV2Error> {
+        if !self.former_marker_file.is_unlinked() {
+            return Err(PostUnlinkPublicationMarkerV2Error::AuthorityChanged);
+        }
+        self.authority
+            .revalidate_post_unlink_absent_at(current_root)?;
+        if !self.former_marker_file.is_unlinked() {
+            return Err(PostUnlinkPublicationMarkerV2Error::AuthorityChanged);
+        }
+        Ok(())
+    }
+
+    /// Borrow the immutable publication claim retained in memory after unlink.
+    #[must_use]
+    pub const fn marker(&self) -> &PublicationMarkerV2 {
+        &self.authority.marker
+    }
+
+    /// Borrow the former exact marker-file identity for the live clean audit.
+    #[must_use]
+    pub const fn marker_file_identity(&self) -> &FilesystemFileIdentity {
+        &self.authority.marker_file_identity
+    }
+
+    /// Borrow the exact root identity retained by the held mutation lock.
+    #[must_use]
+    pub const fn root_identity(&self) -> &FilesystemDirectoryIdentity {
+        self.authority.mutation_lock.root_identity()
+    }
+
+    /// Borrow the exact `.vault-local` identity retained by the held lock.
+    #[must_use]
+    pub const fn marker_parent_identity(&self) -> &FilesystemDirectoryIdentity {
+        self.authority.mutation_lock.local_identity()
+    }
+
+    /// Duplicate the held root into a current-path-bound read-only clean-audit
+    /// view. Exact marker absence is revalidated before and after duplication.
+    /// The returned owned traversal view is not mutation-lock authority and is
+    /// not lifetime-branded by Rust; callers must keep this owner alive across
+    /// traversal and revalidate it after the complete audit. Higher-level
+    /// collectors should enforce that borrow and final-revalidation contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns a scrubbed error if exact absence or retained authority cannot
+    /// be proved before and after constructing the read-only view.
+    pub fn held_root_view_at(
+        &self,
+        current_root: &Path,
+    ) -> Result<SecureSourceDirectory, PostUnlinkPublicationMarkerV2Error> {
+        self.revalidate_absent_at(current_root)?;
+        let view = SecureSourceDirectory {
+            file: self
+                .authority
+                .root
+                .file
+                .try_clone()
+                .map_err(|_| PostUnlinkPublicationMarkerV2Error::Indeterminate)?,
+            identity: self.authority.root.identity.clone(),
+            binding: SecureSourceDirectoryBinding::Root(current_root.to_path_buf()),
+        };
+        view.verify_no_alternate_data_streams()
+            .map_err(|_| PostUnlinkPublicationMarkerV2Error::Indeterminate)?;
+        if view.identity() != self.authority.root.identity() {
+            return Err(PostUnlinkPublicationMarkerV2Error::AuthorityChanged);
+        }
+        self.revalidate_absent_at(current_root)?;
+        Ok(view)
+    }
+
+    /// Match a marker-free clean physical baseline to the retained authority.
+    #[must_use]
+    pub fn matches_physical_baseline(
+        &self,
+        root_identity: &FilesystemDirectoryIdentity,
+        local_identity: &FilesystemDirectoryIdentity,
+        lock_identity: &FilesystemFileIdentity,
+    ) -> bool {
+        self.authority
+            .matches_physical_baseline(root_identity, local_identity, lock_identity)
     }
 }
 
@@ -7260,6 +8120,543 @@ mod tests {
         )
         .map_err(io::Error::other)?;
         Ok((held_root, mutation_lock))
+    }
+
+    #[cfg(target_os = "linux")]
+    struct PublishedRootGuard {
+        original: PathBuf,
+        destination: PathBuf,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl PublishedRootGuard {
+        fn destination(&self) -> &Path {
+            &self.destination
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for PublishedRootGuard {
+        fn drop(&mut self) {
+            if self.destination.exists() && !self.original.exists() {
+                let _ = fs::rename(&self.destination, &self.original);
+            }
+            if self.destination.exists() {
+                let _ = fs::remove_dir_all(&self.destination);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn published_held_marker(
+        fixture: &TestVault,
+    ) -> io::Result<(
+        super::HeldPublicationMarkerV2,
+        PublishedRootGuard,
+        ExistingLockIdentities,
+    )> {
+        let identities = initialize_existing_lock(fixture.root())?;
+        let held_root = super::open_secure_source_root(fixture.root())?;
+        let lock = ExistingVaultMutationLock::acquire(
+            fixture.root(),
+            &identities.root,
+            &identities.local,
+            &identities.lock,
+        )
+        .map_err(io::Error::other)?;
+        let common_parent_path = fixture
+            .root()
+            .parent()
+            .ok_or_else(|| io::Error::other("test root has no parent"))?;
+        let common_parent = super::filesystem_directory_identity(common_parent_path)?;
+        let destination_name = format!(
+            "inex-held-marker-published-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let destination = common_parent_path.join(&destination_name);
+        let input = held_marker_test_input(fixture.root(), &common_parent, &destination_name)?;
+        let held = lock
+            .create_held_publication_marker_v2(fixture.root(), held_root, input)
+            .map_err(io::Error::other)?;
+        fs::rename(fixture.root(), &destination)?;
+        let guard = PublishedRootGuard {
+            original: fixture.root().to_path_buf(),
+            destination,
+        };
+        held.revalidate_at(guard.destination())
+            .map_err(io::Error::other)?;
+        Ok((held, guard, identities))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_publication_lock_busy(root: &Path, identities: &ExistingLockIdentities) {
+        assert!(matches!(
+            ExistingVaultMutationLock::acquire(
+                root,
+                &identities.root,
+                &identities.local,
+                &identities.lock,
+            ),
+            Err(ExistingVaultMutationLockError::Busy)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn held_publication_marker_exact_unlink_returns_synced_post_owner() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        let (held, published, identities) = published_held_marker(&fixture)?;
+        let marker_path = published
+            .destination()
+            .join(VAULT_LOCAL_DIRECTORY)
+            .join(IMPORT_PUBLISH_MARKER_V2);
+
+        let outcome = held.unlink_exact_published_marker_at(published.destination());
+        let owner = match outcome {
+            super::HeldPublicationMarkerV2UnlinkOutcome::RemovedAndParentSynced(owner) => owner,
+            other => panic!("expected synchronized exact unlink, got {other:?}"),
+        };
+        assert!(!marker_path.exists());
+        owner
+            .revalidate_absent_at(published.destination())
+            .map_err(io::Error::other)?;
+        let root_view = owner
+            .held_root_view_at(published.destination())
+            .map_err(io::Error::other)?;
+        assert_eq!(root_view.identity(), &identities.root);
+        assert!(owner.matches_physical_baseline(
+            &identities.root,
+            &identities.local,
+            &identities.lock,
+        ));
+        assert_publication_lock_busy(published.destination(), &identities);
+        drop(root_view);
+        drop(owner);
+        let reacquired = ExistingVaultMutationLock::acquire(
+            published.destination(),
+            &identities.root,
+            &identities.local,
+            &identities.lock,
+        )
+        .map_err(io::Error::other)?;
+        drop(reacquired);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn held_publication_marker_unlink_rejects_staging_without_removal() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        let identities = initialize_existing_lock(fixture.root())?;
+        let held_root = super::open_secure_source_root(fixture.root())?;
+        let lock = ExistingVaultMutationLock::acquire(
+            fixture.root(),
+            &identities.root,
+            &identities.local,
+            &identities.lock,
+        )
+        .map_err(io::Error::other)?;
+        let common_parent = super::filesystem_directory_identity(
+            fixture
+                .root()
+                .parent()
+                .ok_or_else(|| io::Error::other("test root has no parent"))?,
+        )?;
+        let input = held_marker_test_input(fixture.root(), &common_parent, "published-target")?;
+        let held = lock
+            .create_held_publication_marker_v2(fixture.root(), held_root, input)
+            .map_err(io::Error::other)?;
+        let marker_path = fixture.local().join(IMPORT_PUBLISH_MARKER_V2);
+
+        let owner = match held.unlink_exact_published_marker_at(fixture.root()) {
+            super::HeldPublicationMarkerV2UnlinkOutcome::PostStateIndeterminate(owner) => owner,
+            other => panic!("staging unlink must fail closed, got {other:?}"),
+        };
+        assert!(marker_path.exists());
+        assert_publication_lock_busy(fixture.root(), &identities);
+        drop(owner);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn held_publication_marker_unlink_reconciles_not_removed_and_remove_then_error()
+    -> io::Result<()> {
+        let not_removed = TestVault::new()?;
+        let (held, published, identities) = published_held_marker(&not_removed)?;
+        let marker_path = published
+            .destination()
+            .join(VAULT_LOCAL_DIRECTORY)
+            .join(IMPORT_PUBLISH_MARKER_V2);
+        let held = match held.unlink_exact_published_marker_at_with_faults(
+            published.destination(),
+            |_| Ok(()),
+            |_| Ok(()),
+            super::VerifiedRemoveFault::ErrorBeforeRemove,
+        ) {
+            super::HeldPublicationMarkerV2UnlinkOutcome::NotRemoved(held) => held,
+            other => panic!("expected exact not-removed owner, got {other:?}"),
+        };
+        assert!(marker_path.exists());
+        held.revalidate_at(published.destination())
+            .map_err(io::Error::other)?;
+        assert_publication_lock_busy(published.destination(), &identities);
+        let owner = match held.unlink_exact_published_marker_at(published.destination()) {
+            super::HeldPublicationMarkerV2UnlinkOutcome::RemovedAndParentSynced(owner) => owner,
+            other => panic!("retry should remove exact marker, got {other:?}"),
+        };
+        drop(owner);
+
+        let remove_then_error = TestVault::new()?;
+        let (held, published, _) = published_held_marker(&remove_then_error)?;
+        let marker_path = published
+            .destination()
+            .join(VAULT_LOCAL_DIRECTORY)
+            .join(IMPORT_PUBLISH_MARKER_V2);
+        let owner = match held.unlink_exact_published_marker_at_with_faults(
+            published.destination(),
+            |_| Ok(()),
+            |_| Ok(()),
+            super::VerifiedRemoveFault::RemoveThenError,
+        ) {
+            super::HeldPublicationMarkerV2UnlinkOutcome::RemovedAndParentSynced(owner) => owner,
+            other => panic!("effect reconciliation should prove removal, got {other:?}"),
+        };
+        assert!(!marker_path.exists());
+        owner
+            .revalidate_absent_at(published.destination())
+            .map_err(io::Error::other)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn held_publication_marker_unlink_parent_sync_fault_is_retryable() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        let (held, published, identities) = published_held_marker(&fixture)?;
+        let owner = match held.unlink_exact_published_marker_at_with_faults(
+            published.destination(),
+            |_| Ok(()),
+            |_| Ok(()),
+            super::VerifiedRemoveFault::ParentSync,
+        ) {
+            super::HeldPublicationMarkerV2UnlinkOutcome::RemovedButParentSyncIndeterminate(
+                owner,
+            ) => owner,
+            other => panic!("parent-sync fault must retain retry owner, got {other:?}"),
+        };
+        assert_publication_lock_busy(published.destination(), &identities);
+        let owner = match owner.retry_marker_parent_sync_at_impl(published.destination(), true) {
+            super::PostUnlinkMarkerParentSyncOutcome::StillIndeterminate(owner) => owner,
+            other => panic!("repeated parent-sync fault must retain retry owner, got {other:?}"),
+        };
+        assert_publication_lock_busy(published.destination(), &identities);
+        let owner = match owner.retry_marker_parent_sync_at(published.destination()) {
+            super::PostUnlinkMarkerParentSyncOutcome::Synced(owner) => owner,
+            other => panic!("held parent sync retry should succeed, got {other:?}"),
+        };
+        owner
+            .revalidate_absent_at(published.destination())
+            .map_err(io::Error::other)?;
+        drop(owner);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn held_publication_marker_unlink_retains_after_remove_replacement() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        let (held, published, identities) = published_held_marker(&fixture)?;
+        let replacement = b"replacement created after exact unlink";
+        let marker_path = published
+            .destination()
+            .join(VAULT_LOCAL_DIRECTORY)
+            .join(IMPORT_PUBLISH_MARKER_V2);
+        let owner = match held.unlink_exact_published_marker_at_with_faults(
+            published.destination(),
+            |_| Ok(()),
+            |marker| fs::write(marker, replacement),
+            super::VerifiedRemoveFault::None,
+        ) {
+            super::HeldPublicationMarkerV2UnlinkOutcome::ReplacementRetained(owner) => owner,
+            other => panic!("after-unlink replacement must be retained, got {other:?}"),
+        };
+        assert_eq!(fs::read(&marker_path)?, replacement);
+        assert_publication_lock_busy(published.destination(), &identities);
+        drop(owner);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn post_unlink_parent_sync_retry_rejects_replacement_and_alias() -> io::Result<()> {
+        let replaced = TestVault::new()?;
+        let (held, published, identities) = published_held_marker(&replaced)?;
+        let owner = match held.unlink_exact_published_marker_at_with_faults(
+            published.destination(),
+            |_| Ok(()),
+            |_| Ok(()),
+            super::VerifiedRemoveFault::ParentSync,
+        ) {
+            super::HeldPublicationMarkerV2UnlinkOutcome::RemovedButParentSyncIndeterminate(
+                owner,
+            ) => owner,
+            other => panic!("parent-sync fault must retain retry owner, got {other:?}"),
+        };
+        let marker_path = published
+            .destination()
+            .join(VAULT_LOCAL_DIRECTORY)
+            .join(IMPORT_PUBLISH_MARKER_V2);
+        let replacement = b"replacement before parent-sync retry";
+        fs::write(&marker_path, replacement)?;
+        let terminal = match owner.retry_marker_parent_sync_at(published.destination()) {
+            super::PostUnlinkMarkerParentSyncOutcome::ReplacementRetained(owner) => owner,
+            other => panic!("retry must retain replacement, got {other:?}"),
+        };
+        assert_eq!(fs::read(&marker_path)?, replacement);
+        assert_publication_lock_busy(published.destination(), &identities);
+        drop(terminal);
+
+        let aliased = TestVault::new()?;
+        let (held, published, identities) = published_held_marker(&aliased)?;
+        let owner = match held.unlink_exact_published_marker_at_with_faults(
+            published.destination(),
+            |_| Ok(()),
+            |_| Ok(()),
+            super::VerifiedRemoveFault::ParentSync,
+        ) {
+            super::HeldPublicationMarkerV2UnlinkOutcome::RemovedButParentSyncIndeterminate(
+                owner,
+            ) => owner,
+            other => panic!("parent-sync fault must retain retry owner, got {other:?}"),
+        };
+        let alias = published
+            .destination()
+            .join(VAULT_LOCAL_DIRECTORY)
+            .join("import-publish-marker-foreign");
+        fs::write(&alias, b"reserved alias before parent-sync retry")?;
+        let terminal = match owner.retry_marker_parent_sync_at(published.destination()) {
+            super::PostUnlinkMarkerParentSyncOutcome::PostStateIndeterminate(owner) => owner,
+            other => panic!("reserved alias must make retry terminal, got {other:?}"),
+        };
+        assert_eq!(
+            fs::read(&alias)?,
+            b"reserved alias before parent-sync retry"
+        );
+        assert_publication_lock_busy(published.destination(), &identities);
+        drop(terminal);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn post_unlink_parent_sync_retry_rejects_reappeared_staging() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        let (held, published, identities) = published_held_marker(&fixture)?;
+        let owner = match held.unlink_exact_published_marker_at_with_faults(
+            published.destination(),
+            |_| Ok(()),
+            |_| Ok(()),
+            super::VerifiedRemoveFault::ParentSync,
+        ) {
+            super::HeldPublicationMarkerV2UnlinkOutcome::RemovedButParentSyncIndeterminate(
+                owner,
+            ) => owner,
+            other => panic!("parent-sync fault must retain retry owner, got {other:?}"),
+        };
+        let staging = published.original.clone();
+        fs::create_dir(&staging)?;
+        let terminal = match owner.retry_marker_parent_sync_at(published.destination()) {
+            super::PostUnlinkMarkerParentSyncOutcome::PostStateIndeterminate(owner) => owner,
+            other => panic!("reappeared staging must make retry terminal, got {other:?}"),
+        };
+        assert!(staging.is_dir());
+        assert_publication_lock_busy(published.destination(), &identities);
+        drop(terminal);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn held_publication_marker_unlink_rejects_reappeared_staging_before_removal() -> io::Result<()>
+    {
+        let fixture = TestVault::new()?;
+        let (held, published, identities) = published_held_marker(&fixture)?;
+        let staging = published.original.clone();
+        let marker_path = published
+            .destination()
+            .join(VAULT_LOCAL_DIRECTORY)
+            .join(IMPORT_PUBLISH_MARKER_V2);
+        let terminal = match held.unlink_exact_published_marker_at_with_faults(
+            published.destination(),
+            |_| fs::create_dir(&staging),
+            |_| Ok(()),
+            super::VerifiedRemoveFault::None,
+        ) {
+            super::HeldPublicationMarkerV2UnlinkOutcome::PostStateIndeterminate(owner) => owner,
+            other => panic!("pre-unlink staging sibling must be terminal, got {other:?}"),
+        };
+        assert!(marker_path.is_file());
+        assert!(staging.is_dir());
+        assert_publication_lock_busy(published.destination(), &identities);
+        drop(terminal);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn held_publication_marker_unlink_rejects_reappeared_staging_after_removal() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        let (held, published, identities) = published_held_marker(&fixture)?;
+        let staging = published.original.clone();
+        let marker_path = published
+            .destination()
+            .join(VAULT_LOCAL_DIRECTORY)
+            .join(IMPORT_PUBLISH_MARKER_V2);
+        let terminal = match held.unlink_exact_published_marker_at_with_faults(
+            published.destination(),
+            |_| Ok(()),
+            |_| fs::create_dir(&staging),
+            super::VerifiedRemoveFault::None,
+        ) {
+            super::HeldPublicationMarkerV2UnlinkOutcome::PostStateIndeterminate(owner) => owner,
+            other => panic!("reappeared staging sibling must be terminal, got {other:?}"),
+        };
+        assert!(!marker_path.exists());
+        assert!(staging.is_dir());
+        assert_publication_lock_busy(published.destination(), &identities);
+        drop(terminal);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn held_publication_marker_unlink_preserves_replacement_and_link_indeterminate()
+    -> io::Result<()> {
+        let replaced = TestVault::new()?;
+        let (held, published, identities) = published_held_marker(&replaced)?;
+        let retired = published
+            .destination()
+            .join(VAULT_LOCAL_DIRECTORY)
+            .join("retired-held-marker");
+        let replacement = b"foreign replacement canary";
+        let owner = match held.unlink_exact_published_marker_at_with_faults(
+            published.destination(),
+            |marker| {
+                fs::rename(marker, &retired)?;
+                fs::write(marker, replacement)
+            },
+            |_| Ok(()),
+            super::VerifiedRemoveFault::None,
+        ) {
+            super::HeldPublicationMarkerV2UnlinkOutcome::ReplacementRetained(owner) => owner,
+            other => panic!("replacement must be retained, got {other:?}"),
+        };
+        let marker_path = published
+            .destination()
+            .join(VAULT_LOCAL_DIRECTORY)
+            .join(IMPORT_PUBLISH_MARKER_V2);
+        assert_eq!(fs::read(&marker_path)?, replacement);
+        assert!(retired.exists());
+        assert_publication_lock_busy(published.destination(), &identities);
+        drop(owner);
+
+        let linked = TestVault::new()?;
+        let (held, published, _) = published_held_marker(&linked)?;
+        let hardlink = published
+            .destination()
+            .join(VAULT_LOCAL_DIRECTORY)
+            .join("held-marker-hardlink");
+        let marker_path = published
+            .destination()
+            .join(VAULT_LOCAL_DIRECTORY)
+            .join(IMPORT_PUBLISH_MARKER_V2);
+        let owner = match held.unlink_exact_published_marker_at_with_faults(
+            published.destination(),
+            |marker| fs::hard_link(marker, &hardlink),
+            |_| Ok(()),
+            super::VerifiedRemoveFault::None,
+        ) {
+            super::HeldPublicationMarkerV2UnlinkOutcome::PostStateIndeterminate(owner) => owner,
+            other => panic!("unsafe linked marker must be retained, got {other:?}"),
+        };
+        assert!(marker_path.exists());
+        assert!(hardlink.exists());
+        drop(owner);
+
+        let indeterminate = TestVault::new()?;
+        let (held, published, _) = published_held_marker(&indeterminate)?;
+        let alias = published
+            .destination()
+            .join(VAULT_LOCAL_DIRECTORY)
+            .join("import-publish-marker-foreign");
+        let owner = match held.unlink_exact_published_marker_at_with_faults(
+            published.destination(),
+            |_| fs::write(&alias, b"reserved alias canary"),
+            |_| Ok(()),
+            super::VerifiedRemoveFault::None,
+        ) {
+            super::HeldPublicationMarkerV2UnlinkOutcome::PostStateIndeterminate(owner) => owner,
+            other => panic!("conflicting post-state must be indeterminate, got {other:?}"),
+        };
+        assert_eq!(fs::read(alias)?, b"reserved alias canary");
+        drop(owner);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn publication_unlink_owners_are_redacted_and_api_is_linear() -> io::Result<()> {
+        const {
+            assert!(!super::PUBLICATION_MARKER_SYNC_PARENT_BY_PATH);
+        }
+
+        let fixture = TestVault::new()?;
+        let (held, published, _) = published_held_marker(&fixture)?;
+        let outcome = held.unlink_exact_published_marker_at(published.destination());
+        let debug = format!("{outcome:?}");
+        assert_eq!(
+            debug,
+            "HeldPublicationMarkerV2UnlinkOutcome::RemovedAndParentSynced(..)"
+        );
+        assert!(!debug.contains(published.destination().to_string_lossy().as_ref()));
+        let owner = match outcome {
+            super::HeldPublicationMarkerV2UnlinkOutcome::RemovedAndParentSynced(owner) => owner,
+            other => panic!("expected synchronized owner, got {other:?}"),
+        };
+        assert_eq!(
+            format!("{owner:?}"),
+            "SyncedPostUnlinkPublicationMarkerV2 { .. }"
+        );
+        drop(owner);
+
+        let source = include_str!("atomic.rs");
+        let unsynced = source
+            .split("pub struct UnsyncedPostUnlinkPublicationMarkerV2")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("pub struct SyncedPostUnlinkPublicationMarkerV2")
+                    .next()
+            })
+            .expect("unsynced owner source exists");
+        assert!(!unsynced.contains("derive(Clone"));
+        assert!(!unsynced.contains("impl Drop for Unsynced"));
+        let unsynced_impl = source
+            .split("impl UnsyncedPostUnlinkPublicationMarkerV2")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("impl SyncedPostUnlinkPublicationMarkerV2")
+                    .next()
+            })
+            .expect("unsynced impl source exists");
+        assert!(unsynced_impl.contains("retry_marker_parent_sync_at"));
+        assert!(!unsynced_impl.contains("unlink_exact_published_marker_at"));
+        assert!(!unsynced_impl.contains("held_root_view_at"));
+        let held_drop_impl = ["impl Drop for ", "HeldPublicationMarkerV2"].concat();
+        let manually_dropped_held = ["ManuallyDrop<", "HeldPublicationMarkerV2"].concat();
+        assert!(!source.contains(&held_drop_impl));
+        assert!(!source.contains(&manually_dropped_held));
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
