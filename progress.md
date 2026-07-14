@@ -888,3 +888,7 @@
 
 - 提交 `f34e0dc`（`feat(vscode): target Markdown paragraphs for annotations`）：将空选区默认目标从单行近似改为光标所在的连续非空 Markdown 行；空白行仍拒绝，range 不含行终止符。纯函数独立于 VS Code host，便于直接回归 Unicode UTF-8 buffer 的 byte-range 语义。
 - PRD 的 MVP 状态同步为真实 paragraph 行为。验证：`git diff --check`、`pnpm --dir editors/vscode check`、tests 51/51、`pnpm --dir editors/vscode build` 均通过。
+
+## 2026-07-15 — Umbra daemon 全量复验
+
+- 在上述 RPC 回归并入后，`cargo test -p inex-daemon --lib` 为 71/71 通过，`cargo clippy -p inex-daemon --all-targets -- -D warnings` 通过；工作树保持 clean。下一项仍是将编辑器本地的 toggle/unwrap 交互偏好落实为配置，而非把快捷键语义写死在 extension 代码中。
