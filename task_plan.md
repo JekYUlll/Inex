@@ -119,6 +119,9 @@ Phase 6 extension — 现有 Markdown Git 仓库与加密附件迁移（Phase 7 
       - [ ] 实现held-marker owner、完整live/fresh九段collector、v2 claim创建/发布/reconcile状态机与终态输出
         - [x] held-marker core owner、existing opener、canonical双读、held directory sync与rename revalidation（`347b4cd`）
         - [ ] marker-aware physical/live collector只排除exact held marker identity，并重新形成完整九段candidate evidence
+          - [x] 形成lifetime-bound marker-aware physical projection：只排除descriptor-open identity匹配的exact v2 marker，marker不进入section 1/9及record/path预算，并保留同brand最终exact复验（`5d9e686`）
+          - [ ] 从target-only held main ref、canonical config、Git control shape preflight与bounded canonical commit读取自举fresh root-commit evidence
+          - [ ] 基于同一marker-aware physical brand重建sections 2–8、runtime object proof与candidate aggregate，并与marker claim seal逐项对账
         - [ ] publication-specific exact unlink outcome与Initial/Fresh consuming typestate
   - [ ] 完成repository import构造/durability/publication每一边界的Linux force-kill、hostile same-UID source/target race、artifact-bound residue与原生Windows矩阵
 - **Status:** in_progress（用户实测驱动的迁移/附件扩展；原Markdown-only实现仍保持已验证基线）
