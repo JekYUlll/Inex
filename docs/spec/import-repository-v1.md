@@ -1122,6 +1122,15 @@ Every count and target oid above is derived from the bounded read-only target
 manifests that produce candidate seal v1. No source count is copied from a new
 source plan, and no opaque seal or physical identity is printed.
 
+`source-policy: path-disjointness-only` still performs a bounded physical path
+proof: source and destination parents are captured before and after
+canonicalization, every component must remain a non-link directory, and a
+descriptor-relative directory-identity walk rejects a destination root or
+parent that is physically inside the source tree, including a pre-existing
+bind-mount alias. It does not parse source Git state, read source file bodies,
+prompt for a password, or run a KDF. Any indeterminate traversal fails before
+existing-only dispatch and performs no target mutation.
+
 After parameter/path validation reaches an existing destination, every
 existing-only nonzero exit whose stdout transport remains writable prints this
 independent terminal block before its scrubbed diagnostic. An output-transport
@@ -1326,7 +1335,7 @@ before publication.
 | Hostile same-UID check-to-unlink race | Cooperative writers and final/error post-state checks preserve every replacement they observe. Tests and documentation do not claim kernel CAS or absolute no-replacement deletion; this adversarial race remains an explicit GA security gate until a conditional descriptor-relative primitive or stronger isolation exists. |
 | Fresh retry with a valid but marker-free target | Existing target is not accepted as this invocation's success, even when it decrypts to the same source snapshot; no mutation occurs. |
 | Fresh retry with exact legacy random 16-byte marker, legacy plus v2 marker, or unknown marker version | Classified as legacy-unverifiable or conflict, retained byte-for-byte, and never upgraded or deleted automatically. Only the original still-live legacy publisher may use its held in-memory proof. |
-| Current Linux engineering preview | Legacy 16-byte publication and no existing-only guard are reported honestly as non-GA; `publication-reconcile` evidence is preserved and blind rerun/manual marker deletion is prohibited. |
+| Current Linux engineering preview | The v2 publisher and target-only exact-v2 reconcile/preview guard are connected to the early CLI route. Legacy, malformed, aliased, marker-free, or otherwise unattributed existing targets still fail closed without mutation. This remains non-GA until the Linux force-kill/hostile same-UID matrix and native Windows publication gates are complete; blind rerun or manual marker deletion remains prohibited. |
 | Successful target Git repository | Exactly one `refs/heads/main` root commit with zero parents; exact encrypted tree/index/worktree; no source refs, remotes, alternates, objects, parents, or plaintext file object. |
 | Source preservation | Tracked worktree files and root Git semantic/control manifests remain unchanged in dry-run, success, and every injected failure. |
 | Linux and Windows native runs | Same logical classification, counts, canonical semantic source manifest, rejection decisions, and decrypted target bytes for the same portable source bytes; random vault ids, nonces, ciphertext, physical identities, timestamps, tree ids, and root commit ids may differ. |

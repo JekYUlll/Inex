@@ -12,7 +12,8 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 
 use inex_core::atomic::{
-    FilesystemDirectoryIdentity, IMPORT_STAGING_PREFIX, filesystem_directory_identity,
+    FilesystemDirectoryIdentity, IMPORT_STAGING_PREFIX, RepositoryPublicationNamespaceState,
+    filesystem_directory_identity, inspect_repository_publication_namespace,
     path_is_supported_local_filesystem,
 };
 use inex_core::crypto::VaultContentProfile;
@@ -32,6 +33,7 @@ const TARGET_METADATA_PATHS: [&str; 3] = [".gitattributes", ".gitignore", "vault
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RepositoryImportIoOperation {
+    ResolveSource,
     ResolveDestination,
     InspectStaging,
 }
@@ -39,7 +41,8 @@ pub(crate) enum RepositoryImportIoOperation {
 impl fmt::Display for RepositoryImportIoOperation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
-            Self::ResolveDestination => "validating the absent repository-import destination",
+            Self::ResolveSource => "normalizing the repository-import source path",
+            Self::ResolveDestination => "normalizing the repository-import destination path",
             Self::InspectStaging => "revalidating the encrypted repository-import staging root",
         })
     }
@@ -48,6 +51,7 @@ impl fmt::Display for RepositoryImportIoOperation {
 #[derive(Debug)]
 pub(crate) enum RepositoryImportError {
     Git(inex_git::RepositoryImportError),
+    InvalidSourcePath,
     InvalidDestination,
     DestinationExists,
     DestinationParentChanged,
@@ -70,6 +74,7 @@ pub(crate) enum RepositoryImportError {
     VaultAuditFailed,
     GitCandidateFailed,
     Publication(inex_git::RepositoryCandidatePublicationFailureKind),
+    Reconciliation(RepositoryReconcileTerminal),
     Io {
         operation: RepositoryImportIoOperation,
         kind: io::ErrorKind,
@@ -80,8 +85,11 @@ impl fmt::Display for RepositoryImportError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Git(error) => write!(formatter, "repository source validation failed: {error}"),
+            Self::InvalidSourcePath => formatter.write_str(
+                "repository import requires one existing link-free source directory",
+            ),
             Self::InvalidDestination => formatter.write_str(
-                "repository import requires one absent destination below an existing safe parent",
+                "repository import requires one direct-child destination below an existing safe parent",
             ),
             Self::DestinationExists => formatter.write_str(
                 "repository import requires a completely absent destination",
@@ -143,6 +151,7 @@ impl fmt::Display for RepositoryImportError {
                 "fresh encrypted Git candidate construction or audit failed; destination remains absent",
             ),
             Self::Publication(kind) => kind.fmt(formatter),
+            Self::Reconciliation(terminal) => formatter.write_str(terminal.result()),
             Self::Io { operation, kind } => {
                 write!(formatter, "I/O failed while {operation}: {kind:?}")
             }
@@ -203,6 +212,166 @@ pub(crate) struct RepositoryImportPlan {
     asset_bytes: u64,
     largest_asset_bytes: u64,
     normalized_entries: usize,
+}
+
+pub(crate) enum RepositoryImportDispatch {
+    Creation(Box<RepositoryImportPlan>),
+    Existing(RepositoryReconcileRequest),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RepositoryReconcileMarkerState {
+    ReservedInspectionIndeterminate,
+    Absent,
+    LegacyUnverifiable,
+    ReservedConflict,
+    V2Invalid,
+    V2Exact,
+}
+
+pub(crate) struct RepositoryReconcileRequest {
+    destination: DestinationPlan,
+    marker_state: RepositoryReconcileMarkerState,
+    destination_identity: Option<FilesystemDirectoryIdentity>,
+}
+
+impl fmt::Debug for RepositoryReconcileRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RepositoryReconcileRequest")
+            .field("destination", &"[REDACTED]")
+            .field("marker_state", &self.marker_state)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RepositoryReconcileTerminal {
+    ReservedInspectionIndeterminate,
+    Absent,
+    LegacyUnverifiable,
+    ReservedConflict,
+    V2Invalid,
+    V2ClaimRejected,
+    DurabilityIndeterminate,
+    MarkerRetained,
+    MarkerReplaced,
+    MarkerPostStateIndeterminate,
+    PostUnlinkAbsentIndeterminate,
+}
+
+impl RepositoryReconcileTerminal {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the frozen terminal contract is clearer as one exhaustive table"
+    )]
+    pub(crate) const fn fields(self) -> [&'static str; 7] {
+        match self {
+            Self::ReservedInspectionIndeterminate => [
+                "reserved-inspection-indeterminate",
+                "existing-unattributed",
+                "reconcile-conflict",
+                "existing-unaudited",
+                "not-attempted",
+                "manual-audit",
+                "publication marker namespace inspection failed",
+            ],
+            Self::Absent => [
+                "absent",
+                "existing-unattributed",
+                "reconcile-not-started",
+                "existing-unaudited",
+                "not-attempted",
+                "manual-audit",
+                "existing repository is unattributed",
+            ],
+            Self::LegacyUnverifiable => [
+                "legacy-unverifiable",
+                "existing-unattributed",
+                "reconcile-conflict",
+                "existing-unaudited",
+                "retained",
+                "manual-audit",
+                "legacy publication marker is unverifiable",
+            ],
+            Self::ReservedConflict => [
+                "reserved-conflict",
+                "existing-unattributed",
+                "reconcile-conflict",
+                "existing-unaudited",
+                "retained",
+                "manual-audit",
+                "publication marker namespace conflicts",
+            ],
+            Self::V2Invalid => [
+                "v2-invalid",
+                "existing-unattributed",
+                "reconcile-conflict",
+                "existing-unaudited",
+                "retained",
+                "manual-audit",
+                "publication marker is invalid",
+            ],
+            Self::V2ClaimRejected => [
+                "v2-exact",
+                "publication-indeterminate",
+                "reconcile-conflict",
+                "existing-unaudited",
+                "retained",
+                "manual-audit",
+                "publication claim failed audit",
+            ],
+            Self::DurabilityIndeterminate => [
+                "v2-exact",
+                "existing-published",
+                "indeterminate",
+                "existing-audited",
+                "retained",
+                "publication-reconcile",
+                "publication durability is indeterminate",
+            ],
+            Self::MarkerRetained => [
+                "v2-exact",
+                "existing-published",
+                "durable-with-marker",
+                "existing-audited",
+                "retained",
+                "publication-reconcile",
+                "publication marker remains",
+            ],
+            Self::MarkerReplaced => [
+                "marker-replaced",
+                "existing-published",
+                "indeterminate",
+                "existing-audited",
+                "replacement-retained",
+                "manual-audit",
+                "publication marker was replaced",
+            ],
+            Self::MarkerPostStateIndeterminate => [
+                "marker-poststate-indeterminate",
+                "existing-published",
+                "indeterminate",
+                "existing-audited",
+                "indeterminate",
+                "manual-audit",
+                "publication marker post-state is indeterminate",
+            ],
+            Self::PostUnlinkAbsentIndeterminate => [
+                "post-unlink-absent-indeterminate",
+                "existing-published",
+                "indeterminate",
+                "existing-audited",
+                "indeterminate",
+                "publication-reconcile",
+                "post-unlink publication state is indeterminate",
+            ],
+        }
+    }
+
+    pub(crate) const fn result(self) -> &'static str {
+        self.fields()[6]
+    }
 }
 
 impl fmt::Debug for RepositoryImportPlan {
@@ -283,6 +452,65 @@ impl RepositoryImportReport {
 
     pub(crate) fn git_root_commit(&self) -> String {
         self.publication.root_commit_oid()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RepositoryReconcileOutcome {
+    Preview,
+    Reconciled,
+}
+
+enum RepositoryReconcileCandidate {
+    Preview(inex_git::ExistingRepositoryCandidatePreview),
+    Reconciled(Box<inex_git::PublishedRepositoryCandidate>),
+}
+
+pub(crate) struct RepositoryReconcileReport {
+    candidate: RepositoryReconcileCandidate,
+}
+
+impl RepositoryReconcileReport {
+    pub(crate) const fn outcome(&self) -> RepositoryReconcileOutcome {
+        match &self.candidate {
+            RepositoryReconcileCandidate::Preview(_) => RepositoryReconcileOutcome::Preview,
+            RepositoryReconcileCandidate::Reconciled(_) => RepositoryReconcileOutcome::Reconciled,
+        }
+    }
+
+    pub(crate) const fn worktree_files(&self) -> u32 {
+        match &self.candidate {
+            RepositoryReconcileCandidate::Preview(candidate) => candidate.worktree_files(),
+            RepositoryReconcileCandidate::Reconciled(candidate) => candidate.worktree_files(),
+        }
+    }
+
+    pub(crate) const fn encrypted_markdown(&self) -> u32 {
+        match &self.candidate {
+            RepositoryReconcileCandidate::Preview(candidate) => candidate.encrypted_markdown(),
+            RepositoryReconcileCandidate::Reconciled(candidate) => candidate.encrypted_markdown(),
+        }
+    }
+
+    pub(crate) const fn encrypted_assets(&self) -> u32 {
+        match &self.candidate {
+            RepositoryReconcileCandidate::Preview(candidate) => candidate.encrypted_assets(),
+            RepositoryReconcileCandidate::Reconciled(candidate) => candidate.encrypted_assets(),
+        }
+    }
+
+    pub(crate) const fn git_objects(&self) -> u32 {
+        match &self.candidate {
+            RepositoryReconcileCandidate::Preview(candidate) => candidate.git_objects(),
+            RepositoryReconcileCandidate::Reconciled(candidate) => candidate.git_objects(),
+        }
+    }
+
+    pub(crate) fn root_commit_oid(&self) -> String {
+        match &self.candidate {
+            RepositoryReconcileCandidate::Preview(candidate) => candidate.root_commit_oid(),
+            RepositoryReconcileCandidate::Reconciled(candidate) => candidate.root_commit_oid(),
+        }
     }
 }
 
@@ -369,12 +597,84 @@ impl RepositoryImportExecutionError {
     }
 }
 
-pub(crate) fn plan(
+pub(crate) struct RepositoryReconcileExecutionError {
+    terminal: RepositoryReconcileTerminal,
+    publication: Option<inex_git::RepositoryCandidatePublicationFailure>,
+}
+
+impl RepositoryReconcileExecutionError {
+    pub(crate) const fn terminal(&self) -> RepositoryReconcileTerminal {
+        self.terminal
+    }
+
+    pub(crate) fn into_error(self) -> RepositoryImportError {
+        let Self {
+            terminal,
+            publication: _publication,
+        } = self;
+        RepositoryImportError::Reconciliation(terminal)
+    }
+}
+
+pub(crate) fn dispatch(
     source_repository: &Path,
     destination: &Path,
+) -> Result<RepositoryImportDispatch, RepositoryImportError> {
+    let (source_root, source_identity) = resolve_source_root(source_repository)?;
+    let (destination, exists) = DestinationPlan::resolve(destination)?;
+    ensure_disjoint(&source_root, &destination.path)?;
+    if destination.parent_identity == source_identity {
+        return Err(RepositoryImportError::SourceDestinationOverlap);
+    }
+
+    if exists {
+        let destination_identity = destination_identity_if_safe(&destination.path)?;
+        if destination_identity.as_ref() == Some(&source_identity) {
+            return Err(RepositoryImportError::SourceDestinationOverlap);
+        }
+        let mut disjointness_identities = vec![destination.parent_identity.clone()];
+        if let Some(identity) = &destination_identity {
+            disjointness_identities.push(identity.clone());
+        }
+        if source_tree_contains_directory_identity(
+            &source_root,
+            &source_identity,
+            &disjointness_identities,
+        )? {
+            return Err(RepositoryImportError::SourceDestinationOverlap);
+        }
+        let mut marker_state =
+            reconcile_marker_state(inspect_repository_publication_namespace(&destination.path));
+        let revalidated_identity = destination_identity_if_safe(&destination.path)?;
+        if destination_identity != revalidated_identity {
+            marker_state = RepositoryReconcileMarkerState::ReservedInspectionIndeterminate;
+        }
+        return Ok(RepositoryImportDispatch::Existing(
+            RepositoryReconcileRequest {
+                destination,
+                marker_state,
+                destination_identity: revalidated_identity,
+            },
+        ));
+    }
+
+    let source = inex_git::plan_source_repository(&source_root)?;
+    if source.root() != source_root || !source.contains_directory_identity(&source_identity) {
+        return Err(RepositoryImportError::SourceChanged);
+    }
+    destination.revalidate(&source)?;
+    if source.contains_directory_identity(&destination.parent_identity) {
+        return Err(RepositoryImportError::SourceDestinationOverlap);
+    }
+    plan_creation(source, destination)
+        .map(Box::new)
+        .map(RepositoryImportDispatch::Creation)
+}
+
+fn plan_creation(
+    source: inex_git::SourceSnapshot,
+    destination: DestinationPlan,
 ) -> Result<RepositoryImportPlan, RepositoryImportError> {
-    let source = inex_git::plan_source_repository(source_repository)?;
-    let destination = DestinationPlan::new(&source, destination)?;
     let mut entries = Vec::with_capacity(source.entries().len());
     let mut raw_directories = BTreeSet::new();
     let mut markdown_files = 0_usize;
@@ -558,6 +858,80 @@ pub(crate) fn execute(
         terminal,
         publication: publication_failure,
     })
+}
+
+pub(crate) fn execute_reconcile(
+    request: &RepositoryReconcileRequest,
+    dry_run: bool,
+) -> Result<RepositoryReconcileReport, RepositoryReconcileExecutionError> {
+    if marker_state_terminal(request.marker_state).is_some() {
+        let destination_identity_unchanged =
+            destination_identity_if_safe(&request.destination.path).ok()
+                == Some(request.destination_identity.clone());
+        let current_state = if request.destination.existing_parent_is_unchanged()
+            && destination_identity_unchanged
+        {
+            reconcile_marker_state(inspect_repository_publication_namespace(
+                &request.destination.path,
+            ))
+        } else {
+            RepositoryReconcileMarkerState::ReservedInspectionIndeterminate
+        };
+        let terminal = if current_state == request.marker_state {
+            marker_state_terminal(current_state)
+                .unwrap_or(RepositoryReconcileTerminal::ReservedInspectionIndeterminate)
+        } else {
+            RepositoryReconcileTerminal::ReservedInspectionIndeterminate
+        };
+        return Err(RepositoryReconcileExecutionError {
+            terminal,
+            publication: None,
+        });
+    }
+
+    if !request.destination.existing_parent_is_unchanged()
+        || destination_identity_if_safe(&request.destination.path).ok()
+            != Some(request.destination_identity.clone())
+    {
+        return Err(RepositoryReconcileExecutionError {
+            terminal: RepositoryReconcileTerminal::V2ClaimRejected,
+            publication: None,
+        });
+    }
+
+    let child_name = request
+        .destination
+        .path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(RepositoryReconcileExecutionError {
+            terminal: RepositoryReconcileTerminal::V2ClaimRejected,
+            publication: None,
+        })?;
+    let result = if dry_run {
+        inex_git::preview_existing_repository_candidate(
+            &request.destination.path,
+            &request.destination.parent_identity,
+            child_name,
+        )
+        .map(RepositoryReconcileCandidate::Preview)
+    } else {
+        inex_git::reconcile_existing_repository_candidate(
+            &request.destination.path,
+            &request.destination.parent_identity,
+            child_name,
+        )
+        .map(Box::new)
+        .map(RepositoryReconcileCandidate::Reconciled)
+    };
+
+    match result {
+        Ok(candidate) => Ok(RepositoryReconcileReport { candidate }),
+        Err(publication) => Err(RepositoryReconcileExecutionError {
+            terminal: reconciliation_terminal(publication.kind()),
+            publication: Some(publication),
+        }),
+    }
 }
 
 fn build_staging_vault(
@@ -854,20 +1228,8 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
 }
 
 impl DestinationPlan {
-    fn new(
-        source: &inex_git::SourceSnapshot,
-        destination: &Path,
-    ) -> Result<Self, RepositoryImportError> {
-        if destination.as_os_str().is_empty() {
-            return Err(RepositoryImportError::InvalidDestination);
-        }
-        let absolute = if destination.is_absolute() {
-            destination.to_path_buf()
-        } else {
-            std::env::current_dir()
-                .map_err(|error| io_error(RepositoryImportIoOperation::ResolveDestination, &error))?
-                .join(destination)
-        };
+    fn resolve(destination: &Path) -> Result<(Self, bool), RepositoryImportError> {
+        let absolute = lexical_absolute_path(destination, ImportPathRole::Destination)?;
         if !matches!(
             absolute.components().next_back(),
             Some(Component::Normal(_))
@@ -878,45 +1240,37 @@ impl DestinationPlan {
             .file_name()
             .and_then(|value| value.to_str())
             .ok_or(RepositoryImportError::InvalidDestination)?;
-        if name
-            .to_ascii_lowercase()
-            .starts_with(&IMPORT_STAGING_PREFIX.to_ascii_lowercase())
+        if raw_portable_case_fold_key(name)
+            .as_str()
+            .starts_with(raw_portable_case_fold_key(IMPORT_STAGING_PREFIX).as_str())
         {
             return Err(RepositoryImportError::InvalidDestination);
         }
         let raw_parent = absolute
             .parent()
             .ok_or(RepositoryImportError::InvalidDestination)?;
-        validate_directory_chain(raw_parent)?;
-        let parent = fs::canonicalize(raw_parent)
-            .map_err(|error| io_error(RepositoryImportIoOperation::ResolveDestination, &error))?;
-        validate_directory_chain(&parent)?;
+        let (parent, parent_identity) =
+            resolve_verified_directory(raw_parent, ImportPathRole::Destination)?;
         if !path_is_supported_local_filesystem(&parent)
             .map_err(|error| io_error(RepositoryImportIoOperation::ResolveDestination, &error))?
         {
             return Err(RepositoryImportError::UnsupportedDestinationFilesystem);
         }
         let path = parent.join(name);
-        reject_existing(&path)?;
-        ensure_disjoint(source.root(), &path)?;
-        let parent_identity = filesystem_directory_identity(&parent)
-            .map_err(|error| io_error(RepositoryImportIoOperation::ResolveDestination, &error))?;
-        if source.contains_directory_identity(&parent_identity) {
-            return Err(RepositoryImportError::SourceDestinationOverlap);
-        }
-        Ok(Self {
-            path,
-            parent,
-            parent_identity,
-        })
+        let exists = destination_exists(&path)?;
+        Ok((
+            Self {
+                path,
+                parent,
+                parent_identity,
+            },
+            exists,
+        ))
     }
 
     fn revalidate(&self, source: &inex_git::SourceSnapshot) -> Result<(), RepositoryImportError> {
-        validate_directory_chain(&self.parent)?;
-        let parent = fs::canonicalize(&self.parent)
-            .map_err(|error| io_error(RepositoryImportIoOperation::ResolveDestination, &error))?;
-        let identity = filesystem_directory_identity(&parent)
-            .map_err(|error| io_error(RepositoryImportIoOperation::ResolveDestination, &error))?;
+        let (parent, identity) =
+            resolve_verified_directory(&self.parent, ImportPathRole::Destination)?;
         if parent != self.parent || identity != self.parent_identity {
             return Err(RepositoryImportError::DestinationParentChanged);
         }
@@ -925,6 +1279,12 @@ impl DestinationPlan {
             return Err(RepositoryImportError::SourceDestinationOverlap);
         }
         reject_existing(&self.path)
+    }
+
+    fn existing_parent_is_unchanged(&self) -> bool {
+        resolve_verified_directory(&self.parent, ImportPathRole::Destination).is_ok_and(
+            |(parent, identity)| parent == self.parent && identity == self.parent_identity,
+        )
     }
 }
 
@@ -978,38 +1338,252 @@ impl StagingRoot {
     }
 }
 
-fn validate_directory_chain(path: &Path) -> Result<(), RepositoryImportError> {
+#[derive(Clone, Copy)]
+enum ImportPathRole {
+    Source,
+    Destination,
+}
+
+impl ImportPathRole {
+    const fn invalid(self) -> RepositoryImportError {
+        match self {
+            Self::Source => RepositoryImportError::InvalidSourcePath,
+            Self::Destination => RepositoryImportError::InvalidDestination,
+        }
+    }
+
+    const fn operation(self) -> RepositoryImportIoOperation {
+        match self {
+            Self::Source => RepositoryImportIoOperation::ResolveSource,
+            Self::Destination => RepositoryImportIoOperation::ResolveDestination,
+        }
+    }
+}
+
+fn lexical_absolute_path(
+    path: &Path,
+    role: ImportPathRole,
+) -> Result<PathBuf, RepositoryImportError> {
+    if path.as_os_str().is_empty() {
+        return Err(role.invalid());
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| io_error(role.operation(), &error))?
+            .join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(Path::new(std::path::MAIN_SEPARATOR_STR)),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(role.invalid());
+                }
+            }
+            Component::Normal(name) => normalized.push(name),
+        }
+    }
+    if normalized.is_absolute() {
+        Ok(normalized)
+    } else {
+        Err(role.invalid())
+    }
+}
+
+fn resolve_source_root(
+    source: &Path,
+) -> Result<(PathBuf, FilesystemDirectoryIdentity), RepositoryImportError> {
+    let absolute = lexical_absolute_path(source, ImportPathRole::Source)?;
+    resolve_verified_directory(&absolute, ImportPathRole::Source)
+}
+
+fn resolve_verified_directory(
+    path: &Path,
+    role: ImportPathRole,
+) -> Result<(PathBuf, FilesystemDirectoryIdentity), RepositoryImportError> {
+    validate_directory_chain(path, role)?;
+    let input_identity =
+        filesystem_directory_identity(path).map_err(|error| io_error(role.operation(), &error))?;
+    let canonical = fs::canonicalize(path).map_err(|error| io_error(role.operation(), &error))?;
+    validate_directory_chain(&canonical, role)?;
+    let canonical_identity = filesystem_directory_identity(&canonical)
+        .map_err(|error| io_error(role.operation(), &error))?;
+    validate_directory_chain(path, role)?;
+    let revalidated_input_identity =
+        filesystem_directory_identity(path).map_err(|error| io_error(role.operation(), &error))?;
+    if input_identity != canonical_identity || input_identity != revalidated_input_identity {
+        return Err(role.invalid());
+    }
+    Ok((canonical, canonical_identity))
+}
+
+fn validate_directory_chain(
+    path: &Path,
+    role: ImportPathRole,
+) -> Result<(), RepositoryImportError> {
     let mut ancestors = path
         .ancestors()
         .filter(|entry| !entry.as_os_str().is_empty())
         .collect::<Vec<_>>();
     ancestors.reverse();
     for ancestor in ancestors {
-        let metadata = fs::symlink_metadata(ancestor)
-            .map_err(|error| io_error(RepositoryImportIoOperation::ResolveDestination, &error))?;
+        let metadata =
+            fs::symlink_metadata(ancestor).map_err(|error| io_error(role.operation(), &error))?;
         if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
-            return Err(RepositoryImportError::InvalidDestination);
+            return Err(role.invalid());
         }
         #[cfg(windows)]
         {
             use std::os::windows::fs::MetadataExt as _;
             const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
             if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-                return Err(RepositoryImportError::InvalidDestination);
+                return Err(role.invalid());
             }
         }
     }
     Ok(())
 }
 
-fn reject_existing(path: &Path) -> Result<(), RepositoryImportError> {
+fn destination_exists(path: &Path) -> Result<bool, RepositoryImportError> {
     match fs::symlink_metadata(path) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Ok(_) => Err(RepositoryImportError::DestinationExists),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Ok(_) => Ok(true),
         Err(error) => Err(io_error(
             RepositoryImportIoOperation::ResolveDestination,
             &error,
         )),
+    }
+}
+
+fn destination_identity_if_safe(
+    path: &Path,
+) -> Result<Option<FilesystemDirectoryIdentity>, RepositoryImportError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| io_error(RepositoryImportIoOperation::ResolveDestination, &error))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        return Ok(None);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Ok(None);
+        }
+    }
+    filesystem_directory_identity(path)
+        .map(Some)
+        .map_err(|error| io_error(RepositoryImportIoOperation::ResolveDestination, &error))
+}
+
+#[cfg(target_os = "linux")]
+const MAX_SOURCE_DISJOINTNESS_ENTRIES: usize = 1_000_000;
+#[cfg(target_os = "linux")]
+const MAX_SOURCE_DISJOINTNESS_DEPTH: usize = 256;
+
+fn source_tree_contains_directory_identity(
+    source_root: &Path,
+    expected_root_identity: &FilesystemDirectoryIdentity,
+    identities: &[FilesystemDirectoryIdentity],
+) -> Result<bool, RepositoryImportError> {
+    #[cfg(target_os = "linux")]
+    {
+        let root = inex_core::atomic::open_secure_source_root(source_root)
+            .map_err(|_| RepositoryImportError::SourceChanged)?;
+        if root.identity() != expected_root_identity {
+            return Err(RepositoryImportError::SourceChanged);
+        }
+        let mut entries = 0_usize;
+        let contains =
+            secure_source_tree_contains_directory_identity(&root, identities, &mut entries, 0)?;
+        root.verify_binding()
+            .map_err(|_| RepositoryImportError::SourceChanged)?;
+        Ok(contains)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let current = filesystem_directory_identity(source_root)
+            .map_err(|_| RepositoryImportError::SourceChanged)?;
+        if &current != expected_root_identity {
+            return Err(RepositoryImportError::SourceChanged);
+        }
+        let _ = identities;
+        Ok(false)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn secure_source_tree_contains_directory_identity(
+    directory: &inex_core::atomic::SecureSourceDirectory,
+    identities: &[FilesystemDirectoryIdentity],
+    entries: &mut usize,
+    depth: usize,
+) -> Result<bool, RepositoryImportError> {
+    if identities
+        .iter()
+        .any(|identity| identity == directory.identity())
+    {
+        return Ok(true);
+    }
+    directory
+        .verify_binding()
+        .map_err(|_| RepositoryImportError::SourceChanged)?;
+    let children = directory
+        .read_dir()
+        .map_err(|_| RepositoryImportError::SourceChanged)?;
+    for child in children {
+        let child = child.map_err(|_| RepositoryImportError::SourceChanged)?;
+        *entries = entries
+            .checked_add(1)
+            .filter(|count| *count <= MAX_SOURCE_DISJOINTNESS_ENTRIES)
+            .ok_or(RepositoryImportError::SourceChanged)?;
+        if !child
+            .file_type()
+            .map_err(|_| RepositoryImportError::SourceChanged)?
+            .is_dir()
+        {
+            continue;
+        }
+        match directory
+            .open_child(&child.file_name())
+            .map_err(|_| RepositoryImportError::SourceChanged)?
+        {
+            inex_core::atomic::SecureSourceChild::Directory(child_directory) => {
+                if depth >= MAX_SOURCE_DISJOINTNESS_DEPTH {
+                    return Err(RepositoryImportError::SourceChanged);
+                }
+                if secure_source_tree_contains_directory_identity(
+                    &child_directory,
+                    identities,
+                    entries,
+                    depth + 1,
+                )? {
+                    return Ok(true);
+                }
+            }
+            inex_core::atomic::SecureSourceChild::File(_)
+            | inex_core::atomic::SecureSourceChild::Other => {
+                return Err(RepositoryImportError::SourceChanged);
+            }
+        }
+    }
+    directory
+        .verify_binding()
+        .map_err(|_| RepositoryImportError::SourceChanged)?;
+    Ok(false)
+}
+
+fn reject_existing(path: &Path) -> Result<(), RepositoryImportError> {
+    if destination_exists(path)? {
+        Err(RepositoryImportError::DestinationExists)
+    } else {
+        Ok(())
     }
 }
 
@@ -1018,6 +1592,75 @@ fn ensure_disjoint(source: &Path, destination: &Path) -> Result<(), RepositoryIm
         Err(RepositoryImportError::SourceDestinationOverlap)
     } else {
         Ok(())
+    }
+}
+
+const fn marker_state_terminal(
+    state: RepositoryReconcileMarkerState,
+) -> Option<RepositoryReconcileTerminal> {
+    match state {
+        RepositoryReconcileMarkerState::ReservedInspectionIndeterminate => {
+            Some(RepositoryReconcileTerminal::ReservedInspectionIndeterminate)
+        }
+        RepositoryReconcileMarkerState::Absent => Some(RepositoryReconcileTerminal::Absent),
+        RepositoryReconcileMarkerState::LegacyUnverifiable => {
+            Some(RepositoryReconcileTerminal::LegacyUnverifiable)
+        }
+        RepositoryReconcileMarkerState::ReservedConflict => {
+            Some(RepositoryReconcileTerminal::ReservedConflict)
+        }
+        RepositoryReconcileMarkerState::V2Invalid => Some(RepositoryReconcileTerminal::V2Invalid),
+        RepositoryReconcileMarkerState::V2Exact => None,
+    }
+}
+
+fn reconcile_marker_state(
+    state: Result<
+        RepositoryPublicationNamespaceState,
+        inex_core::atomic::RepositoryPublicationNamespaceInspectionError,
+    >,
+) -> RepositoryReconcileMarkerState {
+    match state {
+        Err(_) => RepositoryReconcileMarkerState::ReservedInspectionIndeterminate,
+        Ok(RepositoryPublicationNamespaceState::Absent) => RepositoryReconcileMarkerState::Absent,
+        Ok(RepositoryPublicationNamespaceState::LegacyUnverifiable) => {
+            RepositoryReconcileMarkerState::LegacyUnverifiable
+        }
+        Ok(RepositoryPublicationNamespaceState::ReservedConflict) => {
+            RepositoryReconcileMarkerState::ReservedConflict
+        }
+        Ok(RepositoryPublicationNamespaceState::V2Invalid) => {
+            RepositoryReconcileMarkerState::V2Invalid
+        }
+        Ok(RepositoryPublicationNamespaceState::V2Exact) => RepositoryReconcileMarkerState::V2Exact,
+    }
+}
+
+const fn reconciliation_terminal(
+    kind: inex_git::RepositoryCandidatePublicationFailureKind,
+) -> RepositoryReconcileTerminal {
+    use inex_git::RepositoryCandidatePublicationFailureKind as Kind;
+
+    match kind {
+        Kind::PublicationDurabilityIndeterminate | Kind::PublicationDurabilityRejected => {
+            RepositoryReconcileTerminal::DurabilityIndeterminate
+        }
+        Kind::PublicationMarkerRetained => RepositoryReconcileTerminal::MarkerRetained,
+        Kind::PublicationMarkerReplaced => RepositoryReconcileTerminal::MarkerReplaced,
+        Kind::PublicationMarkerPostStateIndeterminate => {
+            RepositoryReconcileTerminal::MarkerPostStateIndeterminate
+        }
+        Kind::PostUnlinkIndeterminate | Kind::CleanAuditRejected => {
+            RepositoryReconcileTerminal::PostUnlinkAbsentIndeterminate
+        }
+        Kind::UnsupportedPlatform
+        | Kind::InitialAuthorityRejected
+        | Kind::InitialClaimRejected
+        | Kind::ExistingClaimRejected
+        | Kind::InitialPublicationNotMoved
+        | Kind::DestinationExists
+        | Kind::PublicationIndeterminate
+        | Kind::InitialPublicationRejected => RepositoryReconcileTerminal::V2ClaimRejected,
     }
 }
 
@@ -1142,6 +1785,261 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the test mirrors every row of the frozen terminal contract"
+    )]
+    fn reconcile_terminal_fields_match_the_frozen_contract() {
+        let cases = [
+            (
+                RepositoryReconcileTerminal::ReservedInspectionIndeterminate,
+                [
+                    "reserved-inspection-indeterminate",
+                    "existing-unattributed",
+                    "reconcile-conflict",
+                    "existing-unaudited",
+                    "not-attempted",
+                    "manual-audit",
+                    "publication marker namespace inspection failed",
+                ],
+            ),
+            (
+                RepositoryReconcileTerminal::Absent,
+                [
+                    "absent",
+                    "existing-unattributed",
+                    "reconcile-not-started",
+                    "existing-unaudited",
+                    "not-attempted",
+                    "manual-audit",
+                    "existing repository is unattributed",
+                ],
+            ),
+            (
+                RepositoryReconcileTerminal::LegacyUnverifiable,
+                [
+                    "legacy-unverifiable",
+                    "existing-unattributed",
+                    "reconcile-conflict",
+                    "existing-unaudited",
+                    "retained",
+                    "manual-audit",
+                    "legacy publication marker is unverifiable",
+                ],
+            ),
+            (
+                RepositoryReconcileTerminal::ReservedConflict,
+                [
+                    "reserved-conflict",
+                    "existing-unattributed",
+                    "reconcile-conflict",
+                    "existing-unaudited",
+                    "retained",
+                    "manual-audit",
+                    "publication marker namespace conflicts",
+                ],
+            ),
+            (
+                RepositoryReconcileTerminal::V2Invalid,
+                [
+                    "v2-invalid",
+                    "existing-unattributed",
+                    "reconcile-conflict",
+                    "existing-unaudited",
+                    "retained",
+                    "manual-audit",
+                    "publication marker is invalid",
+                ],
+            ),
+            (
+                RepositoryReconcileTerminal::V2ClaimRejected,
+                [
+                    "v2-exact",
+                    "publication-indeterminate",
+                    "reconcile-conflict",
+                    "existing-unaudited",
+                    "retained",
+                    "manual-audit",
+                    "publication claim failed audit",
+                ],
+            ),
+            (
+                RepositoryReconcileTerminal::DurabilityIndeterminate,
+                [
+                    "v2-exact",
+                    "existing-published",
+                    "indeterminate",
+                    "existing-audited",
+                    "retained",
+                    "publication-reconcile",
+                    "publication durability is indeterminate",
+                ],
+            ),
+            (
+                RepositoryReconcileTerminal::MarkerRetained,
+                [
+                    "v2-exact",
+                    "existing-published",
+                    "durable-with-marker",
+                    "existing-audited",
+                    "retained",
+                    "publication-reconcile",
+                    "publication marker remains",
+                ],
+            ),
+            (
+                RepositoryReconcileTerminal::MarkerReplaced,
+                [
+                    "marker-replaced",
+                    "existing-published",
+                    "indeterminate",
+                    "existing-audited",
+                    "replacement-retained",
+                    "manual-audit",
+                    "publication marker was replaced",
+                ],
+            ),
+            (
+                RepositoryReconcileTerminal::MarkerPostStateIndeterminate,
+                [
+                    "marker-poststate-indeterminate",
+                    "existing-published",
+                    "indeterminate",
+                    "existing-audited",
+                    "indeterminate",
+                    "manual-audit",
+                    "publication marker post-state is indeterminate",
+                ],
+            ),
+            (
+                RepositoryReconcileTerminal::PostUnlinkAbsentIndeterminate,
+                [
+                    "post-unlink-absent-indeterminate",
+                    "existing-published",
+                    "indeterminate",
+                    "existing-audited",
+                    "indeterminate",
+                    "publication-reconcile",
+                    "post-unlink publication state is indeterminate",
+                ],
+            ),
+        ];
+        for (terminal, expected) in cases {
+            assert_eq!(terminal.fields(), expected);
+            assert_eq!(terminal.result(), expected[6]);
+        }
+    }
+
+    #[test]
+    fn reconcile_classification_and_failure_routing_are_exhaustive() {
+        use inex_git::RepositoryCandidatePublicationFailureKind as Failure;
+
+        let namespace_cases = [
+            (
+                Err(inex_core::atomic::RepositoryPublicationNamespaceInspectionError),
+                RepositoryReconcileMarkerState::ReservedInspectionIndeterminate,
+            ),
+            (
+                Ok(RepositoryPublicationNamespaceState::Absent),
+                RepositoryReconcileMarkerState::Absent,
+            ),
+            (
+                Ok(RepositoryPublicationNamespaceState::LegacyUnverifiable),
+                RepositoryReconcileMarkerState::LegacyUnverifiable,
+            ),
+            (
+                Ok(RepositoryPublicationNamespaceState::ReservedConflict),
+                RepositoryReconcileMarkerState::ReservedConflict,
+            ),
+            (
+                Ok(RepositoryPublicationNamespaceState::V2Invalid),
+                RepositoryReconcileMarkerState::V2Invalid,
+            ),
+            (
+                Ok(RepositoryPublicationNamespaceState::V2Exact),
+                RepositoryReconcileMarkerState::V2Exact,
+            ),
+        ];
+        for (state, expected) in namespace_cases {
+            assert_eq!(reconcile_marker_state(state), expected);
+            assert_eq!(
+                marker_state_terminal(expected).is_none(),
+                expected == RepositoryReconcileMarkerState::V2Exact
+            );
+        }
+
+        let failure_cases = [
+            (
+                Failure::UnsupportedPlatform,
+                RepositoryReconcileTerminal::V2ClaimRejected,
+            ),
+            (
+                Failure::InitialAuthorityRejected,
+                RepositoryReconcileTerminal::V2ClaimRejected,
+            ),
+            (
+                Failure::InitialClaimRejected,
+                RepositoryReconcileTerminal::V2ClaimRejected,
+            ),
+            (
+                Failure::ExistingClaimRejected,
+                RepositoryReconcileTerminal::V2ClaimRejected,
+            ),
+            (
+                Failure::InitialPublicationNotMoved,
+                RepositoryReconcileTerminal::V2ClaimRejected,
+            ),
+            (
+                Failure::DestinationExists,
+                RepositoryReconcileTerminal::V2ClaimRejected,
+            ),
+            (
+                Failure::PublicationIndeterminate,
+                RepositoryReconcileTerminal::V2ClaimRejected,
+            ),
+            (
+                Failure::InitialPublicationRejected,
+                RepositoryReconcileTerminal::V2ClaimRejected,
+            ),
+            (
+                Failure::PublicationDurabilityIndeterminate,
+                RepositoryReconcileTerminal::DurabilityIndeterminate,
+            ),
+            (
+                Failure::PublicationDurabilityRejected,
+                RepositoryReconcileTerminal::DurabilityIndeterminate,
+            ),
+            (
+                Failure::PublicationMarkerRetained,
+                RepositoryReconcileTerminal::MarkerRetained,
+            ),
+            (
+                Failure::PublicationMarkerReplaced,
+                RepositoryReconcileTerminal::MarkerReplaced,
+            ),
+            (
+                Failure::PublicationMarkerPostStateIndeterminate,
+                RepositoryReconcileTerminal::MarkerPostStateIndeterminate,
+            ),
+            (
+                Failure::PostUnlinkIndeterminate,
+                RepositoryReconcileTerminal::PostUnlinkAbsentIndeterminate,
+            ),
+            (
+                Failure::CleanAuditRejected,
+                RepositoryReconcileTerminal::PostUnlinkAbsentIndeterminate,
+            ),
+        ];
+        for (failure, expected) in failure_cases {
+            assert_eq!(reconciliation_terminal(failure), expected);
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one source-contract test freezes the complete publication seam"
+    )]
     fn production_source_freezes_audited_owner_and_v2_publication_seam() {
         let source = include_str!("repository_import.rs");
         let production = source
@@ -1149,7 +2047,7 @@ mod tests {
             .map_or(source, |(production, _)| production);
         let execute = production
             .split_once("pub(crate) fn execute(")
-            .and_then(|(_, tail)| tail.split_once("\nfn build_staging_vault("))
+            .and_then(|(_, tail)| tail.split_once("\npub(crate) fn execute_reconcile("))
             .map_or_else(
                 || panic!("execute source boundary changed"),
                 |(execute, _)| execute,
@@ -1189,6 +2087,61 @@ mod tests {
         assert!(!production.contains("atomic_publish_directory_no_replace_checked"));
         assert!(!production.contains("into_warnings_before_legacy_publication"));
 
+        let dispatch = production
+            .split_once("pub(crate) fn dispatch(")
+            .and_then(|(_, tail)| tail.split_once("\nfn plan_creation("))
+            .map_or_else(
+                || panic!("dispatch source boundary changed"),
+                |(dispatch, _)| dispatch,
+            );
+        let path_source = dispatch
+            .find("resolve_source_root(source_repository)")
+            .expect("source path normalization exists");
+        let path_destination = dispatch
+            .find("DestinationPlan::resolve(destination)")
+            .expect("destination path normalization exists");
+        let existing = dispatch.find("if exists").expect("existing branch exists");
+        let reserved = dispatch
+            .find("inspect_repository_publication_namespace(&destination.path)")
+            .expect("reserved namespace routing exists");
+        let source_git = dispatch
+            .find("inex_git::plan_source_repository(&source_root)")
+            .expect("creation source planning exists");
+        assert!(
+            path_source < path_destination
+                && path_destination < existing
+                && existing < reserved
+                && reserved < source_git
+        );
+        for forbidden in ["password", "Vault::", "calibrated_creation_params", "Kdf"] {
+            assert!(
+                !dispatch.contains(forbidden),
+                "path-first dispatch gained forbidden work: {forbidden}"
+            );
+        }
+
+        let reconcile = production
+            .split_once("pub(crate) fn execute_reconcile(")
+            .and_then(|(_, tail)| tail.split_once("\nfn build_staging_vault("))
+            .map_or_else(
+                || panic!("execute_reconcile source boundary changed"),
+                |(reconcile, _)| reconcile,
+            );
+        let dry_run_branch = reconcile.find("if dry_run").expect("dry-run branch exists");
+        let preview = reconcile
+            .find("inex_git::preview_existing_repository_candidate(")
+            .expect("dry-run uses the read-only preview");
+        let mutation = reconcile
+            .find("inex_git::reconcile_existing_repository_candidate(")
+            .expect("normal execution uses reconciliation");
+        assert!(dry_run_branch < preview && preview < mutation);
+        for forbidden in ["plan_source_repository", "password", "Vault::", "Kdf"] {
+            assert!(
+                !reconcile.contains(forbidden),
+                "target-only reconciliation gained forbidden work: {forbidden}"
+            );
+        }
+
         let cli = include_str!("lib.rs");
         assert!(cli.contains("repository_import::execute(plan, password, created_at_ms"));
         assert!(!cli.contains("repository_import::execute(plan, password.as_slice()"));
@@ -1216,6 +2169,25 @@ mod tests {
             .map(|offset| offset + success_output)
             .expect("success output flush exists");
         assert!(success_output < success_flush);
+
+        let reconcile_command = cli
+            .split("fn command_repository_reconcile(")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("fn format_repository_reconcile_terminal(")
+                    .next()
+            })
+            .expect("repository reconcile command exists");
+        let failure_format = reconcile_command
+            .find("format_repository_reconcile_terminal(failure.terminal())")
+            .expect("reconcile failure formats one block");
+        let failure_write = reconcile_command
+            .find("write_repository_reconcile_output(&output)")
+            .expect("reconcile failure writes one block");
+        let failure_drop = reconcile_command
+            .find("failure.into_error()")
+            .expect("reconcile failure owner is consumed");
+        assert!(failure_format < failure_write && failure_write < failure_drop);
     }
 
     #[cfg(target_os = "linux")]
@@ -1290,6 +2262,108 @@ mod tests {
             }
         }
 
+        #[test]
+        fn path_only_disjointness_scan_detects_nested_physical_identity() {
+            let temporary = TestDirectory::new("disjointness-identity");
+            let source = temporary.path().join("source");
+            let nested = source.join("notes").join("images");
+            let outside = temporary.path().join("outside");
+            fs::create_dir_all(&nested)
+                .unwrap_or_else(|error| panic!("nested directory creation failed: {error}"));
+            fs::create_dir(&outside)
+                .unwrap_or_else(|error| panic!("outside directory creation failed: {error}"));
+            let regular = source.join("regular.bin");
+            fs::write(&regular, b"non-directory entries are not opened")
+                .unwrap_or_else(|error| panic!("regular file creation failed: {error}"));
+            fs::hard_link(&regular, source.join("hardlink.bin"))
+                .unwrap_or_else(|error| panic!("hardlink creation failed: {error}"));
+            std::os::unix::fs::symlink("regular.bin", source.join("symlink.bin"))
+                .unwrap_or_else(|error| panic!("symlink creation failed: {error}"));
+            let source_identity = filesystem_directory_identity(&source)
+                .unwrap_or_else(|error| panic!("source identity failed: {error}"));
+            let nested_identity = filesystem_directory_identity(&nested)
+                .unwrap_or_else(|error| panic!("nested identity failed: {error}"));
+            let outside_identity = filesystem_directory_identity(&outside)
+                .unwrap_or_else(|error| panic!("outside identity failed: {error}"));
+
+            assert!(
+                source_tree_contains_directory_identity(
+                    &source,
+                    &source_identity,
+                    &[nested_identity],
+                )
+                .unwrap_or_else(|error| panic!("nested scan failed: {error}"))
+            );
+            assert!(
+                !source_tree_contains_directory_identity(
+                    &source,
+                    &source_identity,
+                    &[outside_identity],
+                )
+                .unwrap_or_else(|error| panic!("outside scan failed: {error}"))
+            );
+        }
+
+        #[test]
+        fn non_v2_reconcile_detects_same_class_destination_replacement() {
+            let temporary = TestDirectory::new("reconcile-replaced-absent");
+            let source = temporary.path().join("source");
+            let destination = temporary.path().join("existing-vault");
+            let retained = temporary.path().join("retained-original");
+            fs::create_dir(&source)
+                .unwrap_or_else(|error| panic!("source creation failed: {error}"));
+            fs::write(source.join("note.md"), b"source canary\n")
+                .unwrap_or_else(|error| panic!("source canary failed: {error}"));
+            fs::create_dir(&destination)
+                .unwrap_or_else(|error| panic!("destination creation failed: {error}"));
+            fs::write(destination.join("original.bin"), b"original")
+                .unwrap_or_else(|error| panic!("original canary failed: {error}"));
+
+            let request = match dispatch(&source, &destination)
+                .unwrap_or_else(|error| panic!("dispatch failed: {error}"))
+            {
+                RepositoryImportDispatch::Existing(request) => request,
+                RepositoryImportDispatch::Creation(_) => {
+                    panic!("existing destination routed to creation")
+                }
+            };
+            fs::rename(&destination, &retained)
+                .unwrap_or_else(|error| panic!("original retention failed: {error}"));
+            fs::create_dir(&destination)
+                .unwrap_or_else(|error| panic!("replacement creation failed: {error}"));
+            fs::write(destination.join("replacement.bin"), b"replacement")
+                .unwrap_or_else(|error| panic!("replacement canary failed: {error}"));
+
+            let terminal = match execute_reconcile(&request, false) {
+                Err(failure) => failure.terminal(),
+                Ok(_) => panic!("replaced destination unexpectedly reconciled"),
+            };
+            assert_eq!(
+                terminal,
+                RepositoryReconcileTerminal::ReservedInspectionIndeterminate
+            );
+            assert_eq!(
+                fs::read(retained.join("original.bin"))
+                    .unwrap_or_else(|error| panic!("original canary read failed: {error}")),
+                b"original"
+            );
+            assert_eq!(
+                fs::read(destination.join("replacement.bin"))
+                    .unwrap_or_else(|error| panic!("replacement canary read failed: {error}")),
+                b"replacement"
+            );
+            assert!(
+                !retained
+                    .join(inex_core::atomic::VAULT_LOCAL_DIRECTORY)
+                    .exists()
+            );
+            assert!(
+                !destination
+                    .join(inex_core::atomic::VAULT_LOCAL_DIRECTORY)
+                    .exists()
+            );
+        }
+
         const fn weak_params() -> Argon2idParams {
             Argon2idParams {
                 ops_limit: 1,
@@ -1324,8 +2398,14 @@ mod tests {
                     "source snapshot",
                 ],
             );
-            let plan = plan(&source, &destination)
-                .unwrap_or_else(|error| panic!("repository plan failed: {error}"));
+            let plan = match dispatch(&source, &destination)
+                .unwrap_or_else(|error| panic!("repository dispatch failed: {error}"))
+            {
+                RepositoryImportDispatch::Creation(plan) => *plan,
+                RepositoryImportDispatch::Existing(_) => {
+                    panic!("fresh fixture unexpectedly routed to reconcile")
+                }
+            };
             (temporary, plan)
         }
 

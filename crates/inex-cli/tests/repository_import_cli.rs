@@ -194,6 +194,50 @@ fn trustworthy_plan_password_failure_reports_last_proven_terminal_state() {
 }
 
 #[test]
+fn existing_unattributed_destination_routes_before_source_git_or_password() {
+    let temporary = TestDirectory::new("existing-unattributed");
+    let source = temporary.path().join("not-a-git-repository");
+    let destination = temporary.path().join("existing-vault");
+    fs::create_dir(&source).unwrap_or_else(|error| panic!("source creation failed: {error}"));
+    fs::create_dir(&destination)
+        .unwrap_or_else(|error| panic!("destination creation failed: {error}"));
+    fs::write(source.join("plain.md"), b"must not be read\n")
+        .unwrap_or_else(|error| panic!("source canary write failed: {error}"));
+    fs::write(destination.join("foreign.bin"), b"preserve exactly")
+        .unwrap_or_else(|error| panic!("destination canary write failed: {error}"));
+
+    let output = run_import_without_password(&source, &destination);
+    assert!(!output.status.success());
+    let stdout = String::from_utf8(output.stdout)
+        .unwrap_or_else(|error| panic!("stdout UTF-8 failed: {error}"));
+    let stderr = String::from_utf8(output.stderr)
+        .unwrap_or_else(|error| panic!("stderr UTF-8 failed: {error}"));
+    assert_eq!(
+        stdout,
+        concat!(
+            "import-mode: repository-reconcile\n",
+            "terminal-operation: repository-reconcile\n",
+            "existing-vault: yes\n",
+            "marker-state: absent\n",
+            "candidate-root: existing-unattributed\n",
+            "vault-publication: reconcile-not-started\n",
+            "git-repository: existing-unaudited\n",
+            "marker-cleanup: not-attempted\n",
+            "recovery-required: manual-audit\n",
+            "result: existing repository is unattributed\n",
+        )
+    );
+    assert!(!stderr.contains("source validation failed"));
+    assert!(stderr.contains("existing repository is unattributed"));
+    assert_eq!(
+        fs::read(destination.join("foreign.bin"))
+            .unwrap_or_else(|error| panic!("destination canary read failed: {error}")),
+        b"preserve exactly"
+    );
+    assert!(!destination.join(VAULT_LOCAL_DIRECTORY).exists());
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
 fn imports_current_snapshot_into_one_parentless_ciphertext_commit() {
     let temporary = TestDirectory::new("success");

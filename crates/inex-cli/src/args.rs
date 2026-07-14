@@ -12,7 +12,7 @@ pub(crate) const USAGE: &str = "\
 Usage:
   inex init <vault>
   inex import <plaintext-source> <new-vault> [--dry-run]
-  inex import-repository <source-repository> <new-vault> [--dry-run]
+  inex import-repository <source-repository> <destination-vault> [--dry-run]
   inex verify <vault>
   inex password add <vault> [--slot <current-slot-uuid>]
   inex password remove <vault> <slot-to-remove> --slot <retained-slot-uuid>
@@ -61,9 +61,13 @@ storage, 16 MiB per Markdown file, and 256 MiB total Markdown plaintext.
 from one clean, tracked source `HEAD` snapshot. It imports exact lowercase
 `.md` files as encrypted Markdown and every other tracked regular file as an
 encrypted opaque asset. The source repository and its plaintext history are
-read-only and are never copied into the target object database. `--dry-run`
-performs no password prompt, KDF work, directory creation, Git initialization,
-or product-state write.
+read-only and are never copied into the target object database. If the
+destination already contains the sole canonical v2 publication claim, the
+same command performs target-only reconciliation before source Git planning,
+password prompting, or KDF work; all other existing destinations fail closed
+without mutation. `--dry-run` performs a read-only exact-v2 preview and never
+removes its marker, creates a directory, initializes Git, or writes product
+state.
 
 `verify` performs locked structural validation only. It does not authenticate
 vault metadata or document ciphertext. It acquires the vault mutation lock and

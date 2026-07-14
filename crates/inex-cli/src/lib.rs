@@ -357,16 +357,21 @@ fn command_import_repository(
     vault_path: &Path,
     dry_run: bool,
 ) -> Result<ExitCode, AppError> {
-    let plan = repository_import::plan(source, vault_path)?;
-    print_repository_import_plan(&plan, dry_run);
-
-    if dry_run {
-        plan.revalidate_source()?;
-        print_repository_import_dry_run_success();
-        return Ok(ExitCode::SUCCESS);
+    match repository_import::dispatch(source, vault_path)? {
+        repository_import::RepositoryImportDispatch::Creation(plan) => {
+            print_repository_import_plan(&plan, dry_run);
+            if dry_run {
+                plan.revalidate_source()?;
+                print_repository_import_dry_run_success();
+                Ok(ExitCode::SUCCESS)
+            } else {
+                command_repository_import_create(&plan)
+            }
+        }
+        repository_import::RepositoryImportDispatch::Existing(request) => {
+            command_repository_reconcile(&request, dry_run)
+        }
     }
-
-    command_repository_import_create(&plan)
 }
 
 fn print_repository_import_plan(plan: &repository_import::RepositoryImportPlan, dry_run: bool) {
@@ -407,6 +412,159 @@ fn print_repository_import_dry_run_success() {
     println!("git-repository: not-created");
     println!("recovery-required: none");
     println!("result: repository import plan valid");
+}
+
+fn command_repository_reconcile(
+    request: &repository_import::RepositoryReconcileRequest,
+    dry_run: bool,
+) -> Result<ExitCode, AppError> {
+    let report = match repository_import::execute_reconcile(request, dry_run) {
+        Ok(report) => report,
+        Err(failure) => {
+            let output = format_repository_reconcile_terminal(failure.terminal());
+            write_repository_reconcile_output(&output)?;
+            return Err(failure.into_error().into());
+        }
+    };
+    let output = format_repository_reconcile_success(&report);
+    write_repository_reconcile_output(&output)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn format_repository_reconcile_terminal(
+    terminal: repository_import::RepositoryReconcileTerminal,
+) -> String {
+    let [
+        marker,
+        candidate,
+        publication,
+        git,
+        cleanup,
+        recovery,
+        result,
+    ] = terminal.fields();
+    format!(
+        "import-mode: repository-reconcile\n\
+         terminal-operation: repository-reconcile\n\
+         existing-vault: yes\n\
+         marker-state: {marker}\n\
+         candidate-root: {candidate}\n\
+         vault-publication: {publication}\n\
+         git-repository: {git}\n\
+         marker-cleanup: {cleanup}\n\
+         recovery-required: {recovery}\n\
+         result: {result}\n"
+    )
+}
+
+fn format_repository_reconcile_success(
+    report: &repository_import::RepositoryReconcileReport,
+) -> String {
+    let root = report.root_commit_oid();
+    format_repository_reconcile_success_values(
+        report.outcome(),
+        [
+            report.worktree_files(),
+            report.encrypted_markdown(),
+            report.encrypted_assets(),
+            report.git_objects(),
+        ],
+        &root,
+    )
+}
+
+fn format_repository_reconcile_success_values(
+    outcome: repository_import::RepositoryReconcileOutcome,
+    counts: [u32; 4],
+    root: &str,
+) -> String {
+    let [
+        worktree_files,
+        encrypted_markdown,
+        encrypted_assets,
+        git_objects,
+    ] = counts;
+    match outcome {
+        repository_import::RepositoryReconcileOutcome::Preview => format!(
+            "import-mode: repository-reconcile-dry-run\n\
+             terminal-operation: repository-reconcile-preview\n\
+             existing-vault: yes\n\
+             source-policy: path-disjointness-only\n\
+             source-git-replanned: no\n\
+             password-prompted: no\n\
+             kdf-ran: no\n\
+             destination-policy: existing-v2-publication-reconcile-only\n\
+             publication-marker-version: 2\n\
+             candidate-seal-version: repository-candidate-seal-v1\n\
+             target-worktree-files: {worktree_files}\n\
+             target-encrypted-markdown: {encrypted_markdown}\n\
+             target-encrypted-assets: {encrypted_assets}\n\
+             target-git-objects: {git_objects}\n\
+             target-root-commit: {root}\n\
+             target-root-parent-count: 0\n\
+             target-plaintext-file-objects: 0\n\
+             candidate-physical-audit: passed\n\
+             candidate-git-object-audit: passed\n\
+             marker-state: v2-exact\n\
+             candidate-root: existing-published\n\
+             vault-publication: indeterminate\n\
+             git-repository: existing-audited\n\
+             marker-cleanup: retained\n\
+             recovery-required: publication-reconcile\n\
+             result: repository reconciliation plan valid\n",
+        ),
+        repository_import::RepositoryReconcileOutcome::Reconciled => format!(
+            "import-mode: repository-reconcile\n\
+             terminal-operation: repository-reconcile\n\
+             existing-vault: yes\n\
+             source-policy: path-disjointness-only\n\
+             source-git-replanned: no\n\
+             password-prompted: no\n\
+             kdf-ran: no\n\
+             destination-policy: existing-v2-publication-reconcile-only\n\
+             publication-marker-version: 2\n\
+             candidate-seal-version: repository-candidate-seal-v1\n\
+             target-worktree-files: {worktree_files}\n\
+             target-encrypted-markdown: {encrypted_markdown}\n\
+             target-encrypted-assets: {encrypted_assets}\n\
+             target-git-objects: {git_objects}\n\
+             target-root-commit: {root}\n\
+             target-root-parent-count: 0\n\
+             target-plaintext-file-objects: 0\n\
+             candidate-physical-audit: passed\n\
+             candidate-git-object-audit: passed\n\
+             candidate-root: existing-published\n\
+             vault-publication: reconciled\n\
+             git-repository: existing-audited\n\
+             marker-cleanup: removed\n\
+             recovery-required: none\n\
+             result: repository publication reconciled\n",
+        ),
+    }
+}
+
+fn write_repository_reconcile_output(output: &str) -> Result<(), AppError> {
+    let mut stdout = io::stdout().lock();
+    write_repository_reconcile_output_to(&mut stdout, output)
+}
+
+fn write_repository_reconcile_output_to(
+    writer: &mut impl Write,
+    output: &str,
+) -> Result<(), AppError> {
+    const MAX_RECONCILE_OUTPUT_BYTES: usize = 4 * 1024;
+    if output.len() > MAX_RECONCILE_OUTPUT_BYTES {
+        return Err(AppError::Io {
+            operation: IoOperation::WriteOutput,
+            kind: io::ErrorKind::InvalidData,
+        });
+    }
+    writer
+        .write_all(output.as_bytes())
+        .map_err(|error| AppError::io(IoOperation::WriteOutput, &error))?;
+    writer
+        .flush()
+        .map_err(|error| AppError::io(IoOperation::WriteOutput, &error))
 }
 
 fn command_repository_import_create(
@@ -1003,6 +1161,26 @@ mod tests {
 
     struct TestDirectory(PathBuf);
 
+    #[derive(Default)]
+    struct OutputWriteSpy {
+        bytes: Vec<u8>,
+        writes: usize,
+        flushes: usize,
+    }
+
+    impl Write for OutputWriteSpy {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+
     impl TestDirectory {
         fn new() -> Self {
             let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -1061,6 +1239,112 @@ mod tests {
         assert!(message.contains(&slot_id.to_string()));
         assert!(message.contains("weak legacy Argon2id"));
         assert!(message.contains("should be replaced"));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "goldens freeze both complete reconciliation output protocols"
+    )]
+    fn reconciliation_output_goldens_and_bounded_acknowledgement_are_exact() {
+        let root = "0123456789abcdef0123456789abcdef01234567";
+        let preview = format_repository_reconcile_success_values(
+            repository_import::RepositoryReconcileOutcome::Preview,
+            [12, 7, 5, 19],
+            root,
+        );
+        assert_eq!(
+            preview,
+            concat!(
+                "import-mode: repository-reconcile-dry-run\n",
+                "terminal-operation: repository-reconcile-preview\n",
+                "existing-vault: yes\n",
+                "source-policy: path-disjointness-only\n",
+                "source-git-replanned: no\n",
+                "password-prompted: no\n",
+                "kdf-ran: no\n",
+                "destination-policy: existing-v2-publication-reconcile-only\n",
+                "publication-marker-version: 2\n",
+                "candidate-seal-version: repository-candidate-seal-v1\n",
+                "target-worktree-files: 12\n",
+                "target-encrypted-markdown: 7\n",
+                "target-encrypted-assets: 5\n",
+                "target-git-objects: 19\n",
+                "target-root-commit: 0123456789abcdef0123456789abcdef01234567\n",
+                "target-root-parent-count: 0\n",
+                "target-plaintext-file-objects: 0\n",
+                "candidate-physical-audit: passed\n",
+                "candidate-git-object-audit: passed\n",
+                "marker-state: v2-exact\n",
+                "candidate-root: existing-published\n",
+                "vault-publication: indeterminate\n",
+                "git-repository: existing-audited\n",
+                "marker-cleanup: retained\n",
+                "recovery-required: publication-reconcile\n",
+                "result: repository reconciliation plan valid\n",
+            )
+        );
+
+        let reconciled = format_repository_reconcile_success_values(
+            repository_import::RepositoryReconcileOutcome::Reconciled,
+            [12, 7, 5, 19],
+            root,
+        );
+        assert_eq!(
+            reconciled,
+            concat!(
+                "import-mode: repository-reconcile\n",
+                "terminal-operation: repository-reconcile\n",
+                "existing-vault: yes\n",
+                "source-policy: path-disjointness-only\n",
+                "source-git-replanned: no\n",
+                "password-prompted: no\n",
+                "kdf-ran: no\n",
+                "destination-policy: existing-v2-publication-reconcile-only\n",
+                "publication-marker-version: 2\n",
+                "candidate-seal-version: repository-candidate-seal-v1\n",
+                "target-worktree-files: 12\n",
+                "target-encrypted-markdown: 7\n",
+                "target-encrypted-assets: 5\n",
+                "target-git-objects: 19\n",
+                "target-root-commit: 0123456789abcdef0123456789abcdef01234567\n",
+                "target-root-parent-count: 0\n",
+                "target-plaintext-file-objects: 0\n",
+                "candidate-physical-audit: passed\n",
+                "candidate-git-object-audit: passed\n",
+                "candidate-root: existing-published\n",
+                "vault-publication: reconciled\n",
+                "git-repository: existing-audited\n",
+                "marker-cleanup: removed\n",
+                "recovery-required: none\n",
+                "result: repository publication reconciled\n",
+            )
+        );
+
+        let terminal = format_repository_reconcile_terminal(
+            repository_import::RepositoryReconcileTerminal::Absent,
+        );
+        let mut writer = OutputWriteSpy::default();
+        write_repository_reconcile_output_to(&mut writer, &terminal)
+            .unwrap_or_else(|error| panic!("terminal write failed: {error}"));
+        assert_eq!(writer.writes, 1);
+        assert_eq!(writer.flushes, 1);
+        assert_eq!(writer.bytes, terminal.as_bytes());
+
+        let mut oversized_writer = OutputWriteSpy::default();
+        let error =
+            write_repository_reconcile_output_to(&mut oversized_writer, &"x".repeat(4 * 1024 + 1))
+                .expect_err("oversized reconciliation output must fail");
+        assert!(matches!(
+            error,
+            AppError::Io {
+                operation: IoOperation::WriteOutput,
+                kind: io::ErrorKind::InvalidData,
+            }
+        ));
+        assert_eq!(oversized_writer.writes, 0);
+        assert_eq!(oversized_writer.flushes, 0);
+        assert!(oversized_writer.bytes.is_empty());
     }
 
     #[test]
