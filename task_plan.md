@@ -113,7 +113,8 @@ Phase 6 extension — 现有 Markdown Git 仓库与加密附件迁移（Phase 7 
             - [x] 以isolated stdin-only Git parser绑定held `.git/config`，并把held `vault.json`摘要绑定authenticated `Vault::config_etag()`与content profile（`fb58808`）
             - [ ] 在existing-only mutation lock窗口内部重新构造全部runtime/auth/content证据、最终whole-tree exact revalidation，并保持同一fresh-audited Vault生产接线
               - [x] 返回不可Clone/Copy且继续持锁的owned `InitialCandidateAuthority`；构造器内部创建全部proof且不接受锁外预制proof（`3205a49`）
-              - [ ] CLI以不可Clone的`IndependentlyAuditedVault`延长fresh unlock+逐envelope/source审计owner生命周期；v2接线必须整体替换旧v1 publisher，禁止串联两套marker/lock
+              - [x] CLI以不可Clone的`IndependentlyAuditedVault`延长fresh unlock+逐envelope/source审计owner生命周期，并按值接管/尽早清零password；仍在旧v1 seam前显式消费，未错误串联v2（`88e2837`）
+              - [ ] 以v2 consuming publisher整体替换旧v1 publisher，复用同一held lock且禁止串联两套marker/lock
       - [ ] 实现held-marker owner、完整live/fresh九段collector、v2 claim创建/发布/reconcile状态机与终态输出
   - [ ] 完成repository import构造/durability/publication每一边界的Linux force-kill、hostile same-UID source/target race、artifact-bound residue与原生Windows矩阵
 - **Status:** in_progress（用户实测驱动的迁移/附件扩展；原Markdown-only实现仍保持已验证基线）
