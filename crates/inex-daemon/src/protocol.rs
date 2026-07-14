@@ -53,6 +53,7 @@ pub enum Method {
     UmbraDocumentOpen,
     UmbraDocumentConvert,
     UmbraAnnotationApply,
+    UmbraAnnotationRemove,
     UmbraConfigGet,
     VaultListTree,
     FileStat,
@@ -73,7 +74,7 @@ pub enum Method {
 }
 
 impl Method {
-    const ALL: [Self; 32] = [
+    const ALL: [Self; 33] = [
         Self::SystemHello,
         Self::SystemPing,
         Self::SystemShutdown,
@@ -89,6 +90,7 @@ impl Method {
         Self::UmbraDocumentOpen,
         Self::UmbraDocumentConvert,
         Self::UmbraAnnotationApply,
+        Self::UmbraAnnotationRemove,
         Self::UmbraConfigGet,
         Self::VaultListTree,
         Self::FileStat,
@@ -127,6 +129,7 @@ impl Method {
             Self::UmbraDocumentOpen => "umbra.document.open",
             Self::UmbraDocumentConvert => "umbra.document.convert",
             Self::UmbraAnnotationApply => "umbra.annotation.apply",
+            Self::UmbraAnnotationRemove => "umbra.annotation.remove",
             Self::UmbraConfigGet => "umbra.config.get",
             Self::VaultListTree => "vault.listTree",
             Self::FileStat => "file.stat",

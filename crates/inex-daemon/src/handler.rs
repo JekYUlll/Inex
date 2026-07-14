@@ -154,6 +154,7 @@ impl<C: MonotonicClock> RpcService<C> {
             Method::UmbraDocumentOpen => self.umbra_document_open(params),
             Method::UmbraDocumentConvert => self.umbra_document_convert(params),
             Method::UmbraAnnotationApply => self.umbra_annotation_apply(params),
+            Method::UmbraAnnotationRemove => self.umbra_annotation_remove(params),
             Method::UmbraConfigGet => self.umbra_config_get(params),
             Method::VaultListTree => self.vault_list_tree(params),
             Method::FileStat => self.file_stat(params),
@@ -494,6 +495,41 @@ impl<C: MonotonicClock> RpcService<C> {
                 &render_map,
                 &selections,
                 &spec,
+                merge_adjacent,
+                unix_time_ms()?,
+            )
+            .map_err(|error| map_vault_error(error, ErrorContext::Document))?;
+        Ok(json!({
+            "etag": applied.document.etag,
+            "metadata": header_metadata_value(&applied.document.header),
+            "durability": durability_name(applied.document.parent_sync),
+            "contentBase64": encode_base64url(applied.projection.markdown.as_bytes()).as_str(),
+            "renderMap": render_map_value(&applied.projection.render_map),
+        }))
+    }
+
+    fn umbra_annotation_remove(&mut self, params: Params) -> RpcResult {
+        let mut params = ParamObject::new(params);
+        let session = required_session(&mut params)?;
+        let logical_path = params.required_logical_path("logicalPath")?;
+        let expected_etag = params.required_etag("ifMatch")?;
+        let projection = params.required_base64url("contentBase64", MAX_PLAINTEXT_LEN)?;
+        let render_map = parse_render_map(&mut params)?;
+        let selections = parse_text_ranges(&mut params, "selections")?;
+        let merge_adjacent = params.optional_bool("mergeAdjacent")?.unwrap_or(false);
+        params.finish()?;
+        let projection = std::str::from_utf8(projection.as_slice())
+            .map_err(|_| ErrorObject::new(ErrorCode::InvalidParams))?;
+        let applied = self
+            .sessions
+            .vault_mut(session.as_str())
+            .map_err(map_session_error)?
+            .remove_private_annotations(
+                &logical_path,
+                expected_etag.as_str(),
+                projection,
+                &render_map,
+                &selections,
                 merge_adjacent,
                 unix_time_ms()?,
             )
