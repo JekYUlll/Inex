@@ -36,6 +36,12 @@
 - Vault 新增 `remove_private_annotations`：要求 caller 提供当前 ETag、完整 projection、完整 RenderMap 和选区；仅 `CompletePrivateBlocks` 分类可以继续。所有 payload 先经 `K_umbra` 认证，再在单一 feature-2 CAS 中以原 Markdown 替换 markers、删除 slots 并重新渲染。
 - 回归验证 partial private range 被拒绝且不写入；完整 block 解包恢复仅 Umbra projection，密文文件不出现正文或 tag canary。`cargo test -p inex-core --lib` 294/294、严格 Clippy、fmt/diff-check 通过。下一步接 daemon `umbra.annotation.remove` 和 VS Code 确认 UI。
 
+## 2026-07-15 — VS Code confirmed private annotation removal
+
+- sidecar 新增严格的 `umbra.annotation.remove` client；CustomEditor 始终复制当前 projection、etag 和 RenderMap 后提交，成功后只替换 daemon 返回的新 projection。
+- 新增 `Inex: Remove Private Annotation` 命令，默认需 modal confirmation，且必须选择完整 private block；没有 active/unlocked Umbra projection 或空选区时拒绝。
+- 验证：daemon 71/71、严格 Clippy；VS Code typecheck 和 50/50 tests 通过。下一步 profile shortcut 与 metadata edit；当前不把普通 selected text 当作 remove，保持 core 分类拒绝。
+
 ## 2026-07-15 — Vault feature-2 启用事务
 
 - 提交 `538168d`：`Vault::enable_umbra_private_annotations` 只接受 live Umbra session；它调用已认证 core metadata upgrader，并以 vault.json etag CAS 提交，随后重新 parse 确认 exact committed metadata 才更新内存 config。锁定 session 的调用被拒绝。

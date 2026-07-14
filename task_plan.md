@@ -103,6 +103,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
     - [x] daemon 已提供 `umbra.document.convert`，将普通文档以 ETag CAS 升级为 feature-2；方法注册表扩为有容量约束的 64-bit 位图，避免新增 Umbra RPC 时溢出（本轮）
     - [x] VS Code CustomEditor 已支持普通 handle 与只读 Umbra projection 的互斥生命周期：转换后释放 normal handle、重新打开时仅已解锁 Umbra 才读取 projection，锁定/dispose/替换清理 projection 和 RenderMap（本轮）
     - [x] VS Code 已提供 `togglePrivateAnnotation`/`choosePrivateAnnotation` 命令及默认 Ctrl+Alt+/、Ctrl+Alt+Shift+/ 贡献式绑定；首次 Umbra 初始化显示不可恢复警告，QuickPick 多选 tags 并将 projection/RenderMap/verified selection 一同交给 daemon（本轮）
+    - [x] VS Code `removePrivateAnnotation` 已经确认提示后将完整 block 选区提交至 `umbra.annotation.remove`，只采用 daemon 返回的新 projection（本轮）
     - [ ] 接入 CustomEditor webview 选区、QuickPick、多标签及配置化命令/keybindings
   - [ ] 扩展Sublime stateful picker、profile命令和keymap示例
   - [ ] 跑通多选、wrap/unwrap/edit、跨编辑器目录、canary/残留及Outer隔离矩阵
