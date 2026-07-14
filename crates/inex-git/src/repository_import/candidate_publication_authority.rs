@@ -1341,7 +1341,7 @@ pub(crate) mod tests {
                 .join(IMPORT_PUBLISH_MARKER_V2)
         }
 
-        fn assert_marker_unchanged(&self) {
+        pub(crate) fn assert_marker_unchanged(&self) {
             let marker_path = self.marker_path();
             assert_eq!(
                 fs::read(&marker_path).expect("held marker bytes read"),

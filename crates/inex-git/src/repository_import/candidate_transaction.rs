@@ -322,6 +322,78 @@ impl fmt::Debug for PublishedRepositoryCandidate {
     }
 }
 
+/// Read-only target-derived snapshot for an existing canonical v2 claim.
+///
+/// The existing-only lock and held marker remain live only while the complete
+/// fresh audit and final role revalidation run. They are released before this
+/// fixed summary is returned. This type carries no cleanup or forward
+/// publication authority.
+#[must_use]
+pub struct ExistingRepositoryCandidatePreview {
+    worktree_files: u32,
+    encrypted_markdown: u32,
+    encrypted_assets: u32,
+    git_objects: u32,
+    root_commit_oid: [u8; 20],
+}
+
+impl ExistingRepositoryCandidatePreview {
+    /// Return the exact worktree-file count from the held fresh audit.
+    #[must_use]
+    pub const fn worktree_files(&self) -> u32 {
+        self.worktree_files
+    }
+
+    /// Return the exact encrypted Markdown count from the held fresh audit.
+    #[must_use]
+    pub const fn encrypted_markdown(&self) -> u32 {
+        self.encrypted_markdown
+    }
+
+    /// Return the exact encrypted asset count from the held fresh audit.
+    #[must_use]
+    pub const fn encrypted_assets(&self) -> u32 {
+        self.encrypted_assets
+    }
+
+    /// Return the exact Git-object count from the held fresh audit.
+    #[must_use]
+    pub const fn git_objects(&self) -> u32 {
+        self.git_objects
+    }
+
+    /// Return the audited parentless SHA-1 root commit in lowercase hexadecimal.
+    #[must_use]
+    pub fn root_commit_oid(&self) -> String {
+        lower_hex(&self.root_commit_oid)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn from_published(published: &PublishedWithMarker) -> Self {
+        let audit = published.audit();
+        Self {
+            worktree_files: audit.worktree_files(),
+            encrypted_markdown: audit.encrypted_markdown(),
+            encrypted_assets: audit.encrypted_assets(),
+            git_objects: audit.git_objects(),
+            root_commit_oid: audit.root_commit_oid(),
+        }
+    }
+}
+
+impl fmt::Debug for ExistingRepositoryCandidatePreview {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ExistingRepositoryCandidatePreview")
+            .field("worktree_files", &self.worktree_files)
+            .field("encrypted_markdown", &self.encrypted_markdown)
+            .field("encrypted_assets", &self.encrypted_assets)
+            .field("git_objects", &self.git_objects)
+            .field("root_commit_oid", &"[REDACTED]")
+            .finish()
+    }
+}
+
 /// Consume one audited initial candidate through the complete v2 publication
 /// state machine.
 ///
@@ -428,6 +500,51 @@ pub fn reconcile_existing_repository_candidate(
         let durable = drive_publication_durability(published)?;
         let clean_pending = drive_marker_cleanup(durable)?;
         drive_clean_audit(clean_pending).map(PublishedRepositoryCandidate::from_clean)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (
+            destination_root,
+            common_parent_identity,
+            destination_child_name,
+        );
+        Err(RepositoryCandidatePublicationFailure::unsupported())
+    }
+}
+
+/// Audit one existing canonical v2 claim without synchronizing or removing it.
+///
+/// The returned snapshot is target-derived and authority-free. Linux releases
+/// the existing-only lock only after the full held audit and final published
+/// role check complete. No source, password, KDF, vault unlock, staging,
+/// synchronization, or cleanup operation is performed.
+///
+/// # Errors
+///
+/// Returns an opaque failure owner that retains any acquired authority until
+/// the caller has emitted its terminal preview result and drops it.
+pub fn preview_existing_repository_candidate(
+    destination_root: &Path,
+    common_parent_identity: &FilesystemDirectoryIdentity,
+    destination_child_name: &str,
+) -> Result<ExistingRepositoryCandidatePreview, RepositoryCandidatePublicationFailure> {
+    #[cfg(target_os = "linux")]
+    {
+        let published = claim_fresh_existing_candidate(FreshExistingClaimInput {
+            destination_root,
+            common_parent_identity,
+            destination_child_name,
+        })
+        .map_err(|error| {
+            RepositoryCandidatePublicationFailure::retained(
+                RepositoryCandidatePublicationFailureKind::ExistingClaimRejected,
+                RetainedPublicationOwner::FreshClaim(Box::new(error)),
+            )
+        })?;
+        let preview = ExistingRepositoryCandidatePreview::from_published(&published);
+        drop(published);
+        Ok(preview)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -719,7 +836,10 @@ mod tests {
         let reconcile = source
             .split("pub fn reconcile_existing_repository_candidate")
             .nth(1)
-            .and_then(|tail| tail.split("fn drive_initial_publication").next())
+            .and_then(|tail| {
+                tail.split("/// Audit one existing canonical v2 claim")
+                    .next()
+            })
             .expect("fresh reconcile entry exists");
         let claim = reconcile
             .find("claim_fresh_existing_candidate(")
@@ -738,6 +858,26 @@ mod tests {
             assert!(
                 !reconcile.contains(forbidden),
                 "fresh reconcile accepts forbidden authority: {forbidden}"
+            );
+        }
+
+        let preview = source
+            .split("pub fn preview_existing_repository_candidate")
+            .nth(1)
+            .and_then(|tail| tail.split("fn drive_initial_publication").next())
+            .expect("fresh preview entry exists");
+        assert!(preview.contains("claim_fresh_existing_candidate("));
+        assert!(preview.contains("drop(published);"));
+        for forbidden in [
+            "drive_publication_durability",
+            "drive_marker_cleanup",
+            "drive_clean_audit",
+            ".synchronize(",
+            ".unlink_marker(",
+        ] {
+            assert!(
+                !preview.contains(forbidden),
+                "fresh preview gained mutation authority: {forbidden}"
             );
         }
     }
@@ -770,6 +910,28 @@ mod tests {
         );
         fixture.assert_lock_busy();
         drop(reconciled);
+        fixture.assert_lock_available();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fresh_preview_audits_without_removing_the_marker() {
+        let fixture =
+            super::super::candidate_publication_authority::tests::fixture("transaction-preview");
+        let (destination, parent_identity, child_name) = fixture.coordinates();
+        let preview =
+            preview_existing_repository_candidate(destination, parent_identity, child_name)
+                .unwrap_or_else(|error| panic!("fresh preview failed: {error:?}"));
+        let (worktree, markdown, assets, objects) = fixture.expected_counts();
+        assert_eq!(preview.worktree_files(), worktree);
+        assert_eq!(preview.encrypted_markdown(), markdown);
+        assert_eq!(preview.encrypted_assets(), assets);
+        assert_eq!(preview.git_objects(), objects);
+        assert_eq!(
+            preview.root_commit_oid(),
+            lower_hex(&fixture.expected_root_commit_oid())
+        );
+        fixture.assert_marker_unchanged();
         fixture.assert_lock_available();
     }
 }
