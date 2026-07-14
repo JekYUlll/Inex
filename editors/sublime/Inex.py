@@ -40,7 +40,11 @@ try:
         validate_logical_path,
     )
     from .inex_password import PasswordPromptError, prompt_password
-    from .inex_annotation import AnnotationPickerError, AnnotationPickerState
+    from .inex_annotation import (
+        AnnotationPickerError,
+        AnnotationPickerState,
+        parse_visible_private_annotation_spec,
+    )
     from .inex_markdown import markdown_headings, markdown_links
     from .inex_rpc import (
         InexRpcClient,
@@ -74,7 +78,11 @@ except ImportError:  # Direct package development outside Sublime's loader.
         validate_logical_path,
     )
     from inex_password import PasswordPromptError, prompt_password
-    from inex_annotation import AnnotationPickerError, AnnotationPickerState
+    from inex_annotation import (
+        AnnotationPickerError,
+        AnnotationPickerState,
+        parse_visible_private_annotation_spec,
+    )
     from inex_markdown import markdown_headings, markdown_links
     from inex_rpc import (
         InexRpcClient,
@@ -2040,6 +2048,131 @@ def _apply_private_annotation_from_active_view(window: sublime.Window) -> None:
     sublime.set_timeout_async(load_picker, 0)
 
 
+def _edit_private_annotation_from_active_view(window: sublime.Window) -> None:
+    """Edit one RenderMap-authenticated private block without exposing slot IDs."""
+    view = window.active_view()
+    document = _registry.get(view.id()) if view is not None else None
+    session = _command_session(window)
+    if view is None or document is None or session is None:
+        if document is None:
+            _show_error(ModelError("An active Inex document is required"))
+        return
+    client, _vault_id, generation = session
+    if not document.is_umbra or document.dirty or document.read_only:
+        _show_error(ModelError("A clean active Umbra projection is required"))
+        return
+    expected_map = document.umbra_render_map
+    if expected_map is None or len(view.sel()) != 1:
+        _show_error(ModelError("Place one cursor or selection inside a private annotation"))
+        return
+    projection = bytearray()
+    try:
+        region = next(iter(view.sel()))
+        start = len(view.substr(sublime.Region(0, region.begin())).encode("utf-8"))
+        end = len(view.substr(sublime.Region(0, region.end())).encode("utf-8"))
+        projection = bytearray(view.substr(sublime.Region(0, view.size())).encode("utf-8"))
+        if projection != document.content:
+            raise ModelError("Umbra projection changed; reopen it before annotating")
+        slot = next((
+            candidate for candidate in expected_map["privateSlots"]
+            if start >= candidate["startByte"] and end <= candidate["endByte"]
+            and (start != candidate["startByte"] or end != candidate["endByte"])
+        ), None)
+        if slot is None:
+            raise ModelError("Place one cursor or selection inside a private annotation")
+        slot_start = slot["startByte"]
+        slot_end = slot["endByte"]
+        if not isinstance(slot_start, int) or not isinstance(slot_end, int) or slot_end - slot_start < 2:
+            raise ModelError("Private annotation range is invalid")
+        header = bytearray(projection[slot_start:slot_end])
+        try:
+            initial_spec = parse_visible_private_annotation_spec(header)
+        finally:
+            wipe(header)
+        selections = [{
+            "startByte": slot_start + 1 if start == end else start,
+            "endByte": slot_start + 2 if start == end else end,
+        }]
+    except Exception as error:
+        wipe(projection)
+        _show_error(error)
+        return
+    expected_etag = document.etag
+    umbra_generation = _umbra_generation
+
+    def load_picker() -> None:
+        try:
+            if not client.umbra_status()["unlocked"]:
+                raise RpcLifecycleError("Unlock Umbra private mode first")
+            config = client.load_umbra_annotation_config()
+            state = AnnotationPickerState(config, initial_spec)
+            sublime.set_timeout(lambda: present(state), 0)
+        except Exception as error:
+            wipe(projection)
+            sublime.set_timeout(lambda error=error: _show_error(error), 0)
+
+    def present(state: AnnotationPickerState) -> None:
+        if (
+            _runtime_snapshot()[0] is not client
+            or _runtime_snapshot()[2] != generation
+            or _umbra_generation != umbra_generation
+            or _registry.get(document.view_id) is not document
+        ):
+            state.clear()
+            wipe(projection)
+            return
+        _show_annotation_picker(window, state, lambda spec: apply(spec), lambda: wipe(projection))
+
+    def apply(spec: Dict[str, Any]) -> None:
+        request_projection = bytearray(projection)
+        wipe(projection)
+
+        def worker() -> None:
+            content = bytearray()
+            try:
+                content, etag, render_map, durability = client.edit_private_annotation(
+                    document.logical_path, request_projection, expected_etag,
+                    expected_map, selections, spec,
+                )
+                sublime.set_timeout(lambda: completed(content, etag, render_map, durability), 0)
+                content = bytearray()
+            except Exception as error:
+                wipe(content)
+                sublime.set_timeout(lambda error=error: _show_error(error), 0)
+            finally:
+                wipe(request_projection)
+
+        sublime.set_timeout_async(worker, 0)
+
+    def completed(content: bytearray, etag: str, render_map: Dict[str, Any], durability: str) -> None:
+        try:
+            if (
+                _runtime_snapshot()[0] is not client
+                or _runtime_snapshot()[2] != generation
+                or _umbra_generation != umbra_generation
+                or _registry.get(document.view_id) is not document
+                or document.etag != expected_etag
+                or document.umbra_render_map != expected_map
+                or document.dirty
+            ):
+                raise RpcLifecycleError("Inex session changed during private annotation edit")
+            document.replace_umbra_projection(content, etag, render_map)
+            content = bytearray()
+            _scrubbing_views.add(view.id())
+            try:
+                _replace_buffer_from_bytes(view, bytearray(document.content))
+            finally:
+                _scrubbing_views.discard(view.id())
+            view.run_command("clear_undo_stack")
+            _update_document_ui(document)
+            _warn_if_not_synced("save", (durability,))
+        except Exception as error:
+            wipe(content)
+            _show_error(error)
+
+    sublime.set_timeout_async(load_picker, 0)
+
+
 def _remove_private_annotation_from_active_view(window: sublime.Window) -> None:
     """Ask for confirmation, then let inexd unwrap complete authenticated slots."""
     view = window.active_view()
@@ -2670,6 +2803,11 @@ class InexEnterUmbraModeCommand(sublime_plugin.WindowCommand):
 class InexChoosePrivateAnnotationCommand(sublime_plugin.WindowCommand):
     def run(self) -> None:
         _apply_private_annotation_from_active_view(self.window)
+
+
+class InexEditPrivateAnnotationCommand(sublime_plugin.WindowCommand):
+    def run(self) -> None:
+        _edit_private_annotation_from_active_view(self.window)
 
 
 class InexRemovePrivateAnnotationCommand(sublime_plugin.WindowCommand):

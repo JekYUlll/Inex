@@ -56,6 +56,10 @@
     "command": "inex_choose_private_annotation"
   },
   {
+    "caption": "Inex: Edit Private Annotation",
+    "command": "inex_edit_private_annotation"
+  },
+  {
     "caption": "Inex: Remove Private Annotation",
     "command": "inex_remove_private_annotation"
   },

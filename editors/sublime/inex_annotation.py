@@ -6,6 +6,8 @@ in the picker instance and can be discarded immediately on cancel or lock.
 
 from __future__ import annotations
 
+import re
+
 from typing import Any, Dict, List, Optional, Set
 
 
@@ -13,10 +15,42 @@ class AnnotationPickerError(Exception):
     pass
 
 
+_TAG_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+_VISIBLE_HEADER_RE = re.compile(
+    r"\A:::inex-private\nid: p_[a-f0-9]{32}\n"
+    r"kind: (block|comment)\ntags: \[([^\]\n]*)\]\n"
+    r"outer: (drop|cover|placeholder)\n---\n"
+)
+
+
+def parse_visible_private_annotation_spec(content: bytearray) -> Dict[str, Any]:
+    """Parse only canonical unlocked slot headers for edit-picker defaults."""
+    if not isinstance(content, bytearray):
+        raise AnnotationPickerError("Current private annotation metadata is invalid")
+    try:
+        header_end = content.index(b"---\n") + len(b"---\n")
+        header = bytes(content[:header_end]).decode("utf-8", "strict")
+    except (UnicodeDecodeError, ValueError):
+        raise AnnotationPickerError("Current private annotation metadata is invalid")
+    match = _VISIBLE_HEADER_RE.match(header)
+    if match is None:
+        raise AnnotationPickerError("Current private annotation metadata is invalid")
+    kind, raw_tags, outer = match.groups()
+    tag_ids = [] if raw_tags == "" else raw_tags.split(", ")
+    if (
+        kind not in ("block", "comment")
+        or outer not in ("drop", "cover", "placeholder")
+        or any(not _TAG_ID_RE.match(tag_id) for tag_id in tag_ids)
+        or any(tag_ids[index - 1] >= tag_id for index, tag_id in enumerate(tag_ids) if index > 0)
+    ):
+        raise AnnotationPickerError("Current private annotation metadata is invalid")
+    return {"kind": kind, "tagIds": tag_ids, "outer": {"mode": outer}}
+
+
 class AnnotationPickerState:
     """Repeated-panel state with one kind, many tags, and one Outer mode."""
 
-    def __init__(self, config: Dict[str, Any]) -> None:
+    def __init__(self, config: Dict[str, Any], initial_spec: Optional[Dict[str, Any]] = None) -> None:
         if not isinstance(config, dict):
             raise AnnotationPickerError("Umbra catalog is invalid")
         tags = config.get("tags")
@@ -37,9 +71,11 @@ class AnnotationPickerState:
                 raise AnnotationPickerError("Umbra tag is duplicated")
             self._tag_ids.add(tag_id)
             self._tags.append({"id": tag_id, "label": label, "archived": archived})
-        kind = defaults.get("kind")
-        outer = defaults.get("outer")
-        tag_ids = defaults.get("tagIds")
+        source = defaults if initial_spec is None else initial_spec
+        kind = source.get("kind") if isinstance(source, dict) else None
+        outer_value = source.get("outer") if isinstance(source, dict) else None
+        outer = outer_value.get("mode") if isinstance(outer_value, dict) else outer_value
+        tag_ids = source.get("tagIds") if isinstance(source, dict) else None
         if kind not in ("block", "comment") or outer not in ("drop", "cover", "placeholder") or not isinstance(tag_ids, list):
             raise AnnotationPickerError("Umbra annotation defaults are invalid")
         if any(not isinstance(tag_id, str) or tag_id not in self._tag_ids for tag_id in tag_ids):

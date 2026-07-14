@@ -445,7 +445,7 @@ class RequestAndResponseTests(unittest.TestCase):
                     "metadata": metadata,
                     "renderMap": render_map,
                 }
-            if method in ("umbra.annotation.apply", "umbra.annotation.remove"):
+            if method in ("umbra.annotation.apply", "umbra.annotation.edit", "umbra.annotation.remove"):
                 return {
                     "contentBase64": encode_base64url(content, 1024),
                     "etag": next_etag,
@@ -468,6 +468,16 @@ class RequestAndResponseTests(unittest.TestCase):
         self.assertEqual(durability, "synced")
         self.assertEqual(calls[1][1]["renderMap"], render_map)
         self.assertEqual(calls[1][1]["selections"], [{"startByte": 0, "endByte": len(content)}])
+        edited, edited_etag, edited_map, edited_durability = client.edit_private_annotation(
+            "today.md", opened, opened_etag, opened_map,
+            [{"startByte": 0, "endByte": len(opened)}],
+            {"kind": "block", "tagIds": [], "outer": {"mode": "placeholder"}},
+        )
+        self.assertEqual(edited, content)
+        self.assertEqual(edited_etag, next_etag)
+        self.assertEqual(edited_map, render_map)
+        self.assertEqual(edited_durability, "synced")
+        self.assertEqual(calls[2][0], "umbra.annotation.edit")
         removed, removed_etag, removed_map, removed_durability = client.remove_private_annotations(
             "today.md", opened, opened_etag, opened_map,
             [{"startByte": 0, "endByte": len(opened)}],
@@ -476,7 +486,7 @@ class RequestAndResponseTests(unittest.TestCase):
         self.assertEqual(removed_etag, next_etag)
         self.assertEqual(removed_map, render_map)
         self.assertEqual(removed_durability, "synced")
-        self.assertNotIn("spec", calls[2][1])
+        self.assertNotIn("spec", calls[3][1])
 
         invalid = InexRpcClient("/unused")
         invalid._session = "A" * SESSION_TOKEN_TEXT_BYTES

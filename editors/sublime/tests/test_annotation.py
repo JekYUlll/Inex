@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import unittest
 
-from inex_annotation import AnnotationPickerError, AnnotationPickerState
+from inex_annotation import (
+    AnnotationPickerError,
+    AnnotationPickerState,
+    parse_visible_private_annotation_spec,
+)
 
 
 def catalog():
@@ -10,6 +14,7 @@ def catalog():
         "tags": [
             {"id": "comment-content", "label": "Comment", "archived": False},
             {"id": "family", "label": "Family", "archived": False},
+            {"id": "relationship", "label": "Relationship", "archived": False},
             {"id": "old", "label": "Old", "archived": True},
         ],
         "defaults": {"kind": "comment", "tagIds": ["comment-content"], "outer": "drop"},
@@ -57,3 +62,25 @@ class AnnotationPickerTests(unittest.TestCase):
                 "id": "bad", "label": "Bad", "kind": "comment",
                 "tagIds": [], "outer": "cover", "promptForCover": False,
             })
+
+    def test_canonical_visible_header_prefills_picker_without_cover_text(self):
+        spec = parse_visible_private_annotation_spec(bytearray(
+            b":::inex-private\nid: p_0123456789abcdef0123456789abcdef\n"
+            b"kind: block\ntags: [family, relationship]\nouter: cover\n---\nprivate\n:::\n"
+        ))
+        self.assertEqual(spec, {
+            "kind": "block", "tagIds": ["family", "relationship"], "outer": {"mode": "cover"},
+        })
+        state = AnnotationPickerState(catalog(), spec)
+        self.assertEqual(state.spec("public cover"), {
+            "kind": "block", "tagIds": ["family", "relationship"],
+            "outer": {"mode": "cover", "coverText": "public cover"},
+        })
+
+    def test_visible_header_rejects_noncanonical_tags_and_invalid_metadata(self):
+        for content in (
+            b":::inex-private\nid: p_0123456789abcdef0123456789abcdef\nkind: inline\ntags: []\nouter: drop\n---\n",
+            b":::inex-private\nid: p_0123456789abcdef0123456789abcdef\nkind: block\ntags: [relationship, family]\nouter: drop\n---\n",
+        ):
+            with self.assertRaises(AnnotationPickerError):
+                parse_visible_private_annotation_spec(bytearray(content))
