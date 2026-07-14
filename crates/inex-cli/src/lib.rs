@@ -453,9 +453,7 @@ fn command_repository_import_create(
             return Err(error);
         }
     };
-    let report =
-        repository_import::execute(plan, password.as_slice(), created_at_ms, creation_params);
-    drop(password);
+    let report = repository_import::execute(plan, password, created_at_ms, creation_params);
     let report = match report {
         Ok(report) => report,
         Err(failure) => {

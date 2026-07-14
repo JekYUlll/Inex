@@ -21,10 +21,12 @@ use inex_core::format::{MAX_ASSET_PLAINTEXT_LEN, MAX_DOCUMENT_PLAINTEXT_LEN};
 use inex_core::path::{AssetPath, LogicalDir, LogicalPath, raw_portable_case_fold_key};
 use inex_core::search::MAX_SEARCH_INDEX_BYTES;
 use inex_core::sodium::Argon2idParams;
+use inex_core::tree::TreeEntryKind;
 use inex_core::vault::Vault;
 use inex_core::vault_config::{ConfigWarning, KdfPolicy};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 const MAX_IMPORT_PLAINTEXT_BYTES: u64 = 4_294_967_296;
 const TARGET_METADATA_PATHS: [&str; 3] = [".gitattributes", ".gitignore", "vault.json"];
@@ -295,6 +297,39 @@ pub(crate) struct RepositoryImportReport {
     pub(crate) warnings: Vec<ConfigWarning>,
 }
 
+/// One freshly unlocked vault whose complete logical inventory and every
+/// planned plaintext envelope have been independently audited against source.
+///
+/// The type is deliberately private and non-cloneable. A future initial
+/// candidate-authority call must borrow `vault` from this owner before the
+/// legacy-publication conversion consumes it.
+struct IndependentlyAuditedVault {
+    vault: Vault,
+    warnings: Vec<ConfigWarning>,
+}
+
+impl fmt::Debug for IndependentlyAuditedVault {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IndependentlyAuditedVault")
+            .field("vault", &"[REDACTED]")
+            .field("warnings", &self.warnings.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl IndependentlyAuditedVault {
+    /// End the audited-vault lifetime at the explicit legacy-publication seam.
+    ///
+    /// The future v2 authority path must borrow `self.vault` before this point
+    /// and replace, rather than wrap, the legacy v1 publisher.
+    fn into_warnings_before_legacy_publication(self) -> Vec<ConfigWarning> {
+        let Self { vault, warnings } = self;
+        drop(vault);
+        warnings
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RepositoryImportTerminal {
     NotCreated,
@@ -450,7 +485,7 @@ pub(crate) fn plan(
 
 pub(crate) fn execute(
     plan: &RepositoryImportPlan,
-    password: &[u8],
+    password: Zeroizing<Vec<u8>>,
     created_at_ms: i64,
     creation_params: Argon2idParams,
 ) -> Result<RepositoryImportReport, RepositoryImportExecutionError> {
@@ -462,10 +497,10 @@ pub(crate) fn execute(
         terminal = RepositoryImportTerminal::StagingIncomplete;
         plan.destination.revalidate(&plan.source)?;
         staging.revalidate(&plan.destination)?;
-        let warnings = build_and_audit_staging_vault(
+        build_staging_vault(
             plan,
             staging.path(),
-            password,
+            password.as_slice(),
             created_at_ms,
             creation_params,
         )?;
@@ -481,10 +516,19 @@ pub(crate) fn execute(
             .map_err(|_| RepositoryImportError::GitCandidateFailed)?;
         inex_git::durably_audit_repository_import_target(staging.path(), &target)
             .map_err(|_| RepositoryImportError::GitCandidateFailed)?;
+
+        let audited_vault =
+            unlock_and_independently_audit_staging_vault(plan, &staging, password.as_slice())?;
+        drop(password);
         terminal = RepositoryImportTerminal::StagingAudited;
         plan.revalidate_source()?;
         plan.destination.revalidate(&plan.source)?;
         staging.revalidate(&plan.destination)?;
+
+        // Future initial candidate authority is acquired here while the same
+        // freshly unlocked, fully audited `audited_vault.vault` is still
+        // owned. The legacy v1 publisher must never be layered after v2.
+        let warnings = audited_vault.into_warnings_before_legacy_publication();
 
         let publication = match atomic_publish_directory_no_replace_checked(
             staging.path(),
@@ -526,13 +570,31 @@ pub(crate) fn execute(
     result.map_err(|error| RepositoryImportExecutionError { error, terminal })
 }
 
-fn build_and_audit_staging_vault(
+fn build_staging_vault(
     plan: &RepositoryImportPlan,
     staging: &Path,
     password: &[u8],
     created_at_ms: i64,
     creation_params: Argon2idParams,
-) -> Result<Vec<ConfigWarning>, RepositoryImportError> {
+) -> Result<(), RepositoryImportError> {
+    build_staging_vault_with_policy(
+        plan,
+        staging,
+        password,
+        created_at_ms,
+        creation_params,
+        KdfPolicy::default(),
+    )
+}
+
+fn build_staging_vault_with_policy(
+    plan: &RepositoryImportPlan,
+    staging: &Path,
+    password: &[u8],
+    created_at_ms: i64,
+    creation_params: Argon2idParams,
+    policy: KdfPolicy,
+) -> Result<(), RepositoryImportError> {
     let profile = if plan.asset_files == 0 {
         VaultContentProfile::DocumentsOnly
     } else {
@@ -544,7 +606,7 @@ fn build_and_audit_staging_vault(
         created_at_ms,
         profile,
         creation_params,
-        KdfPolicy::default(),
+        policy,
     )
     .map_err(|_| RepositoryImportError::VaultCreateFailed)?;
 
@@ -585,20 +647,46 @@ fn build_and_audit_staging_vault(
     }
     plan.revalidate_source()?;
     drop(vault);
+    Ok(())
+}
 
-    let mut reopened = Vault::unlock(staging, password, None, KdfPolicy::default())
+fn unlock_and_independently_audit_staging_vault(
+    plan: &RepositoryImportPlan,
+    staging: &StagingRoot,
+    password: &[u8],
+) -> Result<IndependentlyAuditedVault, RepositoryImportError> {
+    unlock_and_independently_audit_staging_vault_with_policy(
+        plan,
+        staging,
+        password,
+        KdfPolicy::default(),
+    )
+}
+
+fn unlock_and_independently_audit_staging_vault_with_policy(
+    plan: &RepositoryImportPlan,
+    staging: &StagingRoot,
+    password: &[u8],
+    policy: KdfPolicy,
+) -> Result<IndependentlyAuditedVault, RepositoryImportError> {
+    staging.revalidate(&plan.destination)?;
+    let mut reopened = Vault::unlock(staging.path(), password, None, policy)
         .map_err(|_| RepositoryImportError::VaultAuditFailed)?;
     let warnings = reopened.warnings().to_vec();
     independently_audit_vault(plan, &mut reopened)?;
-    drop(reopened);
     plan.revalidate_source()?;
-    Ok(warnings)
+    staging.revalidate(&plan.destination)?;
+    Ok(IndependentlyAuditedVault {
+        vault: reopened,
+        warnings,
+    })
 }
 
 fn independently_audit_vault(
     plan: &RepositoryImportPlan,
     vault: &mut Vault,
 ) -> Result<(), RepositoryImportError> {
+    require_exact_logical_inventory(plan, vault)?;
     for planned in &plan.entries {
         let source_entry = plan
             .source
@@ -624,6 +712,37 @@ fn independently_audit_vault(
         }
         drop(source_plaintext);
         drop(verified);
+    }
+    Ok(())
+}
+
+fn require_exact_logical_inventory(
+    plan: &RepositoryImportPlan,
+    vault: &mut Vault,
+) -> Result<(), RepositoryImportError> {
+    let mut expected = Vec::with_capacity(plan.directories.len() + plan.entries.len());
+    expected.extend(
+        plan.directories
+            .iter()
+            .map(|directory| (directory.as_str(), TreeEntryKind::Directory)),
+    );
+    expected.extend(plan.entries.iter().map(|planned| match &planned.kind {
+        PlannedKind::Markdown(path) => (path.as_str(), TreeEntryKind::File),
+        PlannedKind::Asset(path) => (path.as_str(), TreeEntryKind::Asset),
+    }));
+    expected.sort_unstable();
+
+    let actual = vault
+        .list()
+        .map_err(|_| RepositoryImportError::VaultAuditFailed)?;
+    if actual.len() != expected.len()
+        || actual
+            .entries()
+            .iter()
+            .zip(expected)
+            .any(|(actual, (path, kind))| actual.logical_path() != path || actual.kind() != kind)
+    {
+        return Err(RepositoryImportError::VaultAuditFailed);
     }
     Ok(())
 }
@@ -1021,5 +1140,282 @@ mod tests {
                 "publication-reconcile",
             ]
         );
+    }
+
+    #[test]
+    fn production_source_freezes_audited_owner_and_legacy_publication_seams() {
+        let source = include_str!("repository_import.rs");
+        let production = source
+            .split_once("\n#[cfg(test)]")
+            .map_or(source, |(production, _)| production);
+        let execute = production
+            .split_once("pub(crate) fn execute(")
+            .and_then(|(_, tail)| tail.split_once("\nfn build_staging_vault("))
+            .map_or_else(
+                || panic!("execute source boundary changed"),
+                |(execute, _)| execute,
+            );
+        let position = |needle: &str| {
+            execute
+                .find(needle)
+                .unwrap_or_else(|| panic!("execute omitted source contract: {needle}"))
+        };
+
+        let build = position("build_staging_vault(");
+        let git = position("inex_git::initialize_and_audit_target(");
+        let git_audit =
+            position("inex_git::audit_repository_import_target(staging.path(), &target)");
+        let git_durable =
+            position("inex_git::durably_audit_repository_import_target(staging.path(), &target)");
+        let fresh_audit = position("unlock_and_independently_audit_staging_vault(");
+        let password_drop = position("drop(password);");
+        let terminal_audited = position("terminal = RepositoryImportTerminal::StagingAudited;");
+        let owner_consumed = position("into_warnings_before_legacy_publication()");
+        let legacy_publish = position("atomic_publish_directory_no_replace_checked(");
+        assert!(
+            build < git
+                && git < git_audit
+                && git_audit < git_durable
+                && git_durable < fresh_audit
+                && fresh_audit < password_drop
+                && password_drop < terminal_audited
+                && terminal_audited < owner_consumed
+                && owner_consumed < legacy_publish
+        );
+        assert!(production.contains("password: Zeroizing<Vec<u8>>"));
+        assert_eq!(production.matches("Vault::unlock(").count(), 1);
+        assert!(production.contains("\nstruct IndependentlyAuditedVault {"));
+        assert!(!production.contains("acquire_initial_candidate_authority"));
+        assert!(!production.contains("IMPORT_PUBLISH_MARKER_V2"));
+
+        let cli = include_str!("lib.rs");
+        assert!(cli.contains("repository_import::execute(plan, password, created_at_ms"));
+        assert!(!cli.contains("repository_import::execute(plan, password.as_slice()"));
+    }
+
+    #[cfg(target_os = "linux")]
+    mod lifecycle {
+        use std::ffi::OsStr;
+        use std::process::Command;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        use super::*;
+
+        const PASSWORD: &[u8] = b"audited owner test password";
+        const CREATED_AT_MS: i64 = 1_783_699_200_000;
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        struct TestDirectory(PathBuf);
+
+        impl TestDirectory {
+            fn new(label: &str) -> Self {
+                let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+                let nanos = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |duration| duration.as_nanos());
+                let path = std::env::temp_dir().join(format!(
+                    "inex-cli-audited-vault-{label}-{}-{nanos}-{counter}",
+                    std::process::id()
+                ));
+                fs::create_dir_all(&path)
+                    .unwrap_or_else(|error| panic!("test directory creation failed: {error}"));
+                Self(path)
+            }
+
+            fn path(&self) -> &Path {
+                &self.0
+            }
+        }
+
+        impl Drop for TestDirectory {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        fn null_device() -> &'static OsStr {
+            OsStr::new("/dev/null")
+        }
+
+        fn git(root: &Path, arguments: &[&str]) {
+            let output = Command::new("git")
+                .current_dir(root)
+                .args(arguments)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", null_device())
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .output()
+                .unwrap_or_else(|error| panic!("git spawn failed: {error}"));
+            assert!(
+                output.status.success(),
+                "git {arguments:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        fn weak_policy() -> KdfPolicy {
+            KdfPolicy {
+                min_creation_ops_limit: 1,
+                min_creation_mem_limit_bytes: 8 * 1024,
+                max_creation_ops_limit: 4,
+                max_creation_mem_limit_bytes: 64 * 1024 * 1024,
+                max_unlock_ops_limit: 4,
+                max_unlock_mem_limit_bytes: 64 * 1024 * 1024,
+            }
+        }
+
+        const fn weak_params() -> Argon2idParams {
+            Argon2idParams {
+                ops_limit: 1,
+                mem_limit_bytes: 8 * 1024,
+            }
+        }
+
+        fn fixture(label: &str) -> (TestDirectory, RepositoryImportPlan) {
+            let temporary = TestDirectory::new(label);
+            let source = temporary.path().join("source");
+            let destination = temporary.path().join("vault");
+            fs::create_dir(&source)
+                .unwrap_or_else(|error| panic!("source creation failed: {error}"));
+            git(&source, &["init", "-q", "--initial-branch=main"]);
+            fs::write(source.join("journal.md"), b"# Audited owner\n")
+                .unwrap_or_else(|error| panic!("Markdown write failed: {error}"));
+            fs::write(source.join("image.bin"), b"asset canary")
+                .unwrap_or_else(|error| panic!("asset write failed: {error}"));
+            git(&source, &["add", "--all"]);
+            git(
+                &source,
+                &[
+                    "-c",
+                    "user.email=audited-owner@example.invalid",
+                    "-c",
+                    "user.name=Audited Owner Tests",
+                    "-c",
+                    "commit.gpgSign=false",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "source snapshot",
+                ],
+            );
+            let plan = plan(&source, &destination)
+                .unwrap_or_else(|error| panic!("repository plan failed: {error}"));
+            (temporary, plan)
+        }
+
+        fn build_git_candidate(
+            plan: &RepositoryImportPlan,
+        ) -> (StagingRoot, inex_git::TargetRepository) {
+            let staging = StagingRoot::create(&plan.destination)
+                .unwrap_or_else(|error| panic!("staging creation failed: {error}"));
+            build_staging_vault_with_policy(
+                plan,
+                staging.path(),
+                PASSWORD,
+                CREATED_AT_MS,
+                weak_params(),
+                weak_policy(),
+            )
+            .unwrap_or_else(|error| panic!("vault build failed: {error}"));
+            assert!(!staging.path().join(".git").exists());
+            let tracked = tracked_target_paths(plan)
+                .unwrap_or_else(|error| panic!("tracked paths failed: {error}"));
+            let target = inex_git::initialize_and_audit_target(
+                staging.path(),
+                &tracked,
+                CREATED_AT_MS.div_euclid(1_000),
+            )
+            .unwrap_or_else(|error| panic!("Git target creation failed: {error}"));
+            assert!(staging.path().join(".git/config").is_file());
+            (staging, target)
+        }
+
+        #[test]
+        fn git_precedes_fresh_audit_and_owner_debug_is_redacted() {
+            let (_temporary, plan) = fixture("order");
+            let (staging, target) = build_git_candidate(&plan);
+
+            let audited = unlock_and_independently_audit_staging_vault(&plan, &staging, PASSWORD)
+                .unwrap_or_else(|error| panic!("fresh audit failed: {error}"));
+            assert!(!audited.warnings.is_empty());
+            let debug = format!("{audited:?}");
+            assert!(debug.contains("vault: \"[REDACTED]\""));
+            assert!(debug.contains("warnings: 1"));
+            assert!(!debug.contains("audited owner test password"));
+            assert!(!debug.contains(&staging.path().to_string_lossy().into_owned()));
+            assert!(!debug.contains("WeakKdf"));
+
+            let warnings = audited.into_warnings_before_legacy_publication();
+            assert_eq!(warnings.len(), 1);
+            inex_git::audit_repository_import_target(staging.path(), &target)
+                .unwrap_or_else(|error| panic!("legacy target audit changed: {error}"));
+        }
+
+        #[derive(Clone, Copy, Debug)]
+        enum ExtraLogicalEntry {
+            Directory,
+            Markdown,
+            Asset,
+        }
+
+        #[test]
+        fn fresh_audit_rejects_extra_directory_markdown_and_asset_inventory() {
+            let (_temporary, plan) = fixture("extra-inventory");
+            for extra in [
+                ExtraLogicalEntry::Directory,
+                ExtraLogicalEntry::Markdown,
+                ExtraLogicalEntry::Asset,
+            ] {
+                let (staging, target) = build_git_candidate(&plan);
+                let mut vault = Vault::unlock(staging.path(), PASSWORD, None, KdfPolicy::default())
+                    .unwrap_or_else(|error| panic!("tamper vault unlock failed: {error}"));
+                match extra {
+                    ExtraLogicalEntry::Directory => {
+                        vault
+                            .create_directory(
+                                &LogicalDir::parse_canonical("rogue")
+                                    .unwrap_or_else(|error| panic!("rogue dir failed: {error}")),
+                            )
+                            .unwrap_or_else(|error| panic!("rogue dir create failed: {error}"));
+                    }
+                    ExtraLogicalEntry::Markdown => {
+                        let _ = vault
+                            .create_document(
+                                &LogicalPath::parse_canonical("rogue.md").unwrap_or_else(|error| {
+                                    panic!("rogue Markdown failed: {error}")
+                                }),
+                                b"rogue plaintext",
+                                CREATED_AT_MS,
+                            )
+                            .unwrap_or_else(|error| {
+                                panic!("rogue Markdown create failed: {error}")
+                            });
+                    }
+                    ExtraLogicalEntry::Asset => {
+                        let _ = vault
+                            .create_import_asset(
+                                &AssetPath::parse_canonical("rogue.bin")
+                                    .unwrap_or_else(|error| panic!("rogue asset failed: {error}")),
+                                Zeroizing::new(b"rogue asset".to_vec()),
+                                CREATED_AT_MS,
+                            )
+                            .unwrap_or_else(|error| panic!("rogue asset create failed: {error}"));
+                    }
+                }
+                drop(vault);
+
+                assert!(
+                    matches!(
+                        unlock_and_independently_audit_staging_vault(&plan, &staging, PASSWORD),
+                        Err(RepositoryImportError::VaultAuditFailed)
+                    ),
+                    "extra {extra:?} passed exact logical inventory audit"
+                );
+                drop(target);
+                fs::remove_dir_all(staging.path())
+                    .unwrap_or_else(|error| panic!("staging cleanup failed: {error}"));
+            }
+        }
     }
 }
