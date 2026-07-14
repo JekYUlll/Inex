@@ -18,8 +18,12 @@ const FIXED_ENTRY_BYTES: usize = 62;
 const REGULAR_FILE_MODE: u32 = 0o100_644;
 const NAME_LENGTH_MASK: u16 = 0x0fff;
 const ENTRY_FLAG_MASK: u16 = 0xf000;
+#[cfg(any(target_os = "linux", test))]
 const MAX_INDEX_BYTES: usize = 64 * 1024 * 1024;
+#[cfg(any(target_os = "linux", test))]
 const MAX_INDEX_ENTRIES: usize = 100_000;
+const MAX_TARGET_INDEX_BYTES: usize = 68 * 1024 * 1024;
+const MAX_TARGET_INDEX_ENTRIES: usize = 100_003;
 const MAX_PATH_BYTES: usize = 1024;
 const MAX_RETAINED_PATH_BYTES: usize = 256 * 1024 * 1024;
 const MAX_PATH_COMPONENTS: usize = 128;
@@ -92,14 +96,42 @@ enum FirstV4Entry {
     IndependentBlock,
 }
 
+#[derive(Clone, Copy)]
+struct RawIndexLimits {
+    bytes: usize,
+    entries: usize,
+}
+
+#[cfg(any(target_os = "linux", test))]
+const SOURCE_INDEX_LIMITS: RawIndexLimits = RawIndexLimits {
+    bytes: MAX_INDEX_BYTES,
+    entries: MAX_INDEX_ENTRIES,
+};
+const TARGET_INDEX_LIMITS: RawIndexLimits = RawIndexLimits {
+    bytes: MAX_TARGET_INDEX_BYTES,
+    entries: MAX_TARGET_INDEX_ENTRIES,
+};
+
 /// Parse and validate a complete traditional SHA-1 Git index.
 ///
 /// An all-zero trailer is the explicit `index.skipHash` representation. Every
 /// non-zero trailer must equal SHA-1 over all preceding bytes.
+#[cfg(any(target_os = "linux", test))]
 pub(super) fn parse_sha1_index(bytes: &[u8]) -> Result<RawIndex, RawIndexError> {
-    if bytes.len() > MAX_INDEX_BYTES {
-        return Err(RawIndexError::ResourceLimit);
-    }
+    parse_sha1_index_with_limits(bytes, SOURCE_INDEX_LIMITS)
+}
+
+/// Parse the same frozen SHA-1 format with the target's three managed-entry
+/// allowance and target-file byte bound.
+pub(super) fn parse_target_sha1_index(bytes: &[u8]) -> Result<RawIndex, RawIndexError> {
+    parse_sha1_index_with_limits(bytes, TARGET_INDEX_LIMITS)
+}
+
+fn parse_sha1_index_with_limits(
+    bytes: &[u8],
+    limits: RawIndexLimits,
+) -> Result<RawIndex, RawIndexError> {
+    validate_index_byte_length(bytes.len(), limits)?;
     let content_end = bytes
         .len()
         .checked_sub(SHA1_BYTES)
@@ -116,7 +148,7 @@ pub(super) fn parse_sha1_index(bytes: &[u8]) -> Result<RawIndex, RawIndexError> 
     }
     let entry_count = usize::try_from(read_u32(bytes, 8, content_end)?)
         .map_err(|_| RawIndexError::ResourceLimit)?;
-    if entry_count > MAX_INDEX_ENTRIES {
+    if entry_count > limits.entries {
         return Err(RawIndexError::ResourceLimit);
     }
 
@@ -154,7 +186,14 @@ pub(super) fn parse_sha1_index(bytes: &[u8]) -> Result<RawIndex, RawIndexError> 
     let entries_end = offset;
     let extensions = parse_extensions(bytes, entries_end, content_end)?;
     validate_eoie(&extensions, entries_end)?;
-    validate_ieot(bytes, version, &parsed_entries, entries_end, &extensions)?;
+    validate_ieot(
+        bytes,
+        version,
+        &parsed_entries,
+        entries_end,
+        &extensions,
+        limits,
+    )?;
 
     Ok(RawIndex {
         version,
@@ -163,6 +202,14 @@ pub(super) fn parse_sha1_index(bytes: &[u8]) -> Result<RawIndex, RawIndexError> 
             .map(|entry| entry.semantic)
             .collect(),
     })
+}
+
+fn validate_index_byte_length(length: usize, limits: RawIndexLimits) -> Result<(), RawIndexError> {
+    if length <= limits.bytes {
+        Ok(())
+    } else {
+        Err(RawIndexError::ResourceLimit)
+    }
 }
 
 fn verify_checksum(bytes: &[u8], content_end: usize) -> Result<(), RawIndexError> {
@@ -458,6 +505,7 @@ fn validate_ieot(
     entries: &[ParsedEntry],
     entries_end: usize,
     extensions: &[Extension<'_>],
+    limits: RawIndexLimits,
 ) -> Result<(), RawIndexError> {
     let Some(ieot) = extensions
         .iter()
@@ -472,7 +520,7 @@ fn validate_ieot(
         return Err(RawIndexError::Unsupported);
     }
     let block_count = (ieot.data.len() - 4) / 8;
-    if block_count > entries.len() || block_count > MAX_INDEX_ENTRIES {
+    if block_count > entries.len() || block_count > limits.entries {
         return Err(RawIndexError::ResourceLimit);
     }
 
@@ -656,7 +704,7 @@ mod tests {
                 .expect("test path name mask fits u16");
             bytes.extend_from_slice(&name_length.to_be_bytes());
             if version == 4 {
-                let common = if index == 0 || restarts.contains(&index) {
+                let common = if index == 0 || restarts.binary_search(&index).is_ok() {
                     0
                 } else {
                     previous
@@ -877,6 +925,56 @@ mod tests {
         too_many.extend_from_slice(&[0_u8; SHA1_BYTES]);
         assert_eq!(
             parse_sha1_index(&too_many),
+            Err(RawIndexError::ResourceLimit)
+        );
+    }
+
+    #[test]
+    fn target_profile_adds_only_three_entries_and_four_mibibytes() {
+        assert_eq!(SOURCE_INDEX_LIMITS.entries, 100_000);
+        assert_eq!(TARGET_INDEX_LIMITS.entries, 100_003);
+        assert_eq!(SOURCE_INDEX_LIMITS.bytes, 64 * 1024 * 1024);
+        assert_eq!(TARGET_INDEX_LIMITS.bytes, 68 * 1024 * 1024);
+
+        let owned_paths = (0..MAX_TARGET_INDEX_ENTRIES)
+            .map(|index| format!("entry-{index:06}").into_bytes())
+            .collect::<Vec<_>>();
+        let paths = owned_paths.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let restarts = (0..MAX_TARGET_INDEX_ENTRIES).collect::<Vec<_>>();
+        let entries = build_entries(4, &paths, &restarts);
+        let counts = vec![1_usize; MAX_TARGET_INDEX_ENTRIES];
+        let ieot = extension(IEOT_EXTENSION, &ieot_data(&entries.starts, &counts));
+        let mut target = finish(entries.bytes, &[ieot], Checksum::Exact);
+
+        assert_eq!(parse_sha1_index(&target), Err(RawIndexError::ResourceLimit));
+        let parsed = parse_target_sha1_index(&target).expect("target maximum parses");
+        assert_eq!(parsed.entries.len(), MAX_TARGET_INDEX_ENTRIES);
+
+        target[8..12].copy_from_slice(
+            &u32::try_from(MAX_TARGET_INDEX_ENTRIES + 1)
+                .expect("target test count fits u32")
+                .to_be_bytes(),
+        );
+        resign(&mut target);
+        assert_eq!(
+            parse_target_sha1_index(&target),
+            Err(RawIndexError::ResourceLimit)
+        );
+
+        assert_eq!(
+            validate_index_byte_length(MAX_INDEX_BYTES, SOURCE_INDEX_LIMITS),
+            Ok(())
+        );
+        assert_eq!(
+            validate_index_byte_length(MAX_INDEX_BYTES + 1, SOURCE_INDEX_LIMITS),
+            Err(RawIndexError::ResourceLimit)
+        );
+        assert_eq!(
+            validate_index_byte_length(MAX_TARGET_INDEX_BYTES, TARGET_INDEX_LIMITS),
+            Ok(())
+        );
+        assert_eq!(
+            validate_index_byte_length(MAX_TARGET_INDEX_BYTES + 1, TARGET_INDEX_LIMITS),
             Err(RawIndexError::ResourceLimit)
         );
     }

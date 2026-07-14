@@ -49,7 +49,6 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 mod candidate_bundle_v5;
-#[cfg(any(target_os = "linux", test))]
 mod raw_index;
 mod repository_import;
 
