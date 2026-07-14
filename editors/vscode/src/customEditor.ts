@@ -1008,6 +1008,37 @@ export class InexCustomEditorProvider
     }
   }
 
+  public async removePrivateAnnotationFromActive(): Promise<void> {
+    const document = this.activeDocument;
+    if (
+      document === undefined ||
+      !document.isUmbraProjection ||
+      !this.documents.has(document) ||
+      !this.controller.isSessionCurrent(document.session)
+    ) {
+      throw new Error("Open an unlocked Umbra projection before removing a private annotation");
+    }
+    const selection = document.currentSelection();
+    const renderMap = document.renderMap();
+    if (selection === undefined || selection.startByte === selection.endByte || renderMap === undefined) {
+      throw new Error("Select one complete private annotation block before removing it");
+    }
+    const snapshot = document.snapshot();
+    try {
+      const sidecar = this.requireCurrentDocumentSession(document);
+      const applied = await sidecar.removeUmbraAnnotation(
+        document.logicalPath,
+        { content: snapshot.content, etag: document.etag, metadata: document.metadata, renderMap },
+        [selection],
+      );
+      this.requireCurrentDocumentSession(document);
+      document.replaceFromUmbraProjection(applied, applied.metadata);
+      this.previews.refreshDocument(document, 0);
+    } finally {
+      snapshot.content.fill(0);
+    }
+  }
+
   public async prepareFileMutation(
     session: VaultSession,
     logicalPath: string,

@@ -233,6 +233,17 @@ export function activate(
         await applyChosenPrivateAnnotation(controller, editor);
       });
     }),
+    vscode.commands.registerCommand("inex.removePrivateAnnotation", async () => {
+      await runUiAction(async () => {
+        const choice = await vscode.window.showWarningMessage(
+          "Remove the selected private annotation? Its Markdown will become ordinary Umbra content after save.",
+          { modal: true },
+          "Remove Private Annotation",
+        );
+        if (choice !== "Remove Private Annotation") return;
+        await editor.removePrivateAnnotationFromActive();
+      });
+    }),
     vscode.commands.registerCommand("inex.showSecurityStatus", async () => {
       const sidecar = controller.isUnlocked ? "unlocked in memory" : "locked";
       await vscode.window.showInformationMessage(
