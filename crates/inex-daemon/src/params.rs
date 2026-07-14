@@ -271,6 +271,78 @@ impl ParamObject {
         Ok(Self::from_fields(fields))
     }
 
+    /// Remove a required bounded array of exact nested objects.
+    ///
+    /// Each returned object remains owned by a [`ParamObject`], so unconsumed
+    /// fields and all rejected values are recursively scrubbed on drop.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidParams` for a missing/non-array/non-object item and
+    /// `LimitExceeded` when the item count exceeds `maximum_items`.
+    pub fn required_object_array(
+        &mut self,
+        field: &'static str,
+        maximum_items: usize,
+    ) -> Result<Vec<Self>, ParamError> {
+        let value = self.take_required(field)?;
+        let Value::Array(values) = value else {
+            return Err(invalid_removed(value, field));
+        };
+        if values.len() > maximum_items {
+            let mut rejected = Value::Array(values);
+            sensitive::scrub_value(&mut rejected);
+            return Err(ParamError::limit(field));
+        }
+        values
+            .into_iter()
+            .map(|value| match value {
+                Value::Object(fields) => Ok(Self::from_fields(fields)),
+                other => Err(invalid_removed(other, field)),
+            })
+            .collect()
+    }
+
+    /// Remove a required bounded array of sensitive strings.
+    ///
+    /// The resulting allocation zeroizes every accepted string on drop.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidParams` for a missing/non-array/non-string item or an
+    /// item below `minimum_bytes`, and `LimitExceeded` for count or length
+    /// limits.
+    pub fn required_sensitive_string_array(
+        &mut self,
+        field: &'static str,
+        maximum_items: usize,
+        minimum_bytes: usize,
+        maximum_bytes: usize,
+    ) -> Result<Vec<Zeroizing<String>>, ParamError> {
+        let value = self.take_required(field)?;
+        let Value::Array(values) = value else {
+            return Err(invalid_removed(value, field));
+        };
+        if values.len() > maximum_items {
+            let mut rejected = Value::Array(values);
+            sensitive::scrub_value(&mut rejected);
+            return Err(ParamError::limit(field));
+        }
+        let mut output = Vec::with_capacity(values.len());
+        for value in values {
+            let Value::String(value) = value else {
+                return Err(invalid_removed(value, field));
+            };
+            output.push(validate_sensitive_length(
+                Zeroizing::new(value),
+                field,
+                minimum_bytes,
+                maximum_bytes,
+            )?);
+        }
+        Ok(output)
+    }
+
     /// Remove an optional nested object for exact nested-schema extraction.
     ///
     /// # Errors

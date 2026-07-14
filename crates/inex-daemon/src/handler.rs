@@ -22,8 +22,11 @@ use inex_core::search::{
 };
 use inex_core::sodium::{Argon2idParams, MAX_PASSWORD_BYTES};
 use inex_core::tree::{TreeEntryKind, TreeError};
+use inex_core::umbra_config::{OuterMode, PrivateAnnotationKind};
+use inex_core::umbra_document::{OuterSlotStrategy, PrivateAnnotationSpec};
 use inex_core::umbra_keyslot::UmbraKeyslotError;
 use inex_core::umbra_render::OwnedRenderMap;
+use inex_core::umbra_render::{RenderedOuterSegment, RenderedPrivateSlot, TextRange};
 use inex_core::vault::{
     DocumentMetadata, MAX_EDRY_ENVELOPE_BYTES, RenameOutcome, UmbraStatus, Vault, VaultError,
 };
@@ -46,6 +49,7 @@ const MAX_CLIENT_VERSION_BYTES: usize = 256;
 const MAX_CAPABILITY_TEXT_BYTES: usize = 128;
 const TREE_RESPONSE_RESERVE_BYTES: usize = 16 * 1024;
 const TREE_ENTRY_JSON_OVERHEAD_BYTES: usize = 64;
+const MAX_UMBRA_MAP_ENTRIES: usize = 100_000;
 
 type RpcResult = Result<Value, ErrorObject>;
 
@@ -148,6 +152,7 @@ impl<C: MonotonicClock> RpcService<C> {
             Method::UmbraLock => self.umbra_lock(params),
             Method::UmbraEnable => self.umbra_enable(params),
             Method::UmbraDocumentOpen => self.umbra_document_open(params),
+            Method::UmbraAnnotationApply => self.umbra_annotation_apply(params),
             Method::VaultListTree => self.vault_list_tree(params),
             Method::FileStat => self.file_stat(params),
             Method::FileRead => self.file_read(params),
@@ -444,6 +449,43 @@ impl<C: MonotonicClock> RpcService<C> {
             "contentBase64": encode_base64url(projection.markdown.as_bytes()).as_str(),
             "etag": metadata.etag,
             "renderMap": render_map_value(&projection.render_map),
+        }))
+    }
+
+    fn umbra_annotation_apply(&mut self, params: Params) -> RpcResult {
+        let mut params = ParamObject::new(params);
+        let session = required_session(&mut params)?;
+        let logical_path = params.required_logical_path("logicalPath")?;
+        let expected_etag = params.required_etag("ifMatch")?;
+        let projection = params.required_base64url("contentBase64", MAX_PLAINTEXT_LEN)?;
+        let render_map = parse_render_map(&mut params)?;
+        let selections = parse_text_ranges(&mut params, "selections")?;
+        let spec = parse_private_annotation_spec(&mut params)?;
+        let merge_adjacent = params.optional_bool("mergeAdjacent")?.unwrap_or(false);
+        params.finish()?;
+        let projection = std::str::from_utf8(projection.as_slice())
+            .map_err(|_| ErrorObject::new(ErrorCode::InvalidParams))?;
+        let applied = self
+            .sessions
+            .vault_mut(session.as_str())
+            .map_err(map_session_error)?
+            .apply_private_annotation(
+                &logical_path,
+                expected_etag.as_str(),
+                projection,
+                &render_map,
+                &selections,
+                &spec,
+                merge_adjacent,
+                unix_time_ms()?,
+            )
+            .map_err(|error| map_vault_error(error, ErrorContext::Document))?;
+        Ok(json!({
+            "etag": applied.document.etag,
+            "metadata": header_metadata_value(&applied.document.header),
+            "durability": durability_name(applied.document.parent_sync),
+            "contentBase64": encode_base64url(applied.projection.markdown.as_bytes()).as_str(),
+            "renderMap": render_map_value(&applied.projection.render_map),
         }))
     }
 
@@ -938,6 +980,99 @@ fn parse_uuid(value: &CanonicalUuid) -> Result<Uuid, ErrorObject> {
 
 fn acknowledgement() -> Value {
     json!({"ok": true})
+}
+
+fn parse_render_map(params: &mut ParamObject) -> Result<OwnedRenderMap, ErrorObject> {
+    let mut object = params.required_object("renderMap")?;
+    let generation = object.required_base64url("generationBase64", 32)?;
+    let generation: [u8; 32] = generation
+        .as_slice()
+        .try_into()
+        .map_err(|_| ErrorObject::new(ErrorCode::InvalidParams))?;
+    let projection_len = usize_from_rpc(object.required_u64("projectionBytes", 0, u64::MAX)?)?;
+    let mut private_slots = Vec::new();
+    for mut slot in object.required_object_array("privateSlots", MAX_UMBRA_MAP_ENTRIES)? {
+        let slot_id = slot.required_string("slotId", 1, 64)?;
+        let start = usize_from_rpc(slot.required_u64("startByte", 0, u64::MAX)?)?;
+        let end = usize_from_rpc(slot.required_u64("endByte", 0, u64::MAX)?)?;
+        slot.finish()?;
+        private_slots.push(RenderedPrivateSlot {
+            slot_id,
+            projection_range: TextRange::new(start, end)
+                .map_err(|_| ErrorObject::new(ErrorCode::InvalidParams))?,
+        });
+    }
+    let mut outer_segments = Vec::new();
+    for mut segment in object.required_object_array("outerSegments", MAX_UMBRA_MAP_ENTRIES)? {
+        let projection_start =
+            usize_from_rpc(segment.required_u64("projectionStartByte", 0, u64::MAX)?)?;
+        let projection_end =
+            usize_from_rpc(segment.required_u64("projectionEndByte", 0, u64::MAX)?)?;
+        let outer_start = usize_from_rpc(segment.required_u64("outerStartByte", 0, u64::MAX)?)?;
+        let outer_end = usize_from_rpc(segment.required_u64("outerEndByte", 0, u64::MAX)?)?;
+        segment.finish()?;
+        outer_segments.push(RenderedOuterSegment {
+            projection_range: TextRange::new(projection_start, projection_end)
+                .map_err(|_| ErrorObject::new(ErrorCode::InvalidParams))?,
+            outer_range: TextRange::new(outer_start, outer_end)
+                .map_err(|_| ErrorObject::new(ErrorCode::InvalidParams))?,
+        });
+    }
+    object.finish()?;
+    Ok(OwnedRenderMap {
+        generation,
+        projection_len,
+        private_slots,
+        outer_segments,
+    })
+}
+
+fn parse_text_ranges(
+    params: &mut ParamObject,
+    field: &'static str,
+) -> Result<Vec<TextRange>, ErrorObject> {
+    let mut ranges = Vec::new();
+    for mut range in params.required_object_array(field, MAX_UMBRA_MAP_ENTRIES)? {
+        let start = usize_from_rpc(range.required_u64("startByte", 0, u64::MAX)?)?;
+        let end = usize_from_rpc(range.required_u64("endByte", 0, u64::MAX)?)?;
+        range.finish()?;
+        ranges.push(
+            TextRange::new(start, end).map_err(|_| ErrorObject::new(ErrorCode::InvalidParams))?,
+        );
+    }
+    Ok(ranges)
+}
+
+fn parse_private_annotation_spec(
+    params: &mut ParamObject,
+) -> Result<PrivateAnnotationSpec, ErrorObject> {
+    let mut object = params.required_object("spec")?;
+    let kind = match object.required_string("kind", 1, 16)?.as_str() {
+        "block" => PrivateAnnotationKind::Block,
+        "comment" => PrivateAnnotationKind::Comment,
+        _ => return Err(ErrorObject::new(ErrorCode::InvalidParams)),
+    };
+    let tag_ids = object.required_sensitive_string_array("tagIds", MAX_UMBRA_MAP_ENTRIES, 1, 64)?;
+    let tag_ids = tag_ids.iter().map(|id| id.as_str().to_owned()).collect();
+    let mut outer = object.required_object("outer")?;
+    let mode = match outer.required_string("mode", 1, 16)?.as_str() {
+        "drop" => OuterMode::Drop,
+        "cover" => OuterMode::Cover,
+        "placeholder" => OuterMode::Placeholder,
+        _ => return Err(ErrorObject::new(ErrorCode::InvalidParams)),
+    };
+    let cover_text = outer.optional_string("coverText", 0, MAX_PLAINTEXT_LEN)?;
+    outer.finish()?;
+    object.finish()?;
+    Ok(PrivateAnnotationSpec {
+        kind,
+        tag_ids,
+        outer: OuterSlotStrategy { mode, cover_text },
+    })
+}
+
+fn usize_from_rpc(value: u64) -> Result<usize, ErrorObject> {
+    usize::try_from(value).map_err(|_| ErrorObject::new(ErrorCode::LimitExceeded))
 }
 
 fn umbra_status_value(status: UmbraStatus) -> Value {
@@ -1811,7 +1946,48 @@ mod tests {
             encode_base64url(b"private outer text\\n").as_str()
         );
         assert_eq!(opened["result"]["renderMap"]["projectionBytes"], 20);
+        let base_etag = opened["result"]["etag"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        let render_map = opened["result"]["renderMap"].clone();
+        let projection = opened["result"]["contentBase64"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
         scrub_object(&mut opened);
+        let mut annotated = response(
+            &mut service,
+            61,
+            "umbra.annotation.apply",
+            json!({
+                "session": session.as_str(),
+                "logicalPath": "private.md",
+                "ifMatch": base_etag,
+                "contentBase64": projection,
+                "renderMap": render_map,
+                "selections": [{"startByte": 0, "endByte": 7}],
+                "spec": {
+                    "kind": "comment",
+                    "tagIds": ["comment-content"],
+                    "outer": {"mode": "drop"},
+                },
+                "mergeAdjacent": false,
+            }),
+        );
+        assert_eq!(
+            annotated["result"]["renderMap"]["privateSlots"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+        assert_ne!(annotated["result"]["etag"], base_etag);
+        scrub_object(&mut annotated);
+        let disk = fs::read(directory.path().join("private.md.enc"))
+            .unwrap_or_else(|error| panic!("read encrypted Umbra document failed: {error}"));
+        let disk = String::from_utf8_lossy(&disk);
+        assert!(!disk.contains("private outer text"));
+        assert!(!disk.contains("comment-content"));
         let mut locked = response(
             &mut service,
             7,

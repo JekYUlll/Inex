@@ -51,6 +51,7 @@ pub enum Method {
     UmbraLock,
     UmbraEnable,
     UmbraDocumentOpen,
+    UmbraAnnotationApply,
     VaultListTree,
     FileStat,
     FileRead,
@@ -70,7 +71,7 @@ pub enum Method {
 }
 
 impl Method {
-    const ALL: [Self; 29] = [
+    const ALL: [Self; 30] = [
         Self::SystemHello,
         Self::SystemPing,
         Self::SystemShutdown,
@@ -84,6 +85,7 @@ impl Method {
         Self::UmbraLock,
         Self::UmbraEnable,
         Self::UmbraDocumentOpen,
+        Self::UmbraAnnotationApply,
         Self::VaultListTree,
         Self::FileStat,
         Self::FileRead,
@@ -119,6 +121,7 @@ impl Method {
             Self::UmbraLock => "umbra.lock",
             Self::UmbraEnable => "umbra.enable",
             Self::UmbraDocumentOpen => "umbra.document.open",
+            Self::UmbraAnnotationApply => "umbra.annotation.apply",
             Self::VaultListTree => "vault.listTree",
             Self::FileStat => "file.stat",
             Self::FileRead => "file.read",
