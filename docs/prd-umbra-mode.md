@@ -99,6 +99,29 @@ Clients contribute ordinary editor keybindings only; they must not handle raw
 keyboard events. Profile shortcuts use ordinary command arguments, for example
 `{ "profileId": "relationship-comment" }`.
 
+### Current VS Code MVP status
+
+The current VS Code implementation contributes `togglePrivateAnnotation`,
+`choosePrivateAnnotation`, `applyPrivateAnnotationProfile`, and
+`removePrivateAnnotation`. `Ctrl+Alt+/` and `Ctrl+Alt+Shift+/` are contributed
+through normal keybinding metadata. A profile binding can be added in the user
+keybindings file:
+
+```json
+{
+  "key": "ctrl+alt+2",
+  "command": "inex.applyPrivateAnnotationProfile",
+  "args": { "profileId": "relationship-comment" },
+  "when": "inex.vaultUnlocked"
+}
+```
+
+The MVP currently requires an explicit single textarea selection. Multi-cursor
+adapters, no-selection paragraph/line expansion, cursor-inside metadata edit,
+and tag/profile management commands remain pending. Outer projection editing
+and Umbra draft recovery are deliberately fail-closed until their dedicated
+authenticated save paths are implemented.
+
 ## Selection transaction
 
 Before a mutation, the core normalizes selections, resolves empty selections,
