@@ -113,7 +113,8 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
     - [x] `togglePrivateAnnotation` 现按 active RenderMap 分类：完整 private block 走确认解包，其他选区走 chooser；不以裸 slot ID 判定（本轮）
     - [x] VS Code 空选区可安全扩展到当前 Markdown paragraph（光标所在连续非空行），临时 plaintext snapshot 会立即清零；heading/multicursor 策略仍 deferred（`f34e0dc`）
     - [x] VS Code 现将 `noSelectionTarget`（paragraph/line/reject）与 `confirmBeforeUnwrap` 作为 window-local 配置贡献；不保存 tag/profile/private content，toggle 与显式 remove 共用确认策略（`3ad47a5`）
-    - [ ] 接入 CustomEditor webview 选区、QuickPick、多标签及配置化命令/keybindings
+    - [x] VS Code 已实现 `toggleBehavior`（alwaysAsk/useLast/useDefaultProfile/askOnFirstUse）与 `rememberLastSelection`：last spec 仅存于解锁 session 内存、lock 时清零；default profile 仅从已解锁 encrypted catalog 读取（`53ee77b`）
+    - [x] 接入 CustomEditor webview 选区、QuickPick、多标签及配置化命令/keybindings
   - [ ] 扩展Sublime stateful picker、profile命令和keymap示例
   - [x] 加密 tag catalog 现支持 stable-ID create/rename/archive/reorder：配置验证唯一性、canonical order、profile/default 引用与 Cover profile 语义；Vault 通过 load→mutate→CAS encrypted save 原子提交（`1298641`）
   - [x] daemon 已提供 `umbra.tag.create/rename/archive/reorder`：所有 tag 文本经 zeroizing 参数层读取，生命周期回归验证 create→rename→archive→reorder 后只有 Umbra 已解锁才能读回（`f46d2ff`）

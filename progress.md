@@ -1,5 +1,11 @@
 # Inex Progress Log
 
+## 2026-07-15 — VS Code configurable annotation toggle
+
+- 提交 `53ee77b`：贡献 `toggleBehavior`（alwaysAsk/useLast/useDefaultProfile/askOnFirstUse）和 `rememberLastSelection`。`Ctrl+Alt+/` 现在按配置选择 chooser、当前解锁 session 的 last spec 或 encrypted defaults 指定的 profile。
+- last spec 包含私密 tag IDs，因此只驻留 extension 的当前解锁 session 闭包，并由 `controller.onDidLock` 清除；不写入 VS Code settings、工作区或日志。default profile 只在 Umbra 已解锁后从 daemon catalog 读取。
+- 新增纯行为回归。验证：VS Code check、56/56 tests、build、diff-check 通过。
+
 ## 2026-07-15 — VS Code encrypted annotation-profile management
 
 - 提交 `fe77dc5`：sidecar 增加 `umbra.profile.create/edit/remove` typed RPC client，发送前限制 stable ID、标签、tag ID canonicalization、kind/Outer 和 Cover-prompt 语义。
