@@ -1041,3 +1041,8 @@
 
 - 提交 `91f7d7a`（`feat(sublime): convert documents to Umbra containers`）：strict RPC client 新增 `umbra.document.convert`，以当前 document ETag CAS 请求 feature-2 upgrade，并只接受 exact `{etag, metadata, durability}` response 且 metadata flag 为 2。
 - 这使后续 UI 可在 conversion 后重新经 `umbra.document.open` 获取 canonical projection/RenderMap，不能把原 normal buffer 或旧 ETag 当作私密容器状态。验证：RPC 27/27、compile、diff-check 通过。
+
+## 2026-07-15 — Sublime authenticated Umbra projection model
+
+- 提交 `d5036fc`（`feat(sublime): model authenticated Umbra projections`）：`ManagedDocument` 显式支持无 ordinary RPC handle 的 Umbra projection；普通 document 仍必须有 handle，Umbra document 反而拒绝 normal handle，避免 close/lock 路径误发 `document.close`。
+- `replace_umbra_projection` 在 daemon mutation 成功后一次性替换 plaintext、ETag 和 RenderMap，更新 model 保存版本并清零旧 projection；close 丢弃 RenderMap。验证：model 19/19、compile、diff-check 通过。
