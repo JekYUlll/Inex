@@ -99,6 +99,8 @@ Phase 6 extension — 现有 Markdown Git 仓库与加密附件迁移（Phase 7 
       - [x] 普通mutation在锁前/锁后识别完整reserved marker namespace，canonical v2路由reconcile，其余冲突路由manual audit；daemon/VS Code保留专用错误码（`bf15316`）
       - [x] 实现私有repository-candidate-seal-v1九段流式encoder、冻结golden digest与typed identity/role边界；exact inventory仍由collector证明（`5aae576`）
       - [x] 实现marker-free target-only物理collector，形成section 1/9的完整typed evidence并供后续live/fresh语义层复用（`239f9f2`）
+      - [x] 为target增加独立68 MiB/100,003项raw SHA-1 index profile，并把同一次secure held读取的语义、identity、size与SHA-256绑定到较晚完整`.git` inventory（`e5744ce`）
+      - [ ] 实现marker-free live sections 2–8：以raw index、独立canonical tree和逐对象streaming proof取代64 MiB `ls-files`/`ls-tree`/object-list大输出依赖
       - [ ] 实现held-marker owner、完整live/fresh九段collector、v2 claim创建/发布/reconcile状态机与终态输出
   - [ ] 完成repository import构造/durability/publication每一边界的Linux force-kill、hostile same-UID source/target race、artifact-bound residue与原生Windows矩阵
 - **Status:** in_progress（用户实测驱动的迁移/附件扩展；原Markdown-only实现仍保持已验证基线）
