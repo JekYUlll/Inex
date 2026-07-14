@@ -1087,3 +1087,8 @@
 
 - strict client 新增 `umbra.tag.create/rename/archive/reorder` 和 `umbra.profile.create/edit/remove/setDefault` 的 authenticated wrappers；stable IDs、UTF-8 限额、sort order、tag sequence canonicalization、cover prompt 语义与 exact `{ok:true}` acknowledgement 都在 host 前验证，异常协议结果终止 sidecar session。
 - 管理 UI 尚未接线，因而插件仍不会直接读取或写入 `.inex/config.umbra.inex`。验证：Sublime 95/95（1 项 pidfd platform skip）、Python compile 与 diff-check 通过。
+
+## 2026-07-15 — Sublime encrypted catalog schema hardening
+
+- `umbra.config.get` 不再只验证 ID 存在：client 现在在私密 label 接触 host UI 前验证 tag 全字段、description/alias 限额、sort order、唯一 stable IDs、profile tag 引用/cover prompt、default kind/tag/profile 引用与 canonical tag ID order。异常响应按 terminal protocol violation 处理。
+- 新增合法 catalog、重复 tag、悬空 profile tag、重复 default tag 和悬空 default profile 回归。验证：Sublime 96/96（1 项 pidfd platform skip）、Python compile、diff-check 通过。
