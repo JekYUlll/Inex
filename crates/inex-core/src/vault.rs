@@ -3198,6 +3198,115 @@ mod tests {
         .unwrap_or_else(|error| panic!("test asset vault creation failed: {error}"))
     }
 
+    fn assert_locked_private_slot_operations_rejected(
+        vault: &mut Vault,
+        path: &LogicalPath,
+        etag: &str,
+    ) {
+        assert!(matches!(
+            vault.render_umbra_projection(path),
+            Err(VaultError::UmbraLocked)
+        ));
+        assert!(matches!(
+            vault.read_umbra_private_slot(path, "p_01"),
+            Err(VaultError::UmbraLocked)
+        ));
+        assert!(matches!(
+            vault.remove_umbra_private_slot(
+                path,
+                etag,
+                "# outer text\n".to_owned(),
+                "p_01",
+                1_783_699_204_000
+            ),
+            Err(VaultError::UmbraLocked)
+        ));
+    }
+
+    fn private_slot_canary_payload() -> PrivateSlotPayloadV1 {
+        PrivateSlotPayloadV1 {
+            format: "inex-private-slot".to_owned(),
+            version: 1,
+            kind: crate::umbra_config::PrivateAnnotationKind::Comment,
+            tag_ids: vec!["relationship".to_owned(), "secret-tag".to_owned()],
+            markdown: "INEX_SECRET_SLOT_CANARY".to_owned(),
+            created_at_ms: 1_783_699_201_000,
+            updated_at_ms: 1_783_699_201_000,
+        }
+    }
+
+    fn assert_annotation_outer_and_disk_are_private(
+        vault: &mut Vault,
+        directory: &TestDirectory,
+        path: &LogicalPath,
+        spec: &PrivateAnnotationSpec,
+    ) -> UmbraDocumentV1 {
+        let (_, outer) = vault
+            .read_umbra_outer_document(path)
+            .expect("read Outer projection");
+        assert_eq!(outer.slots.len(), 2);
+        assert!(outer.outer_markdown.contains("ordinary text"));
+        assert!(!outer.outer_markdown.contains("INEX_SECRET_SLOT_A"));
+        assert!(!outer.outer_markdown.contains("INEX_SECRET_SLOT_B"));
+        for slot_id in outer.slots.keys() {
+            let payload = vault
+                .read_umbra_private_slot(path, slot_id)
+                .expect("decrypt wrapped payload");
+            assert_eq!(payload.kind, spec.kind);
+            assert_eq!(payload.tag_ids, spec.tag_ids);
+        }
+        let disk = fs::read(directory.path().join("2026-07-annotations.md.enc"))
+            .expect("read encrypted document");
+        let disk = String::from_utf8_lossy(&disk);
+        assert!(!disk.contains("INEX_SECRET_SLOT_A"));
+        assert!(!disk.contains("INEX_SECRET_SLOT_B"));
+        assert!(!disk.contains("secret-tag"));
+        outer
+    }
+
+    fn assert_annotation_rejections_preserve_outer(
+        vault: &mut Vault,
+        path: &LogicalPath,
+        created_etag: &str,
+        applied: &AppliedPrivateAnnotation,
+        spec: &PrivateAnnotationSpec,
+        expected_outer: &UmbraDocumentV1,
+    ) {
+        assert!(matches!(
+            vault.apply_private_annotation(
+                path,
+                created_etag,
+                &applied.projection.markdown,
+                &applied.projection.render_map,
+                &[TextRange::new(0, 1).expect("stale range")],
+                spec,
+                false,
+                1_783_699_203_000,
+            ),
+            Err(VaultError::Conflict { .. })
+        ));
+        let private_range = applied.projection.render_map.private_slots[0].projection_range;
+        assert!(matches!(
+            vault.apply_private_annotation(
+                path,
+                &applied.document.etag,
+                &applied.projection.markdown,
+                &applied.projection.render_map,
+                &[private_range],
+                spec,
+                false,
+                1_783_699_203_000,
+            ),
+            Err(VaultError::UmbraRender(
+                UmbraRenderError::AnnotationSelectionNotPlain
+            ))
+        ));
+        let (_, after_rejections) = vault
+            .read_umbra_outer_document(path)
+            .expect("read unchanged document");
+        assert_eq!(&after_rejections, expected_outer);
+    }
+
     #[test]
     fn umbra_slot_is_independent_and_password_reset_requires_live_session() {
         let directory = TestDirectory::new();
@@ -3443,15 +3552,7 @@ mod tests {
                 1_783_699_201_000,
             )
             .expect("create outer document");
-        let payload = PrivateSlotPayloadV1 {
-            format: "inex-private-slot".to_owned(),
-            version: 1,
-            kind: crate::umbra_config::PrivateAnnotationKind::Comment,
-            tag_ids: vec!["relationship".to_owned(), "secret-tag".to_owned()],
-            markdown: "INEX_SECRET_SLOT_CANARY".to_owned(),
-            created_at_ms: 1_783_699_201_000,
-            updated_at_ms: 1_783_699_201_000,
-        };
+        let payload = private_slot_canary_payload();
         let inserted = vault
             .insert_umbra_private_slot(
                 &path,
@@ -3510,24 +3611,7 @@ mod tests {
             replacement
         );
         vault.lock_umbra();
-        assert!(matches!(
-            vault.render_umbra_projection(&path),
-            Err(VaultError::UmbraLocked)
-        ));
-        assert!(matches!(
-            vault.read_umbra_private_slot(&path, "p_01"),
-            Err(VaultError::UmbraLocked)
-        ));
-        assert!(matches!(
-            vault.remove_umbra_private_slot(
-                &path,
-                &replaced.etag,
-                "# outer text\n".to_owned(),
-                "p_01",
-                1_783_699_204_000
-            ),
-            Err(VaultError::UmbraLocked)
-        ));
+        assert_locked_private_slot_operations_rejected(&mut vault, &path, &replaced.etag);
         vault
             .unlock_umbra(b"private slot password")
             .expect("unlock Umbra");
@@ -3610,60 +3694,16 @@ mod tests {
         assert!(applied.projection.markdown.contains("INEX_SECRET_SLOT_A"));
         assert!(applied.projection.markdown.contains("INEX_SECRET_SLOT_B"));
 
-        let (_, outer) = vault
-            .read_umbra_outer_document(&path)
-            .expect("read Outer projection");
-        assert_eq!(outer.slots.len(), 2);
-        assert!(outer.outer_markdown.contains("ordinary text"));
-        assert!(!outer.outer_markdown.contains("INEX_SECRET_SLOT_A"));
-        assert!(!outer.outer_markdown.contains("INEX_SECRET_SLOT_B"));
-        for slot_id in outer.slots.keys() {
-            let payload = vault
-                .read_umbra_private_slot(&path, slot_id)
-                .expect("decrypt wrapped payload");
-            assert_eq!(payload.kind, spec.kind);
-            assert_eq!(payload.tag_ids, spec.tag_ids);
-        }
-        let disk = fs::read(directory.path().join("2026-07-annotations.md.enc"))
-            .expect("read encrypted document");
-        let disk = String::from_utf8_lossy(&disk);
-        assert!(!disk.contains("INEX_SECRET_SLOT_A"));
-        assert!(!disk.contains("INEX_SECRET_SLOT_B"));
-        assert!(!disk.contains("secret-tag"));
-
-        assert!(matches!(
-            vault.apply_private_annotation(
-                &path,
-                &created.etag,
-                &applied.projection.markdown,
-                &applied.projection.render_map,
-                &[TextRange::new(0, 1).expect("stale range")],
-                &spec,
-                false,
-                1_783_699_203_000,
-            ),
-            Err(VaultError::Conflict { .. })
-        ));
-        let private_range = applied.projection.render_map.private_slots[0].projection_range;
-        assert!(matches!(
-            vault.apply_private_annotation(
-                &path,
-                &applied.document.etag,
-                &applied.projection.markdown,
-                &applied.projection.render_map,
-                &[private_range],
-                &spec,
-                false,
-                1_783_699_203_000,
-            ),
-            Err(VaultError::UmbraRender(
-                UmbraRenderError::AnnotationSelectionNotPlain
-            ))
-        ));
-        let (_, after_rejections) = vault
-            .read_umbra_outer_document(&path)
-            .expect("read unchanged document");
-        assert_eq!(after_rejections, outer);
+        let outer =
+            assert_annotation_outer_and_disk_are_private(&mut vault, &directory, &path, &spec);
+        assert_annotation_rejections_preserve_outer(
+            &mut vault,
+            &path,
+            &created.etag,
+            &applied,
+            &spec,
+            &outer,
+        );
     }
 
     #[test]
