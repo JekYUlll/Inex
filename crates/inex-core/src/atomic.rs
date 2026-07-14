@@ -4459,9 +4459,50 @@ impl HeldPublicationMarkerV2 {
             return Err(HeldPublicationMarkerV2Error::AuthorityChanged);
         }
         self.revalidate_at(current_root)?;
-        require_held_publication_destination_absent(
+        require_held_publication_child_absent(
             &self.authority.common_parent,
             self.authority.marker.destination_child_name(),
+        )?;
+        self.revalidate_at(current_root)
+    }
+
+    /// Require the held root to occupy its recorded destination while the
+    /// recorded staging sibling is absent at one bounded observation.
+    ///
+    /// The complete held marker/lock authority and descriptor-relative
+    /// staging absence are repeatedly interleaved. This is the read-only role
+    /// gate used by an initial publisher after its no-replace move and by a
+    /// fresh existing-only reconciliation guard. It performs no sync, move,
+    /// unlink, creation, cleanup, or recovery action.
+    ///
+    /// Absence does not reserve the staging name. A later transition must
+    /// revalidate this authority immediately around every namespace mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a scrubbed namespace, authority, or I/O error unless the exact
+    /// destination role, canonical marker, held identities, mutation lock,
+    /// reserved inventory, and staging absence remain reproducible.
+    pub fn require_published_at(
+        &self,
+        current_root: &Path,
+    ) -> Result<(), HeldPublicationMarkerV2Error> {
+        let current_name = current_root
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .ok_or(HeldPublicationMarkerV2Error::AuthorityChanged)?;
+        if current_name != self.authority.marker.destination_child_name() {
+            return Err(HeldPublicationMarkerV2Error::AuthorityChanged);
+        }
+        self.revalidate_at(current_root)?;
+        require_held_publication_child_absent(
+            &self.authority.common_parent,
+            self.authority.marker.staging_child_name(),
+        )?;
+        self.revalidate_at(current_root)?;
+        require_held_publication_child_absent(
+            &self.authority.common_parent,
+            self.authority.marker.staging_child_name(),
         )?;
         self.revalidate_at(current_root)
     }
@@ -5344,7 +5385,7 @@ fn require_pre_marker_creation_state(
         marker_parent,
         mutation_lock,
     )?;
-    require_held_publication_destination_absent(common_parent, destination_child_name)?;
+    require_held_publication_child_absent(common_parent, destination_child_name)?;
     revalidate_pre_marker_authority(
         staging_root_path,
         common_parent,
@@ -5355,7 +5396,7 @@ fn require_pre_marker_creation_state(
 }
 
 #[cfg(target_os = "linux")]
-fn require_held_publication_destination_absent(
+fn require_held_publication_child_absent(
     common_parent: &SecureSourceDirectory,
     destination_child_name: &str,
 ) -> Result<(), HeldPublicationMarkerV2Error> {
@@ -9241,14 +9282,29 @@ mod tests {
         let held = lock
             .create_held_publication_marker_v2(fixture.root(), held_root, input)
             .map_err(io::Error::other)?;
+        assert!(matches!(
+            held.require_published_at(fixture.root()),
+            Err(super::HeldPublicationMarkerV2Error::AuthorityChanged)
+        ));
 
         fs::rename(fixture.root(), &destination)?;
         assert!(held.revalidate_at(fixture.root()).is_err());
         held.revalidate_at(&destination).map_err(io::Error::other)?;
+        held.require_published_at(&destination)
+            .map_err(io::Error::other)?;
         assert!(matches!(
             held.require_destination_absent_at(&destination),
             Err(super::HeldPublicationMarkerV2Error::AuthorityChanged)
         ));
+        fs::create_dir(fixture.root())?;
+        assert!(matches!(
+            held.require_published_at(&destination),
+            Err(super::HeldPublicationMarkerV2Error::NamespaceConflict)
+        ));
+        assert!(fixture.root().is_dir());
+        fs::remove_dir(fixture.root())?;
+        held.require_published_at(&destination)
+            .map_err(io::Error::other)?;
         let current_root = held
             .held_root_view_at(&destination)
             .map_err(io::Error::other)?;
