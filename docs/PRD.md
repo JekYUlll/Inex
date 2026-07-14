@@ -70,6 +70,15 @@ on Windows and Linux and uses Git for history/synchronization.
 - VS Code proposed/native Search provider integration;
 - advanced resistance to memory/swap/dump inspection.
 
+## Planned Umbra private annotations
+
+The next privacy-focused milestone is specified in
+[Umbra Mode and Private Annotation System](prd-umbra-mode.md). It introduces
+encrypted private slots, tag catalogs, and annotation profiles only after a
+dedicated K_umbra storage/RPC contract is frozen. In particular, private tags
+and profile metadata are never allowed into the existing Outer projection,
+search index, settings, or logs.
+
 ## Non-functional requirements
 
 - Format and RPC versions are explicit; unknown major versions fail closed.

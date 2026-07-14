@@ -68,6 +68,7 @@ REQUIRED_DOCUMENTATION = (
     "docs/editor-security.md",
     "docs/installation.md",
     "docs/operations-and-recovery.md",
+    "docs/prd-umbra-mode.md",
     "docs/release-checklist.md",
     "docs/release-notes-0.1.0-pre-alpha.md",
     "docs/troubleshooting.md",
@@ -76,6 +77,7 @@ REQUIRED_DOCUMENTATION = (
     "docs/spec/git-merge-v1.md",
     "docs/spec/import-v1.md",
     "docs/spec/json-rpc-v1.md",
+    "docs/spec/umbra-v1.md",
     "docs/spec/vault-v1.md",
 )
 VSIX_NAMESPACE = "http://schemas.microsoft.com/developer/vsx-schema/2011"

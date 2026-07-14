@@ -45,6 +45,7 @@ SUBLIME_PACKAGE_FILES = (
 
 DOCUMENTATION_FILES = (
     "PRD.md",
+    "prd-umbra-mode.md",
     "acceptance-matrix.md",
     "architecture.md",
     "dependencies.md",
@@ -61,6 +62,7 @@ DOCUMENTATION_FILES = (
     "spec/import-v1.md",
     "spec/json-rpc-v1.md",
     "spec/opaque-assets-v1.md",
+    "spec/umbra-v1.md",
     "spec/vault-v1.md",
 )
 PACKAGE_REPORT_NOT_COVERED = (

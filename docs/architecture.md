@@ -77,6 +77,12 @@ change existing slots. Journal files bind to a master-key epoch, not a password
 slot. Password changes therefore modify `vault.json` only. A future master-key
 rotation increments the epoch and explicitly rewrites all files.
 
+Umbra private annotations are a planned, opt-in second key layer. When enabled,
+an independently password-wrapped random K_umbra decrypts only private slots
+and `.inex/config.umbra.inex`; a normal vault unlock can render only the public
+Outer projection. The frozen design and no-leakage boundary are in
+[`spec/umbra-v1.md`](spec/umbra-v1.md); no current component implements it.
+
 Production creation calibrates only Argon2id `opsLimit`, once per process,
 against a public dummy input. v1 fixes memory at 64 MiB and parallelism at one,
 searches operations 3–20 toward a 250–750 ms selector observation, and stores the
