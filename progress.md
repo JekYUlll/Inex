@@ -19,6 +19,12 @@
 - 首次运行发现 `MethodRegistry::all()` 的 `u32` 位图在第 32 个方法左移溢出。已改为带编译期容量上限的 `u64` 表示，并处理 64-bit 满表边界；不是放宽协议解析。
 - 验证：`cargo test -p inex-core --lib` 293/293、`cargo test -p inex-daemon --lib` 71/71，以及两 crate 严格 Clippy、fmt、diff-check 全通过。
 
+## 2026-07-15 — VS Code feature-2 CustomEditor lifecycle
+
+- `umbra.document.open` 现在携带 authenticated public document metadata；sidecar 严格校验其 exact response shape。
+- CustomEditor 将 normal daemon document handle 与 Umbra projection 建模为互斥状态。普通打开失败时仅在 Umbra 已解锁的同一 session 尝试 feature-2 projection；转换命令预先同步/保存普通 buffer，关闭 normal handle，执行 CAS conversion，再原子替换为只读投影。
+- feature-2 projection 暂不允许直接 Outer 编辑或 draft recovery，避免用普通 `file.write`/draft 路径错误持久化容器。锁定、dispose、投影替换都会清零 Markdown buffer 与 RenderMap generation。下一步将使用现有 verified webview selection 和多选 QuickPick 调用 `umbra.annotation.apply`。
+
 ## 2026-07-15 — Vault feature-2 启用事务
 
 - 提交 `538168d`：`Vault::enable_umbra_private_annotations` 只接受 live Umbra session；它调用已认证 core metadata upgrader，并以 vault.json etag CAS 提交，随后重新 parse 确认 exact committed metadata 才更新内存 config。锁定 session 的调用被拒绝。
