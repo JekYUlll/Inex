@@ -530,7 +530,8 @@ pub enum HeldPublicationMarkerV2Error {
     /// Caller fields or the staging-root child name are invalid.
     #[error("held publication marker input is invalid")]
     InvalidInput,
-    /// The complete held reserved-prefix inventory is not the expected state.
+    /// A destination child or held reserved-prefix inventory conflicts with
+    /// the requested state.
     #[error("held publication marker namespace conflicts with the requested state")]
     NamespaceConflict,
     /// A held root, directory, lock, file, or canonical body changed.
@@ -4178,13 +4179,13 @@ impl HeldPublicationMarkerV2 {
             candidate_seal: input.candidate_seal,
         })
         .map_err(|_| HeldPublicationMarkerV2Error::InvalidInput)?;
-        require_held_reserved_inventory(&marker_parent, HeldReservedPublicationInventory::Absent)?;
-        revalidate_pre_marker_authority(
+        require_pre_marker_creation_state(
             staging_root_path,
             &common_parent,
             &root,
             &marker_parent,
             &mutation_lock,
+            input.destination_child_name,
         )?;
 
         let mut marker_file = create_secure_publication_marker(&marker_parent)
@@ -4426,6 +4427,43 @@ impl HeldPublicationMarkerV2 {
             .mutation_lock
             .revalidate(current_root)
             .map_err(|_| HeldPublicationMarkerV2Error::AuthorityChanged)
+    }
+
+    /// Require this staging claim's recorded destination sibling to be absent
+    /// at one bounded observation.
+    ///
+    /// The destination lookup is performed relative to the already-held
+    /// common-parent descriptor. The complete marker, root, private directory,
+    /// and lock authority is revalidated before and after the lookup. This
+    /// operation is valid only while `current_root` names the marker's staging
+    /// child; after publication the destination necessarily names the held
+    /// root and this check is no longer meaningful. Absence does not reserve
+    /// the sibling name: callers must recheck it and use a no-replace move at
+    /// publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NamespaceConflict` when an ordinary single-link file or
+    /// directory occupies the exact destination name. Link-like, hard-linked,
+    /// cross-mount, raced, or otherwise indeterminate entries return a
+    /// scrubbed authority or I/O error and are never treated as absent.
+    pub fn require_destination_absent_at(
+        &self,
+        current_root: &Path,
+    ) -> Result<(), HeldPublicationMarkerV2Error> {
+        let current_name = current_root
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .ok_or(HeldPublicationMarkerV2Error::AuthorityChanged)?;
+        if current_name != self.authority.marker.staging_child_name() {
+            return Err(HeldPublicationMarkerV2Error::AuthorityChanged);
+        }
+        self.revalidate_at(current_root)?;
+        require_held_publication_destination_absent(
+            &self.authority.common_parent,
+            self.authority.marker.destination_child_name(),
+        )?;
+        self.revalidate_at(current_root)
     }
 
     /// Borrow the validated canonical marker value without exposing its file.
@@ -5287,6 +5325,52 @@ fn revalidate_pre_marker_authority(
         return Err(HeldPublicationMarkerV2Error::AuthorityChanged);
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn require_pre_marker_creation_state(
+    staging_root_path: &Path,
+    common_parent: &SecureSourceDirectory,
+    root: &SecureSourceDirectory,
+    marker_parent: &SecureSourceDirectory,
+    mutation_lock: &ExistingVaultMutationLock,
+    destination_child_name: &str,
+) -> Result<(), HeldPublicationMarkerV2Error> {
+    require_held_reserved_inventory(marker_parent, HeldReservedPublicationInventory::Absent)?;
+    revalidate_pre_marker_authority(
+        staging_root_path,
+        common_parent,
+        root,
+        marker_parent,
+        mutation_lock,
+    )?;
+    require_held_publication_destination_absent(common_parent, destination_child_name)?;
+    revalidate_pre_marker_authority(
+        staging_root_path,
+        common_parent,
+        root,
+        marker_parent,
+        mutation_lock,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn require_held_publication_destination_absent(
+    common_parent: &SecureSourceDirectory,
+    destination_child_name: &str,
+) -> Result<(), HeldPublicationMarkerV2Error> {
+    common_parent
+        .verify_binding()
+        .map_err(HeldPublicationMarkerV2Error::Io)?;
+    let lookup = common_parent.open_child(std::ffi::OsStr::new(destination_child_name));
+    common_parent
+        .verify_binding()
+        .map_err(HeldPublicationMarkerV2Error::Io)?;
+    match lookup {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(HeldPublicationMarkerV2Error::NamespaceConflict),
+        Err(error) => Err(HeldPublicationMarkerV2Error::Io(error)),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -8123,6 +8207,21 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn try_create_test_held_marker(
+        root: &Path,
+        destination_child_name: &str,
+    ) -> io::Result<Result<super::HeldPublicationMarkerV2, super::HeldPublicationMarkerV2Error>>
+    {
+        let common_parent = super::filesystem_directory_identity(
+            root.parent()
+                .ok_or_else(|| io::Error::other("test root has no parent"))?,
+        )?;
+        let (held_root, lock) = held_root_and_existing_lock(root)?;
+        let input = held_marker_test_input(root, &common_parent, destination_child_name)?;
+        Ok(lock.create_held_publication_marker_v2(root, held_root, input))
+    }
+
+    #[cfg(target_os = "linux")]
     struct PublishedRootGuard {
         original: PathBuf,
         destination: PathBuf,
@@ -8751,6 +8850,147 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn held_publication_marker_rejects_occupied_destination_before_create() -> io::Result<()> {
+        let occupied = TestVault::new()?;
+        let common_parent_path = occupied
+            .root()
+            .parent()
+            .ok_or_else(|| io::Error::other("test root has no parent"))?;
+        let common_parent = super::filesystem_directory_identity(common_parent_path)?;
+        let destination_name = format!(
+            "inex-held-marker-occupied-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let destination = common_parent_path.join(&destination_name);
+        fs::write(&destination, b"foreign-destination-canary")?;
+        assert!(matches!(
+            try_create_test_held_marker(occupied.root(), &destination_name)?,
+            Err(super::HeldPublicationMarkerV2Error::NamespaceConflict)
+        ));
+        assert_eq!(
+            common_parent,
+            super::filesystem_directory_identity(common_parent_path)?
+        );
+        assert_eq!(fs::read(&destination)?, b"foreign-destination-canary");
+        assert!(!occupied.local().join(IMPORT_PUBLISH_MARKER_V2).exists());
+        fs::remove_file(&destination)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn held_publication_marker_rejects_unsafe_destination_entries_before_create() -> io::Result<()>
+    {
+        use std::os::unix::fs::symlink;
+
+        let occupied_directory = TestVault::new()?;
+        let parent = occupied_directory
+            .root()
+            .parent()
+            .ok_or_else(|| io::Error::other("test root has no parent"))?;
+        let directory_name = format!("inex-dest-dir-{}", uuid::Uuid::new_v4().simple());
+        let directory = parent.join(&directory_name);
+        fs::create_dir(&directory)?;
+        assert!(matches!(
+            try_create_test_held_marker(occupied_directory.root(), &directory_name)?,
+            Err(super::HeldPublicationMarkerV2Error::NamespaceConflict)
+        ));
+        assert!(directory.is_dir());
+        assert!(
+            !occupied_directory
+                .local()
+                .join(IMPORT_PUBLISH_MARKER_V2)
+                .exists()
+        );
+        fs::remove_dir(&directory)?;
+
+        let occupied_symlink = TestVault::new()?;
+        let parent = occupied_symlink
+            .root()
+            .parent()
+            .ok_or_else(|| io::Error::other("test root has no parent"))?;
+        let symlink_name = format!("inex-dest-link-{}", uuid::Uuid::new_v4().simple());
+        let symlink_path = parent.join(&symlink_name);
+        symlink(occupied_symlink.root(), &symlink_path)?;
+        assert!(matches!(
+            try_create_test_held_marker(occupied_symlink.root(), &symlink_name)?,
+            Err(super::HeldPublicationMarkerV2Error::Io(_))
+        ));
+        assert_eq!(fs::read_link(&symlink_path)?, occupied_symlink.root());
+        assert!(
+            !occupied_symlink
+                .local()
+                .join(IMPORT_PUBLISH_MARKER_V2)
+                .exists()
+        );
+        fs::remove_file(&symlink_path)?;
+
+        let occupied_hardlink = TestVault::new()?;
+        let parent = occupied_hardlink
+            .root()
+            .parent()
+            .ok_or_else(|| io::Error::other("test root has no parent"))?;
+        let hardlink_nonce = uuid::Uuid::new_v4().simple();
+        let hardlink_name = format!("inex-dest-hardlink-{hardlink_nonce}");
+        let hardlink_source = parent.join(format!("inex-dest-hardlink-source-{hardlink_nonce}"));
+        let hardlink_path = parent.join(&hardlink_name);
+        fs::write(&hardlink_source, b"hardlink-destination-canary")?;
+        fs::hard_link(&hardlink_source, &hardlink_path)?;
+        assert!(matches!(
+            try_create_test_held_marker(occupied_hardlink.root(), &hardlink_name)?,
+            Err(super::HeldPublicationMarkerV2Error::Io(_))
+        ));
+        assert_eq!(fs::read(&hardlink_path)?, b"hardlink-destination-canary");
+        assert!(
+            !occupied_hardlink
+                .local()
+                .join(IMPORT_PUBLISH_MARKER_V2)
+                .exists()
+        );
+        fs::remove_file(&hardlink_path)?;
+        fs::remove_file(&hardlink_source)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn held_publication_marker_destination_check_retains_owner_and_lock() -> io::Result<()> {
+        let appeared = TestVault::new()?;
+        let common_parent_path = appeared
+            .root()
+            .parent()
+            .ok_or_else(|| io::Error::other("test root has no parent"))?;
+        let destination_name = format!(
+            "inex-held-marker-appeared-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let destination = common_parent_path.join(&destination_name);
+        let held = try_create_test_held_marker(appeared.root(), &destination_name)?
+            .map_err(io::Error::other)?;
+        held.require_destination_absent_at(appeared.root())
+            .map_err(io::Error::other)?;
+        fs::create_dir(&destination)?;
+        assert!(matches!(
+            held.require_destination_absent_at(appeared.root()),
+            Err(super::HeldPublicationMarkerV2Error::NamespaceConflict)
+        ));
+        assert!(appeared.local().join(IMPORT_PUBLISH_MARKER_V2).is_file());
+        let identities = ExistingLockIdentities {
+            root: super::filesystem_directory_identity(appeared.root())?,
+            local: super::filesystem_directory_identity(&appeared.local())?,
+            lock: super::filesystem_file_identity(&fs::File::open(
+                appeared.local().join(VAULT_MUTATION_LOCK_FILE),
+            )?)?,
+        };
+        assert_publication_lock_busy(appeared.root(), &identities);
+        fs::remove_dir(&destination)?;
+        held.require_destination_absent_at(appeared.root())
+            .map_err(io::Error::other)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn held_publication_marker_rejects_invalid_input_and_reserved_alias_before_create()
     -> io::Result<()> {
         let invalid = TestVault::new()?;
@@ -9005,6 +9245,10 @@ mod tests {
         fs::rename(fixture.root(), &destination)?;
         assert!(held.revalidate_at(fixture.root()).is_err());
         held.revalidate_at(&destination).map_err(io::Error::other)?;
+        assert!(matches!(
+            held.require_destination_absent_at(&destination),
+            Err(super::HeldPublicationMarkerV2Error::AuthorityChanged)
+        ));
         let current_root = held
             .held_root_view_at(&destination)
             .map_err(io::Error::other)?;
