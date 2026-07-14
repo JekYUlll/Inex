@@ -78,7 +78,8 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
   - [x] 冻结产品交互、私密标签/profile加密边界、Outer隔离、selection原子性及MVP/延期范围
   - [x] 冻结独立K_umbra层级、唯一`umbra-default`密码槽、不可恢复语义与`.inex/config.umbra.inex`边界（`docs/spec/umbra-v1.md`）
   - [x] 实现随机K_umbra、Argon2id KEK 包装/解包、vault/path-bound AEAD、受保护内存清理，以及已解锁会话密码重包装基础（`f96f656`）
-  - [ ] 将密码槽初始化/替换接入Vault会话、受控`.inex`目录创建与feature-2启用事务
+  - [x] 将密码槽初始化/替换接入Vault会话与受控`.inex/keyslots`目录创建；独立unlock/lock和live-session重设密码均已验证（`67e87cf`）
+  - [ ] 将 Umbra 启用事务与feature-2 document-container协商同时接入，避免未支持的读者误开私密文档
   - [ ] 实现core私密slot、TagId、catalog/profile和RenderMap选择事务，并证明canary不进入磁盘Outer面
   - [ ] 扩展daemon session/RPC及VS Code QuickPick/命令/可配置keybindings
   - [ ] 扩展Sublime stateful picker、profile命令和keymap示例

@@ -1,5 +1,12 @@
 # Inex Progress Log
 
+## 2026-07-15 — Vault Umbra 会话与密码槽生命周期
+
+- 提交 `67e87cf`：`Vault` 现在拥有 memory-only Umbra session，并提供初始化、独立解锁、锁定和已解锁会话的密码重设。锁定或丢弃 Vault 会释放 protected `K_umbra`；Outer password 从未传入这些路径。
+- 密码槽仅在受控 `.inex/keyslots/umbra-default.inex-keyslot` 创建/替换，创建与替换均使用现有 vault mutation guard 的原子写入和 etag CAS。内部目录、slot 文件、挂载边界、symlink/reparse 与 ASCII 大小写别名都 fail closed。
+- `umbra_status` 最多验证公开 slot 元数据，绝不派生 KEK 或解密 `K_umbra`；错误密码、非初始化 vault、已锁定会话和重复初始化均有独立错误。
+- 验证：`cargo clippy -p inex-core --all-targets -- -D warnings`，`cargo test -p inex-core --lib`（280/280）通过；回归覆盖独立密码、lock 后禁止重设、旧密码失效和新密码解锁。
+
 ## 2026-07-15 — 目标补充：Neovim 最后优先级客户端
 
 - 用户要求增加 Neovim 插件，但明确优先级为 CLI/daemon 与 VS Code 之后。已列为 Phase 5.5：复用 `inexd` JSON-RPC 和同一 Outer/Umbra 安全边界，不新增独立加密实现，也不阻塞当前 Umbra MVP。
