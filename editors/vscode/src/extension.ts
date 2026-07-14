@@ -12,6 +12,7 @@ import {
 } from "./privateAnnotationPicker.ts";
 import {
   parsePrivateAnnotationPreferences,
+  resolveToggleAnnotationAction,
   type PrivateAnnotationPreferences,
 } from "./privateAnnotationPreferences.ts";
 import type { PrivateAnnotationSpec, UmbraAnnotationProfile } from "./sidecar.ts";
@@ -57,6 +58,9 @@ export function activate(
   const tree = new InexTreeProvider(controller);
   const editor = new InexCustomEditorProvider(controller, integrationTestMode);
   const crud = new InexCrudActions(controller, tree, editor);
+  // Tags/profile semantics are private catalog data. Keep only a best-effort
+  // session-local copy for shortcut behavior; never write it to VS Code settings.
+  let lastAnnotationSpec: PrivateAnnotationSpec | undefined;
   activeController = controller;
   activeEditorProvider = editor;
   const syncVaultContext = () => {
@@ -69,6 +73,9 @@ export function activate(
     tree,
     editor,
     controller.onDidChangeState(syncVaultContext),
+    controller.onDidLock(() => {
+      lastAnnotationSpec = undefined;
+    }),
     vscode.window.registerTreeDataProvider("inex.vault", tree),
     vscode.window.registerCustomEditorProvider(VIEW_TYPE, editor, {
       supportsMultipleEditorsPerDocument: false,
@@ -240,12 +247,24 @@ export function activate(
           }
           return;
         }
-        await applyChosenPrivateAnnotation(controller, editor, undefined, preferences);
+        const applied = await applyTogglePrivateAnnotation(
+          controller,
+          editor,
+          preferences,
+          lastAnnotationSpec,
+        );
+        if (applied !== undefined && preferences.rememberLastSelection) {
+          lastAnnotationSpec = applied;
+        }
       });
     }),
     vscode.commands.registerCommand("inex.choosePrivateAnnotation", async () => {
       await runUiAction(async () => {
-        await applyChosenPrivateAnnotation(controller, editor, undefined, privateAnnotationPreferences());
+        const preferences = privateAnnotationPreferences();
+        const applied = await applyChosenPrivateAnnotation(controller, editor, undefined, preferences);
+        if (applied !== undefined && preferences.rememberLastSelection) {
+          lastAnnotationSpec = applied;
+        }
       });
     }),
     vscode.commands.registerCommand("inex.removePrivateAnnotation", async () => {
@@ -257,13 +276,17 @@ export function activate(
     vscode.commands.registerCommand("inex.editPrivateAnnotation", async () => {
       await runUiAction(async () => {
         const initialSpec = editor.activePrivateAnnotationSpec();
-        await applyChosenPrivateAnnotation(
+        const preferences = privateAnnotationPreferences();
+        const applied = await applyChosenPrivateAnnotation(
           controller,
           editor,
           undefined,
-          privateAnnotationPreferences(),
+          preferences,
           initialSpec,
         );
+        if (applied !== undefined && preferences.rememberLastSelection) {
+          lastAnnotationSpec = applied;
+        }
       });
     }),
     vscode.commands.registerCommand("inex.managePrivateTags", async () => {
@@ -287,7 +310,11 @@ export function activate(
         if (profileId === undefined) {
           throw new Error("Private annotation profile ID is required");
         }
-        await applyChosenPrivateAnnotation(controller, editor, profileId, privateAnnotationPreferences());
+        const preferences = privateAnnotationPreferences();
+        const applied = await applyChosenPrivateAnnotation(controller, editor, profileId, preferences);
+        if (applied !== undefined && preferences.rememberLastSelection) {
+          lastAnnotationSpec = applied;
+        }
       });
     }),
     vscode.commands.registerCommand("inex.showSecurityStatus", async () => {
@@ -386,9 +413,10 @@ async function applyChosenPrivateAnnotation(
   profileId?: string,
   preferences: PrivateAnnotationPreferences = privateAnnotationPreferences(),
   initialSpec?: PrivateAnnotationSpec,
-): Promise<void> {
+  selectedSpec?: PrivateAnnotationSpec,
+): Promise<PrivateAnnotationSpec | undefined> {
   const ready = await ensureUmbraReady(controller);
-  if (ready === undefined) return;
+  if (ready === undefined) return undefined;
   const { session, sidecar } = ready;
   await editor.convertActiveDocumentToUmbra();
   const config = await sidecar.loadUmbraAnnotationConfig();
@@ -412,16 +440,16 @@ async function applyChosenPrivateAnnotation(
       },
       controller.onDidLock,
     );
-    if (coverText === undefined) return;
+    if (coverText === undefined) return undefined;
   }
-  const spec = profile === undefined
+  const spec = selectedSpec ?? (profile === undefined
     ? await choosePrivateAnnotation(config, controller.onDidLock, initialSpec)
     : {
       kind: profile.kind,
       tagIds: profile.tagIds,
       outer: { mode: profile.outer, ...(coverText === undefined ? {} : { coverText }) },
-    };
-  if (spec === undefined) return;
+    });
+  if (spec === undefined) return undefined;
   if (!controller.isSessionCurrent(session)) {
     throw new Error("Inex vault session changed during private annotation selection");
   }
@@ -430,6 +458,46 @@ async function applyChosenPrivateAnnotation(
   } else {
     await editor.editPrivateAnnotationAtActive(spec);
   }
+  return spec;
+}
+
+async function applyTogglePrivateAnnotation(
+  controller: VaultController,
+  editor: InexCustomEditorProvider,
+  preferences: PrivateAnnotationPreferences,
+  lastAnnotationSpec: PrivateAnnotationSpec | undefined,
+): Promise<PrivateAnnotationSpec | undefined> {
+  const actionWithoutDefault = resolveToggleAnnotationAction(
+    preferences,
+    lastAnnotationSpec !== undefined,
+    false,
+  );
+  if (actionWithoutDefault === "last" && lastAnnotationSpec !== undefined) {
+    return await applyChosenPrivateAnnotation(
+      controller,
+      editor,
+      undefined,
+      preferences,
+      undefined,
+      lastAnnotationSpec,
+    );
+  }
+  if (preferences.toggleBehavior === "useDefaultProfile") {
+    const ready = await ensureUmbraReady(controller);
+    if (ready === undefined) return undefined;
+    const config = await ready.sidecar.loadUmbraAnnotationConfig();
+    const profileId = config.defaults.defaultProfileId;
+    if (
+      resolveToggleAnnotationAction(
+        preferences,
+        false,
+        profileId !== "" && config.profiles.some((profile) => profile.id === profileId),
+      ) === "defaultProfile"
+    ) {
+      return await applyChosenPrivateAnnotation(controller, editor, profileId, preferences);
+    }
+  }
+  return await applyChosenPrivateAnnotation(controller, editor, undefined, preferences);
 }
 
 async function ensureUmbraReady(
@@ -734,6 +802,8 @@ function privateAnnotationPreferences(): PrivateAnnotationPreferences {
   return parsePrivateAnnotationPreferences({
     noSelectionTarget: configuration.get<unknown>("noSelectionTarget"),
     confirmBeforeUnwrap: configuration.get<unknown>("confirmBeforeUnwrap"),
+    toggleBehavior: configuration.get<unknown>("toggleBehavior"),
+    rememberLastSelection: configuration.get<unknown>("rememberLastSelection"),
   });
 }
 

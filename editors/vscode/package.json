@@ -298,6 +298,19 @@
           "default": true,
           "scope": "window",
           "description": "Confirm before private Markdown is restored into ordinary Umbra content."
+        },
+        "inex.privateAnnotation.toggleBehavior": {
+          "type": "string",
+          "enum": ["alwaysAsk", "useLast", "useDefaultProfile", "askOnFirstUse"],
+          "default": "alwaysAsk",
+          "scope": "window",
+          "description": "Whether the toggle shortcut opens the chooser or applies a session/default profile."
+        },
+        "inex.privateAnnotation.rememberLastSelection": {
+          "type": "boolean",
+          "default": true,
+          "scope": "window",
+          "description": "Retain the last private annotation choice only in the unlocked editor session."
         }
       }
     }
