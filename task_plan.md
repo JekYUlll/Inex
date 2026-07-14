@@ -88,6 +88,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
   - [ ] 将 Umbra 启用事务与feature-2 document-container协商同时接入，避免未支持的读者误开私密文档
   - [ ] 实现core私密slot、TagId、catalog/profile和RenderMap选择事务，并证明canary不进入磁盘Outer面
     - [x] Vault 已提供 live-session-only 的 private slot insert/read/replace/remove；slot payload 与标签的磁盘 canary 不进入 Outer projection（`3d6d6ef`）
+    - [x] 实现 canonical Umbra projection、RenderMap generation、严格私密块范围分类，以及 marker/slot 一一对应的 ETag 原子变更；普通保存拒绝 dangling/duplicate/missing marker（`9d05c11`）
   - [ ] 扩展daemon session/RPC及VS Code QuickPick/命令/可配置keybindings
   - [ ] 扩展Sublime stateful picker、profile命令和keymap示例
   - [ ] 跑通多选、wrap/unwrap/edit、跨编辑器目录、canary/残留及Outer隔离矩阵
