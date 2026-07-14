@@ -30,6 +30,7 @@ const MAX_BACKLINK_CANDIDATES = 256;
 const MAX_BACKLINK_PLAINTEXT_BYTES = 64 * 1024 * 1024;
 const WEBVIEW_SNAPSHOT_TIMEOUT_MS = 5_000;
 const VIEW_TYPE = "inex.markdownEditor";
+const MAX_EDITOR_SELECTIONS = 64;
 
 interface SnapshotRequest {
   readonly resolve: () => void;
@@ -62,7 +63,7 @@ class InexDocument implements vscode.CustomDocument {
   private pendingReveal: { readonly startByte: number; readonly endByte: number } | undefined;
   private readonly snapshotRequests = new Map<number, SnapshotRequest>();
   private nextSnapshotRequest = 1;
-  private selection: EditorSelection | undefined;
+  private selections: readonly EditorSelection[] = [];
   private umbraRenderMap: RenderMap | undefined;
 
   public constructor(
@@ -104,8 +105,10 @@ class InexDocument implements vscode.CustomDocument {
   }
 
   public currentSelection(): EditorSelection | undefined {
-    return this.selection;
+    return this.selections.at(-1);
   }
+
+  public currentSelections(): readonly EditorSelection[] { return this.selections; }
 
   public restoreSelection(selection: EditorSelection | undefined): void {
     if (
@@ -113,23 +116,20 @@ class InexDocument implements vscode.CustomDocument {
       selection.endByte <= this.content.byteLength &&
       selection.startByte <= selection.endByte
     ) {
-      this.selection = selection;
+      this.selections = [selection];
     }
   }
 
-  public updateSelection(text: string, startByte: number, endByte: number): boolean {
+  public updateSelections(text: string, selections: readonly EditorSelection[]): boolean {
     this.requireUsable();
     if (
-      !Number.isSafeInteger(startByte) ||
-      !Number.isSafeInteger(endByte) ||
-      startByte < 0 ||
-      endByte < startByte ||
-      endByte > Buffer.byteLength(text, "utf8")
+      selections.length === 0 || selections.length > MAX_EDITOR_SELECTIONS ||
+      selections.some(({ startByte, endByte }) => !Number.isSafeInteger(startByte) || !Number.isSafeInteger(endByte) || startByte < 0 || endByte < startByte || endByte > Buffer.byteLength(text, "utf8"))
     ) {
       throw new Error("Inex editor selection is invalid");
     }
     const changed = this.applyEdit(text);
-    this.selection = { startByte, endByte };
+    this.selections = selections.map(({ startByte, endByte }) => ({ startByte, endByte }));
     return changed;
   }
 
@@ -182,7 +182,7 @@ class InexDocument implements vscode.CustomDocument {
     this.revision += 1;
     this.savedRevision = this.revision;
     this.staleBackup = false;
-    this.selection = undefined;
+    this.selections = [];
     this.broadcast();
   }
 
@@ -320,7 +320,7 @@ class InexDocument implements vscode.CustomDocument {
     this.content = Buffer.alloc(0);
     this.umbraRenderMap?.generation.fill(0);
     this.umbraRenderMap = undefined;
-    this.selection = undefined;
+    this.selections = [];
     this.rejectSnapshotRequests(new Error("Inex document was disposed"));
     this.panels.clear();
     this.readyPanels.clear();
@@ -337,7 +337,7 @@ class InexDocument implements vscode.CustomDocument {
     this.content = Buffer.alloc(0);
     this.umbraRenderMap?.generation.fill(0);
     this.umbraRenderMap = undefined;
-    this.selection = undefined;
+    this.selections = [];
     this.rejectSnapshotRequests(new Error("Inex document was locked"));
     for (const panel of this.panels) {
       panel.webview.html = lockedHtml();
@@ -576,12 +576,10 @@ export class InexCustomEditorProvider
 
   public activeSelectionIsCompletePrivateBlock(): boolean {
     const document = this.activeDocument;
-    const selection = document?.currentSelection();
+    const selections = document?.currentSelections();
     const renderMap = document?.renderMap();
-    return document?.isUmbraProjection === true && selection !== undefined && renderMap !== undefined &&
-      renderMap.privateSlots.some(
-        (slot) => slot.range.startByte === selection.startByte && slot.range.endByte === selection.endByte,
-      );
+    return document?.isUmbraProjection === true && selections !== undefined && selections.length > 0 && renderMap !== undefined &&
+      selections.every((selection) => renderMap.privateSlots.some((slot) => slot.range.startByte === selection.startByte && slot.range.endByte === selection.endByte));
   }
 
   public resolveCustomEditor(
@@ -650,15 +648,12 @@ export class InexCustomEditorProvider
       if (
         message.type === "selection" &&
         typeof message.content === "string" &&
-        Number.isSafeInteger(message.startByte) &&
-        Number.isSafeInteger(message.endByte) &&
-        typeof message.startByte === "number" &&
-        typeof message.endByte === "number" &&
+        parseEditorSelections(message) !== undefined &&
         isEditEpoch(message.editEpoch) &&
         this.previews.acceptEditEpoch(document, webviewPanel, message.editEpoch)
       ) {
         try {
-          if (document.updateSelection(message.content, message.startByte, message.endByte)) {
+          if (document.updateSelections(message.content, parseEditorSelections(message)!)) {
             this.changeEmitter.fire({ document });
           }
           this.controller.noteUserActivity(document.session);
@@ -1000,38 +995,32 @@ export class InexCustomEditorProvider
     ) {
       throw new Error("Open an unlocked Umbra projection before adding a private annotation");
     }
-    const selection = document.currentSelection();
+    const selections = document.currentSelections();
     const renderMap = document.renderMap();
-    if (selection === undefined || renderMap === undefined) {
+    if (selections.length === 0 || renderMap === undefined) {
       throw new Error("Place the cursor in Markdown content before adding a private annotation");
     }
-    let resolvedSelection: EditorSelection | undefined = selection;
-    if (selection.startByte === selection.endByte) {
-      const selectionSnapshot = document.snapshot();
-      try {
-        resolvedSelection = emptySelectionRange(
-          selectionSnapshot.content,
-          selection.startByte,
-          noSelectionTarget,
-        );
-      } finally {
-        selectionSnapshot.content.fill(0);
-      }
-    }
-    if (resolvedSelection === undefined) {
+    const snapshot = document.snapshot();
+    let resolvedSelections: readonly EditorSelection[];
+    try {
+      resolvedSelections = selections.map((selection) => selection.startByte === selection.endByte
+        ? emptySelectionRange(snapshot.content, selection.startByte, noSelectionTarget)
+        : selection) as readonly EditorSelection[];
+    } catch (error) { snapshot.content.fill(0); throw error; }
+    if (resolvedSelections.some((selection) => selection === undefined)) {
+      snapshot.content.fill(0);
       throw new Error(
         noSelectionTarget === "reject"
           ? "Select Markdown content before adding a private annotation"
           : "Current Markdown target is empty or unavailable for private annotation",
       );
     }
-    const snapshot = document.snapshot();
     try {
       const sidecar = this.requireCurrentDocumentSession(document);
       const applied = await sidecar.applyUmbraAnnotation(
         document.logicalPath,
         { content: snapshot.content, etag: document.etag, metadata: document.metadata, renderMap },
-        [resolvedSelection],
+        resolvedSelections as readonly TextRange[],
         spec,
       );
       this.requireCurrentDocumentSession(document);
@@ -1052,10 +1041,10 @@ export class InexCustomEditorProvider
     ) {
       throw new Error("Open an unlocked Umbra projection before removing a private annotation");
     }
-    const selection = document.currentSelection();
+    const selections = document.currentSelections();
     const renderMap = document.renderMap();
-    if (selection === undefined || selection.startByte === selection.endByte || renderMap === undefined) {
-      throw new Error("Select one complete private annotation block before removing it");
+    if (selections.length === 0 || selections.some((selection) => selection.startByte === selection.endByte) || renderMap === undefined) {
+      throw new Error("Select complete private annotation blocks before removing them");
     }
     const snapshot = document.snapshot();
     try {
@@ -1063,7 +1052,7 @@ export class InexCustomEditorProvider
       const applied = await sidecar.removeUmbraAnnotation(
         document.logicalPath,
         { content: snapshot.content, etag: document.etag, metadata: document.metadata, renderMap },
-        [selection],
+        selections,
       );
       this.requireCurrentDocumentSession(document);
       document.replaceFromUmbraProjection(applied, applied.metadata);
@@ -1078,7 +1067,7 @@ export class InexCustomEditorProvider
     const document = this.requireActiveUmbraDocument();
     const selection = document.currentSelection();
     const renderMap = document.renderMap();
-    if (selection === undefined || renderMap === undefined) {
+    if (document.currentSelections().length !== 1 || selection === undefined || renderMap === undefined) {
       throw new Error("Place the cursor inside one private annotation to edit it");
     }
     const slot = privateSlotContaining(renderMap, selection);
@@ -1099,7 +1088,7 @@ export class InexCustomEditorProvider
     const document = this.requireActiveUmbraDocument();
     const selection = document.currentSelection();
     const renderMap = document.renderMap();
-    if (selection === undefined || renderMap === undefined) {
+    if (document.currentSelections().length !== 1 || selection === undefined || renderMap === undefined) {
       throw new Error("Place the cursor inside one private annotation to edit it");
     }
     const slot = privateSlotContaining(renderMap, selection);
@@ -1670,7 +1659,7 @@ function editorHtml(): string {
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}'; img-src blob:">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style nonce="${nonce}">html,body{box-sizing:border-box;width:100%;height:100%;margin:0}body{display:grid;grid-template-rows:auto minmax(10rem,1fr) auto;background:var(--vscode-editor-background)}nav{display:flex;gap:.4rem;padding:.35rem .6rem;border-bottom:1px solid var(--vscode-panel-border)}button{color:var(--vscode-button-foreground);background:var(--vscode-button-background);border:0;padding:.25rem .6rem}textarea{box-sizing:border-box;width:100%;height:100%;resize:none;border:0;padding:1rem;color:var(--vscode-editor-foreground);background:var(--vscode-editor-background);font:var(--vscode-editor-font-size) var(--vscode-editor-font-family);outline:none}#previews{display:flex;gap:.75rem;overflow:auto;max-height:40vh;padding:.6rem;border-top:1px solid var(--vscode-panel-border)}#previews[hidden]{display:none}figure{flex:0 0 auto;max-width:min(32rem,80vw);margin:0}figure img{display:block;max-width:100%;max-height:32vh}figcaption{overflow:hidden;margin-top:.25rem;color:var(--vscode-descriptionForeground);text-overflow:ellipsis;white-space:nowrap}.blocked{color:var(--vscode-descriptionForeground)}</style>
-</head><body><nav><button id="headings" type="button">Headings</button><button id="backlinks" type="button">Backlinks</button></nav><textarea id="editor" aria-label="Encrypted Markdown editor" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off"></textarea><section id="previews" aria-label="Validated encrypted image previews" hidden></section>
+</head><body><nav><button id="headings" type="button">Headings</button><button id="backlinks" type="button">Backlinks</button><button id="addRange" type="button">Add range</button><button id="clearRanges" type="button">Clear ranges</button></nav><textarea id="editor" aria-label="Encrypted Markdown editor" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off"></textarea><section id="previews" aria-label="Validated encrypted image previews" hidden></section>
 <script nonce="${nonce}">
 const vscode=acquireVsCodeApi();
 const editor=document.getElementById('editor');
@@ -1682,10 +1671,13 @@ let lastActivity=0;
 let previewGeneration=0;
 let previewSuspended=true;
 let editEpoch=0;
+let extraSelections=[];
 const transfers=new Map();
 const objectUrls=new Set();
 function byteIndex(text,target){let bytes=0,index=0;for(const scalar of text){if(bytes>=target)break;bytes+=encoder.encode(scalar).length;index+=scalar.length;}return index;}
 function byteOffset(text,target){return encoder.encode(text.slice(0,target)).length;}
+function currentRange(){return {startByte:byteOffset(editor.value,editor.selectionStart),endByte:byteOffset(editor.value,editor.selectionEnd)};}
+function sendSelection(){const current=currentRange(),seen=new Set(),selections=[];for(const range of [...extraSelections,current]){const key=range.startByte+':'+range.endByte;if(!seen.has(key)){seen.add(key);selections.push(range);}}vscode.postMessage({type:'selection',content:editor.value,selections,editEpoch});}
 function cancelEditTimer(){if(editTimer!==undefined){clearTimeout(editTimer);editTimer=undefined;}}
 function sendEdit(){cancelEditTimer();if(!applying)vscode.postMessage({type:'edit',content:editor.value,editEpoch});}
 function sendNavigation(type,offset){cancelEditTimer();vscode.postMessage({type,offset,content:editor.value,editEpoch});}
@@ -1714,11 +1706,13 @@ function jpegDimensions(b){let i=2,width=0,height=0,inScan=false;while(i<b.lengt
 function isWebP(b){return b.length>=12&&ascii(b,0,4)==='RIFF'&&ascii(b,8,4)==='WEBP'&&u32le(b,4)+8===b.length;}
 function webpDimensions(b){let i=12,index=0,flags=0,canvasWidth=0,canvasHeight=0,frameWidth=0,frameHeight=0,primaryType='',previous='',extended=false,iccp=false,alpha=false,exif=false,xmp=false;while(i+8<=b.length){const type=ascii(b,i,4),length=u32le(b,i+4),data=i+8,end=data+length,padded=end+(length&1);if(end>b.length||padded>b.length||(length&1)!==0&&b[end]!==0)return undefined;if(type==='ANIM'||type==='ANMF')return undefined;if(type==='VP8X'){if(index!==0||extended||length!==10||(b[data]&193)!==0||(b[data]&2)!==0||b[data+1]!==0||b[data+2]!==0||b[data+3]!==0)return undefined;extended=true;flags=b[data];canvasWidth=u24le(b,data+4)+1;canvasHeight=u24le(b,data+7)+1;if(!validRasterDimensions([canvasWidth,canvasHeight]))return undefined;}else if(type==='ICCP'){if(!extended||index!==1||iccp||primaryType!==''||(flags&32)===0)return undefined;iccp=true;}else if(type==='ALPH'){if(!extended||alpha||primaryType!==''||(flags&16)===0)return undefined;alpha=true;}else if(type==='VP8 '){if(primaryType!==''||!extended&&index!==0||alpha&&previous!=='ALPH'||extended&&(flags&16)!==0&&!alpha||length<10||b[data+3]!==157||b[data+4]!==1||b[data+5]!==42)return undefined;frameWidth=(b[data+6]+b[data+7]*256)&16383;frameHeight=(b[data+8]+b[data+9]*256)&16383;if(!validRasterDimensions([frameWidth,frameHeight]))return undefined;primaryType=type;}else if(type==='VP8L'){if(primaryType!==''||alpha||!extended&&index!==0||length<5||b[data]!==47)return undefined;frameWidth=1+b[data+1]+((b[data+2]&63)<<8);frameHeight=1+(b[data+2]>>6)+(b[data+3]<<2)+((b[data+4]&15)<<10);if(!validRasterDimensions([frameWidth,frameHeight]))return undefined;primaryType=type;}else if(type==='EXIF'){if(!extended||primaryType===''||exif||xmp||(flags&8)===0)return undefined;exif=true;}else if(type==='XMP '){if(!extended||primaryType===''||xmp||(flags&4)===0)return undefined;xmp=true;}else{return undefined;}previous=type;i=padded;index+=1;}if(i!==b.length||primaryType===''||extended&&(canvasWidth!==frameWidth||canvasHeight!==frameHeight||iccp!==((flags&32)!==0)||exif!==((flags&8)!==0)||xmp!==((flags&4)!==0)))return undefined;return [frameWidth,frameHeight];}
 editor.addEventListener('input',()=>{if(!applying){if(editEpoch>=Number.MAX_SAFE_INTEGER){suspendPreviews();return;}editEpoch+=1;suspendPreviews();const now=Date.now();if(now-lastActivity>=1000){lastActivity=now;vscode.postMessage({type:'activity'});}cancelEditTimer();editTimer=setTimeout(sendEdit,150);}});
-editor.addEventListener('select',()=>{if(!applying)vscode.postMessage({type:'selection',content:editor.value,startByte:byteOffset(editor.value,editor.selectionStart),endByte:byteOffset(editor.value,editor.selectionEnd),editEpoch});});
+editor.addEventListener('select',()=>{if(!applying)sendSelection();});
 editor.addEventListener('click',(event)=>{if(event.ctrlKey||event.metaKey)sendNavigation('followLink',editor.selectionStart);});
 editor.addEventListener('keydown',(event)=>{if((event.ctrlKey||event.metaKey)&&event.key==='Enter'){event.preventDefault();sendNavigation('followLink',editor.selectionStart);}});
 document.getElementById('headings').addEventListener('click',()=>sendNavigation('showHeadings',editor.selectionStart));
 document.getElementById('backlinks').addEventListener('click',()=>sendNavigation('showBacklinks',editor.selectionStart));
+document.getElementById('addRange').addEventListener('click',()=>{const range=currentRange();if(range.startByte===range.endByte)return;if(extraSelections.length<63)extraSelections.push(range);sendSelection();});
+document.getElementById('clearRanges').addEventListener('click',()=>{extraSelections=[];sendSelection();});
 window.addEventListener('message',(event)=>{const message=event.data;if(!message||typeof message!=='object')return;if(message.type==='content'&&typeof message.content==='string'&&typeof message.readOnly==='boolean'){cancelEditTimer();applying=true;editor.value=message.content;editor.readOnly=message.readOnly;applying=false;}else if(message.type==='reveal'&&Number.isSafeInteger(message.startByte)&&Number.isSafeInteger(message.endByte)){const start=byteIndex(editor.value,message.startByte);const end=byteIndex(editor.value,message.endByte);editor.focus();editor.setSelectionRange(start,end);}else if(message.type==='snapshotRequest'&&Number.isSafeInteger(message.requestId)){cancelEditTimer();vscode.postMessage({type:'snapshot',requestId:message.requestId,content:editor.value,editEpoch});}else if(message.type==='previewReset'){acceptPreviewReset(message);}else if(message.type==='assetStart'){acceptAssetStart(message);}else if(message.type==='assetChunk'){acceptAssetChunk(message);}else if(message.type==='assetEnd'){acceptAssetEnd(message);}else if(message.type==='assetRejected'&&!previewSuspended&&message.editEpoch===editEpoch&&message.generation===previewGeneration&&typeof message.logicalPath==='string'){if(typeof message.transferId==='string')rejectTransfer(message.transferId,false);blocked(message.logicalPath);}});
 window.addEventListener('beforeunload',suspendPreviews);
 vscode.postMessage({type:'ready',editEpoch});
@@ -1732,6 +1726,16 @@ function lockedHtml(): string {
 
 function mutationHtml(): string {
   return "<!doctype html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'\"></head><body><p>Inex is closing this encrypted document for an authenticated file operation.</p></body></html>";
+}
+
+function parseEditorSelections(value: Record<string, unknown>): readonly EditorSelection[] | undefined {
+  if (!Array.isArray(value.selections) || value.selections.length === 0 || value.selections.length > MAX_EDITOR_SELECTIONS) return undefined;
+  const selections: EditorSelection[] = [];
+  for (const item of value.selections) {
+    if (!isRecord(item) || typeof item.startByte !== "number" || typeof item.endByte !== "number" || !Number.isSafeInteger(item.startByte) || !Number.isSafeInteger(item.endByte)) return undefined;
+    selections.push({ startByte: item.startByte, endByte: item.endByte });
+  }
+  return selections;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
