@@ -45,6 +45,14 @@ pub struct RenderedPrivateSlot {
     pub projection_range: TextRange,
 }
 
+/// A plain-text segment that maps one-for-one between the editable projection
+/// and the authenticated Outer Markdown container.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RenderedOuterSegment {
+    pub projection_range: TextRange,
+    pub outer_range: TextRange,
+}
+
 /// Owned `RenderMap` representation used at the core/API boundary.
 ///
 /// The generation is a digest of the complete rendered projection. It is not
@@ -55,6 +63,7 @@ pub struct OwnedRenderMap {
     pub generation: [u8; 32],
     pub projection_len: usize,
     pub private_slots: Vec<RenderedPrivateSlot>,
+    pub outer_segments: Vec<RenderedOuterSegment>,
 }
 
 /// Fully rendered Umbra Markdown and its selection map.
@@ -87,12 +96,19 @@ pub fn render_umbra_projection(
 ) -> Result<RenderedUmbraProjection, UmbraRenderError> {
     let mut markdown = String::with_capacity(document.outer_markdown.len());
     let mut slots = Vec::with_capacity(document.slots.len());
+    let mut outer_segments = Vec::with_capacity(document.slots.len() + 1);
     let mut cursor = 0;
     let mut seen = BTreeSet::new();
 
     while let Some(relative_start) = document.outer_markdown[cursor..].find(MARKER_PREFIX) {
         let marker_start = cursor + relative_start;
-        markdown.push_str(&document.outer_markdown[cursor..marker_start]);
+        append_outer_segment(
+            &mut markdown,
+            &mut outer_segments,
+            &document.outer_markdown,
+            cursor,
+            marker_start,
+        )?;
         let id_start = marker_start + MARKER_PREFIX.len();
         let relative_end = document.outer_markdown[id_start..]
             .find(MARKER_SUFFIX)
@@ -121,7 +137,13 @@ pub fn render_umbra_projection(
         });
         cursor = id_end + MARKER_SUFFIX.len();
     }
-    markdown.push_str(&document.outer_markdown[cursor..]);
+    append_outer_segment(
+        &mut markdown,
+        &mut outer_segments,
+        &document.outer_markdown,
+        cursor,
+        document.outer_markdown.len(),
+    )?;
     if seen.len() != document.slots.len() || payloads.len() != document.slots.len() {
         return Err(UmbraRenderError::MarkerSlotMismatch);
     }
@@ -131,9 +153,57 @@ pub fn render_umbra_projection(
             generation,
             projection_len: markdown.len(),
             private_slots: slots,
+            outer_segments,
         },
         markdown,
     })
+}
+
+/// Map already-normalized plain projection ranges back to exact Outer
+/// Markdown ranges. A range must fit wholly inside exactly one plain segment.
+///
+/// # Errors
+///
+/// Returns [`UmbraRenderError::MixedPlainSelection`] when a range crosses a
+/// private block or otherwise cannot be represented as one Outer replacement.
+pub fn map_plain_ranges_to_outer(
+    render_map: &OwnedRenderMap,
+    ranges: &[TextRange],
+) -> Result<Vec<TextRange>, UmbraRenderError> {
+    let mut mapped = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        let segment = render_map
+            .outer_segments
+            .iter()
+            .find(|segment| {
+                range.start >= segment.projection_range.start
+                    && range.end <= segment.projection_range.end
+            })
+            .ok_or(UmbraRenderError::MixedPlainSelection)?;
+        let start = segment.outer_range.start + (range.start - segment.projection_range.start);
+        let end = segment.outer_range.start + (range.end - segment.projection_range.start);
+        mapped.push(TextRange::new(start, end)?);
+    }
+    Ok(mapped)
+}
+
+fn append_outer_segment(
+    output: &mut String,
+    segments: &mut Vec<RenderedOuterSegment>,
+    outer: &str,
+    start: usize,
+    end: usize,
+) -> Result<(), UmbraRenderError> {
+    if start == end {
+        return Ok(());
+    }
+    let projection_start = output.len();
+    output.push_str(&outer[start..end]);
+    segments.push(RenderedOuterSegment {
+        projection_range: TextRange::new(projection_start, output.len())?,
+        outer_range: TextRange::new(start, end)?,
+    });
+    Ok(())
 }
 
 /// Verify that every Outer marker names one slot and every slot has exactly
@@ -332,6 +402,8 @@ pub enum UmbraRenderError {
     MissingPrivatePayload,
     #[error("invalid Umbra private slot payload")]
     InvalidPrivatePayload,
+    #[error("plain selection crosses an Umbra private boundary")]
+    MixedPlainSelection,
 }
 
 #[cfg(test)]
@@ -380,6 +452,11 @@ mod tests {
         );
         let first = rendered.render_map.private_slots[0].projection_range;
         let second = rendered.render_map.private_slots[1].projection_range;
+        let before = TextRange::new(0, 6).expect("plain range");
+        assert_eq!(
+            map_plain_ranges_to_outer(&rendered.render_map, &[before]).expect("map outer"),
+            vec![TextRange::new(0, 6).expect("outer range")]
+        );
         assert_eq!(
             normalize_and_classify_selections(
                 &rendered.markdown,
@@ -426,6 +503,7 @@ mod tests {
             generation: [0; 32],
             projection_len: 1,
             private_slots: Vec::new(),
+            outer_segments: Vec::new(),
         };
         assert!(matches!(
             normalize_and_classify_selections(
