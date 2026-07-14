@@ -531,3 +531,4 @@
 - Sublime tests 不是 Python package 安装模式；从 repo root 执行时必须指定 `PYTHONPATH=editors/sublime`。否则 `inex_rpc` 等插件同级模块无法被 unittest discover 导入，属于 test invocation 环境错误而非插件代码回归。
 - Sublime 的 Umbra mutation client 必须同时把 projection byte buffer、ciphertext ETag、完整 RenderMap 作为一个认证输入边界；不能由 UI 根据 fenced marker 推导 slot ID 或重新构造 map。响应 generation 应 canonical decode 为精确 32 bytes 后立即清零临时缓冲；客户端仅保留可再次序列化的 canonical text form。
 - Release lifecycle harness 的 process-containment assertions 以 Linux pidfd/subreaper 为硬安全前提；当前环境缺失该能力时必须 fail closed，不能降级为普通 process-group kill 或将未执行的 assertions计入发布证据。Python release tests 从 repo root 运行需显式 `PYTHONPATH=scripts`。
+- Sublime 的 Umbra lock 是 `K_umbra` 生命周期操作，不能复用 vault lock：它必须只丢弃 daemon 的 Umbra session，Outer tree/session 保持可用。客户端必须拒绝 `initialized: false, unlocked: true` 这类逻辑不可能的 status，防止 host UI 在无密钥状态展示私密操作。

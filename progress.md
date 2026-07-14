@@ -1011,3 +1011,8 @@
 - 验证：`pnpm --dir editors/vscode check && pnpm --dir editors/vscode test && pnpm --dir editors/vscode build` 全部通过，测试为 57/57。发布工具必须从仓库根目录以 `PYTHONPATH=scripts python3 -m unittest discover -s scripts/tests -p 'test_*release*.py' -v` 运行；省略 PYTHONPATH 的首次启动仅发生模块导入错误，未作为产品回归。
 - 正确启动的 release tests 为 58/61；3 项依赖 Linux pidfd/subreaper descendant-control 的 lifecycle gate 在当前容器以 `Linux pidfd descendant control is unavailable` fail closed。该宿主缺少 required capability，不能把当前机的结果升级为 release evidence；后续需在具备 pidfd gate 的 clean release host 重新跑 package/audit/smoke。
 - 本机在 isolated `CARGO_TARGET_DIR=target/current-demo-HEAD/native-target` 成功生成最新 `inex`/`inexd`，但 `package_release.py` 按设计拒绝其 xlings ELF interpreter（`/home/horeb/.xlings/subos/default/lib/ld-linux-x86-64.so.2`），不是 portable Linux release artifact。不得绕过 audit；需要使用 system GCC/glibc release host 重建后再 package/audit/smoke。
+
+## 2026-07-15 — Sublime 独立 Umbra keyslot 会话
+
+- 提交 `5069253`（`feat(sublime): manage independent Umbra keyslot`）：strict client 增加 `umbra.initialize`、`umbra.unlock`、`umbra.enable` 与 `umbra.lock`。初始化/解锁只发送当前 Outer session 和一次密码；lock 仅要求 `{ok: true, unlocked: false}`，不会锁定 Outer vault。
+- 认证响应要求 initialized/unlocked 逻辑一致，所有 status、durability、精确字段形状和密码长度均在 host 前验证；不一致或异常协议响应终止 sidecar session。验证：定向 RPC 26/26、Python compile、diff-check 通过。下一步将此会话接入 Sublime command/UI 并在锁定时清空 picker state。
