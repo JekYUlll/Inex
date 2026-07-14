@@ -2136,6 +2136,49 @@ mod tests {
             Some(1)
         );
         assert_ne!(annotated["result"]["etag"], base_etag);
+        let annotated_etag = annotated["result"]["etag"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        let annotated_projection = annotated["result"]["contentBase64"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        let annotated_render_map = annotated["result"]["renderMap"].clone();
+        let private_slot = annotated_render_map["privateSlots"]
+            .as_array()
+            .and_then(|slots| slots.first())
+            .unwrap_or_else(|| panic!("annotation response must contain one private slot"));
+        let private_start = private_slot["startByte"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("private slot start must be an integer"));
+        let private_end = private_slot["endByte"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("private slot end must be an integer"));
+        let mut unwrapped = response(
+            &mut service,
+            62,
+            "umbra.annotation.remove",
+            json!({
+                "session": session.as_str(),
+                "logicalPath": "private.md",
+                "ifMatch": annotated_etag,
+                "contentBase64": annotated_projection,
+                "renderMap": annotated_render_map,
+                "selections": [{"startByte": private_start, "endByte": private_end}],
+                "mergeAdjacent": false,
+            }),
+        );
+        assert_eq!(
+            unwrapped["result"]["contentBase64"],
+            encode_base64url(b"private outer text\\n").as_str()
+        );
+        assert!(
+            unwrapped["result"]["renderMap"]["privateSlots"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+        );
+        scrub_object(&mut unwrapped);
         scrub_object(&mut annotated);
         let disk = fs::read(directory.path().join("private.md.enc"))
             .unwrap_or_else(|error| panic!("read encrypted Umbra document failed: {error}"));

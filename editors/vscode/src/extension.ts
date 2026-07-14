@@ -414,7 +414,10 @@ async function applyChosenPrivateAnnotation(
     throw new Error("Private annotation profile is unavailable");
   }
   let coverText: string | undefined;
-  if (profile?.promptForCover === true) {
+  // A Cover outer strategy is structurally invalid without public cover text.
+  // Prompt regardless of a malformed/legacy profile's promptForCover flag so
+  // profile application cannot construct a request that the daemon must reject.
+  if (profile?.outer === "cover") {
     coverText = await showSensitiveInputBox(
       {
         ignoreFocusOut: true,
