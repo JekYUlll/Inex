@@ -1122,3 +1122,8 @@
 
 - 新增 `editors/neovim` runtime plugin。Lua `rpc` 模块只启动 absolute regular `inexd`、使用 bounded Content-Length JSON-RPC framing、绑定 pending request callbacks，并在 stdout/protocol/process failure 时清理；插件提供 `:InexStart`、`:InexStatus`、`:InexStop`，`system.hello` 发送 frozen `client/clientVersion/protocolMajor` 参数。
 - 以本机 Neovim 0.12 headless 和当前 system-GCC `inexd` 做真实 start→hello→status→stop smoke，两次返回 `Inex sidecar is ready`。该切片不处理密码、明文 buffer、Outer/Umbra 或 `.inex` 文件；这些必须通过后续同一 authenticated session/RenderMap API 实现，并先完成 Neovim host residue gate。
+
+## 2026-07-15 — Neovim Outer read-only buffer skeleton
+
+- Neovim 插件新增 `:InexUnlock`/`:InexLock`/`:InexOpen`。unlock 只发送 `vault.unlock` 给 daemon；open 只接受普通 feature 0/1 Markdown response，创建 unlisted scratch buffer，禁用 swap/undo persistence/modeline、设为 wipe-on-hide 和只读，并在 BufWipeout/lock 时关闭 daemon document handle。feature-2/Umbra response 明确拒绝。
+- headless regression 首次暴露 Lua lexical-scope bug（`HELLO_PARAMS` 在 helper 定义后声明而被解析为 global nil）；移动声明后真实 `inexd` handshake 再次通过。此 slice 不实现保存或可编辑 buffer，且 `inputsecret`/cmdline、shada、LSP、第三方插件仍是未闭合宿主残留边界。
