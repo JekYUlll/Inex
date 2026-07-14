@@ -111,7 +111,9 @@ Phase 6 extension — 现有 Markdown Git 仓库与加密附件迁移（Phase 7 
           - [ ] 将held `.git/index`、canonical config、authenticated `vault.json`、16 KiB object batch与同一physical IDs交叉绑定，并形成可直接输入candidate seal的统一aggregate
             - [x] 生产tracked collector只从同一held root读取固定`.git/index`，snapshot永久绑定同一physical manifest，并以completed runtime object proof限制aggregate投影（`52d7500`）
             - [x] 以isolated stdin-only Git parser绑定held `.git/config`，并把held `vault.json`摘要绑定authenticated `Vault::config_etag()`与content profile（`fb58808`）
-            - [ ] 在existing-only mutation lock窗口内部重新构造全部runtime/auth/content证据、最终whole-tree exact revalidation，并返回不可Clone/Copy且继续持锁的`InitialCandidateAuthority`；不得接受锁外预制proof
+            - [ ] 在existing-only mutation lock窗口内部重新构造全部runtime/auth/content证据、最终whole-tree exact revalidation，并保持同一fresh-audited Vault生产接线
+              - [x] 返回不可Clone/Copy且继续持锁的owned `InitialCandidateAuthority`；构造器内部创建全部proof且不接受锁外预制proof（`3205a49`）
+              - [ ] CLI以不可Clone的`IndependentlyAuditedVault`延长fresh unlock+逐envelope/source审计owner生命周期；v2接线必须整体替换旧v1 publisher，禁止串联两套marker/lock
       - [ ] 实现held-marker owner、完整live/fresh九段collector、v2 claim创建/发布/reconcile状态机与终态输出
   - [ ] 完成repository import构造/durability/publication每一边界的Linux force-kill、hostile same-UID source/target race、artifact-bound residue与原生Windows矩阵
 - **Status:** in_progress（用户实测驱动的迁移/附件扩展；原Markdown-only实现仍保持已验证基线）
