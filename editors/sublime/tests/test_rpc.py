@@ -24,6 +24,7 @@ from inex_rpc import (
     _expect_session_token,
     _read_pipe_once,
     decode_base64url,
+    encode_base64url,
     encode_request,
     resolve_sidecar,
     response_result,
@@ -408,6 +409,77 @@ class RequestAndResponseTests(unittest.TestCase):
         )
         self.assertEqual(content, bytearray(b"recovered"))
         self.assertEqual(base_etag, "sha256:" + "1" * 64)
+
+    def test_umbra_projection_and_annotation_mutation_are_strict(self):
+        client = InexRpcClient("/unused")
+        client._session = "A" * SESSION_TOKEN_TEXT_BYTES
+        etag = "sha256:" + "1" * 64
+        next_etag = "sha256:" + "2" * 64
+        metadata = {
+            "fileId": "00000000-0000-4000-8000-000000000000",
+            "logicalPath": "today.md",
+            "createdAt": 1,
+            "modifiedAt": 2,
+            "flags": 2,
+        }
+        content = bytearray(b"public\n")
+        render_map = {
+            "generationBase64": encode_base64url(bytearray(32), 32),
+            "projectionBytes": len(content),
+            "privateSlots": [],
+            "outerSegments": [{
+                "projectionStartByte": 0,
+                "projectionEndByte": len(content),
+                "outerStartByte": 0,
+                "outerEndByte": len(content),
+            }],
+        }
+        calls = []
+
+        def call(method, params):
+            calls.append((method, params))
+            if method == "umbra.document.open":
+                return {
+                    "contentBase64": encode_base64url(content, 1024),
+                    "etag": etag,
+                    "metadata": metadata,
+                    "renderMap": render_map,
+                }
+            if method == "umbra.annotation.apply":
+                return {
+                    "contentBase64": encode_base64url(content, 1024),
+                    "etag": next_etag,
+                    "metadata": metadata,
+                    "durability": "synced",
+                    "renderMap": render_map,
+                }
+            self.fail("unexpected RPC method: %s" % method)
+
+        client._call_raw = call
+        opened, opened_etag, opened_map = client.open_umbra_document("today.md")
+        result, result_etag, result_map, durability = client.apply_private_annotation(
+            "today.md", opened, opened_etag, opened_map,
+            [{"startByte": 0, "endByte": len(opened)}],
+            {"kind": "comment", "tagIds": ["comment-content"], "outer": {"mode": "drop"}},
+        )
+        self.assertEqual(result, content)
+        self.assertEqual(result_etag, next_etag)
+        self.assertEqual(result_map, render_map)
+        self.assertEqual(durability, "synced")
+        self.assertEqual(calls[1][1]["renderMap"], render_map)
+        self.assertEqual(calls[1][1]["selections"], [{"startByte": 0, "endByte": len(content)}])
+
+        invalid = InexRpcClient("/unused")
+        invalid._session = "A" * SESSION_TOKEN_TEXT_BYTES
+        invalid._call_raw = lambda method, params: {
+            "contentBase64": encode_base64url(content, 1024),
+            "etag": etag,
+            "metadata": metadata,
+            "renderMap": dict(render_map, generationBase64="AA"),
+        }
+        with self.assertRaises(RpcProtocolError):
+            invalid.open_umbra_document("today.md")
+        self.assertIsInstance(invalid._terminal_error, RpcProtocolError)
 
 
 class SidecarResolutionTests(unittest.TestCase):

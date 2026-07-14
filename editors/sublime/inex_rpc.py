@@ -24,6 +24,7 @@ MAX_STDERR_BYTES = 64 * 1024
 MAX_PIPE_READ_BYTES = 64 * 1024
 MAX_DOCUMENT_BYTES = 16 * 1024 * 1024
 MAX_DRAFT_BYTES = MAX_DOCUMENT_BYTES + 12 + 4096 + 16
+MAX_UMBRA_MAP_ENTRIES = 100000
 SESSION_TOKEN_TEXT_BYTES = 43
 DOCUMENT_HANDLE_TEXT_BYTES = 22
 REQUEST_TIMEOUT_SECONDS = 120.0
@@ -590,29 +591,100 @@ class InexRpcClient:
             content = decode_base64url(result.get("contentBase64"), MAX_DOCUMENT_BYTES)
             etag = _expect_etag(result.get("etag"))
             _validate_metadata(result.get("metadata"), logical_path, (2,))
-            render_map = result.get("renderMap")
-            if not isinstance(render_map, dict) or set(render_map) != {"generationBase64", "projectionBytes", "privateSlots", "outerSegments"}:
-                raise RpcProtocolError("RPC Umbra render map is invalid")
-            if not isinstance(render_map["privateSlots"], list) or not isinstance(render_map["outerSegments"], list):
-                raise RpcProtocolError("RPC Umbra render map is invalid")
-            if not isinstance(render_map["projectionBytes"], int) or render_map["projectionBytes"] != len(content):
-                raise RpcProtocolError("RPC Umbra render map projection is invalid")
-            if not isinstance(render_map["generationBase64"], str):
-                raise RpcProtocolError("RPC Umbra render map generation is invalid")
-            for slot in render_map["privateSlots"]:
-                if not isinstance(slot, dict) or set(slot) != {"slotId", "startByte", "endByte"} or not isinstance(slot.get("slotId"), str):
-                    raise RpcProtocolError("RPC Umbra private slot is invalid")
-                if any(isinstance(slot[key], bool) or not isinstance(slot[key], int) for key in ("startByte", "endByte")) or slot["startByte"] >= slot["endByte"] or slot["endByte"] > len(content):
-                    raise RpcProtocolError("RPC Umbra private slot range is invalid")
-            for segment in render_map["outerSegments"]:
-                if not isinstance(segment, dict) or set(segment) != {"projectionStartByte", "projectionEndByte", "outerStartByte", "outerEndByte"}:
-                    raise RpcProtocolError("RPC Umbra outer segment is invalid")
-                values = [segment[key] for key in ("projectionStartByte", "projectionEndByte", "outerStartByte", "outerEndByte")]
-                if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in values) or values[0] >= values[1] or values[1] > len(content) or values[2] > values[3]:
-                    raise RpcProtocolError("RPC Umbra outer segment range is invalid")
+            render_map = _parse_umbra_render_map(result.get("renderMap"), len(content))
             return content, etag, render_map
         except RpcProtocolError as error:
             wipe(content)
+            self._terminate_protocol(error)
+
+    def apply_private_annotation(
+        self,
+        logical_path: str,
+        content: bytearray,
+        etag: str,
+        render_map: Dict[str, Any],
+        selections: List[Dict[str, int]],
+        spec: Dict[str, Any],
+        merge_adjacent: bool = False,
+    ) -> Tuple[bytearray, str, Dict[str, Any], str]:
+        """Atomically wrap only ranges authenticated by the returned RenderMap."""
+        return self._mutate_private_annotation(
+            "umbra.annotation.apply", logical_path, content, etag, render_map,
+            selections, spec, merge_adjacent,
+        )
+
+    def edit_private_annotation(
+        self,
+        logical_path: str,
+        content: bytearray,
+        etag: str,
+        render_map: Dict[str, Any],
+        selections: List[Dict[str, int]],
+        spec: Dict[str, Any],
+        merge_adjacent: bool = False,
+    ) -> Tuple[bytearray, str, Dict[str, Any], str]:
+        """Atomically edit metadata for ranges authenticated by the returned RenderMap."""
+        return self._mutate_private_annotation(
+            "umbra.annotation.edit", logical_path, content, etag, render_map,
+            selections, spec, merge_adjacent,
+        )
+
+    def remove_private_annotations(
+        self,
+        logical_path: str,
+        content: bytearray,
+        etag: str,
+        render_map: Dict[str, Any],
+        selections: List[Dict[str, int]],
+        merge_adjacent: bool = False,
+    ) -> Tuple[bytearray, str, Dict[str, Any], str]:
+        """Atomically unwrap complete private slots authenticated by the RenderMap."""
+        return self._mutate_private_annotation(
+            "umbra.annotation.remove", logical_path, content, etag, render_map,
+            selections, None, merge_adjacent,
+        )
+
+    def _mutate_private_annotation(
+        self,
+        method: str,
+        logical_path: str,
+        content: bytearray,
+        etag: str,
+        render_map: Dict[str, Any],
+        selections: List[Dict[str, int]],
+        spec: Optional[Dict[str, Any]],
+        merge_adjacent: bool,
+    ) -> Tuple[bytearray, str, Dict[str, Any], str]:
+        if not isinstance(content, bytearray):
+            raise RpcProtocolError("Umbra projection is invalid")
+        if not isinstance(merge_adjacent, bool):
+            raise RpcProtocolError("Umbra merge option is invalid")
+        params = dict(
+            self._protected_params(),
+            logicalPath=logical_path,
+            ifMatch=_expect_etag(etag),
+            contentBase64=encode_base64url(content, MAX_DOCUMENT_BYTES),
+            renderMap=_parse_umbra_render_map(render_map, len(content)),
+            selections=_serialize_umbra_selections(selections, len(content)),
+            mergeAdjacent=merge_adjacent,
+        )
+        if spec is not None:
+            params["spec"] = _serialize_private_annotation_spec(spec)
+        next_content = bytearray()
+        try:
+            result = _expect_exact_object(
+                self._call_raw(method, params),
+                {"etag", "metadata", "durability", "contentBase64", "renderMap"},
+                "Umbra annotation result",
+            )
+            next_content = decode_base64url(result.get("contentBase64"), MAX_DOCUMENT_BYTES)
+            next_etag = _expect_etag(result.get("etag"))
+            _validate_metadata(result.get("metadata"), logical_path, (2,))
+            durability = _expect_durability(result.get("durability"), "Umbra annotation")
+            next_map = _parse_umbra_render_map(result.get("renderMap"), len(next_content))
+            return next_content, next_etag, next_map, durability
+        except RpcProtocolError as error:
+            wipe(next_content)
             self._terminate_protocol(error)
 
     def write_document(
@@ -1186,6 +1258,151 @@ def _expect_durability(value: Any, operation: str) -> str:
     if value not in ("synced", "notSynced"):
         raise RpcProtocolError("RPC %s durability is invalid" % operation)
     return value
+
+
+def _expect_umbra_range(value: Any, name: str, maximum: int) -> Dict[str, int]:
+    if not isinstance(value, dict) or set(value) != {"startByte", "endByte"}:
+        raise RpcProtocolError("RPC %s is invalid" % name)
+    start = value.get("startByte")
+    end = value.get("endByte")
+    if (
+        isinstance(start, bool)
+        or isinstance(end, bool)
+        or not isinstance(start, int)
+        or not isinstance(end, int)
+        or start < 0
+        or end <= start
+        or end > maximum
+    ):
+        raise RpcProtocolError("RPC %s is invalid" % name)
+    return {"startByte": start, "endByte": end}
+
+
+def _parse_umbra_render_map(value: Any, projection_bytes: int) -> Dict[str, Any]:
+    """Validate and normalize a daemon-supplied or client-resubmitted map."""
+    if (
+        isinstance(projection_bytes, bool)
+        or not isinstance(projection_bytes, int)
+        or projection_bytes < 0
+        or projection_bytes > MAX_DOCUMENT_BYTES
+    ):
+        raise RpcProtocolError("RPC Umbra projection length is invalid")
+    render_map = _expect_exact_object(
+        value,
+        {"generationBase64", "projectionBytes", "privateSlots", "outerSegments"},
+        "Umbra render map",
+    )
+    if render_map.get("projectionBytes") != projection_bytes:
+        raise RpcProtocolError("RPC Umbra render map projection is invalid")
+    generation = decode_base64url(render_map.get("generationBase64"), 32)
+    try:
+        if len(generation) != 32:
+            raise RpcProtocolError("RPC Umbra render map generation is invalid")
+    finally:
+        wipe(generation)
+    slots = render_map.get("privateSlots")
+    segments = render_map.get("outerSegments")
+    if (
+        not isinstance(slots, list)
+        or not isinstance(segments, list)
+        or len(slots) > MAX_UMBRA_MAP_ENTRIES
+        or len(segments) > MAX_UMBRA_MAP_ENTRIES
+    ):
+        raise RpcProtocolError("RPC Umbra render map exceeds the client limit")
+    normalized_slots = []
+    seen_slot_ids = set()
+    previous_end = 0
+    for slot in slots:
+        if not isinstance(slot, dict) or set(slot) != {"slotId", "startByte", "endByte"}:
+            raise RpcProtocolError("RPC Umbra private slot is invalid")
+        slot_id = _expect_bounded_string(slot.get("slotId"), "Umbra slot id", 64)
+        if slot_id in seen_slot_ids:
+            raise RpcProtocolError("RPC Umbra private slots are duplicated")
+        item = _expect_umbra_range(slot, "Umbra private slot range", projection_bytes)
+        if item["startByte"] < previous_end:
+            raise RpcProtocolError("RPC Umbra private slot ranges overlap")
+        seen_slot_ids.add(slot_id)
+        previous_end = item["endByte"]
+        normalized_slots.append(dict(item, slotId=slot_id))
+    normalized_segments = []
+    previous_projection_end = 0
+    previous_outer_end = 0
+    for segment in segments:
+        if not isinstance(segment, dict) or set(segment) != {
+            "projectionStartByte", "projectionEndByte", "outerStartByte", "outerEndByte"
+        }:
+            raise RpcProtocolError("RPC Umbra outer segment is invalid")
+        projection_range = _expect_umbra_range(
+            {"startByte": segment.get("projectionStartByte"), "endByte": segment.get("projectionEndByte")},
+            "Umbra projection segment", projection_bytes,
+        )
+        outer_start = segment.get("outerStartByte")
+        outer_end = segment.get("outerEndByte")
+        if (
+            isinstance(outer_start, bool)
+            or isinstance(outer_end, bool)
+            or not isinstance(outer_start, int)
+            or not isinstance(outer_end, int)
+            or outer_start < 0
+            or outer_end < outer_start
+            or projection_range["startByte"] < previous_projection_end
+            or outer_start < previous_outer_end
+        ):
+            raise RpcProtocolError("RPC Umbra outer segment range is invalid")
+        previous_projection_end = projection_range["endByte"]
+        previous_outer_end = outer_end
+        normalized_segments.append({
+            "projectionStartByte": projection_range["startByte"],
+            "projectionEndByte": projection_range["endByte"],
+            "outerStartByte": outer_start,
+            "outerEndByte": outer_end,
+        })
+    return {
+        "generationBase64": render_map["generationBase64"],
+        "projectionBytes": projection_bytes,
+        "privateSlots": normalized_slots,
+        "outerSegments": normalized_segments,
+    }
+
+
+def _serialize_umbra_selections(value: Any, projection_bytes: int) -> List[Dict[str, int]]:
+    if not isinstance(value, list) or not value or len(value) > MAX_UMBRA_MAP_ENTRIES:
+        raise RpcProtocolError("Umbra selections are invalid")
+    return [
+        _expect_umbra_range(item, "Umbra selection", projection_bytes)
+        for item in value
+    ]
+
+
+def _serialize_private_annotation_spec(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {"kind", "tagIds", "outer"}:
+        raise RpcProtocolError("Umbra annotation spec is invalid")
+    kind = value.get("kind")
+    tag_ids = value.get("tagIds")
+    outer = value.get("outer")
+    if kind not in ("block", "comment") or not isinstance(tag_ids, list):
+        raise RpcProtocolError("Umbra annotation spec is invalid")
+    if len(tag_ids) > MAX_UMBRA_MAP_ENTRIES:
+        raise RpcProtocolError("Umbra annotation tags exceed the client limit")
+    normalized_tags = []
+    for tag_id in tag_ids:
+        if not isinstance(tag_id, str) or not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", tag_id):
+            raise RpcProtocolError("Umbra annotation tag is invalid")
+        normalized_tags.append(tag_id)
+    if normalized_tags != sorted(set(normalized_tags)):
+        raise RpcProtocolError("Umbra annotation tags are not canonical")
+    if not isinstance(outer, dict) or set(outer) not in ({"mode"}, {"mode", "coverText"}):
+        raise RpcProtocolError("Umbra annotation outer strategy is invalid")
+    mode = outer.get("mode")
+    cover_text = outer.get("coverText")
+    if mode not in ("drop", "cover", "placeholder") or (mode == "cover") != ("coverText" in outer):
+        raise RpcProtocolError("Umbra annotation outer strategy is invalid")
+    if mode == "cover":
+        cover_text = _expect_bounded_string(cover_text, "Umbra cover text", MAX_DOCUMENT_BYTES)
+    result = {"kind": kind, "tagIds": normalized_tags, "outer": {"mode": mode}}
+    if mode == "cover":
+        result["outer"]["coverText"] = cover_text
+    return result
 
 
 def _validate_metadata(value: Any, logical_path: str, allowed_flags: tuple) -> None:
