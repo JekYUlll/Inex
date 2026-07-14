@@ -1,0 +1,14 @@
+[
+  {
+    "keys": ["ctrl+alt+/"],
+    "command": "inex_toggle_private_annotation"
+  },
+  {
+    "keys": ["ctrl+alt+shift+/"],
+    "command": "inex_choose_private_annotation"
+  },
+  {
+    "keys": ["ctrl+alt+h"],
+    "command": "inex_choose_private_annotation"
+  }
+]

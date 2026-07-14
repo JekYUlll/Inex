@@ -52,6 +52,10 @@
     "command": "inex_enter_umbra_mode"
   },
   {
+    "caption": "Inex: Toggle Private Annotation",
+    "command": "inex_toggle_private_annotation"
+  },
+  {
     "caption": "Inex: Choose Private Annotation",
     "command": "inex_choose_private_annotation"
   },

@@ -33,10 +33,12 @@ from release_common import (
 
 SUBLIME_PACKAGE_FILES = (
     ".python-version",
+    "Default (Linux).sublime-keymap",
     "Inex.py",
     "Inex.sublime-settings",
     "Main.sublime-commands",
     "README.md",
+    "inex_annotation.py",
     "inex_core.py",
     "inex_markdown.py",
     "inex_password.py",

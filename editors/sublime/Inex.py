@@ -2173,6 +2173,56 @@ def _edit_private_annotation_from_active_view(window: sublime.Window) -> None:
     sublime.set_timeout_async(load_picker, 0)
 
 
+def _toggle_private_annotation_from_active_view(window: sublime.Window) -> None:
+    """Route a comment-like command using only the authenticated RenderMap."""
+    view = window.active_view()
+    document = _registry.get(view.id()) if view is not None else None
+    if view is None or document is None:
+        _show_error(ModelError("An active Inex document is required"))
+        return
+    if not document.is_umbra or document.dirty or document.read_only:
+        _show_error(ModelError("Enter a clean unlocked Umbra projection before toggling"))
+        return
+    render_map = document.umbra_render_map
+    if render_map is None:
+        _show_error(ModelError("Umbra projection is unavailable"))
+        return
+    try:
+        selections = []
+        for region in view.sel():
+            start = len(view.substr(sublime.Region(0, region.begin())).encode("utf-8"))
+            end = len(view.substr(sublime.Region(0, region.end())).encode("utf-8"))
+            selections.append({"startByte": start, "endByte": end})
+        if not selections or len(selections) > 64:
+            raise ModelError("Private annotation selections are invalid")
+        slots = render_map["privateSlots"]
+        complete = [any(
+            selection["startByte"] == slot["startByte"]
+            and selection["endByte"] == slot["endByte"]
+            for slot in slots
+        ) for selection in selections]
+        if all(complete):
+            _remove_private_annotation_from_active_view(window)
+            return
+        if len(selections) == 1 and any(
+            selections[0]["startByte"] >= slot["startByte"]
+            and selections[0]["endByte"] <= slot["endByte"]
+            for slot in slots
+        ):
+            _edit_private_annotation_from_active_view(window)
+            return
+        for selection in selections:
+            for slot in slots:
+                if selection["startByte"] < slot["endByte"] and selection["endByte"] > slot["startByte"]:
+                    raise ModelError("Mixed private and ordinary selections cannot be toggled")
+        if any(selection["startByte"] == selection["endByte"] for selection in selections):
+            raise ModelError("Select Markdown before applying a private annotation")
+    except Exception as error:
+        _show_error(error)
+        return
+    _apply_private_annotation_from_active_view(window)
+
+
 def _remove_private_annotation_from_active_view(window: sublime.Window) -> None:
     """Ask for confirmation, then let inexd unwrap complete authenticated slots."""
     view = window.active_view()
@@ -2803,6 +2853,11 @@ class InexEnterUmbraModeCommand(sublime_plugin.WindowCommand):
 class InexChoosePrivateAnnotationCommand(sublime_plugin.WindowCommand):
     def run(self) -> None:
         _apply_private_annotation_from_active_view(self.window)
+
+
+class InexTogglePrivateAnnotationCommand(sublime_plugin.WindowCommand):
+    def run(self) -> None:
+        _toggle_private_annotation_from_active_view(self.window)
 
 
 class InexEditPrivateAnnotationCommand(sublime_plugin.WindowCommand):

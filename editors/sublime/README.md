@@ -86,6 +86,19 @@ replace, close, lock, and failure paths.
   plugin-owned dirty documents exist, then closes handles, locks the capability
   session, and shuts the child down.
 
+After unlocking Umbra and entering an active document into Umbra mode, the
+Linux default keymap contributes normal Sublime-configurable bindings:
+
+- `Ctrl+Alt+/` — **Inex: Toggle Private Annotation**. Complete private blocks
+  request removal confirmation; a cursor inside one opens metadata edit; plain
+  selected Markdown opens the annotation picker.
+- `Ctrl+Alt+Shift+/` and `Ctrl+Alt+H` — **Inex: Choose Private Annotation**.
+
+These are ordinary `.sublime-keymap` contributions. Rebind or remove them in a
+user keymap; the plugin does not intercept raw keyboard events. All resulting
+mutation requests remain authenticated by the daemon with the current Umbra
+projection, ETag, and RenderMap.
+
 Opening a document creates `window.new_file()`, calls `set_scratch(true)`
 **before** insertion, leaves `view.file_name()` unset, and then inserts the
 decoded Markdown. Logical path, document handle, etag, content, saved version,
