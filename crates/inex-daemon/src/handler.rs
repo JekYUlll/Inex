@@ -154,6 +154,7 @@ impl<C: MonotonicClock> RpcService<C> {
             Method::UmbraDocumentOpen => self.umbra_document_open(params),
             Method::UmbraDocumentConvert => self.umbra_document_convert(params),
             Method::UmbraAnnotationApply => self.umbra_annotation_apply(params),
+            Method::UmbraAnnotationEdit => self.umbra_annotation_edit(params),
             Method::UmbraAnnotationRemove => self.umbra_annotation_remove(params),
             Method::UmbraConfigGet => self.umbra_config_get(params),
             Method::VaultListTree => self.vault_list_tree(params),
@@ -530,6 +531,43 @@ impl<C: MonotonicClock> RpcService<C> {
                 projection,
                 &render_map,
                 &selections,
+                merge_adjacent,
+                unix_time_ms()?,
+            )
+            .map_err(|error| map_vault_error(error, ErrorContext::Document))?;
+        Ok(json!({
+            "etag": applied.document.etag,
+            "metadata": header_metadata_value(&applied.document.header),
+            "durability": durability_name(applied.document.parent_sync),
+            "contentBase64": encode_base64url(applied.projection.markdown.as_bytes()).as_str(),
+            "renderMap": render_map_value(&applied.projection.render_map),
+        }))
+    }
+
+    fn umbra_annotation_edit(&mut self, params: Params) -> RpcResult {
+        let mut params = ParamObject::new(params);
+        let session = required_session(&mut params)?;
+        let logical_path = params.required_logical_path("logicalPath")?;
+        let expected_etag = params.required_etag("ifMatch")?;
+        let projection = params.required_base64url("contentBase64", MAX_PLAINTEXT_LEN)?;
+        let render_map = parse_render_map(&mut params)?;
+        let selections = parse_text_ranges(&mut params, "selections")?;
+        let spec = parse_private_annotation_spec(&mut params)?;
+        let merge_adjacent = params.optional_bool("mergeAdjacent")?.unwrap_or(false);
+        params.finish()?;
+        let projection = std::str::from_utf8(projection.as_slice())
+            .map_err(|_| ErrorObject::new(ErrorCode::InvalidParams))?;
+        let applied = self
+            .sessions
+            .vault_mut(session.as_str())
+            .map_err(map_session_error)?
+            .edit_private_annotation(
+                &logical_path,
+                expected_etag.as_str(),
+                projection,
+                &render_map,
+                &selections,
+                &spec,
                 merge_adjacent,
                 unix_time_ms()?,
             )
@@ -2136,15 +2174,15 @@ mod tests {
             Some(1)
         );
         assert_ne!(annotated["result"]["etag"], base_etag);
-        let annotated_etag = annotated["result"]["etag"]
+        let mut annotated_etag = annotated["result"]["etag"]
             .as_str()
             .unwrap_or_default()
             .to_owned();
-        let annotated_projection = annotated["result"]["contentBase64"]
+        let mut annotated_projection = annotated["result"]["contentBase64"]
             .as_str()
             .unwrap_or_default()
             .to_owned();
-        let annotated_render_map = annotated["result"]["renderMap"].clone();
+        let mut annotated_render_map = annotated["result"]["renderMap"].clone();
         let private_slot = annotated_render_map["privateSlots"]
             .as_array()
             .and_then(|slots| slots.first())
@@ -2152,12 +2190,49 @@ mod tests {
         let private_start = private_slot["startByte"]
             .as_u64()
             .unwrap_or_else(|| panic!("private slot start must be an integer"));
-        let private_end = private_slot["endByte"]
-            .as_u64()
-            .unwrap_or_else(|| panic!("private slot end must be an integer"));
-        let mut unwrapped = response(
+        let mut edited = response(
             &mut service,
             62,
+            "umbra.annotation.edit",
+            json!({
+                "session": session.as_str(),
+                "logicalPath": "private.md",
+                "ifMatch": annotated_etag,
+                "contentBase64": annotated_projection,
+                "renderMap": annotated_render_map,
+                "selections": [{"startByte": private_start + 1, "endByte": private_start + 2}],
+                "spec": {
+                    "kind": "block",
+                    "tagIds": ["relationship"],
+                    "outer": {"mode": "placeholder"},
+                },
+                "mergeAdjacent": false,
+            }),
+        );
+        assert_ne!(edited["result"]["etag"], annotated_etag);
+        annotated_etag = edited["result"]["etag"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        annotated_projection = edited["result"]["contentBase64"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        annotated_render_map = edited["result"]["renderMap"].clone();
+        let edited_private_slot = annotated_render_map["privateSlots"]
+            .as_array()
+            .and_then(|slots| slots.first())
+            .unwrap_or_else(|| panic!("edit response must contain one private slot"));
+        let edited_private_start = edited_private_slot["startByte"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("edited private slot start must be an integer"));
+        let edited_private_end = edited_private_slot["endByte"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("edited private slot end must be an integer"));
+        scrub_object(&mut edited);
+        let mut unwrapped = response(
+            &mut service,
+            63,
             "umbra.annotation.remove",
             json!({
                 "session": session.as_str(),
@@ -2165,7 +2240,7 @@ mod tests {
                 "ifMatch": annotated_etag,
                 "contentBase64": annotated_projection,
                 "renderMap": annotated_render_map,
-                "selections": [{"startByte": private_start, "endByte": private_end}],
+                "selections": [{"startByte": edited_private_start, "endByte": edited_private_end}],
                 "mergeAdjacent": false,
             }),
         );
