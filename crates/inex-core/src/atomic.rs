@@ -4418,6 +4418,13 @@ enum HeldReservedPublicationInventory {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PublishedDurabilitySyncPoint {
+    Root,
+    CommonParent,
+}
+
+#[cfg(target_os = "linux")]
 impl HeldPublicationMarkerV2 {
     fn create(
         staging_root_path: &Path,
@@ -4770,6 +4777,61 @@ impl HeldPublicationMarkerV2 {
             self.authority.marker.staging_child_name(),
         )?;
         self.revalidate_at(current_root)
+    }
+
+    /// Synchronize the published root before its common-parent namespace.
+    ///
+    /// Both durability barriers operate on the directories already held by
+    /// this linear publication authority. The destination-role gate brackets
+    /// the root barrier, then the held common parent is verified immediately
+    /// before and after its barrier, followed by one final destination-role
+    /// gate. No pathname is reopened for synchronization, and this operation
+    /// performs no move, unlink, creation, cleanup, or recovery action.
+    ///
+    /// # Errors
+    ///
+    /// Returns a namespace, authority, or I/O error unless the exact published
+    /// role is reproduced at every bounded check around the ordered barriers.
+    /// These checks do not exclude a non-cooperating same-UID process from a
+    /// swap-and-restore race. Because this method borrows `self`, every failure
+    /// retains the same marker and mutation-lock authority for explicit
+    /// inspection or retry.
+    pub fn synchronize_published_root_and_common_parent_at(
+        &self,
+        destination: &Path,
+    ) -> Result<(), HeldPublicationMarkerV2Error> {
+        self.synchronize_published_root_and_common_parent_at_with_hook(destination, |_| Ok(()))
+    }
+
+    fn synchronize_published_root_and_common_parent_at_with_hook<BeforeSync>(
+        &self,
+        destination: &Path,
+        mut before_sync: BeforeSync,
+    ) -> Result<(), HeldPublicationMarkerV2Error>
+    where
+        BeforeSync: FnMut(PublishedDurabilitySyncPoint) -> io::Result<()>,
+    {
+        self.require_published_at(destination)?;
+        before_sync(PublishedDurabilitySyncPoint::Root)
+            .map_err(HeldPublicationMarkerV2Error::Io)?;
+        platform::sync_directory_handle(&self.authority.root.file)
+            .map_err(HeldPublicationMarkerV2Error::Io)?;
+        self.require_published_at(destination)?;
+
+        self.authority
+            .common_parent
+            .verify_binding()
+            .map_err(HeldPublicationMarkerV2Error::Io)?;
+        before_sync(PublishedDurabilitySyncPoint::CommonParent)
+            .map_err(HeldPublicationMarkerV2Error::Io)?;
+        platform::sync_directory_handle(&self.authority.common_parent.file)
+            .map_err(HeldPublicationMarkerV2Error::Io)?;
+        self.authority
+            .common_parent
+            .verify_binding()
+            .map_err(HeldPublicationMarkerV2Error::Io)?;
+
+        self.require_published_at(destination)
     }
 
     /// Borrow the validated canonical marker value without exposing its file.
@@ -9854,6 +9916,182 @@ mod tests {
         drop(current_root);
         fs::rename(&destination, fixture.root())?;
         held.revalidate_at(fixture.root())
+            .map_err(io::Error::other)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn held_publication_durability_is_handle_only_root_then_parent_and_role_gated() -> io::Result<()>
+    {
+        let staging = TestVault::new()?;
+        let destination_name = format!("published-{}", uuid::Uuid::new_v4().simple());
+        let staging_held = try_create_test_held_marker(staging.root(), &destination_name)?
+            .map_err(io::Error::other)?;
+        let mut staging_sync_called = false;
+        assert!(matches!(
+            staging_held.synchronize_published_root_and_common_parent_at_with_hook(
+                staging.root(),
+                |_| {
+                    staging_sync_called = true;
+                    Ok(())
+                },
+            ),
+            Err(super::HeldPublicationMarkerV2Error::AuthorityChanged)
+        ));
+        assert!(!staging_sync_called);
+        drop(staging_held);
+
+        let fixture = TestVault::new()?;
+        let (held, published, identities) = published_held_marker(&fixture)?;
+        let mut sync_order = Vec::new();
+        held.synchronize_published_root_and_common_parent_at_with_hook(
+            published.destination(),
+            |point| {
+                sync_order.push(point);
+                Ok(())
+            },
+        )
+        .map_err(io::Error::other)?;
+        assert_eq!(
+            sync_order,
+            [
+                super::PublishedDurabilitySyncPoint::Root,
+                super::PublishedDurabilitySyncPoint::CommonParent,
+            ]
+        );
+        held.require_published_at(published.destination())
+            .map_err(io::Error::other)?;
+        assert_publication_lock_busy(published.destination(), &identities);
+
+        let source = include_str!("atomic.rs");
+        let public_sync_method =
+            ["pub fn synchronize_published_root_", "and_common_parent_at"].concat();
+        let durability_impl = source
+            .split(&public_sync_method)
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("/// Borrow the validated canonical marker value")
+                    .next()
+            })
+            .expect("published durability implementation source exists");
+        assert!(!durability_impl.contains("sync_directory("));
+        assert_eq!(
+            durability_impl
+                .matches("platform::sync_directory_handle")
+                .count(),
+            2
+        );
+        let root_sync = durability_impl
+            .find("&self.authority.root.file")
+            .expect("held-root sync exists");
+        let parent_sync = durability_impl
+            .find("&self.authority.common_parent.file")
+            .expect("held-common-parent sync exists");
+        assert!(root_sync < parent_sync);
+        assert_eq!(source.matches(&public_sync_method).count(), 1);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn held_publication_durability_faults_retain_owner_and_order() -> io::Result<()> {
+        let fixture = TestVault::new()?;
+        let (held, published, identities) = published_held_marker(&fixture)?;
+        let expected_marker = held.marker().to_bytes();
+
+        let mut root_fault_order = Vec::new();
+        let root_fault = held
+            .synchronize_published_root_and_common_parent_at_with_hook(
+                published.destination(),
+                |point| {
+                    root_fault_order.push(point);
+                    Err(io::Error::other("synthetic held-root sync fault"))
+                },
+            )
+            .expect_err("held-root fault must stop before the common-parent barrier");
+        assert!(matches!(
+            root_fault,
+            super::HeldPublicationMarkerV2Error::Io(_)
+        ));
+        assert_eq!(
+            root_fault_order,
+            [super::PublishedDurabilitySyncPoint::Root]
+        );
+        assert_eq!(held.marker().to_bytes(), expected_marker);
+        held.require_published_at(published.destination())
+            .map_err(io::Error::other)?;
+        assert_publication_lock_busy(published.destination(), &identities);
+
+        let mut parent_fault_order = Vec::new();
+        let parent_fault = held
+            .synchronize_published_root_and_common_parent_at_with_hook(
+                published.destination(),
+                |point| {
+                    parent_fault_order.push(point);
+                    if point == super::PublishedDurabilitySyncPoint::CommonParent {
+                        Err(io::Error::other("synthetic held-parent sync fault"))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .expect_err("held-parent fault must retain the same publication owner");
+        assert!(matches!(
+            parent_fault,
+            super::HeldPublicationMarkerV2Error::Io(_)
+        ));
+        assert_eq!(
+            parent_fault_order,
+            [
+                super::PublishedDurabilitySyncPoint::Root,
+                super::PublishedDurabilitySyncPoint::CommonParent,
+            ]
+        );
+        assert_eq!(held.marker().to_bytes(), expected_marker);
+        held.require_published_at(published.destination())
+            .map_err(io::Error::other)?;
+        assert_publication_lock_busy(published.destination(), &identities);
+
+        held.synchronize_published_root_and_common_parent_at(published.destination())
+            .map_err(io::Error::other)?;
+        assert_eq!(held.marker().to_bytes(), expected_marker);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn held_publication_durability_rejects_staging_reappearance_after_role_gate() -> io::Result<()>
+    {
+        let fixture = TestVault::new()?;
+        let staging_path = fixture.root().to_path_buf();
+        let (held, published, identities) = published_held_marker(&fixture)?;
+        let expected_marker = held.marker().to_bytes();
+        let mut sync_order = Vec::new();
+
+        let outcome = held.synchronize_published_root_and_common_parent_at_with_hook(
+            published.destination(),
+            |point| {
+                sync_order.push(point);
+                if point == super::PublishedDurabilitySyncPoint::Root {
+                    fs::create_dir(&staging_path)?;
+                }
+                Ok(())
+            },
+        );
+        assert!(matches!(
+            outcome,
+            Err(super::HeldPublicationMarkerV2Error::NamespaceConflict)
+        ));
+        assert_eq!(sync_order, [super::PublishedDurabilitySyncPoint::Root]);
+        assert!(staging_path.is_dir());
+        assert_eq!(held.marker().to_bytes(), expected_marker);
+        assert_publication_lock_busy(published.destination(), &identities);
+
+        fs::remove_dir(&staging_path)?;
+        held.synchronize_published_root_and_common_parent_at(published.destination())
+            .map_err(io::Error::other)?;
+        held.require_published_at(published.destination())
             .map_err(io::Error::other)?;
         Ok(())
     }
