@@ -28,6 +28,11 @@ impl CandidateContentSeal {
     pub(in crate::repository_import) const fn into_digest(self) -> [u8; 32] {
         self.0
     }
+
+    #[cfg(test)]
+    pub(in crate::repository_import) const fn test_only_synthetic(digest: [u8; 32]) -> Self {
+        Self(digest)
+    }
 }
 
 impl fmt::Debug for CandidateContentSeal {

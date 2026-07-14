@@ -42,6 +42,27 @@ pub(super) struct FreshMarkerCandidateAudit {
 }
 
 impl FreshMarkerCandidateAudit {
+    #[cfg(test)]
+    pub(super) const fn test_only_synthetic(
+        context: CandidateSealContext,
+        content_seal: [u8; 32],
+        root_commit_oid: [u8; 20],
+        worktree_files: u32,
+        encrypted_markdown: u32,
+        encrypted_assets: u32,
+        git_objects: u32,
+    ) -> Self {
+        Self {
+            context,
+            content_seal: CandidateContentSeal::test_only_synthetic(content_seal),
+            worktree_files,
+            encrypted_markdown,
+            encrypted_assets,
+            git_objects,
+            root_commit_oid,
+        }
+    }
+
     pub(super) const fn context(&self) -> CandidateSealContext {
         self.context
     }

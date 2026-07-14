@@ -22,6 +22,8 @@
 //! pipe and keep a reader join blocked after the direct child is terminated.
 
 use std::fmt;
+#[cfg(target_os = "linux")]
+use std::io;
 use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
@@ -29,8 +31,9 @@ use std::path::PathBuf;
 use inex_core::atomic::ExistingVaultMutationLockError;
 #[cfg(target_os = "linux")]
 use inex_core::atomic::{
-    FilesystemDirectoryIdentity, HeldPublicationMarkerV2, HeldPublicationMarkerV2CreateInput,
-    HeldPublicationMarkerV2Error,
+    AtomicDirectoryPublishError, AtomicDirectoryPublishOutcome, FilesystemDirectoryIdentity,
+    HeldPublicationMarkerV2, HeldPublicationMarkerV2CreateInput, HeldPublicationMarkerV2Error,
+    atomic_move_verified_directory_no_replace_checked,
 };
 use inex_core::crypto::VaultContentProfile;
 use inex_core::vault::Vault;
@@ -321,6 +324,507 @@ impl fmt::Debug for StagingAuditedClaim {
             .field("held_marker", &"[HELD]")
             .finish()
     }
+}
+
+/// One fixed candidate-summary field that changed across publication checks.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum InitialCandidateSummaryMismatch {
+    Context,
+    ContentSeal,
+    RootCommit,
+    WorktreeCount,
+    MarkdownCount,
+    AssetCount,
+    GitObjectCount,
+}
+
+/// Scrubbed terminal reason retained beside the exact publication authority.
+///
+/// In particular, the generic move's original `io::Error` is never retained:
+/// only its stable [`io::ErrorKind`] crosses this safety boundary.
+#[cfg(target_os = "linux")]
+pub(super) enum InitialCandidatePublishFailure {
+    InvalidDerivedDestination,
+    CriticalAuditNotRunExactlyOnce,
+    CriticalSourceMismatch,
+    CriticalDestinationObservation(HeldPublicationMarkerV2Error),
+    CriticalFreshAudit(RepositoryImportError),
+    CriticalSummaryMismatch(InitialCandidateSummaryMismatch),
+    DestinationExists,
+    IndeterminateMove,
+    InvalidMovePaths,
+    MoveIo(io::ErrorKind),
+    PublishedCleanupFailed,
+    RetryDestinationObservation(HeldPublicationMarkerV2Error),
+    RetryFreshAudit(RepositoryImportError),
+    RetrySummaryMismatch(InitialCandidateSummaryMismatch),
+    PublishedRole(HeldPublicationMarkerV2Error),
+    PublishedFreshAudit(RepositoryImportError),
+    PublishedSummaryMismatch(InitialCandidateSummaryMismatch),
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for InitialCandidatePublishFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidDerivedDestination => {
+                "InitialCandidatePublishFailure::InvalidDerivedDestination"
+            }
+            Self::CriticalAuditNotRunExactlyOnce => {
+                "InitialCandidatePublishFailure::CriticalAuditNotRunExactlyOnce"
+            }
+            Self::CriticalSourceMismatch => {
+                "InitialCandidatePublishFailure::CriticalSourceMismatch"
+            }
+            Self::CriticalDestinationObservation(_) => {
+                "InitialCandidatePublishFailure::CriticalDestinationObservation(..)"
+            }
+            Self::CriticalFreshAudit(_) => "InitialCandidatePublishFailure::CriticalFreshAudit(..)",
+            Self::CriticalSummaryMismatch(_) => {
+                "InitialCandidatePublishFailure::CriticalSummaryMismatch(..)"
+            }
+            Self::DestinationExists => "InitialCandidatePublishFailure::DestinationExists",
+            Self::IndeterminateMove => "InitialCandidatePublishFailure::IndeterminateMove",
+            Self::InvalidMovePaths => "InitialCandidatePublishFailure::InvalidMovePaths",
+            Self::MoveIo(_) => "InitialCandidatePublishFailure::MoveIo(..)",
+            Self::PublishedCleanupFailed => {
+                "InitialCandidatePublishFailure::PublishedCleanupFailed"
+            }
+            Self::RetryDestinationObservation(_) => {
+                "InitialCandidatePublishFailure::RetryDestinationObservation(..)"
+            }
+            Self::RetryFreshAudit(_) => "InitialCandidatePublishFailure::RetryFreshAudit(..)",
+            Self::RetrySummaryMismatch(_) => {
+                "InitialCandidatePublishFailure::RetrySummaryMismatch(..)"
+            }
+            Self::PublishedRole(_) => "InitialCandidatePublishFailure::PublishedRole(..)",
+            Self::PublishedFreshAudit(_) => {
+                "InitialCandidatePublishFailure::PublishedFreshAudit(..)"
+            }
+            Self::PublishedSummaryMismatch(_) => {
+                "InitialCandidatePublishFailure::PublishedSummaryMismatch(..)"
+            }
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Display for InitialCandidatePublishFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidDerivedDestination => "initial publication destination is invalid",
+            Self::CriticalAuditNotRunExactlyOnce => {
+                "initial publication critical audit count is invalid"
+            }
+            Self::CriticalSourceMismatch => "initial publication source changed",
+            Self::CriticalDestinationObservation(_) => {
+                "initial publication destination observation failed"
+            }
+            Self::CriticalFreshAudit(_) => "initial publication critical audit failed",
+            Self::CriticalSummaryMismatch(_) => "initial publication critical summary changed",
+            Self::DestinationExists => "initial publication destination exists",
+            Self::IndeterminateMove => "initial publication move is indeterminate",
+            Self::InvalidMovePaths => "initial publication move paths are invalid",
+            Self::MoveIo(_) => "initial publication move I/O failed",
+            Self::PublishedCleanupFailed => "initial publication cleanup failed",
+            Self::RetryDestinationObservation(_) => {
+                "initial publication retry destination observation failed"
+            }
+            Self::RetryFreshAudit(_) => "initial publication retry audit failed",
+            Self::RetrySummaryMismatch(_) => "initial publication retry summary changed",
+            Self::PublishedRole(_) => "initial publication destination role is invalid",
+            Self::PublishedFreshAudit(_) => "initial publication destination audit failed",
+            Self::PublishedSummaryMismatch(_) => "initial publication destination summary changed",
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::error::Error for InitialCandidatePublishFailure {}
+
+/// The only state allowed to retry a move proven not to have happened.
+///
+/// It exposes only a consuming retry. The exact marker and mutation lock are
+/// continuously retained and are deliberately the final field.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub(super) struct RetryableInitialPublication {
+    root: PathBuf,
+    audit: FreshMarkerCandidateAudit,
+    held_marker: HeldPublicationMarkerV2,
+}
+
+#[cfg(target_os = "linux")]
+impl RetryableInitialPublication {
+    pub(super) fn retry(self) -> InitialCandidatePublishOutcome {
+        publish_initial_candidate(StagingAuditedClaim {
+            root: self.root,
+            audit: self.audit,
+            held_marker: self.held_marker,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for RetryableInitialPublication {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RetryableInitialPublication")
+            .field("root", &"[REDACTED]")
+            .field("audit", &self.audit)
+            .field("held_marker", &"[HELD]")
+            .finish()
+    }
+}
+
+/// Terminal owner for every failed or indeterminate initial publication.
+///
+/// No method performs cleanup, extracts authority, or advances this state.
+/// The same held marker and mutation lock remain live until drop.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub(super) struct FailedHeldInitialPublication {
+    failure: InitialCandidatePublishFailure,
+    root: PathBuf,
+    audit: FreshMarkerCandidateAudit,
+    held_marker: HeldPublicationMarkerV2,
+}
+
+#[cfg(target_os = "linux")]
+impl FailedHeldInitialPublication {
+    pub(super) const fn failure(&self) -> &InitialCandidatePublishFailure {
+        &self.failure
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for FailedHeldInitialPublication {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FailedHeldInitialPublication")
+            .field("failure", &self.failure)
+            .field("root", &"[REDACTED]")
+            .field("audit", &self.audit)
+            .field("held_marker", &"[HELD]")
+            .finish()
+    }
+}
+
+/// Consuming result of one initial no-replace publication attempt.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub(super) enum InitialCandidatePublishOutcome {
+    Published(super::candidate_publication_authority::PublishedWithMarker),
+    NotMoved(RetryableInitialPublication),
+    Terminal(Box<FailedHeldInitialPublication>),
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for InitialCandidatePublishOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Published(owner) => formatter.debug_tuple("Published").field(owner).finish(),
+            Self::NotMoved(owner) => formatter.debug_tuple("NotMoved").field(owner).finish(),
+            Self::Terminal(owner) => formatter.debug_tuple("Terminal").field(owner).finish(),
+        }
+    }
+}
+
+/// Unforgeable handoff produced only after the exact post-move checks.
+///
+/// The constructor is private to this module. The sibling publication module
+/// can only consume a token that this transition has already constructed.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub(super) struct VerifiedInitialMove {
+    root: PathBuf,
+    audit: FreshMarkerCandidateAudit,
+    held_marker: HeldPublicationMarkerV2,
+}
+
+#[cfg(target_os = "linux")]
+impl VerifiedInitialMove {
+    fn after_complete_post_move_review(
+        root: PathBuf,
+        audit: FreshMarkerCandidateAudit,
+        held_marker: HeldPublicationMarkerV2,
+    ) -> Self {
+        Self {
+            root,
+            audit,
+            held_marker,
+        }
+    }
+
+    pub(super) fn into_published_parts(
+        self,
+    ) -> (PathBuf, FreshMarkerCandidateAudit, HeldPublicationMarkerV2) {
+        (self.root, self.audit, self.held_marker)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for VerifiedInitialMove {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifiedInitialMove")
+            .field("root", &"[REDACTED]")
+            .field("audit", &self.audit)
+            .field("held_marker", &"[HELD]")
+            .finish()
+    }
+}
+
+/// Consume a staging claim into a no-replace publication attempt.
+///
+/// The destination is not caller supplied: it is derived from the claim root's
+/// parent and the destination child recorded in the continuously held marker.
+/// A successful generic move is only a namespace fact; its parent-sync status
+/// is intentionally discarded and does not confer durability.
+#[cfg(target_os = "linux")]
+pub(super) fn publish_initial_candidate(
+    claim: StagingAuditedClaim,
+) -> InitialCandidatePublishOutcome {
+    publish_initial_candidate_impl(claim, |source, destination, critical_audit| {
+        atomic_move_verified_directory_no_replace_checked(source, destination, |current| {
+            critical_audit(current)
+        })
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn publish_initial_candidate_impl<MoveDriver>(
+    claim: StagingAuditedClaim,
+    move_driver: MoveDriver,
+) -> InitialCandidatePublishOutcome
+where
+    MoveDriver: FnOnce(
+        &Path,
+        &Path,
+        &mut dyn FnMut(&Path) -> io::Result<()>,
+    ) -> Result<AtomicDirectoryPublishOutcome, AtomicDirectoryPublishError>,
+{
+    let destination = match claim.root.parent() {
+        Some(parent) => parent.join(claim.held_marker.marker().destination_child_name()),
+        None => {
+            return terminal_initial_publication(
+                claim,
+                InitialCandidatePublishFailure::InvalidDerivedDestination,
+            );
+        }
+    };
+
+    let critical_failure = std::cell::RefCell::new(None);
+    let critical_calls = std::cell::Cell::new(0_u8);
+    let mut critical_audit = |current: &Path| -> io::Result<()> {
+        let prior_calls = critical_calls.get();
+        critical_calls.set(prior_calls.saturating_add(1));
+        if prior_calls != 0 {
+            *critical_failure.borrow_mut() =
+                Some(InitialCandidatePublishFailure::CriticalAuditNotRunExactlyOnce);
+            return Err(io::Error::other("initial publication audit rejected"));
+        }
+        let failure = critical_initial_publication_review(current, &claim);
+        if let Err(failure) = failure {
+            *critical_failure.borrow_mut() = Some(failure);
+            return Err(io::Error::other("initial publication audit rejected"));
+        }
+        Ok(())
+    };
+    let move_result = move_driver(&claim.root, &destination, &mut critical_audit);
+
+    let critical_call_count = critical_calls.get();
+    if critical_call_count > 1 {
+        return terminal_initial_publication(
+            claim,
+            InitialCandidatePublishFailure::CriticalAuditNotRunExactlyOnce,
+        );
+    }
+    if let Some(failure) = critical_failure.into_inner() {
+        return terminal_initial_publication(claim, failure);
+    }
+    // The generic primitive may reject paths or a pre-existing destination
+    // while resolving its preflight, before it owns enough authority to invoke
+    // the callback. Those terminal errors retain their precise scrubbed class.
+    // A successful or retryable namespace result, however, is invalid unless
+    // the critical audit ran exactly once.
+    if critical_call_count == 0
+        && matches!(
+            &move_result,
+            Ok(_) | Err(AtomicDirectoryPublishError::NotMoved)
+        )
+    {
+        return terminal_initial_publication(
+            claim,
+            InitialCandidatePublishFailure::CriticalAuditNotRunExactlyOnce,
+        );
+    }
+
+    match move_result {
+        Ok(_) => reconcile_published_initial_candidate(claim, destination),
+        Err(AtomicDirectoryPublishError::NotMoved) => reconcile_not_moved_initial_candidate(claim),
+        Err(AtomicDirectoryPublishError::DestinationExists) => {
+            terminal_initial_publication(claim, InitialCandidatePublishFailure::DestinationExists)
+        }
+        Err(AtomicDirectoryPublishError::Indeterminate) => {
+            terminal_initial_publication(claim, InitialCandidatePublishFailure::IndeterminateMove)
+        }
+        Err(AtomicDirectoryPublishError::InvalidPaths) => {
+            terminal_initial_publication(claim, InitialCandidatePublishFailure::InvalidMovePaths)
+        }
+        Err(AtomicDirectoryPublishError::Io { source }) => terminal_initial_publication(
+            claim,
+            InitialCandidatePublishFailure::MoveIo(source.kind()),
+        ),
+        Err(AtomicDirectoryPublishError::PublishedCleanupFailed) => terminal_initial_publication(
+            claim,
+            InitialCandidatePublishFailure::PublishedCleanupFailed,
+        ),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn critical_initial_publication_review(
+    current: &Path,
+    claim: &StagingAuditedClaim,
+) -> Result<(), InitialCandidatePublishFailure> {
+    if current != claim.root {
+        return Err(InitialCandidatePublishFailure::CriticalSourceMismatch);
+    }
+    claim
+        .held_marker
+        .require_destination_absent_at(current)
+        .map_err(InitialCandidatePublishFailure::CriticalDestinationObservation)?;
+    let audit = audit_fresh_marker_candidate(current, &claim.held_marker)
+        .map_err(InitialCandidatePublishFailure::CriticalFreshAudit)?;
+    compare_candidate_summaries(&audit, &claim.audit)
+        .map_err(InitialCandidatePublishFailure::CriticalSummaryMismatch)?;
+    claim
+        .held_marker
+        .require_destination_absent_at(current)
+        .map_err(InitialCandidatePublishFailure::CriticalDestinationObservation)
+}
+
+#[cfg(target_os = "linux")]
+fn reconcile_not_moved_initial_candidate(
+    claim: StagingAuditedClaim,
+) -> InitialCandidatePublishOutcome {
+    if let Err(error) = claim.held_marker.require_destination_absent_at(&claim.root) {
+        return terminal_initial_publication(
+            claim,
+            InitialCandidatePublishFailure::RetryDestinationObservation(error),
+        );
+    }
+    let audit = match audit_fresh_marker_candidate(&claim.root, &claim.held_marker) {
+        Ok(audit) => audit,
+        Err(error) => {
+            return terminal_initial_publication(
+                claim,
+                InitialCandidatePublishFailure::RetryFreshAudit(error),
+            );
+        }
+    };
+    if let Err(mismatch) = compare_candidate_summaries(&audit, &claim.audit) {
+        return terminal_initial_publication(
+            claim,
+            InitialCandidatePublishFailure::RetrySummaryMismatch(mismatch),
+        );
+    }
+    if let Err(error) = claim.held_marker.require_destination_absent_at(&claim.root) {
+        return terminal_initial_publication(
+            claim,
+            InitialCandidatePublishFailure::RetryDestinationObservation(error),
+        );
+    }
+    InitialCandidatePublishOutcome::NotMoved(RetryableInitialPublication {
+        root: claim.root,
+        audit,
+        held_marker: claim.held_marker,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn reconcile_published_initial_candidate(
+    mut claim: StagingAuditedClaim,
+    destination: PathBuf,
+) -> InitialCandidatePublishOutcome {
+    // The generic success proves the exact held root now occupies destination.
+    // Every later terminal owner must therefore record that actual root, not
+    // the now-absent staging pathname.
+    claim.root.clone_from(&destination);
+    if let Err(error) = claim.held_marker.require_published_at(&destination) {
+        return terminal_initial_publication(
+            claim,
+            InitialCandidatePublishFailure::PublishedRole(error),
+        );
+    }
+    let audit = match audit_fresh_marker_candidate(&destination, &claim.held_marker) {
+        Ok(audit) => audit,
+        Err(error) => {
+            return terminal_initial_publication(
+                claim,
+                InitialCandidatePublishFailure::PublishedFreshAudit(error),
+            );
+        }
+    };
+    if let Err(mismatch) = compare_candidate_summaries(&audit, &claim.audit) {
+        return terminal_initial_publication(
+            claim,
+            InitialCandidatePublishFailure::PublishedSummaryMismatch(mismatch),
+        );
+    }
+    if let Err(error) = claim.held_marker.require_published_at(&destination) {
+        return terminal_initial_publication(
+            claim,
+            InitialCandidatePublishFailure::PublishedRole(error),
+        );
+    }
+
+    let token =
+        VerifiedInitialMove::after_complete_post_move_review(destination, audit, claim.held_marker);
+    InitialCandidatePublishOutcome::Published(
+        super::candidate_publication_authority::PublishedWithMarker::from_verified_initial_move(
+            token,
+        ),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn compare_candidate_summaries(
+    current: &FreshMarkerCandidateAudit,
+    expected: &FreshMarkerCandidateAudit,
+) -> Result<(), InitialCandidateSummaryMismatch> {
+    if current.context() != expected.context() {
+        Err(InitialCandidateSummaryMismatch::Context)
+    } else if current.content_seal() != expected.content_seal() {
+        Err(InitialCandidateSummaryMismatch::ContentSeal)
+    } else if current.root_commit_oid() != expected.root_commit_oid() {
+        Err(InitialCandidateSummaryMismatch::RootCommit)
+    } else if current.worktree_files() != expected.worktree_files() {
+        Err(InitialCandidateSummaryMismatch::WorktreeCount)
+    } else if current.encrypted_markdown() != expected.encrypted_markdown() {
+        Err(InitialCandidateSummaryMismatch::MarkdownCount)
+    } else if current.encrypted_assets() != expected.encrypted_assets() {
+        Err(InitialCandidateSummaryMismatch::AssetCount)
+    } else if current.git_objects() != expected.git_objects() {
+        Err(InitialCandidateSummaryMismatch::GitObjectCount)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn terminal_initial_publication(
+    claim: StagingAuditedClaim,
+    failure: InitialCandidatePublishFailure,
+) -> InitialCandidatePublishOutcome {
+    InitialCandidatePublishOutcome::Terminal(Box::new(FailedHeldInitialPublication {
+        failure,
+        root: claim.root,
+        audit: claim.audit,
+        held_marker: claim.held_marker,
+    }))
 }
 
 /// Acquire complete held initial authority for one marker-free candidate.
@@ -663,9 +1167,10 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use inex_core::atomic::{
-        ExistingVaultMutationLock, ExistingVaultMutationLockError, FilesystemDirectoryIdentity,
-        FilesystemFileIdentity, IMPORT_PUBLISH_MARKER_V1, IMPORT_PUBLISH_MARKER_V2,
-        IMPORT_STAGING_PREFIX, PublicationIdentityScheme, VAULT_LOCAL_DIRECTORY,
+        AtomicDirectoryPublishError, AtomicDirectoryPublishOutcome, ExistingVaultMutationLock,
+        ExistingVaultMutationLockError, FilesystemDirectoryIdentity, FilesystemFileIdentity,
+        IMPORT_PUBLISH_MARKER_V1, IMPORT_PUBLISH_MARKER_V2, IMPORT_STAGING_PREFIX,
+        ParentSyncStatus, PublicationIdentityScheme, VAULT_LOCAL_DIRECTORY,
         VAULT_MUTATION_LOCK_FILE, filesystem_directory_identity, filesystem_file_identity,
     };
     use inex_core::crypto::VaultContentProfile;
@@ -681,9 +1186,11 @@ mod tests {
     use super::{
         InitialCandidateAuthority, InitialCandidateAuthorityError, InitialCandidateClaimError,
         InitialCandidateClaimInput, InitialCandidateClaimPreflightError, InitialCandidateInputs,
-        InitialCandidatePostMarkerFailure, acquire_initial_candidate_authority,
-        acquire_initial_candidate_authority_impl, claim_initial_candidate,
-        claim_initial_candidate_impl,
+        InitialCandidatePostMarkerFailure, InitialCandidatePublishFailure,
+        InitialCandidatePublishOutcome, InitialCandidateSummaryMismatch,
+        acquire_initial_candidate_authority, acquire_initial_candidate_authority_impl,
+        claim_initial_candidate, claim_initial_candidate_impl, publish_initial_candidate,
+        publish_initial_candidate_impl,
     };
 
     const PASSWORD: &[u8] = b"initial candidate authority test password";
@@ -768,12 +1275,19 @@ mod tests {
     }
 
     fn acquire_fixture_authority(fixture: &Fixture) -> InitialCandidateAuthority {
+        acquire_fixture_authority_with_context(fixture, context())
+    }
+
+    fn acquire_fixture_authority_with_context(
+        fixture: &Fixture,
+        seal_context: CandidateSealContext,
+    ) -> InitialCandidateAuthority {
         acquire_initial_candidate_authority(
             fixture.root.path(),
             &fixture.target,
             &fixture.vault,
             VaultContentProfile::DocumentsOnly,
-            context(),
+            seal_context,
         )
         .expect("fixture initial authority constructs")
     }
@@ -811,6 +1325,48 @@ mod tests {
             "inex-initial-claim-{label}-{}",
             uuid::Uuid::new_v4().simple()
         )
+    }
+
+    type LockBaseline = (
+        FilesystemDirectoryIdentity,
+        FilesystemDirectoryIdentity,
+        FilesystemFileIdentity,
+    );
+
+    fn claimed_fixture(
+        label: &str,
+    ) -> (Fixture, super::StagingAuditedClaim, LockBaseline, PathBuf) {
+        claimed_fixture_with_context(label, context())
+    }
+
+    fn claimed_fixture_with_context(
+        label: &str,
+        seal_context: CandidateSealContext,
+    ) -> (Fixture, super::StagingAuditedClaim, LockBaseline, PathBuf) {
+        let fixture = fixture(label);
+        let authority = acquire_fixture_authority_with_context(&fixture, seal_context);
+        let baseline = authority_baseline(&authority);
+        let parent = fixture
+            .root
+            .path()
+            .parent()
+            .expect("staging fixture has a parent");
+        let parent_identity = filesystem_directory_identity(parent).expect("parent identity");
+        let destination_child_name = destination_name(label);
+        let destination = parent.join(&destination_child_name);
+        let claim = claim_initial_candidate(
+            authority,
+            InitialCandidateClaimInput {
+                common_parent_identity: &parent_identity,
+                destination_child_name: &destination_child_name,
+            },
+        )
+        .expect("fixture initial claim constructs");
+        (fixture, claim, baseline, destination)
+    }
+
+    fn remove_published_fixture(destination: &Path) {
+        fs::remove_dir_all(destination).expect("published fixture removes");
     }
 
     fn lock_path(root: &Path) -> PathBuf {
@@ -1300,6 +1856,587 @@ mod tests {
             )
             .expect("claim drop releases lock"),
         );
+    }
+
+    #[test]
+    fn initial_publication_real_move_builds_shared_owner_and_holds_lock() {
+        let (fixture, claim, baseline, destination) = claimed_fixture("publish-real");
+        let staging = fixture.root.path().to_path_buf();
+        let expected = (
+            claim.audit().context(),
+            claim.audit().content_seal(),
+            claim.audit().root_commit_oid(),
+            claim.audit().worktree_files(),
+            claim.audit().encrypted_markdown(),
+            claim.audit().encrypted_assets(),
+            claim.audit().git_objects(),
+        );
+
+        let published = match publish_initial_candidate(claim) {
+            InitialCandidatePublishOutcome::Published(owner) => owner,
+            other => panic!("expected published owner, got {other:?}"),
+        };
+        assert_eq!(published.root(), destination);
+        assert!(!staging.exists());
+        assert!(
+            destination
+                .join(VAULT_LOCAL_DIRECTORY)
+                .join(IMPORT_PUBLISH_MARKER_V2)
+                .is_file()
+        );
+        assert_eq!(
+            (
+                published.audit().context(),
+                published.audit().content_seal(),
+                published.audit().root_commit_oid(),
+                published.audit().worktree_files(),
+                published.audit().encrypted_markdown(),
+                published.audit().encrypted_assets(),
+                published.audit().git_objects(),
+            ),
+            expected
+        );
+        assert_baseline_lock_busy(&destination, &baseline);
+        let debug = format!("{published:?}");
+        assert!(!debug.contains(destination.to_string_lossy().as_ref()));
+
+        drop(published);
+        drop(
+            ExistingVaultMutationLock::acquire(&destination, &baseline.0, &baseline.1, &baseline.2)
+                .expect("published owner drop releases the exact lock"),
+        );
+        remove_published_fixture(&destination);
+    }
+
+    #[test]
+    fn initial_publication_ignores_not_synced_without_claiming_durability() {
+        let (_fixture, claim, baseline, destination) = claimed_fixture("publish-not-synced");
+        let published =
+            match publish_initial_candidate_impl(claim, |source, destination, critical_audit| {
+                critical_audit(source).expect("critical audit accepts candidate");
+                fs::rename(source, destination).expect("simulated no-replace move succeeds");
+                Ok(AtomicDirectoryPublishOutcome {
+                    parent_sync: ParentSyncStatus::NotSynced,
+                })
+            }) {
+                InitialCandidatePublishOutcome::Published(owner) => owner,
+                other => panic!("expected marker-held nondurable state, got {other:?}"),
+            };
+        assert_eq!(published.root(), destination);
+        assert_baseline_lock_busy(&destination, &baseline);
+        drop(published);
+        remove_published_fixture(&destination);
+    }
+
+    #[test]
+    fn initial_publication_not_moved_is_the_only_retryable_outcome() {
+        let (_fixture, claim, baseline, destination) = claimed_fixture("publish-retry");
+        let staging = claim.root().to_path_buf();
+        let retry = match publish_initial_candidate_impl(claim, |source, _, critical_audit| {
+            critical_audit(source).expect("critical audit accepts candidate");
+            Err(AtomicDirectoryPublishError::NotMoved)
+        }) {
+            InitialCandidatePublishOutcome::NotMoved(owner) => owner,
+            other => panic!("expected unique retry owner, got {other:?}"),
+        };
+        assert!(staging.is_dir());
+        assert!(!destination.exists());
+        assert_baseline_lock_busy(&staging, &baseline);
+
+        let published = match retry.retry() {
+            InitialCandidatePublishOutcome::Published(owner) => owner,
+            other => panic!("expected consuming retry to publish, got {other:?}"),
+        };
+        assert!(!staging.exists());
+        assert_eq!(published.root(), destination);
+        assert_baseline_lock_busy(&destination, &baseline);
+        drop(published);
+        remove_published_fixture(&destination);
+    }
+
+    #[test]
+    fn initial_publication_not_moved_recheck_drift_is_terminal() {
+        let (_fixture, claim, baseline, destination) =
+            claimed_fixture("publish-retry-recheck-drift");
+        let staging = claim.root().to_path_buf();
+        let terminal = match publish_initial_candidate_impl(claim, |source, _, critical_audit| {
+            critical_audit(source).expect("critical audit accepts candidate");
+            fs::write(source.join(".gitattributes"), b"retry recheck drift\n")
+                .expect("candidate drifts after namespace attempt");
+            Err(AtomicDirectoryPublishError::NotMoved)
+        }) {
+            InitialCandidatePublishOutcome::Terminal(owner) => owner,
+            other => panic!("expected terminal retry recheck owner, got {other:?}"),
+        };
+        assert!(matches!(
+            terminal.failure(),
+            InitialCandidatePublishFailure::RetryFreshAudit(_)
+        ));
+        assert!(staging.is_dir());
+        assert!(!destination.exists());
+        assert_baseline_lock_busy(&staging, &baseline);
+        drop(terminal);
+    }
+
+    #[test]
+    fn initial_publication_critical_drift_and_destination_conflict_are_terminal() {
+        let (drift_fixture, drift_claim, drift_baseline, _) =
+            claimed_fixture("publish-critical-drift");
+        let drift_root = drift_claim.root().to_path_buf();
+        let terminal =
+            match publish_initial_candidate_impl(drift_claim, |source, _, critical_audit| {
+                fs::write(source.join(".gitattributes"), b"critical drift\n")
+                    .expect("critical candidate drifts");
+                let error = critical_audit(source).expect_err("critical audit rejects drift");
+                Err(AtomicDirectoryPublishError::Io { source: error })
+            }) {
+                InitialCandidatePublishOutcome::Terminal(owner) => owner,
+                other => panic!("expected terminal drift owner, got {other:?}"),
+            };
+        assert!(matches!(
+            terminal.failure(),
+            InitialCandidatePublishFailure::CriticalFreshAudit(_)
+        ));
+        assert_baseline_lock_busy(&drift_root, &drift_baseline);
+        let debug = format!("{terminal:?}");
+        assert!(!debug.contains(drift_root.to_string_lossy().as_ref()));
+        drop(terminal);
+        drop(drift_fixture);
+
+        let (_conflict_fixture, conflict_claim, conflict_baseline, conflict_destination) =
+            claimed_fixture("publish-conflict");
+        let conflict_root = conflict_claim.root().to_path_buf();
+        let terminal = match publish_initial_candidate_impl(
+            conflict_claim,
+            |source, destination, critical_audit| {
+                critical_audit(source).expect("critical audit accepts candidate");
+                fs::write(destination, b"foreign destination canary")
+                    .expect("foreign destination appears");
+                Err(AtomicDirectoryPublishError::DestinationExists)
+            },
+        ) {
+            InitialCandidatePublishOutcome::Terminal(owner) => owner,
+            other => panic!("expected terminal conflict owner, got {other:?}"),
+        };
+        assert!(matches!(
+            terminal.failure(),
+            InitialCandidatePublishFailure::DestinationExists
+        ));
+        assert_eq!(
+            fs::read(&conflict_destination).expect("foreign destination reads"),
+            b"foreign destination canary"
+        );
+        assert_baseline_lock_busy(&conflict_root, &conflict_baseline);
+        fs::remove_file(&conflict_destination).expect("foreign destination removes");
+        drop(terminal);
+    }
+
+    #[test]
+    fn initial_publication_real_preflight_preserves_post_claim_destination() {
+        let (_fixture, claim, baseline, destination) =
+            claimed_fixture("publish-real-preflight-conflict");
+        let staging = claim.root().to_path_buf();
+        fs::write(&destination, b"post-claim foreign destination")
+            .expect("foreign destination appears after claim");
+
+        let terminal = match publish_initial_candidate(claim) {
+            InitialCandidatePublishOutcome::Terminal(owner) => owner,
+            other => panic!("expected real preflight terminal owner, got {other:?}"),
+        };
+        assert!(matches!(
+            terminal.failure(),
+            InitialCandidatePublishFailure::DestinationExists
+        ));
+        assert_eq!(
+            fs::read(&destination).expect("foreign destination reads"),
+            b"post-claim foreign destination"
+        );
+        assert!(staging.is_dir());
+        assert_baseline_lock_busy(&staging, &baseline);
+        fs::remove_file(&destination).expect("foreign destination removes");
+        drop(terminal);
+    }
+
+    #[test]
+    fn initial_publication_zero_call_preflight_errors_keep_generic_class() {
+        for (label, injected, expected) in [
+            (
+                "publish-zero-invalid",
+                AtomicDirectoryPublishError::InvalidPaths,
+                0_u8,
+            ),
+            (
+                "publish-zero-io",
+                AtomicDirectoryPublishError::Io {
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::ReadOnlyFilesystem,
+                        "secret zero-call generic source",
+                    ),
+                },
+                1_u8,
+            ),
+            (
+                "publish-zero-indeterminate",
+                AtomicDirectoryPublishError::Indeterminate,
+                2_u8,
+            ),
+        ] {
+            let (_fixture, claim, baseline, destination) = claimed_fixture(label);
+            let staging = claim.root().to_path_buf();
+            let terminal = match publish_initial_candidate_impl(claim, |_, _, _| Err(injected)) {
+                InitialCandidatePublishOutcome::Terminal(owner) => owner,
+                other => panic!("expected zero-call terminal owner, got {other:?}"),
+            };
+            match (terminal.failure(), expected) {
+                (InitialCandidatePublishFailure::InvalidMovePaths, 0)
+                | (InitialCandidatePublishFailure::IndeterminateMove, 2) => {}
+                (InitialCandidatePublishFailure::MoveIo(kind), 1) => {
+                    assert_eq!(*kind, std::io::ErrorKind::ReadOnlyFilesystem);
+                }
+                (other, expected) => {
+                    panic!("unexpected zero-call mapping {other:?} / {expected}")
+                }
+            }
+            assert!(!format!("{terminal:?}").contains("secret zero-call generic source"));
+            assert!(staging.is_dir());
+            assert!(!destination.exists());
+            assert_baseline_lock_busy(&staging, &baseline);
+            drop(terminal);
+        }
+    }
+
+    #[test]
+    fn initial_publication_zero_or_multiple_call_retry_contract_is_terminal() {
+        let (_fixture, claim, baseline, destination) =
+            claimed_fixture("publish-zero-call-not-moved");
+        let staging = claim.root().to_path_buf();
+        let terminal = match publish_initial_candidate_impl(claim, |_, _, _| {
+            Err(AtomicDirectoryPublishError::NotMoved)
+        }) {
+            InitialCandidatePublishOutcome::Terminal(owner) => owner,
+            other => panic!("expected zero-call NotMoved terminal owner, got {other:?}"),
+        };
+        assert!(matches!(
+            terminal.failure(),
+            InitialCandidatePublishFailure::CriticalAuditNotRunExactlyOnce
+        ));
+        assert!(staging.is_dir());
+        assert!(!destination.exists());
+        assert_baseline_lock_busy(&staging, &baseline);
+        drop(terminal);
+
+        let (_fixture, claim, baseline, destination) =
+            claimed_fixture("publish-multiple-call-not-moved");
+        let staging = claim.root().to_path_buf();
+        let terminal = match publish_initial_candidate_impl(claim, |source, _, critical_audit| {
+            critical_audit(source).expect("first critical audit succeeds");
+            assert!(critical_audit(source).is_err());
+            Err(AtomicDirectoryPublishError::NotMoved)
+        }) {
+            InitialCandidatePublishOutcome::Terminal(owner) => owner,
+            other => panic!("expected repeated-call terminal owner, got {other:?}"),
+        };
+        assert!(matches!(
+            terminal.failure(),
+            InitialCandidatePublishFailure::CriticalAuditNotRunExactlyOnce
+        ));
+        assert!(staging.is_dir());
+        assert!(!destination.exists());
+        assert_baseline_lock_busy(&staging, &baseline);
+        drop(terminal);
+    }
+
+    #[test]
+    fn initial_publication_indeterminate_and_post_move_staging_are_terminal() {
+        let (_fixture, claim, baseline, destination) = claimed_fixture("publish-indeterminate");
+        let terminal =
+            match publish_initial_candidate_impl(claim, |source, destination, critical_audit| {
+                critical_audit(source).expect("critical audit accepts candidate");
+                fs::rename(source, destination).expect("candidate physically moves");
+                Err(AtomicDirectoryPublishError::Indeterminate)
+            }) {
+                InitialCandidatePublishOutcome::Terminal(owner) => owner,
+                other => panic!("expected terminal indeterminate owner, got {other:?}"),
+            };
+        assert!(matches!(
+            terminal.failure(),
+            InitialCandidatePublishFailure::IndeterminateMove
+        ));
+        assert_baseline_lock_busy(&destination, &baseline);
+        drop(terminal);
+        remove_published_fixture(&destination);
+
+        let (_fixture, claim, baseline, destination) = claimed_fixture("publish-staging-reappears");
+        let staging = claim.root().to_path_buf();
+        let terminal =
+            match publish_initial_candidate_impl(claim, |source, destination, critical_audit| {
+                critical_audit(source).expect("critical audit accepts candidate");
+                fs::rename(source, destination).expect("candidate physically moves");
+                fs::create_dir(source).expect("foreign staging name reappears");
+                Ok(AtomicDirectoryPublishOutcome {
+                    parent_sync: ParentSyncStatus::Synced,
+                })
+            }) {
+                InitialCandidatePublishOutcome::Terminal(owner) => owner,
+                other => panic!("expected terminal post-move role owner, got {other:?}"),
+            };
+        assert!(matches!(
+            terminal.failure(),
+            InitialCandidatePublishFailure::PublishedRole(_)
+        ));
+        assert_eq!(terminal.root, destination);
+        assert!(staging.is_dir());
+        assert_baseline_lock_busy(&destination, &baseline);
+        fs::remove_dir(&staging).expect("foreign staging canary removes");
+        drop(terminal);
+        remove_published_fixture(&destination);
+    }
+
+    #[test]
+    fn initial_publication_scrubs_all_remaining_generic_move_failures() {
+        for (label, injected, expected_kind) in [
+            (
+                "publish-invalid-paths",
+                AtomicDirectoryPublishError::InvalidPaths,
+                None,
+            ),
+            (
+                "publish-move-io",
+                AtomicDirectoryPublishError::Io {
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "secret generic move source",
+                    ),
+                },
+                Some(std::io::ErrorKind::PermissionDenied),
+            ),
+            (
+                "publish-cleanup-failed",
+                AtomicDirectoryPublishError::PublishedCleanupFailed,
+                None,
+            ),
+        ] {
+            let (_fixture, claim, baseline, destination) = claimed_fixture(label);
+            let staging = claim.root().to_path_buf();
+            let terminal =
+                match publish_initial_candidate_impl(claim, |source, _, critical_audit| {
+                    critical_audit(source).expect("critical audit accepts candidate");
+                    Err(injected)
+                }) {
+                    InitialCandidatePublishOutcome::Terminal(owner) => owner,
+                    other => panic!("expected scrubbed terminal owner, got {other:?}"),
+                };
+            match (terminal.failure(), expected_kind) {
+                (
+                    InitialCandidatePublishFailure::InvalidMovePaths
+                    | InitialCandidatePublishFailure::PublishedCleanupFailed,
+                    None,
+                ) => {}
+                (InitialCandidatePublishFailure::MoveIo(actual), Some(expected)) => {
+                    assert_eq!(*actual, expected);
+                }
+                (other, expected) => panic!("unexpected mapping {other:?} / {expected:?}"),
+            }
+            assert!(!format!("{terminal:?}").contains("secret generic move source"));
+            assert!(staging.is_dir());
+            assert!(!destination.exists());
+            assert_baseline_lock_busy(&staging, &baseline);
+            drop(terminal);
+        }
+    }
+
+    #[test]
+    fn initial_publication_summary_mismatch_is_terminal_before_move() {
+        let (_fixture, mut claim, baseline, destination) = claimed_fixture("publish-mismatch-a");
+        let alternate_context = CandidateSealContext {
+            scheme: PublicationIdentityScheme::LinuxDevInodeV1,
+            publication_id: [0xa7; 16],
+        };
+        let (_other_fixture, mut other_claim, _, _) =
+            claimed_fixture_with_context("publish-mismatch-b", alternate_context);
+        std::mem::swap(&mut claim.audit, &mut other_claim.audit);
+        drop(other_claim);
+        let staging = claim.root().to_path_buf();
+
+        let terminal = match publish_initial_candidate_impl(claim, |source, _, critical_audit| {
+            let error = critical_audit(source).expect_err("summary mismatch rejects");
+            Err(AtomicDirectoryPublishError::Io { source: error })
+        }) {
+            InitialCandidatePublishOutcome::Terminal(owner) => owner,
+            other => panic!("expected terminal summary owner, got {other:?}"),
+        };
+        assert!(matches!(
+            terminal.failure(),
+            InitialCandidatePublishFailure::CriticalSummaryMismatch(
+                InitialCandidateSummaryMismatch::Context
+            )
+        ));
+        assert!(staging.is_dir());
+        assert!(!destination.exists());
+        assert_baseline_lock_busy(&staging, &baseline);
+        drop(terminal);
+    }
+
+    #[test]
+    fn initial_publication_compares_every_summary_field_directly() {
+        use super::super::candidate_fresh_audit::FreshMarkerCandidateAudit;
+
+        let expected_context = context();
+        let different_context = CandidateSealContext {
+            scheme: PublicationIdentityScheme::LinuxDevInodeV1,
+            publication_id: [0xc3; 16],
+        };
+        let synthetic = |seal, oid, worktree, markdown, assets, objects| {
+            FreshMarkerCandidateAudit::test_only_synthetic(
+                expected_context,
+                seal,
+                oid,
+                worktree,
+                markdown,
+                assets,
+                objects,
+            )
+        };
+        let cases = [
+            (
+                FreshMarkerCandidateAudit::test_only_synthetic(
+                    different_context,
+                    [0x11; 32],
+                    [0x22; 20],
+                    3,
+                    4,
+                    5,
+                    6,
+                ),
+                InitialCandidateSummaryMismatch::Context,
+            ),
+            (
+                synthetic([0x12; 32], [0x22; 20], 3, 4, 5, 6),
+                InitialCandidateSummaryMismatch::ContentSeal,
+            ),
+            (
+                synthetic([0x11; 32], [0x23; 20], 3, 4, 5, 6),
+                InitialCandidateSummaryMismatch::RootCommit,
+            ),
+            (
+                synthetic([0x11; 32], [0x22; 20], 7, 4, 5, 6),
+                InitialCandidateSummaryMismatch::WorktreeCount,
+            ),
+            (
+                synthetic([0x11; 32], [0x22; 20], 3, 7, 5, 6),
+                InitialCandidateSummaryMismatch::MarkdownCount,
+            ),
+            (
+                synthetic([0x11; 32], [0x22; 20], 3, 4, 7, 6),
+                InitialCandidateSummaryMismatch::AssetCount,
+            ),
+            (
+                synthetic([0x11; 32], [0x22; 20], 3, 4, 5, 7),
+                InitialCandidateSummaryMismatch::GitObjectCount,
+            ),
+        ];
+        for (current, expected_mismatch) in cases {
+            let expected = synthetic([0x11; 32], [0x22; 20], 3, 4, 5, 6);
+            assert_eq!(
+                super::compare_candidate_summaries(&current, &expected),
+                Err(expected_mismatch)
+            );
+        }
+    }
+
+    #[test]
+    fn initial_publication_api_and_transition_order_are_frozen() {
+        let source = include_str!("candidate_initial_authority.rs");
+        let input = source
+            .split("pub(super) fn publish_initial_candidate(")
+            .nth(1)
+            .and_then(|tail| tail.split("fn publish_initial_candidate_impl").next())
+            .expect("publication entry point exists");
+        assert!(input.contains("claim: StagingAuditedClaim"));
+        assert!(!input.contains("destination:"));
+        assert!(!input.contains("target:"));
+
+        let critical = source
+            .split("fn critical_initial_publication_review")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("fn reconcile_not_moved_initial_candidate")
+                    .next()
+            })
+            .expect("critical review exists");
+        let first_absence = critical
+            .find("require_destination_absent_at")
+            .expect("first destination check exists");
+        let audit = critical
+            .find("audit_fresh_marker_candidate")
+            .expect("fresh audit exists");
+        let compare = critical
+            .find("compare_candidate_summaries")
+            .expect("summary comparison exists");
+        let second_absence = critical
+            .rfind("require_destination_absent_at")
+            .expect("second destination check exists");
+        assert!(first_absence < audit && audit < compare && compare < second_absence);
+        assert_ne!(first_absence, second_absence);
+
+        let comparison = source
+            .split("fn compare_candidate_summaries")
+            .nth(1)
+            .and_then(|tail| tail.split("fn terminal_initial_publication").next())
+            .expect("summary comparison exists");
+        for field in [
+            "context()",
+            "content_seal()",
+            "root_commit_oid()",
+            "worktree_files()",
+            "encrypted_markdown()",
+            "encrypted_assets()",
+            "git_objects()",
+        ] {
+            assert!(comparison.contains(field), "missing comparison: {field}");
+        }
+
+        for owner_name in [
+            "RetryableInitialPublication",
+            "FailedHeldInitialPublication",
+            "VerifiedInitialMove",
+        ] {
+            let owner = source
+                .split(&format!("pub(super) struct {owner_name}"))
+                .nth(1)
+                .and_then(|tail| tail.split(&format!("impl {owner_name}")).next())
+                .expect("linear owner source exists");
+            assert!(!owner.contains("derive(Clone"));
+            assert!(!owner.contains("derive(Copy"));
+            assert!(
+                owner.find("audit:").expect("audit field")
+                    < owner.find("held_marker:").expect("held marker field")
+            );
+            let custom_drop = format!("impl Drop for {owner_name}");
+            assert!(!source.contains(&custom_drop));
+        }
+        let terminal_impl = source
+            .split("impl FailedHeldInitialPublication")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("impl fmt::Debug for FailedHeldInitialPublication")
+                    .next()
+            })
+            .expect("terminal implementation exists");
+        assert!(!terminal_impl.contains("retry"));
+        assert!(!terminal_impl.contains("cleanup"));
+        assert!(!terminal_impl.contains("extract"));
+
+        let transition = source
+            .split("fn publish_initial_candidate_impl")
+            .nth(1)
+            .and_then(|tail| tail.split("fn critical_initial_publication_review").next())
+            .expect("move transition exists");
+        assert!(transition.contains("marker().destination_child_name()"));
+        assert!(transition.contains("Ok(_) =>"));
+        assert!(!transition.contains("parent_sync"));
+        assert!(transition.contains("MoveIo(source.kind())"));
+        assert!(!transition.contains("MoveIo(source)"));
     }
 
     #[test]

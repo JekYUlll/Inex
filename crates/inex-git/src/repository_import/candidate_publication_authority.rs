@@ -30,6 +30,8 @@ use super::RepositoryImportError;
 #[cfg(target_os = "linux")]
 use super::candidate_fresh_audit::{FreshMarkerCandidateAudit, audit_fresh_marker_candidate};
 #[cfg(target_os = "linux")]
+use super::candidate_initial_authority::VerifiedInitialMove;
+#[cfg(target_os = "linux")]
 use super::candidate_seal::DOMAIN;
 
 /// Shared repository-level child-name policy used by initial and fresh claims.
@@ -231,6 +233,16 @@ pub(super) struct PublishedWithMarker {
 
 #[cfg(target_os = "linux")]
 impl PublishedWithMarker {
+    /// Consume the private proof emitted by the initial no-replace transition.
+    pub(super) fn from_verified_initial_move(token: VerifiedInitialMove) -> Self {
+        let (root, audit, held_marker) = token.into_published_parts();
+        Self {
+            root,
+            audit,
+            held_marker,
+        }
+    }
+
     pub(super) fn root(&self) -> &Path {
         &self.root
     }
