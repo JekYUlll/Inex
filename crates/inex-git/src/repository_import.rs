@@ -104,6 +104,8 @@ const MAX_IMPORT_PLAINTEXT_BYTES: u64 = 4_294_967_296;
 #[cfg(target_os = "linux")]
 const MAX_MARKDOWN_PLAINTEXT_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_TARGET_FILE_BYTES: usize = 68 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const MAX_TARGET_ROOT_COMMIT_BYTES: usize = 512;
 const GIT_TIMEOUT: Duration = Duration::from_mins(1);
 const GIT_TERMINATION_TIMEOUT: Duration = Duration::from_secs(2);
 const IMPORT_AUTHOR: &str = "Inex Repository Import <inex-import@localhost.invalid>";
@@ -3644,6 +3646,75 @@ struct GitIdentityEnvironment<'a> {
     committer_date: &'a str,
 }
 
+/// One narrow, current-path binding for target-only repository reads.
+///
+/// This guard is Linux-only because its authority depends on the held,
+/// no-follow root and empty-hooks directory handles. It is intentionally not a
+/// general Git-command capability: the only command exposed through it reads
+/// one fixed commit object with a frozen output bound.
+#[cfg(target_os = "linux")]
+struct TargetRootIdentityGuard<'runner> {
+    runner: &'runner GitRunner,
+    root: SecureSourceDirectory,
+    expected: FilesystemDirectoryIdentity,
+}
+
+#[cfg(target_os = "linux")]
+impl TargetRootIdentityGuard<'_> {
+    /// Recheck both retained handles and the current `runner.root` name.
+    fn verify(&self) -> Result<(), RepositoryImportError> {
+        if !self.runner.target || self.runner.target_hooks.is_none() {
+            return Err(RepositoryImportError::TargetAuditFailed);
+        }
+        self.runner.verify_runtime_bindings()?;
+        self.root
+            .verify_no_alternate_data_streams()
+            .map_err(|_| RepositoryImportError::TargetAuditFailed)?;
+        if self.root.identity() != &self.expected {
+            return Err(RepositoryImportError::TargetAuditFailed);
+        }
+        let current = open_secure_source_root(&self.runner.root)
+            .map_err(|_| RepositoryImportError::TargetAuditFailed)?;
+        current
+            .verify_no_alternate_data_streams()
+            .map_err(|_| RepositoryImportError::TargetAuditFailed)?;
+        if current.identity() != &self.expected {
+            return Err(RepositoryImportError::TargetAuditFailed);
+        }
+        self.runner.verify_runtime_bindings()
+    }
+
+    /// Read exactly `git cat-file commit <lowercase-sha1>` with no stdin and a
+    /// 512-byte stdout ceiling.
+    ///
+    /// The caller cannot select an operation, object type, argument suffix, or
+    /// output limit. Both success and every scrubbed command failure pass
+    /// through the same post-command root check before a result is released.
+    fn read_canonical_root_commit(
+        &self,
+        oid: &str,
+    ) -> Result<Zeroizing<Vec<u8>>, RepositoryImportError> {
+        require_sha1_oid(oid).map_err(|_| RepositoryImportError::TargetAuditFailed)?;
+        self.verify()?;
+        let result = self.runner.run_inner(
+            RepositoryGitOperation::AuditTarget,
+            &[
+                OsString::from("cat-file"),
+                OsString::from("commit"),
+                OsString::from(oid),
+            ],
+            None,
+            MAX_TARGET_ROOT_COMMIT_BYTES,
+            None,
+            true,
+            true,
+            false,
+        );
+        self.verify()?;
+        result
+    }
+}
+
 impl GitRunner {
     fn source_bound(
         executable: PathBuf,
@@ -3718,6 +3789,32 @@ impl GitRunner {
                 .map_err(|_| RepositoryImportError::TargetAuditFailed)?;
         }
         Ok(())
+    }
+
+    /// Bind target-only reads to one exact current physical root.
+    #[cfg(target_os = "linux")]
+    fn target_root_identity_guard(
+        &self,
+        expected: &FilesystemDirectoryIdentity,
+    ) -> Result<TargetRootIdentityGuard<'_>, RepositoryImportError> {
+        if !self.target || self.target_hooks.is_none() {
+            return Err(RepositoryImportError::TargetAuditFailed);
+        }
+        self.verify_runtime_bindings()?;
+        let root = open_secure_source_root(&self.root)
+            .map_err(|_| RepositoryImportError::TargetAuditFailed)?;
+        root.verify_no_alternate_data_streams()
+            .map_err(|_| RepositoryImportError::TargetAuditFailed)?;
+        if root.identity() != expected {
+            return Err(RepositoryImportError::TargetAuditFailed);
+        }
+        let guard = TargetRootIdentityGuard {
+            runner: self,
+            root,
+            expected: expected.clone(),
+        };
+        guard.verify()?;
+        Ok(guard)
     }
 
     fn target_object_batch(&self) -> Result<TargetObjectBatch<'_>, RepositoryImportError> {

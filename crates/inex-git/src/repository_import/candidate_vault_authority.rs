@@ -68,6 +68,26 @@ impl FreshTargetConfigEvidence<'_> {
     }
 }
 
+/// Internal error channel for target-only config collection.
+///
+/// Candidate/grammar failures stay separate from scrubbed Git and I/O errors
+/// so a fresh reconciliation can preserve the latter verbatim. The
+/// initial-only authority explicitly folds this channel back into its legacy
+/// [`CandidateSealError`] contract.
+#[derive(Debug)]
+pub(in crate::repository_import) enum FreshTargetConfigCollectionError {
+    /// Held physical evidence, canonical config grammar, or branding failed.
+    Candidate(CandidateSealError),
+    /// The isolated Git parser failed with its original scrubbed category.
+    Repository(super::RepositoryImportError),
+}
+
+impl From<CandidateSealError> for FreshTargetConfigCollectionError {
+    fn from(error: CandidateSealError) -> Self {
+        Self::Candidate(error)
+    }
+}
+
 /// Initial-process proof that authenticated vault metadata and canonical Git
 /// configuration belong to one exact marker-free physical manifest.
 ///
@@ -174,9 +194,10 @@ mod linux {
     use super::super::candidate_seal::GitControlRole;
     use super::super::{GitRunner, RepositoryImportError};
     use super::{
-        AuthenticatedVaultConfigAuthority, CandidateSealError, FreshTargetConfigEvidence,
-        MarkerFreePhysicalManifest, PhysicalRecordId, PhysicalRecordKindRef, TARGET_CONFIG_PATH,
-        VAULT_JSON_PATH, authenticated_profile, exact_file_id,
+        AuthenticatedVaultConfigAuthority, CandidateSealError, FreshTargetConfigCollectionError,
+        FreshTargetConfigEvidence, MarkerFreePhysicalManifest, PhysicalRecordId,
+        PhysicalRecordKindRef, TARGET_CONFIG_PATH, VAULT_JSON_PATH, authenticated_profile,
+        exact_file_id,
     };
     use inex_core::vault::Vault;
 
@@ -187,32 +208,52 @@ mod linux {
         physical: &'physical MarkerFreePhysicalManifest,
         held_root: &SecureSourceDirectory,
         runner: &GitRunner,
-    ) -> Result<FreshTargetConfigEvidence<'physical>, CandidateSealError> {
-        require_target_common_root(physical, held_root, runner)?;
+    ) -> Result<FreshTargetConfigEvidence<'physical>, FreshTargetConfigCollectionError> {
+        require_target_common_root(physical, held_root, runner)
+            .map_err(FreshTargetConfigCollectionError::Candidate)?;
 
-        let record = exact_file_id(physical, TARGET_CONFIG_PATH)?;
+        let record = exact_file_id(physical, TARGET_CONFIG_PATH)
+            .map_err(FreshTargetConfigCollectionError::Candidate)?;
         let expected_driver = super::super::super::installed_driver_command()
             .map_err(|_| CandidateSealError::InvalidContext)?;
-        with_held_target_config_snapshot(physical, held_root, |snapshot| {
+        let validation = with_held_target_config_snapshot(physical, held_root, |snapshot| {
             if !snapshot.is_bound_to(physical) || snapshot.role() != GitControlRole::Config {
                 return Err(CandidateSealError::InvalidContext);
             }
             snapshot.inspect_bytes(|bytes| {
-                let output = runner
+                Ok(runner
                     .run_isolated_stdin_config(bytes, MAX_TARGET_CONFIG_OUTPUT_BYTES)
-                    .map_err(|error| map_repository_error(&error))?;
-                validate_target_config_output(output.as_slice(), &expected_driver)
+                    .map(|output| {
+                        validate_target_config_output(output.as_slice(), &expected_driver)
+                    }))
             })
-        })?;
+        })
+        .map_err(FreshTargetConfigCollectionError::Candidate)?;
 
-        require_target_common_root(physical, held_root, runner)?;
+        // Close held root, current runner root, and hooks bindings even when
+        // the isolated Git parser or config grammar failed. Only then release
+        // either nested error to the caller.
+        require_target_common_root(physical, held_root, runner)
+            .map_err(FreshTargetConfigCollectionError::Candidate)?;
         held_root
             .verify_no_alternate_data_streams()
-            .map_err(|_| CandidateSealError::InvalidRecord)?;
+            .map_err(|_| CandidateSealError::InvalidRecord)
+            .map_err(FreshTargetConfigCollectionError::Candidate)?;
+        match validation {
+            Err(error) => return Err(FreshTargetConfigCollectionError::Repository(error)),
+            Ok(Err(error)) => return Err(FreshTargetConfigCollectionError::Candidate(error)),
+            Ok(Ok(())) => {}
+        }
 
         let evidence = FreshTargetConfigEvidence { physical, record };
-        if evidence.role(physical)? != GitControlRole::Config {
-            return Err(CandidateSealError::InvalidContext);
+        if evidence
+            .role(physical)
+            .map_err(FreshTargetConfigCollectionError::Candidate)?
+            != GitControlRole::Config
+        {
+            return Err(FreshTargetConfigCollectionError::Candidate(
+                CandidateSealError::InvalidContext,
+            ));
         }
         Ok(evidence)
     }
@@ -229,7 +270,8 @@ mod linux {
         vault: &Vault,
         runner: &GitRunner,
     ) -> Result<AuthenticatedVaultConfigAuthority<'physical>, CandidateSealError> {
-        let git_config = collect_fresh_target_config_evidence(physical, held_root, runner)?;
+        let git_config = collect_fresh_target_config_evidence(physical, held_root, runner)
+            .map_err(map_fresh_target_config_error_for_initial)?;
         require_common_root(physical, held_root, vault, runner)?;
 
         let vault_json = exact_file_id(physical, VAULT_JSON_PATH)?;
@@ -257,6 +299,15 @@ mod linux {
             CandidateSealError::ResourceLimit
         } else {
             CandidateSealError::InvalidRecord
+        }
+    }
+
+    fn map_fresh_target_config_error_for_initial(
+        error: FreshTargetConfigCollectionError,
+    ) -> CandidateSealError {
+        match error {
+            FreshTargetConfigCollectionError::Candidate(error) => error,
+            FreshTargetConfigCollectionError::Repository(error) => map_repository_error(&error),
         }
     }
 
@@ -415,11 +466,16 @@ mod linux {
             collect_held_marker_physical_manifest, collect_marker_free_physical_manifest,
         };
         use super::super::super::candidate_seal::{CandidateSealError, GitControlRole};
-        use super::super::super::{GitRunner, discover_git_executable};
-        use super::super::{
-            MarkerFreePhysicalManifest, TARGET_CONFIG_PATH, VAULT_JSON_PATH,
-            collect_authenticated_vault_config_authority, collect_fresh_target_config_evidence,
+        use super::super::super::{
+            GitRunner, RepositoryGitOperation, RepositoryImportError, RepositoryIoOperation,
+            discover_git_executable,
         };
+        use super::super::{
+            FreshTargetConfigCollectionError, MarkerFreePhysicalManifest, TARGET_CONFIG_PATH,
+            VAULT_JSON_PATH, collect_authenticated_vault_config_authority,
+            collect_fresh_target_config_evidence,
+        };
+        use super::map_fresh_target_config_error_for_initial;
 
         static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
         const PASSWORD: &[u8] = b"test-only vault authority password";
@@ -634,23 +690,29 @@ mod linux {
                     &invalid_root,
                     &invalid.runner
                 ),
-                Err(CandidateSealError::InvalidRecord)
+                Err(FreshTargetConfigCollectionError::Candidate(
+                    CandidateSealError::InvalidRecord
+                ))
             ));
 
             let first = fixture("fresh-root-a", VaultContentProfile::DocumentsOnly);
             let second = fixture("fresh-root-b", VaultContentProfile::DocumentsOnly);
             let (first_physical, first_root) = physical_and_root(&first);
             let (_second_physical, second_root) = physical_and_root(&second);
-            assert_eq!(
+            assert!(matches!(
                 collect_fresh_target_config_evidence(&first_physical, &first_root, &second.runner)
                     .err(),
-                Some(CandidateSealError::InvalidContext)
-            );
-            assert_eq!(
+                Some(FreshTargetConfigCollectionError::Candidate(
+                    CandidateSealError::InvalidContext
+                ))
+            ));
+            assert!(matches!(
                 collect_fresh_target_config_evidence(&first_physical, &second_root, &first.runner)
                     .err(),
-                Some(CandidateSealError::InvalidContext)
-            );
+                Some(FreshTargetConfigCollectionError::Candidate(
+                    CandidateSealError::InvalidContext
+                ))
+            ));
         }
 
         #[test]
@@ -709,6 +771,40 @@ mod linux {
                 );
             assert!(!declaration.contains("derive"));
             assert!(!production.contains("impl Clone for FreshTargetConfigEvidence"));
+        }
+
+        #[test]
+        fn initial_wrapper_explicitly_restores_legacy_config_error_mapping() {
+            assert_eq!(
+                map_fresh_target_config_error_for_initial(
+                    FreshTargetConfigCollectionError::Candidate(CandidateSealError::InvalidContext,),
+                ),
+                CandidateSealError::InvalidContext
+            );
+            assert_eq!(
+                map_fresh_target_config_error_for_initial(
+                    FreshTargetConfigCollectionError::Repository(
+                        RepositoryImportError::ResourceLimit,
+                    ),
+                ),
+                CandidateSealError::ResourceLimit
+            );
+            for repository_error in [
+                RepositoryImportError::GitCommandFailed {
+                    operation: RepositoryGitOperation::InspectConfiguration,
+                },
+                RepositoryImportError::Io {
+                    operation: RepositoryIoOperation::SpawnGit,
+                    kind: std::io::ErrorKind::NotFound,
+                },
+            ] {
+                assert_eq!(
+                    map_fresh_target_config_error_for_initial(
+                        FreshTargetConfigCollectionError::Repository(repository_error),
+                    ),
+                    CandidateSealError::InvalidRecord
+                );
+            }
         }
 
         #[test]
@@ -840,8 +936,10 @@ pub(super) fn collect_fresh_target_config_evidence(
     _physical: &MarkerFreePhysicalManifest,
     _unsupported_held_root: (),
     _unsupported_runner: (),
-) -> Result<FreshTargetConfigEvidence<'_>, CandidateSealError> {
-    Err(CandidateSealError::InvalidContext)
+) -> Result<FreshTargetConfigEvidence<'_>, FreshTargetConfigCollectionError> {
+    Err(FreshTargetConfigCollectionError::Candidate(
+        CandidateSealError::InvalidContext,
+    ))
 }
 
 #[cfg(not(target_os = "linux"))]

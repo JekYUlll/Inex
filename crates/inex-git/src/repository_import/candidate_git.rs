@@ -17,9 +17,13 @@ use std::cmp::Ordering;
 use std::fmt;
 
 use inex_core::atomic::PublicationIdentityScheme;
+#[cfg(target_os = "linux")]
+use inex_core::atomic::SecureSourceDirectory;
 use sha1::{Digest as _, Sha1};
 use sha2::Sha256;
 
+#[cfg(target_os = "linux")]
+use super::candidate_control::collect_fresh_target_main_ref;
 use super::candidate_manifest::{
     MarkerFreePhysicalManifest, PhysicalRecordId, PhysicalRecordKindRef, PhysicalRecordRef,
 };
@@ -28,7 +32,13 @@ use super::candidate_seal::{
     GitControlRecordKind, GitControlRole, HeadRefsRecord, ObjectKind, ObjectRecord,
     RootCommitRecord,
 };
+#[cfg(target_os = "linux")]
+use super::candidate_vault_authority::{
+    FreshTargetConfigCollectionError, collect_fresh_target_config_evidence,
+};
 use super::candidate_worktree::{FreshTrackedManifest, FreshTreeManifest};
+#[cfg(target_os = "linux")]
+use super::{GitRunner, RepositoryImportError};
 
 mod runtime_object_proof;
 
@@ -421,6 +431,105 @@ pub(super) fn parse_canonical_root_commit(
         raw_size,
         raw_sha256: raw_sha256(body),
     })
+}
+
+/// Bootstrap the canonical root commit from one held fresh target.
+///
+/// This is the sole target-only production constructor for
+/// [`FreshRootCommitEvidence`]. It first rejects every Git control shape
+/// outside the frozen loose-object profile, then binds canonical config and
+/// `refs/heads/main` snapshots to the exact same physical-manifest allocation.
+/// Only after those pathname-free proofs agree does it permit the fixed
+/// `git cat-file commit <oid>` reader under an exact current-root guard.
+///
+/// The bounded command inherits the existing trusted-local supervision
+/// boundary: the direct child has a deadline, but a hostile descendant that
+/// retains stdout can still delay the reader join. This proof grants no
+/// publication authority and retains no path, command output, config body, or
+/// commit body.
+#[cfg(target_os = "linux")]
+pub(super) fn collect_fresh_target_root_commit_evidence(
+    physical: &MarkerFreePhysicalManifest,
+    held_root: &SecureSourceDirectory,
+    runner: &GitRunner,
+) -> Result<FreshRootCommitEvidence, RepositoryImportError> {
+    let shape =
+        preflight_fresh_git_control_shape(physical).map_err(map_bootstrap_candidate_error)?;
+    let config = collect_fresh_target_config_evidence(physical, held_root, runner)
+        .map_err(map_bootstrap_config_error)?;
+    let main_ref = collect_fresh_target_main_ref(physical, held_root)
+        .map_err(map_bootstrap_candidate_error)?;
+
+    if !shape.is_bound_to(physical)
+        || !config.is_bound_to(physical)
+        || !main_ref.is_bound_to(physical)
+    {
+        return Err(RepositoryImportError::TargetAuditFailed);
+    }
+    config
+        .role(physical)
+        .map_err(map_bootstrap_candidate_error)?;
+    shape
+        .require_loose_object(main_ref.commit_oid())
+        .map_err(map_bootstrap_candidate_error)?;
+
+    let root_guard = runner.target_root_identity_guard(physical.root_identity())?;
+    let encoded_ref = main_ref_body(main_ref.commit_oid());
+    let encoded_ref = std::str::from_utf8(&encoded_ref[..40])
+        .map_err(|_| RepositoryImportError::TargetAuditFailed)?;
+    let body = root_guard.read_canonical_root_commit(encoded_ref)?;
+    let root_commit =
+        parse_canonical_root_commit(body.as_slice()).map_err(map_bootstrap_candidate_error)?;
+    drop(body);
+    if root_commit.commit_oid() != main_ref.commit_oid() {
+        return Err(RepositoryImportError::TargetAuditFailed);
+    }
+
+    root_guard.verify()?;
+    held_root
+        .verify_no_alternate_data_streams()
+        .map_err(|_| RepositoryImportError::TargetAuditFailed)?;
+    if held_root.identity() != physical.root_identity() {
+        return Err(RepositoryImportError::TargetAuditFailed);
+    }
+    Ok(root_commit)
+}
+
+/// Non-Linux builds have no held-root or target-command authority.
+#[cfg(not(target_os = "linux"))]
+pub(super) fn collect_fresh_target_root_commit_evidence(
+    _physical: &MarkerFreePhysicalManifest,
+    _unsupported_held_root: (),
+    _runner: &super::GitRunner,
+) -> Result<FreshRootCommitEvidence, super::RepositoryImportError> {
+    Err(super::RepositoryImportError::TargetAuditFailed)
+}
+
+#[cfg(target_os = "linux")]
+fn map_bootstrap_candidate_error(error: CandidateSealError) -> RepositoryImportError {
+    if matches!(error, CandidateSealError::ResourceLimit) {
+        RepositoryImportError::ResourceLimit
+    } else {
+        RepositoryImportError::TargetAuditFailed
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn map_bootstrap_config_error(error: FreshTargetConfigCollectionError) -> RepositoryImportError {
+    match error {
+        FreshTargetConfigCollectionError::Candidate(error) => map_bootstrap_candidate_error(error),
+        FreshTargetConfigCollectionError::Repository(RepositoryImportError::ResourceLimit) => {
+            RepositoryImportError::ResourceLimit
+        }
+        FreshTargetConfigCollectionError::Repository(RepositoryImportError::TargetAuditFailed) => {
+            RepositoryImportError::TargetAuditFailed
+        }
+        FreshTargetConfigCollectionError::Repository(
+            error @ (RepositoryImportError::Io { .. }
+            | RepositoryImportError::GitCommandFailed { .. }),
+        ) => error,
+        FreshTargetConfigCollectionError::Repository(_) => RepositoryImportError::TargetAuditFailed,
+    }
 }
 
 /// Construct exact sections 7/8 evidence from opaque tracked/tree views.
@@ -1308,9 +1417,17 @@ mod tests {
     #[cfg(target_os = "linux")]
     use std::fs;
     #[cfg(target_os = "linux")]
+    use std::io::Write as _;
+    #[cfg(target_os = "linux")]
+    use std::os::unix::fs::PermissionsExt as _;
+    #[cfg(target_os = "linux")]
     use std::path::{Path, PathBuf};
     #[cfg(target_os = "linux")]
+    use std::process::{Command, Stdio};
+    #[cfg(target_os = "linux")]
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    #[cfg(target_os = "linux")]
+    use std::time::{Duration, Instant};
 
     use super::*;
     #[cfg(target_os = "linux")]
@@ -1318,6 +1435,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     use inex_core::atomic::{
         PublicationIdentityScheme, VAULT_LOCAL_DIRECTORY, VAULT_MUTATION_LOCK_FILE,
+        open_secure_source_root,
     };
 
     #[cfg(target_os = "linux")]
@@ -1422,6 +1540,140 @@ mod tests {
         target
     }
 
+    #[cfg(target_os = "linux")]
+    struct BootstrapFixture {
+        root: TestDirectory,
+        repository: crate::repository_import::TargetRepository,
+        executable: PathBuf,
+    }
+
+    #[cfg(target_os = "linux")]
+    fn bootstrap_fixture() -> BootstrapFixture {
+        let root = TestDirectory::new();
+        fs::create_dir(root.path().join(VAULT_LOCAL_DIRECTORY)).expect("private directory creates");
+        write(
+            &root
+                .path()
+                .join(VAULT_LOCAL_DIRECTORY)
+                .join(VAULT_MUTATION_LOCK_FILE),
+            b"",
+        );
+        write(&root.path().join("vault.json"), b"fresh target metadata");
+        let repository = crate::repository_import::initialize_and_audit_target(
+            root.path(),
+            &[PathBuf::from("vault.json")],
+            1_784_044_800,
+        )
+        .expect("real canonical target initializes");
+        let executable = crate::repository_import::discover_git_executable()
+            .expect("real Git executable resolves");
+        BootstrapFixture {
+            root,
+            repository,
+            executable,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn physical_and_held_root(
+        fixture: &BootstrapFixture,
+    ) -> (MarkerFreePhysicalManifest, SecureSourceDirectory) {
+        let physical = collect_marker_free_physical_manifest(fixture.root.path())
+            .expect("fresh target physical manifest collects");
+        let held_root =
+            open_secure_source_root(fixture.root.path()).expect("fresh target root holds");
+        (physical, held_root)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn loose_path(root: &Path, oid: &str) -> PathBuf {
+        root.join(".git/objects").join(&oid[..2]).join(&oid[2..])
+    }
+
+    #[cfg(target_os = "linux")]
+    fn hash_literal_object(fixture: &BootstrapFixture, kind: &str, body: &[u8]) -> String {
+        let mut child = Command::new(&fixture.executable)
+            .current_dir(fixture.root.path())
+            .args(["hash-object", "-t", kind, "--literally", "-w", "--stdin"])
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", super::super::null_device())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("literal hash-object starts");
+        child
+            .stdin
+            .take()
+            .expect("literal hash-object stdin exists")
+            .write_all(body)
+            .expect("literal object body writes");
+        let output = child
+            .wait_with_output()
+            .expect("literal hash-object completes");
+        assert!(output.status.success(), "literal hash-object succeeds");
+        let oid = std::str::from_utf8(&output.stdout)
+            .expect("literal object id is UTF-8")
+            .trim_end_matches(['\r', '\n'])
+            .to_owned();
+        assert_eq!(oid.len(), 40);
+        oid
+    }
+
+    #[cfg(target_os = "linux")]
+    fn replace_main_ref_object(fixture: &BootstrapFixture, kind: &str, body: &[u8]) -> String {
+        let main_ref = fixture.root.path().join(".git/refs/heads/main");
+        let previous = fs::read_to_string(&main_ref)
+            .expect("current main ref reads")
+            .trim()
+            .to_owned();
+        let oid = hash_literal_object(fixture, kind, body);
+        write(&main_ref, format!("{oid}\n").as_bytes());
+        if previous != oid {
+            let previous_path = loose_path(fixture.root.path(), &previous);
+            fs::remove_file(&previous_path).expect("previous root object removes");
+            let fanout = previous_path.parent().expect("loose object has fanout");
+            if fs::read_dir(fanout).expect("fanout reads").next().is_none() {
+                fs::remove_dir(fanout).expect("unused fanout removes");
+            }
+        }
+        oid
+    }
+
+    #[cfg(target_os = "linux")]
+    fn create_git_spy(real_git: &Path, directory: &TestDirectory) -> PathBuf {
+        let spy = directory.path().join("git-spy");
+        let real = real_git
+            .to_str()
+            .expect("real Git path is UTF-8")
+            .replace('\'', "'\"'\"'");
+        let script = format!(
+            "#!/bin/sh\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\" >> \"$0.log\"; done\nprintf '%s\\n' -- >> \"$0.log\"\ncase \" $* \" in\n  *\" cat-file commit \"*) if IFS= read -r unexpected; then exit 98; fi ;;\nesac\nexec '{real}' \"$@\"\n"
+        );
+        fs::write(&spy, script).expect("Git spy writes");
+        let mut permissions = fs::metadata(&spy)
+            .expect("Git spy metadata reads")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&spy, permissions).expect("Git spy becomes executable");
+        spy
+    }
+
+    #[cfg(target_os = "linux")]
+    fn spy_commands(spy: &Path) -> Vec<Vec<String>> {
+        let log = fs::read_to_string(format!("{}.log", spy.display())).expect("Git spy log reads");
+        let mut commands = Vec::new();
+        let mut current = Vec::new();
+        for line in log.lines() {
+            if line == "--" {
+                commands.push(std::mem::take(&mut current));
+            } else {
+                current.push(line.to_owned());
+            }
+        }
+        assert!(current.is_empty(), "every logged command is terminated");
+        commands
+    }
+
     #[test]
     fn canonical_commit_parser_accepts_i64_edges_and_rejects_noncanonical_forms() {
         let tree = object(ObjectKind::Tree, b"");
@@ -1461,6 +1713,450 @@ mod tests {
             parse_canonical_root_commit(&trailing),
             Err(CandidateSealError::InvalidRecord)
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn target_root_commit_bootstrap_reads_one_real_canonical_commit_with_fixed_commands() {
+        let fixture = bootstrap_fixture();
+        let spy_directory = TestDirectory::new();
+        let spy = create_git_spy(&fixture.executable, &spy_directory);
+        let runner = GitRunner::target(spy.clone(), fixture.root.path().to_path_buf())
+            .expect("spy target runner binds");
+        let (physical, held_root) = physical_and_held_root(&fixture);
+
+        let observed = collect_fresh_target_root_commit_evidence(&physical, &held_root, &runner)
+            .expect("real canonical commit bootstraps");
+        let expected = parse_canonical_root_commit(fixture.repository.commit_bytes.as_slice())
+            .expect("creation proof contains canonical commit");
+        assert_eq!(observed, expected);
+
+        let oid = fixture.repository.root_commit_oid().to_owned();
+        assert_eq!(
+            spy_commands(&spy),
+            vec![
+                vec![
+                    "config".to_owned(),
+                    "--file".to_owned(),
+                    "-".to_owned(),
+                    "--no-includes".to_owned(),
+                    "--null".to_owned(),
+                    "--list".to_owned(),
+                ],
+                vec![
+                    "-c".to_owned(),
+                    "core.fsmonitor=false".to_owned(),
+                    "-c".to_owned(),
+                    "protocol.allow=never".to_owned(),
+                    "-c".to_owned(),
+                    "submodule.recurse=false".to_owned(),
+                    "-c".to_owned(),
+                    "core.splitIndex=false".to_owned(),
+                    "-c".to_owned(),
+                    "core.hooksPath=.git/inex-empty-hooks".to_owned(),
+                    "cat-file".to_owned(),
+                    "commit".to_owned(),
+                    oid,
+                ],
+            ]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn target_root_commit_bootstrap_rejects_bounds_type_corruption_and_noncanonical_grammar() {
+        let fixture = bootstrap_fixture();
+        let runner = GitRunner::target(
+            fixture.executable.clone(),
+            fixture.root.path().to_path_buf(),
+        )
+        .expect("real target runner binds");
+        let canonical = fixture.repository.commit_bytes.as_slice().to_vec();
+
+        let mut parent = canonical.clone();
+        let author = parent
+            .windows(b"author ".len())
+            .position(|window| window == b"author ")
+            .expect("canonical author header exists");
+        parent.splice(
+            author..author,
+            b"parent 1111111111111111111111111111111111111111\n"
+                .iter()
+                .copied(),
+        );
+
+        let mut extra_header = canonical.clone();
+        let author = extra_header
+            .windows(b"author ".len())
+            .position(|window| window == b"author ")
+            .expect("canonical author header exists");
+        extra_header.splice(author..author, b"encoding UTF-8\n".iter().copied());
+
+        let timezone = String::from_utf8(canonical.clone())
+            .expect("canonical commit is UTF-8")
+            .replace(" +0000", " +0100")
+            .into_bytes();
+        let mut tree = canonical.clone();
+        let tree_end = tree
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .expect("tree header ends");
+        tree[5..tree_end].make_ascii_uppercase();
+        let mut trailing = canonical.clone();
+        trailing.push(b'!');
+
+        let over_limit = vec![b'x'; MAX_CANONICAL_ROOT_COMMIT_BYTES + 1];
+        replace_main_ref_object(&fixture, "commit", &over_limit);
+        let (physical, held_root) = physical_and_held_root(&fixture);
+        assert!(matches!(
+            collect_fresh_target_root_commit_evidence(&physical, &held_root, &runner),
+            Err(RepositoryImportError::ResourceLimit)
+        ));
+
+        for body in [&parent, &extra_header, &timezone, &tree, &trailing] {
+            replace_main_ref_object(&fixture, "commit", body);
+            let (physical, held_root) = physical_and_held_root(&fixture);
+            assert!(matches!(
+                collect_fresh_target_root_commit_evidence(&physical, &held_root, &runner),
+                Err(RepositoryImportError::TargetAuditFailed)
+            ));
+        }
+
+        replace_main_ref_object(&fixture, "blob", b"wrong target object type");
+        let (physical, held_root) = physical_and_held_root(&fixture);
+        assert!(matches!(
+            collect_fresh_target_root_commit_evidence(&physical, &held_root, &runner),
+            Err(RepositoryImportError::GitCommandFailed {
+                operation: crate::repository_import::RepositoryGitOperation::AuditTarget
+            })
+        ));
+
+        let oid = replace_main_ref_object(&fixture, "commit", &canonical);
+        let loose = loose_path(fixture.root.path(), &oid);
+        let compressed = fs::read(&loose).expect("canonical loose commit reads");
+        let original_permissions = fs::metadata(&loose)
+            .expect("canonical loose commit metadata reads")
+            .permissions();
+        let mut writable_permissions = original_permissions.clone();
+        writable_permissions.set_mode(0o600);
+        fs::set_permissions(&loose, writable_permissions)
+            .expect("canonical loose commit becomes writable");
+        fs::write(&loose, b"not a zlib object").expect("loose commit corrupts");
+        let (physical, held_root) = physical_and_held_root(&fixture);
+        assert!(matches!(
+            collect_fresh_target_root_commit_evidence(&physical, &held_root, &runner),
+            Err(RepositoryImportError::GitCommandFailed {
+                operation: crate::repository_import::RepositoryGitOperation::AuditTarget
+            })
+        ));
+        fs::write(&loose, compressed).expect("canonical loose commit restores");
+        fs::set_permissions(loose, original_permissions)
+            .expect("canonical loose commit permissions restore");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn target_root_commit_bootstrap_rejects_shape_and_config_before_cat_file() {
+        let fixture = bootstrap_fixture();
+        let spy_directory = TestDirectory::new();
+        let spy = create_git_spy(&fixture.executable, &spy_directory);
+        let runner = GitRunner::target(spy.clone(), fixture.root.path().to_path_buf())
+            .expect("spy target runner binds");
+
+        let alternates = fixture.root.path().join(".git/objects/info/alternates");
+        write(&alternates, b"/forbidden/alternate\n");
+        let (physical, held_root) = physical_and_held_root(&fixture);
+        assert!(matches!(
+            collect_fresh_target_root_commit_evidence(&physical, &held_root, &runner),
+            Err(RepositoryImportError::TargetAuditFailed)
+        ));
+        assert!(!PathBuf::from(format!("{}.log", spy.display())).exists());
+        fs::remove_file(alternates).expect("forbidden alternate removes");
+
+        let pack = fixture
+            .root
+            .path()
+            .join(".git/objects/pack/pack-deadbeef.pack");
+        write(&pack, b"forbidden pack");
+        let (physical, held_root) = physical_and_held_root(&fixture);
+        assert!(matches!(
+            collect_fresh_target_root_commit_evidence(&physical, &held_root, &runner),
+            Err(RepositoryImportError::TargetAuditFailed)
+        ));
+        assert!(!PathBuf::from(format!("{}.log", spy.display())).exists());
+        fs::remove_file(pack).expect("forbidden pack removes");
+
+        let config_path = fixture.root.path().join(".git/config");
+        let mut config = fs::read(&config_path).expect("canonical config reads");
+        config.extend_from_slice(b"[remote \"origin\"]\n\turl = https://invalid.example/\n");
+        fs::write(&config_path, config).expect("invalid extra config writes");
+        let (physical, held_root) = physical_and_held_root(&fixture);
+        assert!(matches!(
+            collect_fresh_target_root_commit_evidence(&physical, &held_root, &runner),
+            Err(RepositoryImportError::TargetAuditFailed)
+        ));
+        let commands = spy_commands(&spy);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(
+            commands[0],
+            ["config", "--file", "-", "--no-includes", "--null", "--list"]
+        );
+        assert!(
+            commands
+                .iter()
+                .flatten()
+                .all(|argument| argument != "cat-file")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn target_root_commit_bootstrap_requires_typed_oid_and_common_live_root() {
+        let fixture = bootstrap_fixture();
+        let substitute = canonical_commit(
+            parse_canonical_root_commit(fixture.repository.commit_bytes.as_slice())
+                .expect("creation commit parses")
+                .tree_oid(),
+            "1784044801",
+        );
+        let spy_directory = TestDirectory::new();
+        let spy = spy_directory.path().join("substitute-git");
+        let body_path = PathBuf::from(format!("{}.body", spy.display()));
+        fs::write(&body_path, substitute).expect("substitute commit body writes");
+        let real = fixture
+            .executable
+            .to_str()
+            .expect("real Git path is UTF-8")
+            .replace('\'', "'\"'\"'");
+        fs::write(
+            &spy,
+            format!(
+                "#!/bin/sh\ncase \" $* \" in *\" cat-file commit \"*) cat \"$0.body\"; exit 0 ;; esac\nexec '{real}' \"$@\"\n"
+            ),
+        )
+        .expect("substitute Git spy writes");
+        let mut permissions = fs::metadata(&spy)
+            .expect("substitute spy metadata reads")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&spy, permissions).expect("substitute spy becomes executable");
+        let runner = GitRunner::target(spy, fixture.root.path().to_path_buf())
+            .expect("substitute target runner binds");
+        let (physical, held_root) = physical_and_held_root(&fixture);
+        assert!(matches!(
+            collect_fresh_target_root_commit_evidence(&physical, &held_root, &runner),
+            Err(RepositoryImportError::TargetAuditFailed)
+        ));
+
+        let other = bootstrap_fixture();
+        let other_runner =
+            GitRunner::target(other.executable.clone(), other.root.path().to_path_buf())
+                .expect("other target runner binds");
+        let (physical, held_root) = physical_and_held_root(&fixture);
+        assert!(matches!(
+            collect_fresh_target_root_commit_evidence(&physical, &held_root, &other_runner),
+            Err(RepositoryImportError::TargetAuditFailed)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn target_root_commit_bootstrap_preserves_config_git_and_io_errors() {
+        let fixture = bootstrap_fixture();
+        let (physical, held_root) = physical_and_held_root(&fixture);
+        let missing_runner = GitRunner::target(
+            fixture.root.path().join("missing-config-git"),
+            fixture.root.path().to_path_buf(),
+        )
+        .expect("target runner binds independently of executable spawn");
+        assert!(matches!(
+            collect_fresh_target_root_commit_evidence(&physical, &held_root, &missing_runner),
+            Err(RepositoryImportError::Io {
+                operation: crate::repository_import::RepositoryIoOperation::SpawnGit,
+                kind: std::io::ErrorKind::NotFound,
+            })
+        ));
+
+        let wrapper_directory = TestDirectory::new();
+        let wrapper = wrapper_directory.path().join("failing-config-git");
+        let real = fixture
+            .executable
+            .to_str()
+            .expect("real Git path is UTF-8")
+            .replace('\'', "'\"'\"'");
+        fs::write(
+            &wrapper,
+            format!("#!/bin/sh\nif [ \"$1\" = config ]; then exit 73; fi\nexec '{real}' \"$@\"\n"),
+        )
+        .expect("failing config wrapper writes");
+        let mut permissions = fs::metadata(&wrapper)
+            .expect("failing config wrapper metadata reads")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&wrapper, permissions)
+            .expect("failing config wrapper becomes executable");
+        let failed_runner = GitRunner::target(wrapper, fixture.root.path().to_path_buf())
+            .expect("failing config target runner binds");
+        assert!(matches!(
+            collect_fresh_target_root_commit_evidence(&physical, &held_root, &failed_runner),
+            Err(RepositoryImportError::GitCommandFailed {
+                operation: crate::repository_import::RepositoryGitOperation::InspectConfiguration
+            })
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn target_root_commit_bootstrap_rejects_root_rename_inside_command_window() {
+        let fixture = bootstrap_fixture();
+        let wrapper_directory = TestDirectory::new();
+        let wrapper = wrapper_directory.path().join("gated-root-git");
+        let ready = wrapper_directory.path().join("cat-file-ready");
+        let release = wrapper_directory.path().join("cat-file-release");
+        let body = wrapper_directory.path().join("canonical-commit-body");
+        fs::write(&body, fixture.repository.commit_bytes.as_slice())
+            .expect("canonical wrapper body writes");
+
+        let shell_quote = |path: &Path| {
+            format!(
+                "'{}'",
+                path.to_str()
+                    .expect("test path is UTF-8")
+                    .replace('\'', "'\"'\"'")
+            )
+        };
+        let real = shell_quote(&fixture.executable);
+        let ready_argument = shell_quote(&ready);
+        let release_argument = shell_quote(&release);
+        let body_argument = shell_quote(&body);
+        fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\ncase \" $* \" in\n  *\" cat-file commit \"*)\n    : > {ready_argument}\n    while [ ! -e {release_argument} ]; do :; done\n    /bin/cat {body_argument}\n    exit 0\n    ;;\nesac\nexec {real} \"$@\"\n"
+            ),
+        )
+        .expect("gated Git wrapper writes");
+        let mut permissions = fs::metadata(&wrapper)
+            .expect("gated Git wrapper metadata reads")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&wrapper, permissions).expect("gated Git wrapper becomes executable");
+
+        let runner = GitRunner::target(wrapper, fixture.root.path().to_path_buf())
+            .expect("gated target runner binds");
+        let (physical, held_root) = physical_and_held_root(&fixture);
+        let moved = fixture
+            .root
+            .path()
+            .with_extension("command-window-old-root");
+        let root_for_thread = fixture.root.path().to_path_buf();
+        let moved_for_thread = moved.clone();
+        let ready_for_thread = ready.clone();
+        let release_for_thread = release.clone();
+        let outcome = std::thread::scope(|scope| {
+            let renamer = scope.spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !ready_for_thread.exists() {
+                    if Instant::now() >= deadline {
+                        let _ = fs::write(&release_for_thread, []);
+                        return Err("cat-file wrapper did not enter its command window");
+                    }
+                    std::thread::yield_now();
+                }
+                fs::rename(&root_for_thread, &moved_for_thread)
+                    .map_err(|_| "target root did not rename")?;
+                fs::write(&release_for_thread, [])
+                    .map_err(|_| "cat-file wrapper did not release")?;
+                Ok::<(), &'static str>(())
+            });
+            let outcome = collect_fresh_target_root_commit_evidence(&physical, &held_root, &runner);
+            renamer
+                .join()
+                .expect("command-window renamer does not panic")
+                .expect("command-window rename and release succeed");
+            outcome
+        });
+        assert!(matches!(
+            outcome,
+            Err(RepositoryImportError::TargetAuditFailed)
+        ));
+        assert!(!fixture.root.path().exists());
+        assert!(moved.exists());
+        fs::rename(&moved, fixture.root.path()).expect("target root restores for cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn target_root_identity_guard_rejects_unheld_hooks_and_old_renamed_root() {
+        let fixture = bootstrap_fixture();
+        let (physical, _held_root) = physical_and_held_root(&fixture);
+        let uninitialized = GitRunner::target_uninitialized(
+            fixture.executable.clone(),
+            fixture.root.path().to_path_buf(),
+        );
+        assert!(matches!(
+            uninitialized.target_root_identity_guard(physical.root_identity()),
+            Err(RepositoryImportError::TargetAuditFailed)
+        ));
+
+        let missing_runner = GitRunner::target(
+            fixture.root.path().join("missing-git-executable"),
+            fixture.root.path().to_path_buf(),
+        )
+        .expect("target root can bind before the fixed executable is spawned");
+        let missing_guard = missing_runner
+            .target_root_identity_guard(physical.root_identity())
+            .expect("missing-executable guard still binds the exact root");
+        assert!(matches!(
+            missing_guard.read_canonical_root_commit(fixture.repository.root_commit_oid()),
+            Err(RepositoryImportError::Io {
+                operation: crate::repository_import::RepositoryIoOperation::SpawnGit,
+                kind: std::io::ErrorKind::NotFound,
+            })
+        ));
+
+        let runner = GitRunner::target(
+            fixture.executable.clone(),
+            fixture.root.path().to_path_buf(),
+        )
+        .expect("target runner binds");
+        let guard = runner
+            .target_root_identity_guard(physical.root_identity())
+            .expect("exact root guard binds");
+        let moved = fixture.root.path().with_extension("held-old-root");
+        fs::rename(fixture.root.path(), &moved).expect("target root renames");
+        assert!(matches!(
+            guard.verify(),
+            Err(RepositoryImportError::TargetAuditFailed)
+        ));
+        fs::rename(&moved, fixture.root.path()).expect("target root restores for cleanup");
+
+        write(
+            &fixture.root.path().join(".git/inex-empty-hooks/pre-commit"),
+            b"#!/bin/sh\nexit 99\n",
+        );
+        assert!(matches!(
+            runner.target_root_identity_guard(physical.root_identity()),
+            Err(RepositoryImportError::TargetAuditFailed)
+        ));
+    }
+
+    #[test]
+    fn target_root_commit_bootstrap_api_accepts_no_vault_source_or_password_authority() {
+        let source = include_str!("candidate_git.rs");
+        let start = source
+            .find("pub(super) fn collect_fresh_target_root_commit_evidence(")
+            .expect("Linux bootstrap signature exists");
+        let signature = source[start..]
+            .split_once(") -> Result<FreshRootCommitEvidence, RepositoryImportError>")
+            .map(|(signature, _)| signature)
+            .expect("Linux bootstrap signature is bounded");
+        assert!(signature.contains("physical: &MarkerFreePhysicalManifest"));
+        assert!(signature.contains("held_root: &SecureSourceDirectory"));
+        assert!(signature.contains("runner: &GitRunner"));
+        assert!(!signature.contains("Vault"));
+        assert!(!signature.contains("SourceSnapshot"));
+        assert!(!signature.contains("password"));
     }
 
     #[test]
