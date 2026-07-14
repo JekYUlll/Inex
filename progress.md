@@ -883,3 +883,8 @@
 - 提交 `b75f9ed`（`fix(umbra): validate profile cover annotations`）：VS Code 对 profile 的 `outer: cover` 强制收集非空公开 cover text，不再信任 `promptForCover` 是否被旧配置错误关闭；因此不会把结构无效的 Cover 请求交给 daemon。
 - daemon 生命周期测试现以 apply 响应给出的 ETag、projection 和 RenderMap 的 exact private-slot 范围调用 `umbra.annotation.remove`，断言恢复原投影且不再有 private slot。首轮误用 RPC RenderMap 的 `projectionStartByte`/`projectionEndByte` 字段而失败；实际协议字段为 `startByte`/`endByte`，已按 canonical response 修正后通过。
 - 验证：`cargo fmt --check`、targeted daemon lifecycle 1/1、`pnpm --dir editors/vscode check`、VS Code tests 50/50 通过。
+
+## 2026-07-15 — VS Code 真实 Markdown paragraph 空选区
+
+- 提交 `f34e0dc`（`feat(vscode): target Markdown paragraphs for annotations`）：将空选区默认目标从单行近似改为光标所在的连续非空 Markdown 行；空白行仍拒绝，range 不含行终止符。纯函数独立于 VS Code host，便于直接回归 Unicode UTF-8 buffer 的 byte-range 语义。
+- PRD 的 MVP 状态同步为真实 paragraph 行为。验证：`git diff --check`、`pnpm --dir editors/vscode check`、tests 51/51、`pnpm --dir editors/vscode build` 均通过。
