@@ -23,7 +23,11 @@ end, { desc = "Lock Inex Outer vault and wipe managed buffers" })
 
 vim.api.nvim_create_user_command("InexOpen", function(arguments)
   inex.open_document(arguments.args)
-end, { nargs = 1, complete = "file", desc = "Open an Inex Markdown document" })
+end, { nargs = 1, desc = "Open an Inex Markdown document" })
+
+vim.api.nvim_create_user_command("InexNew", function(arguments)
+  inex.create_document(arguments.args)
+end, { nargs = 1, desc = "Create and open an empty Inex Markdown document" })
 
 vim.api.nvim_create_user_command("InexStop", function()
   inex.stop()

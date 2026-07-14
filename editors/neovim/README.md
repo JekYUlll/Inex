@@ -22,9 +22,17 @@ Commands currently available:
   Outer session through `vault.unlock`.
 - `:InexOpen path/to/note.md` opens a normal Outer Markdown projection in an
   unnamed, unlisted buffer with swap/undo persistence disabled and wipe-on-hide.
+- `:InexNew path/to/note.md` creates an empty ordinary Markdown document through
+  daemon `file.write` and opens it with the same buffer restrictions.
 - `:InexLock` closes daemon document handles, wipes managed buffers, then locks
   the Outer session.
 - `:InexStop` terminates the local RPC process and drops pending callbacks.
+
+`InexOpen` and `InexNew` take an Inex logical Markdown path (for example,
+`entry.md`), not a local plaintext filesystem path. `InexNew` currently expects
+an existing parent directory; directory browsing/creation is a later MVP
+command. These commands intentionally do not offer ordinary filesystem
+completion.
 
 The current MVP intentionally rejects feature-2/Umbra documents. Umbra, save,
 search, and editable buffers follow only through the same authenticated session
