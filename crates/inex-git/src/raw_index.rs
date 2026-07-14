@@ -25,6 +25,7 @@ const MAX_INDEX_ENTRIES: usize = 100_000;
 const MAX_TARGET_INDEX_BYTES: usize = 68 * 1024 * 1024;
 const MAX_TARGET_INDEX_ENTRIES: usize = 100_003;
 const MAX_PATH_BYTES: usize = 1024;
+#[cfg(any(target_os = "linux", test))]
 const MAX_RETAINED_PATH_BYTES: usize = 256 * 1024 * 1024;
 const MAX_PATH_COMPONENTS: usize = 128;
 const EOIE_DATA_BYTES: usize = 4 + SHA1_BYTES;
@@ -36,12 +37,14 @@ const EOIE_EXTENSION: [u8; 4] = *b"EOIE";
 const IEOT_EXTENSION: [u8; 4] = *b"IEOT";
 
 /// One normal entry proven directly from the raw SHA-1 index bytes.
+#[cfg(any(target_os = "linux", test))]
 #[derive(Clone, Eq, PartialEq)]
 pub(super) struct RawIndexEntry {
     pub(super) path: Vec<u8>,
     pub(super) oid: [u8; SHA1_BYTES],
 }
 
+#[cfg(any(target_os = "linux", test))]
 impl fmt::Debug for RawIndexEntry {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -53,12 +56,14 @@ impl fmt::Debug for RawIndexEntry {
 }
 
 /// The minimal semantic result consumed by repository-import verification.
+#[cfg(any(target_os = "linux", test))]
 #[derive(Clone, Eq, PartialEq)]
 pub(super) struct RawIndex {
     pub(super) version: u32,
     pub(super) entries: Vec<RawIndexEntry>,
 }
 
+#[cfg(any(target_os = "linux", test))]
 impl fmt::Debug for RawIndex {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -77,6 +82,7 @@ pub(super) enum RawIndexError {
     ResourceLimit,
 }
 
+#[cfg(any(target_os = "linux", test))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ParsedEntry {
     semantic: RawIndexEntry,
@@ -102,6 +108,32 @@ struct RawIndexLimits {
     entries: usize,
 }
 
+#[derive(Clone, Copy)]
+struct IndexHeader {
+    content_end: usize,
+    version: u32,
+    entry_count: usize,
+}
+
+#[derive(Clone, Copy)]
+struct ParsedEntryOffset {
+    start: usize,
+}
+
+#[derive(Clone, Copy)]
+struct ParsedEntryHeader {
+    fixed_end: usize,
+    oid: [u8; SHA1_BYTES],
+    encoded_name_length: u16,
+}
+
+#[derive(Clone, Copy)]
+struct ParsedEntryAgainstPath {
+    start: usize,
+    end: usize,
+    oid: [u8; SHA1_BYTES],
+}
+
 #[cfg(any(target_os = "linux", test))]
 const SOURCE_INDEX_LIMITS: RawIndexLimits = RawIndexLimits {
     bytes: MAX_INDEX_BYTES,
@@ -123,35 +155,115 @@ pub(super) fn parse_sha1_index(bytes: &[u8]) -> Result<RawIndex, RawIndexError> 
 
 /// Parse the same frozen SHA-1 format with the target's three managed-entry
 /// allowance and target-file byte bound.
+#[cfg(test)]
 pub(super) fn parse_target_sha1_index(bytes: &[u8]) -> Result<RawIndex, RawIndexError> {
     parse_sha1_index_with_limits(bytes, TARGET_INDEX_LIMITS)
 }
 
+/// The target index semantics proven without retaining expanded path bytes.
+#[derive(Clone, Eq, PartialEq)]
+pub(super) struct TargetRawIndexSummary {
+    pub(super) version: u32,
+    pub(super) oids: Vec<[u8; SHA1_BYTES]>,
+}
+
+impl fmt::Debug for TargetRawIndexSummary {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TargetRawIndexSummary")
+            .field("version", &self.version)
+            .field("entry_count", &self.oids.len())
+            .finish()
+    }
+}
+
+/// Validate the target SHA-1 index against borrowed canonical paths.
+///
+/// The first index scan compares every expanded path directly with the
+/// corresponding borrowed path and records only its fixed-size object ID and
+/// byte offset. IEOT blocks are then decoded independently and compared again
+/// with those same borrowed paths and recorded IDs. V2/v3 paths are compared
+/// as borrowed raw index slices. V4 prefix compression is verified directly
+/// against the preceding and current borrowed expected paths, so this function
+/// never owns or reconstructs canonical path bytes.
+///
+/// `expected_paths` must be the strictly canonical, byte-sorted ordinal view
+/// of the caller's already-bound physical manifest. The caller remains
+/// responsible for that manifest's aggregate path budget; this parser binds
+/// the index count and every path byte to the supplied view. The returned
+/// summary owns only fixed-size OIDs, and its `Debug` output reveals neither
+/// paths nor OIDs.
+pub(super) fn validate_target_sha1_index_paths(
+    bytes: &[u8],
+    expected_paths: &[&[u8]],
+) -> Result<TargetRawIndexSummary, RawIndexError> {
+    let header = validate_index_header(bytes, TARGET_INDEX_LIMITS)?;
+    if expected_paths.len() > TARGET_INDEX_LIMITS.entries {
+        return Err(RawIndexError::ResourceLimit);
+    }
+    if header.entry_count != expected_paths.len() {
+        return Err(RawIndexError::Malformed);
+    }
+
+    let mut offsets = Vec::new();
+    offsets
+        .try_reserve(header.entry_count)
+        .map_err(|_| RawIndexError::ResourceLimit)?;
+    let mut oids = Vec::new();
+    oids.try_reserve(header.entry_count)
+        .map_err(|_| RawIndexError::ResourceLimit)?;
+    let mut offset = HEADER_BYTES;
+    for (entry_index, expected_path) in expected_paths.iter().enumerate() {
+        let previous_path = entry_index
+            .checked_sub(1)
+            .and_then(|previous| expected_paths.get(previous).copied());
+        let parsed = parse_entry_against_path(
+            bytes,
+            header.version,
+            offset,
+            header.content_end,
+            previous_path,
+            expected_path,
+            FirstV4Entry::IndexStart,
+        )?;
+        if previous_path.is_some_and(|previous| previous >= *expected_path) {
+            return Err(RawIndexError::Malformed);
+        }
+        offsets.push(ParsedEntryOffset {
+            start: parsed.start,
+        });
+        offset = parsed.end;
+        oids.push(parsed.oid);
+    }
+    let entries_end = offset;
+    let extensions = parse_extensions(bytes, entries_end, header.content_end)?;
+    validate_eoie(&extensions, entries_end)?;
+    validate_ieot_against_paths(
+        bytes,
+        header.version,
+        &offsets,
+        entries_end,
+        &extensions,
+        TARGET_INDEX_LIMITS,
+        expected_paths,
+        &oids,
+    )?;
+
+    Ok(TargetRawIndexSummary {
+        version: header.version,
+        oids,
+    })
+}
+
+#[cfg(any(target_os = "linux", test))]
 fn parse_sha1_index_with_limits(
     bytes: &[u8],
     limits: RawIndexLimits,
 ) -> Result<RawIndex, RawIndexError> {
-    validate_index_byte_length(bytes.len(), limits)?;
-    let content_end = bytes
-        .len()
-        .checked_sub(SHA1_BYTES)
-        .filter(|end| *end >= HEADER_BYTES)
-        .ok_or(RawIndexError::Malformed)?;
-    verify_checksum(bytes, content_end)?;
-
-    if bytes.get(..4) != Some(INDEX_SIGNATURE.as_slice()) {
-        return Err(RawIndexError::Malformed);
-    }
-    let version = read_u32(bytes, 4, content_end)?;
-    if !matches!(version, 2..=4) {
-        return Err(RawIndexError::Unsupported);
-    }
-    let entry_count = usize::try_from(read_u32(bytes, 8, content_end)?)
-        .map_err(|_| RawIndexError::ResourceLimit)?;
-    if entry_count > limits.entries {
-        return Err(RawIndexError::ResourceLimit);
-    }
-
+    let header = validate_index_header(bytes, limits)?;
+    let content_end = header.content_end;
+    let version = header.version;
+    let entry_count = header.entry_count;
     let mut parsed_entries = Vec::new();
     parsed_entries
         .try_reserve(entry_count)
@@ -204,6 +316,38 @@ fn parse_sha1_index_with_limits(
     })
 }
 
+fn validate_index_header(
+    bytes: &[u8],
+    limits: RawIndexLimits,
+) -> Result<IndexHeader, RawIndexError> {
+    validate_index_byte_length(bytes.len(), limits)?;
+    let content_end = bytes
+        .len()
+        .checked_sub(SHA1_BYTES)
+        .filter(|end| *end >= HEADER_BYTES)
+        .ok_or(RawIndexError::Malformed)?;
+    verify_checksum(bytes, content_end)?;
+
+    if bytes.get(..4) != Some(INDEX_SIGNATURE.as_slice()) {
+        return Err(RawIndexError::Malformed);
+    }
+    let version = read_u32(bytes, 4, content_end)?;
+    if !matches!(version, 2..=4) {
+        return Err(RawIndexError::Unsupported);
+    }
+    let entry_count = usize::try_from(read_u32(bytes, 8, content_end)?)
+        .map_err(|_| RawIndexError::ResourceLimit)?;
+    if entry_count > limits.entries {
+        return Err(RawIndexError::ResourceLimit);
+    }
+
+    Ok(IndexHeader {
+        content_end,
+        version,
+        entry_count,
+    })
+}
+
 fn validate_index_byte_length(length: usize, limits: RawIndexLimits) -> Result<(), RawIndexError> {
     if length <= limits.bytes {
         Ok(())
@@ -228,6 +372,7 @@ fn verify_checksum(bytes: &[u8], content_end: usize) -> Result<(), RawIndexError
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn parse_entry(
     bytes: &[u8],
     version: u32,
@@ -236,6 +381,37 @@ fn parse_entry(
     previous_path: Option<&[u8]>,
     first_v4_entry: FirstV4Entry,
 ) -> Result<ParsedEntry, RawIndexError> {
+    let header = parse_entry_header(bytes, start, limit)?;
+
+    let (path, end) = if version == 4 {
+        parse_v4_path(
+            bytes,
+            header.fixed_end,
+            limit,
+            previous_path,
+            first_v4_entry,
+        )?
+    } else {
+        parse_v2_v3_path(bytes, start, header.fixed_end, limit)?
+    };
+    validate_name_length(header.encoded_name_length, path.len())?;
+    validate_path(&path)?;
+
+    Ok(ParsedEntry {
+        semantic: RawIndexEntry {
+            path,
+            oid: header.oid,
+        },
+        start,
+        end,
+    })
+}
+
+fn parse_entry_header(
+    bytes: &[u8],
+    start: usize,
+    limit: usize,
+) -> Result<ParsedEntryHeader, RawIndexError> {
     let fixed_end = start
         .checked_add(FIXED_ENTRY_BYTES)
         .filter(|end| *end <= limit)
@@ -254,23 +430,127 @@ fn parse_entry(
     if flags & ENTRY_FLAG_MASK != 0 {
         return Err(RawIndexError::Unsupported);
     }
-    let encoded_name_length = flags & NAME_LENGTH_MASK;
-
-    let (path, end) = if version == 4 {
-        parse_v4_path(bytes, fixed_end, limit, previous_path, first_v4_entry)?
-    } else {
-        parse_v2_v3_path(bytes, start, fixed_end, limit)?
-    };
-    validate_name_length(encoded_name_length, path.len())?;
-    validate_path(&path)?;
-
-    Ok(ParsedEntry {
-        semantic: RawIndexEntry { path, oid },
-        start,
-        end,
+    Ok(ParsedEntryHeader {
+        fixed_end,
+        oid,
+        encoded_name_length: flags & NAME_LENGTH_MASK,
     })
 }
 
+fn parse_entry_against_path(
+    bytes: &[u8],
+    version: u32,
+    start: usize,
+    limit: usize,
+    previous_path: Option<&[u8]>,
+    expected_path: &[u8],
+    first_v4_entry: FirstV4Entry,
+) -> Result<ParsedEntryAgainstPath, RawIndexError> {
+    let header = parse_entry_header(bytes, start, limit)?;
+    let end = if version == 4 {
+        parse_v4_path_against(
+            bytes,
+            header.fixed_end,
+            limit,
+            previous_path,
+            expected_path,
+            first_v4_entry,
+        )?
+    } else {
+        parse_v2_v3_path_against(bytes, start, header.fixed_end, limit, expected_path)?
+    };
+    validate_name_length(header.encoded_name_length, expected_path.len())?;
+    validate_path(expected_path)?;
+    Ok(ParsedEntryAgainstPath {
+        start,
+        end,
+        oid: header.oid,
+    })
+}
+
+fn parse_v2_v3_path_against(
+    bytes: &[u8],
+    entry_start: usize,
+    name_start: usize,
+    limit: usize,
+    expected_path: &[u8],
+) -> Result<usize, RawIndexError> {
+    let name_end = bounded_nul(bytes, name_start, limit)?;
+    if bytes.get(name_start..name_end) != Some(expected_path) {
+        return Err(RawIndexError::Malformed);
+    }
+    let base_length = FIXED_ENTRY_BYTES
+        .checked_add(expected_path.len())
+        .ok_or(RawIndexError::ResourceLimit)?;
+    let padding = 8_usize
+        .checked_sub(base_length % 8)
+        .ok_or(RawIndexError::Malformed)?;
+    let end = entry_start
+        .checked_add(base_length)
+        .and_then(|value| value.checked_add(padding))
+        .filter(|end| *end <= limit)
+        .ok_or(RawIndexError::Malformed)?;
+    let padding_start = entry_start
+        .checked_add(base_length)
+        .ok_or(RawIndexError::Malformed)?;
+    if bytes
+        .get(padding_start..end)
+        .ok_or(RawIndexError::Malformed)?
+        .iter()
+        .any(|byte| *byte != 0)
+    {
+        return Err(RawIndexError::Malformed);
+    }
+    Ok(end)
+}
+
+fn parse_v4_path_against(
+    bytes: &[u8],
+    encoded_start: usize,
+    limit: usize,
+    previous_path: Option<&[u8]>,
+    expected_path: &[u8],
+    first_v4_entry: FirstV4Entry,
+) -> Result<usize, RawIndexError> {
+    let (strip, suffix_start) = decode_canonical_varint(bytes, encoded_start, limit)?;
+    let suffix_end = bounded_nul(bytes, suffix_start, limit)?;
+    let suffix = bytes
+        .get(suffix_start..suffix_end)
+        .ok_or(RawIndexError::Malformed)?;
+    let prefix = match previous_path {
+        Some(previous) => {
+            let retained = previous
+                .len()
+                .checked_sub(strip)
+                .ok_or(RawIndexError::Malformed)?;
+            previous.get(..retained).ok_or(RawIndexError::Malformed)?
+        }
+        None if first_v4_entry == FirstV4Entry::IndexStart => {
+            if strip != 0 {
+                return Err(RawIndexError::Malformed);
+            }
+            &[]
+        }
+        None => &[],
+    };
+    let path_len = prefix
+        .len()
+        .checked_add(suffix.len())
+        .filter(|length| *length <= MAX_PATH_BYTES)
+        .ok_or(RawIndexError::ResourceLimit)?;
+    if expected_path.len() != path_len
+        || !expected_path.starts_with(prefix)
+        || expected_path.get(prefix.len()..) != Some(suffix)
+    {
+        return Err(RawIndexError::Malformed);
+    }
+    suffix_end
+        .checked_add(1)
+        .filter(|end| *end <= limit)
+        .ok_or(RawIndexError::Malformed)
+}
+
+#[cfg(any(target_os = "linux", test))]
 fn parse_v2_v3_path(
     bytes: &[u8],
     entry_start: usize,
@@ -307,6 +587,7 @@ fn parse_v2_v3_path(
     Ok((path, end))
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn parse_v4_path(
     bytes: &[u8],
     encoded_start: usize,
@@ -499,6 +780,7 @@ fn validate_eoie(extensions: &[Extension<'_>], entries_end: usize) -> Result<(),
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn validate_ieot(
     bytes: &[u8],
     version: u32,
@@ -565,6 +847,81 @@ fn validate_ieot(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // The arguments are independent proof inputs, not state.
+fn validate_ieot_against_paths(
+    bytes: &[u8],
+    version: u32,
+    offsets: &[ParsedEntryOffset],
+    entries_end: usize,
+    extensions: &[Extension<'_>],
+    limits: RawIndexLimits,
+    expected_paths: &[&[u8]],
+    expected_oids: &[[u8; SHA1_BYTES]],
+) -> Result<(), RawIndexError> {
+    if offsets.len() != expected_paths.len() || offsets.len() != expected_oids.len() {
+        return Err(RawIndexError::Malformed);
+    }
+    let Some(ieot) = extensions
+        .iter()
+        .find(|extension| extension.signature == IEOT_EXTENSION)
+    else {
+        return Ok(());
+    };
+    if ieot.data.len() < 12 || (ieot.data.len() - 4) % 8 != 0 {
+        return Err(RawIndexError::Malformed);
+    }
+    if read_u32(ieot.data, 0, ieot.data.len())? != 1 {
+        return Err(RawIndexError::Unsupported);
+    }
+    let block_count = (ieot.data.len() - 4) / 8;
+    if block_count > offsets.len() || block_count > limits.entries {
+        return Err(RawIndexError::ResourceLimit);
+    }
+
+    let mut entry_index = 0_usize;
+    for block_index in 0..block_count {
+        let record_offset = 4 + block_index * 8;
+        let block_offset = usize::try_from(read_u32(ieot.data, record_offset, ieot.data.len())?)
+            .map_err(|_| RawIndexError::ResourceLimit)?;
+        let block_entries =
+            usize::try_from(read_u32(ieot.data, record_offset + 4, ieot.data.len())?)
+                .map_err(|_| RawIndexError::ResourceLimit)?;
+        if block_entries == 0 {
+            return Err(RawIndexError::Malformed);
+        }
+        let expected_start = offsets
+            .get(entry_index)
+            .map(|entry| entry.start)
+            .ok_or(RawIndexError::Malformed)?;
+        if block_offset != expected_start || (block_index == 0 && block_offset != HEADER_BYTES) {
+            return Err(RawIndexError::Malformed);
+        }
+        let next_entry_index = entry_index
+            .checked_add(block_entries)
+            .filter(|index| *index <= offsets.len())
+            .ok_or(RawIndexError::Malformed)?;
+        let expected_end = offsets
+            .get(next_entry_index)
+            .map_or(entries_end, |entry| entry.start);
+        independently_validate_block_against_paths(
+            bytes,
+            version,
+            &offsets[entry_index..next_entry_index],
+            &expected_paths[entry_index..next_entry_index],
+            &expected_oids[entry_index..next_entry_index],
+            block_offset,
+            expected_end,
+        )?;
+        entry_index = next_entry_index;
+    }
+    if entry_index == offsets.len() {
+        Ok(())
+    } else {
+        Err(RawIndexError::Malformed)
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
 fn independently_validate_block(
     bytes: &[u8],
     version: u32,
@@ -590,7 +947,53 @@ fn independently_validate_block(
             return Err(RawIndexError::Malformed);
         }
         offset = parsed.end;
-        previous_path = Some(parsed.semantic.path);
+        previous_path = (version == 4).then_some(parsed.semantic.path);
+    }
+    if offset == limit {
+        Ok(())
+    } else {
+        Err(RawIndexError::Malformed)
+    }
+}
+
+fn independently_validate_block_against_paths(
+    bytes: &[u8],
+    version: u32,
+    offsets: &[ParsedEntryOffset],
+    expected_paths: &[&[u8]],
+    expected_oids: &[[u8; SHA1_BYTES]],
+    mut offset: usize,
+    limit: usize,
+) -> Result<(), RawIndexError> {
+    if offsets.len() != expected_paths.len() || offsets.len() != expected_oids.len() {
+        return Err(RawIndexError::Malformed);
+    }
+    for (index, ((entry_offset, expected_path), expected_oid)) in offsets
+        .iter()
+        .zip(expected_paths)
+        .zip(expected_oids)
+        .enumerate()
+    {
+        let previous_path = index
+            .checked_sub(1)
+            .and_then(|previous| expected_paths.get(previous).copied());
+        let parsed = parse_entry_against_path(
+            bytes,
+            version,
+            offset,
+            limit,
+            previous_path,
+            expected_path,
+            if index == 0 {
+                FirstV4Entry::IndependentBlock
+            } else {
+                FirstV4Entry::IndexStart
+            },
+        )?;
+        if parsed.start != entry_offset.start || parsed.oid != *expected_oid {
+            return Err(RawIndexError::Malformed);
+        }
+        offset = parsed.end;
     }
     if offset == limit {
         Ok(())
@@ -817,6 +1220,34 @@ mod tests {
     }
 
     #[test]
+    fn target_path_validator_borrows_paths_and_returns_only_fixed_oids() {
+        let expected = [b"a.md".as_slice(), b"dir/image.png".as_slice()];
+        for version in 2..=4 {
+            let bytes = simple(version, &expected);
+            let summary = validate_target_sha1_index_paths(&bytes, &expected)
+                .expect("borrowed target paths match");
+            assert_eq!(summary.version, version);
+            assert_eq!(summary.oids, [[1_u8; SHA1_BYTES], [2_u8; SHA1_BYTES]]);
+            let debug = format!("{summary:?}");
+            assert!(debug.contains("entry_count: 2"));
+            assert!(!debug.contains("a.md"));
+        }
+
+        let bytes = simple(4, &expected);
+        assert_eq!(
+            validate_target_sha1_index_paths(&bytes, &[b"a.md"]),
+            Err(RawIndexError::Malformed)
+        );
+        assert_eq!(
+            validate_target_sha1_index_paths(
+                &bytes,
+                &[b"a.md".as_slice(), b"dir/wrong.png".as_slice()]
+            ),
+            Err(RawIndexError::Malformed)
+        );
+    }
+
+    #[test]
     fn enforces_exact_or_explicitly_zero_checksum() {
         let exact = simple(2, &[b"note.md"]);
         assert!(parse_sha1_index(&exact).is_ok());
@@ -949,6 +1380,11 @@ mod tests {
         assert_eq!(parse_sha1_index(&target), Err(RawIndexError::ResourceLimit));
         let parsed = parse_target_sha1_index(&target).expect("target maximum parses");
         assert_eq!(parsed.entries.len(), MAX_TARGET_INDEX_ENTRIES);
+        let summary = validate_target_sha1_index_paths(&target, &paths)
+            .expect("streaming target maximum parses");
+        assert_eq!(summary.version, 4);
+        assert_eq!(summary.oids.len(), MAX_TARGET_INDEX_ENTRIES);
+        assert_eq!(summary.oids.first(), Some(&[1_u8; SHA1_BYTES]));
 
         target[8..12].copy_from_slice(
             &u32::try_from(MAX_TARGET_INDEX_ENTRIES + 1)
@@ -1121,12 +1557,17 @@ mod tests {
         let marker = eoie(parts.bytes.len(), std::slice::from_ref(&table));
         let valid = finish(parts.bytes, &[table, marker], Checksum::Exact);
         assert!(parse_sha1_index(&valid).is_ok());
+        assert!(validate_target_sha1_index_paths(&valid, &paths).is_ok());
 
         let compressed = build_entries(4, &paths, &[]);
         let table = extension(IEOT_EXTENSION, &ieot_data(&compressed.starts, &[2, 1]));
         let marker = eoie(compressed.bytes.len(), std::slice::from_ref(&table));
         let invalid = finish(compressed.bytes, &[table, marker], Checksum::Exact);
         assert_eq!(parse_sha1_index(&invalid), Err(RawIndexError::Malformed));
+        assert_eq!(
+            validate_target_sha1_index_paths(&invalid, &paths),
+            Err(RawIndexError::Malformed)
+        );
     }
 
     #[test]
@@ -1152,17 +1593,27 @@ mod tests {
 
     #[test]
     fn every_truncation_returns_without_panicking() {
-        let parts = build_entries(4, &[b"alpha/one", b"alpha/two", b"beta"], &[2]);
+        let paths = [b"alpha/one".as_slice(), b"alpha/two", b"beta"];
+        let parts = build_entries(4, &paths, &[2]);
         let table = extension(IEOT_EXTENSION, &ieot_data(&parts.starts, &[2, 1]));
         let tree = extension(TREE_EXTENSION, b"opaque");
         let marker = eoie(parts.bytes.len(), &[table.clone(), tree.clone()]);
         let bytes = finish(parts.bytes, &[table, tree, marker], Checksum::Exact);
         assert!(parse_sha1_index(&bytes).is_ok());
+        assert!(validate_target_sha1_index_paths(&bytes, &paths).is_ok());
         for length in 0..bytes.len() {
             let result = std::panic::catch_unwind(|| parse_sha1_index(&bytes[..length]));
             assert!(
                 result.is_ok(),
                 "parser panicked at truncation length {length}"
+            );
+            assert!(result.expect("no panic").is_err());
+            let result = std::panic::catch_unwind(|| {
+                validate_target_sha1_index_paths(&bytes[..length], &paths)
+            });
+            assert!(
+                result.is_ok(),
+                "streaming target parser panicked at truncation length {length}"
             );
             assert!(result.expect("no panic").is_err());
         }

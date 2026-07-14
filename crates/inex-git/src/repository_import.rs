@@ -49,8 +49,8 @@ mod candidate_seal;
 mod candidate_manifest;
 
 #[cfg(target_os = "linux")]
-use super::raw_index::parse_sha1_index;
-use super::raw_index::{RawIndex, RawIndexError, parse_target_sha1_index};
+use super::raw_index::{RawIndex, parse_sha1_index};
+use super::raw_index::{RawIndexError, TargetRawIndexSummary, validate_target_sha1_index_paths};
 use super::{
     DRIVER_NAME, copy_platform_process_environment, discover_git_executable,
     installed_driver_command, validate_git_version,
@@ -504,7 +504,8 @@ type TargetOidByPath = BTreeMap<String, String>;
 
 struct CanonicalTreeObject {
     oid: String,
-    body: Zeroizing<Vec<u8>>,
+    size: u64,
+    sha256: [u8; 32],
 }
 
 type CanonicalTreesByPath = BTreeMap<String, CanonicalTreeObject>;
@@ -534,7 +535,7 @@ impl fmt::Debug for BoundControlFile {
 }
 
 struct TargetRawIndexEvidence {
-    raw_index: RawIndex,
+    summary: TargetRawIndexSummary,
     control: TargetIndexControlEvidence,
 }
 
@@ -548,8 +549,8 @@ impl fmt::Debug for TargetRawIndexEvidence {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("TargetRawIndexEvidence")
-            .field("version", &self.raw_index.version)
-            .field("entry_count", &self.raw_index.entries.len())
+            .field("version", &self.summary.version)
+            .field("entry_count", &self.summary.oids.len())
             .field("control", &"[REDACTED]")
             .finish_non_exhaustive()
     }
@@ -713,12 +714,14 @@ const fn map_target_raw_index_error(error: RawIndexError) -> RepositoryImportErr
 
 fn target_raw_index_evidence_from_held(
     held: HeldFile,
+    expected_paths: &[&[u8]],
 ) -> Result<TargetRawIndexEvidence, RepositoryImportError> {
-    let raw_index = parse_target_sha1_index(&held.bytes).map_err(map_target_raw_index_error)?;
+    let summary = validate_target_sha1_index_paths(&held.bytes, expected_paths)
+        .map_err(map_target_raw_index_error)?;
     let size = u64::try_from(held.bytes.len()).map_err(|_| RepositoryImportError::ResourceLimit)?;
     let digest = sha256(&held.bytes);
     Ok(TargetRawIndexEvidence {
-        raw_index,
+        summary,
         control: TargetIndexControlEvidence {
             identity: held.identity,
             size,
@@ -728,7 +731,10 @@ fn target_raw_index_evidence_from_held(
 }
 
 #[cfg(target_os = "linux")]
-fn capture_target_raw_index(root: &Path) -> Result<TargetRawIndexEvidence, RepositoryImportError> {
+fn capture_target_raw_index(
+    root: &Path,
+    expected_paths: &[&[u8]],
+) -> Result<TargetRawIndexEvidence, RepositoryImportError> {
     let held = read_secure_relative_file_with_limit_error(
         root,
         Path::new(".git/index"),
@@ -736,11 +742,14 @@ fn capture_target_raw_index(root: &Path) -> Result<TargetRawIndexEvidence, Repos
         &RepositoryImportError::TargetAuditFailed,
         &RepositoryImportError::ResourceLimit,
     )?;
-    target_raw_index_evidence_from_held(held)
+    target_raw_index_evidence_from_held(held, expected_paths)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn capture_target_raw_index(root: &Path) -> Result<TargetRawIndexEvidence, RepositoryImportError> {
+fn capture_target_raw_index(
+    root: &Path,
+    expected_paths: &[&[u8]],
+) -> Result<TargetRawIndexEvidence, RepositoryImportError> {
     let path = root.join(".git/index");
     let metadata =
         fs::symlink_metadata(&path).map_err(|_| RepositoryImportError::TargetAuditFailed)?;
@@ -752,7 +761,7 @@ fn capture_target_raw_index(root: &Path) -> Result<TargetRawIndexEvidence, Repos
         MAX_TARGET_FILE_BYTES,
         RepositoryImportError::TargetAuditFailed,
     )?;
-    target_raw_index_evidence_from_held(held)
+    target_raw_index_evidence_from_held(held, expected_paths)
 }
 
 fn require_target_index_control_binding(
@@ -2629,17 +2638,34 @@ fn read_target_tracked_file(root: &Path, path: &Path) -> Result<HeldFile, Reposi
     Err(RepositoryImportError::TargetAuditFailed)
 }
 
-fn prove_target_worktree_allowlist(
+trait TargetAllowlistEntry {
+    fn target_path(&self) -> &Path;
+}
+
+impl TargetAllowlistEntry for PathBuf {
+    fn target_path(&self) -> &Path {
+        self
+    }
+}
+
+impl TargetAllowlistEntry for TargetTrackedEntry {
+    fn target_path(&self) -> &Path {
+        &self.relative_path
+    }
+}
+
+fn prove_target_worktree_allowlist<T: TargetAllowlistEntry>(
     root: &Path,
-    paths: &[PathBuf],
+    paths: &[T],
     git_required: bool,
 ) -> Result<(), RepositoryImportError> {
     let expected_files = paths
         .iter()
-        .filter_map(|path| slash_path(path))
+        .filter_map(|entry| slash_path(entry.target_path()))
         .collect::<BTreeSet<_>>();
     let mut expected_directories = BTreeSet::new();
-    for path in paths {
+    for entry in paths {
+        let path = entry.target_path();
         let mut parent = path.parent();
         while let Some(directory) = parent {
             if directory.as_os_str().is_empty() {
@@ -2873,14 +2899,24 @@ fn audit_target_with_executable(
     if filesystem_directory_identity(&root).ok().as_ref() != Some(&expected.root_identity) {
         return Err(RepositoryImportError::TargetAuditFailed);
     }
-    let paths = expected
+    prove_target_worktree_allowlist(&root, &expected.tracked, true)?;
+    let runner = GitRunner::target(executable, root.clone())?;
+    let expected_index_paths = expected
         .tracked
         .iter()
-        .map(|entry| entry.relative_path.clone())
-        .collect::<Vec<_>>();
-    prove_target_worktree_allowlist(&root, &paths, true)?;
-    let runner = GitRunner::target(executable, root.clone())?;
-    let TargetRawIndexEvidence { raw_index, control } = capture_target_raw_index(&runner.root)?;
+        .map(|entry| {
+            entry
+                .relative_path
+                .to_str()
+                .map(str::as_bytes)
+                .ok_or(RepositoryImportError::TargetAuditFailed)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let TargetRawIndexEvidence { summary, control } =
+        capture_target_raw_index(&runner.root, &expected_index_paths)?;
+    require_exact_target_raw_oids(&summary, &expected.tracked)?;
+    drop(summary);
+    drop(expected_index_paths);
     let initial_git_control = inventory_target_git_control(&root)?;
     validate_target_git_control(&initial_git_control, &expected.object_ids)?;
     if initial_git_control != expected.git_control {
@@ -2888,7 +2924,7 @@ fn audit_target_with_executable(
     }
     require_target_index_control_binding(&control, &initial_git_control)?;
     drop(initial_git_control);
-    prove_target_semantics(&runner, expected, raw_index, &expected.git_control)?;
+    prove_target_semantics(&runner, expected, &expected.git_control)?;
     let git_control = inventory_target_git_control(&root)?;
     validate_target_git_control(&git_control, &expected.object_ids)?;
     if git_control != expected.git_control {
@@ -2914,12 +2950,7 @@ fn revalidate_target_worktree(
     if filesystem_directory_identity(root).ok().as_ref() != Some(&expected.root_identity) {
         return Err(RepositoryImportError::TargetAuditFailed);
     }
-    let paths = expected
-        .tracked
-        .iter()
-        .map(|entry| entry.relative_path.clone())
-        .collect::<Vec<_>>();
-    prove_target_worktree_allowlist(root, &paths, true)?;
+    prove_target_worktree_allowlist(root, &expected.tracked, true)?;
     for entry in &expected.tracked {
         drop(inspect_target_tracked_entry(
             root,
@@ -2937,7 +2968,6 @@ fn revalidate_target_worktree(
 fn prove_target_semantics(
     runner: &GitRunner,
     expected: &TargetRepository,
-    raw_index: RawIndex,
     git_control: &[NamespaceSeal],
 ) -> Result<(), RepositoryImportError> {
     let object_format = runner.run(
@@ -2983,8 +3013,6 @@ fn prove_target_semantics(
     }
     validate_target_config(runner)?;
 
-    require_exact_target_raw_index(&raw_index, &expected.tracked)?;
-    drop(raw_index);
     for entry in &expected.tracked {
         let body = inspect_target_tracked_entry(&runner.root, &entry.relative_path, Some(entry))?;
         if typed_git_object_oid("blob", body.bytes.as_slice())? != entry.blob_oid {
@@ -3114,17 +3142,15 @@ fn require_single_config(
     }
 }
 
-fn require_exact_target_raw_index(
-    raw_index: &RawIndex,
+fn require_exact_target_raw_oids(
+    raw_index: &TargetRawIndexSummary,
     tracked: &[TargetTrackedEntry],
 ) -> Result<(), RepositoryImportError> {
-    if raw_index.entries.len() != tracked.len() {
+    if raw_index.oids.len() != tracked.len() {
         return Err(RepositoryImportError::TargetAuditFailed);
     }
-    for (raw, expected) in raw_index.entries.iter().zip(tracked) {
-        let expected_path =
-            slash_path(&expected.relative_path).ok_or(RepositoryImportError::TargetAuditFailed)?;
-        if raw.path != expected_path.as_bytes() || raw.oid != decode_sha1_oid(&expected.blob_oid)? {
+    for (raw_oid, expected) in raw_index.oids.iter().zip(tracked) {
+        if raw_oid != &decode_sha1_oid(&expected.blob_oid)? {
             return Err(RepositoryImportError::TargetAuditFailed);
         }
     }
@@ -3192,17 +3218,13 @@ fn expected_target_object_expectations(
         )?;
     }
     for tree in trees.values() {
-        if typed_git_object_oid("tree", tree.body.as_slice())? != tree.oid {
-            return Err(RepositoryImportError::TargetAuditFailed);
-        }
         insert_target_object_expectation(
             &mut objects,
             &tree.oid,
             TargetObjectExpectation {
                 object_type: "tree",
-                size: u64::try_from(tree.body.len())
-                    .map_err(|_| RepositoryImportError::ResourceLimit)?,
-                sha256: sha256(tree.body.as_slice()),
+                size: tree.size,
+                sha256: tree.sha256,
             },
         )?;
     }
@@ -3326,17 +3348,14 @@ fn construct_canonical_target_trees(
             .then_with(|| left.cmp(right))
     });
     let mut objects = BTreeMap::new();
-    let mut total_tree_bytes = 0_usize;
     for directory in directories {
         let mut entries = entries_by_directory
             .remove(&directory)
             .ok_or(RepositoryImportError::TargetAuditFailed)?;
         let body = serialize_canonical_tree(&mut entries)?;
-        total_tree_bytes = total_tree_bytes
-            .checked_add(body.len())
-            .filter(|total| *total <= MAX_RETAINED_PATH_BYTES)
-            .ok_or(RepositoryImportError::ResourceLimit)?;
         let oid = typed_git_object_oid("tree", body.as_slice())?;
+        let size = u64::try_from(body.len()).map_err(|_| RepositoryImportError::ResourceLimit)?;
+        let digest = sha256(body.as_slice());
         if !directory.is_empty() {
             let (parent, name) = target_tree_parent_and_name(&directory)?;
             entries_by_directory
@@ -3348,7 +3367,15 @@ fn construct_canonical_target_trees(
                     directory: true,
                 });
         }
-        objects.insert(directory, CanonicalTreeObject { oid, body });
+        drop(body);
+        objects.insert(
+            directory,
+            CanonicalTreeObject {
+                oid,
+                size,
+                sha256: digest,
+            },
+        );
     }
     if entries_by_directory.is_empty() {
         Ok(objects)
@@ -5029,22 +5056,34 @@ mod tests {
         repository.git_control = inventory_target_git_control(target.path())
             .expect("rewritten index control inventories");
 
-        let evidence = capture_target_raw_index(target.path()).expect("raw target index captures");
+        let expected_paths = repository
+            .tracked
+            .iter()
+            .map(|entry| {
+                entry
+                    .relative_path
+                    .to_str()
+                    .expect("target test path is UTF-8")
+                    .as_bytes()
+            })
+            .collect::<Vec<_>>();
+        let evidence = capture_target_raw_index(target.path(), &expected_paths)
+            .expect("raw target index captures");
         require_target_index_control_binding(&evidence.control, &repository.git_control)
             .expect("raw read binds current Git control index");
-        require_exact_target_raw_index(&evidence.raw_index, &repository.tracked)
-            .expect("equal raw and expected entries bind");
+        require_exact_target_raw_oids(&evidence.summary, &repository.tracked)
+            .expect("equal raw and expected object IDs bind");
 
-        let mut raw_drift = evidence.raw_index.clone();
-        raw_drift.entries.pop().expect("target has managed entries");
+        let mut raw_drift = evidence.summary.clone();
+        raw_drift.oids.pop().expect("target has managed entries");
         assert!(matches!(
-            require_exact_target_raw_index(&raw_drift, &repository.tracked),
+            require_exact_target_raw_oids(&raw_drift, &repository.tracked),
             Err(RepositoryImportError::TargetAuditFailed)
         ));
         let mut expected_drift = repository.tracked.clone();
         expected_drift.pop().expect("target has managed entries");
         assert!(matches!(
-            require_exact_target_raw_index(&evidence.raw_index, &expected_drift),
+            require_exact_target_raw_oids(&evidence.summary, &expected_drift),
             Err(RepositoryImportError::TargetAuditFailed)
         ));
 
