@@ -101,6 +101,21 @@ assert(vim.api.nvim_buf_get_name(private_buffer) == "inex-umbra://first.md", "In
 assert(vim.bo[private_buffer].buftype == "nofile" and vim.bo[private_buffer].swapfile == false and vim.bo[private_buffer].undofile == false and vim.bo[private_buffer].bufhidden == "wipe" and vim.bo[private_buffer].buflisted == false and vim.bo[private_buffer].modeline == false and vim.bo[private_buffer].modifiable == false, "Inex Umbra buffer protections are invalid")
 assert(vim.deep_equal(vim.api.nvim_buf_get_lines(private_buffer, 0, -1, false), { "# Updated", "秘密 Markdown" }), "Inex Umbra projection must retain the authenticated Markdown")
 assert(not vim.api.nvim_buf_is_valid(buffer), "normal buffer must be wiped after Umbra conversion")
+local original_projection_bytes = #table.concat(vim.api.nvim_buf_get_lines(private_buffer, 0, -1, false), "\n")
+inex.apply_private_annotation(
+  {{ startByte = 0, endByte = original_projection_bytes }},
+  { kind = "comment", tagIds = {}, outer = { mode = "drop" } }
+)
+assert(vim.wait(5000, function()
+  return #inex.private_slot_ranges(private_buffer) == 1
+end, 10), "Inex private annotation apply timed out")
+local private_ranges = inex.private_slot_ranges(private_buffer)
+assert(vim.api.nvim_buf_get_lines(private_buffer, 0, -1, false)[1]:find(":::inex-private", 1, true), "Inex annotation must use daemon projection")
+inex.remove_private_annotation(private_ranges)
+assert(vim.wait(5000, function()
+  return #inex.private_slot_ranges(private_buffer) == 0
+end, 10), "Inex private annotation remove timed out")
+assert(vim.deep_equal(vim.api.nvim_buf_get_lines(private_buffer, 0, -1, false), { "# Updated", "秘密 Markdown" }), "Inex annotation remove must restore daemon projection")
 inex.lock_umbra()
 assert(not inex.is_umbra_unlocked(), "Inex Umbra lock must clear local state")
 assert(vim.wait(5000, function() return not vim.api.nvim_buf_is_valid(private_buffer) end, 10), "Inex Umbra lock must wipe private projection")

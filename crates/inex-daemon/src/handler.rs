@@ -1302,7 +1302,7 @@ fn parse_private_annotation_spec(
         "comment" => PrivateAnnotationKind::Comment,
         _ => return Err(ErrorObject::new(ErrorCode::InvalidParams)),
     };
-    let tag_ids = object.required_sensitive_string_array("tagIds", MAX_UMBRA_MAP_ENTRIES, 1, 64)?;
+    let tag_ids = object.required_sensitive_string_array("tagIds", MAX_UMBRA_MAP_ENTRIES, 0, 64)?;
     let tag_ids = tag_ids.iter().map(|id| id.as_str().to_owned()).collect();
     let mut outer = object.required_object("outer")?;
     let mode = match outer.required_string("mode", 1, 16)?.as_str() {
@@ -1360,7 +1360,7 @@ fn parse_annotation_profile(params: &mut ParamObject) -> Result<AnnotationProfil
         "comment" => PrivateAnnotationKind::Comment,
         _ => return Err(ErrorObject::new(ErrorCode::InvalidParams)),
     };
-    let tag_ids = object.required_sensitive_string_array("tagIds", MAX_UMBRA_MAP_ENTRIES, 1, 64)?;
+    let tag_ids = object.required_sensitive_string_array("tagIds", MAX_UMBRA_MAP_ENTRIES, 0, 64)?;
     let tag_ids = tag_ids
         .iter()
         .map(|tag_id| tag_id.as_str().to_owned())
@@ -2468,7 +2468,7 @@ mod tests {
                 "selections": [{"startByte": 0, "endByte": 7}],
                 "spec": {
                     "kind": "comment",
-                    "tagIds": ["comment-content"],
+                    "tagIds": [],
                     "outer": {"mode": "drop"},
                 },
                 "mergeAdjacent": false,

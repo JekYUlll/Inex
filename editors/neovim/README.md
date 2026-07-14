@@ -44,6 +44,14 @@ Commands currently available:
   opens an existing feature-2 document. These projections are read-only in this
   milestone, are nofile/unlisted/no-swap/no-undo buffers, and are wiped when
   either Umbra or Outer is locked.
+- Lua callers can use `require("inex").apply_private_annotation(selections, spec)`
+  and `remove_private_annotation(selections)` to forward an authenticated
+  projection/ETag/RenderMap mutation to the daemon; the plugin also exposes
+  `:InexApplyPrivateAnnotation startByte endByte` and
+  `:InexRemovePrivateAnnotation startByte endByte` with the safe default
+  `comment`/no-tags/`drop` spec. Byte-range commands are an interim testing
+  surface: visual selection, tag/profile picker, edit command, and configured
+  keybindings remain the next Neovim MVP slice.
 - `:InexStop` terminates the local RPC process and drops pending callbacks.
 
 `InexOpen`, `InexNew`, and `InexMkdir` take Inex logical paths (for example,

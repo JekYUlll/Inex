@@ -45,6 +45,27 @@ vim.api.nvim_create_user_command("InexConvertUmbra", function()
   inex.convert_current_document_to_umbra()
 end, { desc = "Convert the current saved Inex document to Umbra" })
 
+vim.api.nvim_create_user_command("InexApplyPrivateAnnotation", function(arguments)
+  if #arguments.fargs ~= 2 then
+    vim.notify("InexApplyPrivateAnnotation requires startByte and endByte", vim.log.levels.ERROR)
+    return
+  end
+  local start_byte, end_byte = tonumber(arguments.fargs[1]), tonumber(arguments.fargs[2])
+  inex.apply_private_annotation(
+    {{ startByte = start_byte, endByte = end_byte }},
+    { kind = "comment", tagIds = {}, outer = { mode = "drop" } }
+  )
+end, { nargs = "*", desc = "Apply a default private annotation to a byte range" })
+
+vim.api.nvim_create_user_command("InexRemovePrivateAnnotation", function(arguments)
+  if #arguments.fargs ~= 2 then
+    vim.notify("InexRemovePrivateAnnotation requires startByte and endByte", vim.log.levels.ERROR)
+    return
+  end
+  local start_byte, end_byte = tonumber(arguments.fargs[1]), tonumber(arguments.fargs[2])
+  inex.remove_private_annotation({{ startByte = start_byte, endByte = end_byte }})
+end, { nargs = "*", desc = "Remove a private annotation from a complete byte range" })
+
 vim.api.nvim_create_user_command("InexOpen", function(arguments)
   inex.open_document(arguments.args)
 end, { nargs = 1, desc = "Open an Inex Markdown document" })

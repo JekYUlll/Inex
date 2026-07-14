@@ -149,10 +149,46 @@ local function valid_metadata(value, logical_path)
     and value.createdAt >= 0 and value.modifiedAt >= 0
 end
 
+local function metadata_reason(value, logical_path)
+  if type(value) ~= "table" then return "not object" end
+  if not has_exact_keys(value, { fileId = true, logicalPath = true, createdAt = true, modifiedAt = true, flags = true, count = 5 }) then return "shape" end
+  if value.logicalPath ~= logical_path then return "path" end
+  if value.flags ~= 0 and value.flags ~= 1 then return "flags" end
+  if type(value.fileId) ~= "string" or not value.fileId:match("^[0-9a-f][0-9a-f-]+$") then return "file id" end
+  if type(value.createdAt) ~= "number" or type(value.modifiedAt) ~= "number" or value.createdAt % 1 ~= 0 or value.modifiedAt % 1 ~= 0 or value.createdAt < 0 or value.modifiedAt < 0 then return "timestamps" end
+  return "unknown"
+end
+
 local function valid_range(start_byte, end_byte)
   return type(start_byte) == "number" and type(end_byte) == "number"
     and start_byte % 1 == 0 and end_byte % 1 == 0
     and start_byte >= 0 and end_byte > start_byte and end_byte <= MAX_DOCUMENT_BYTES
+end
+
+local function valid_tag_id(value)
+  return type(value) == "string" and value:match("^[a-z0-9][a-z0-9._-]{0,63}$") ~= nil
+end
+
+local function valid_annotation_spec(value)
+  if not has_exact_keys(value, { kind = true, tagIds = true, outer = true, count = 3 })
+    or (value.kind ~= "block" and value.kind ~= "comment") or type(value.tagIds) ~= "table"
+    or #value.tagIds > 4096 or type(value.outer) ~= "table" then
+    return false
+  end
+  local previous = nil
+  for _, tag_id in ipairs(value.tagIds) do
+    if not valid_tag_id(tag_id) or (previous and previous >= tag_id) then
+      return false
+    end
+    previous = tag_id
+  end
+  if value.outer.mode == "cover" then
+    return has_exact_keys(value.outer, { mode = true, coverText = true, count = 2 })
+      and type(value.outer.coverText) == "string" and #value.outer.coverText > 0
+      and #value.outer.coverText <= 4096 and not value.outer.coverText:find("%z")
+  end
+  return has_exact_keys(value.outer, { mode = true, count = 1 })
+    and (value.outer.mode == "drop" or value.outer.mode == "placeholder")
 end
 
 -- Validate every private projection boundary before displaying it. The map is
@@ -401,15 +437,26 @@ function M.enable_umbra()
   end)
 end
 
-local function show_umbra_projection(logical_path, result)
+local function parse_umbra_projection(logical_path, result)
   if not has_exact_keys(result, { contentBase64 = true, etag = true, metadata = true, renderMap = true, count = 4 })
     or type(result.etag) ~= "string" or not result.etag:match(ETAG_RE)
     or not valid_metadata(result.metadata, logical_path) then
-    return nil
+    return nil, "metadata " .. metadata_reason(type(result) == "table" and result.metadata or nil, logical_path)
   end
   local content = decode_base64url(result.contentBase64)
-  if not content or not valid_render_map(result.renderMap, #content) then
+  if not content then
+    return nil, "content"
+  end
+  if not valid_render_map(result.renderMap, #content) then
     content = ""
+    return nil, "render map"
+  end
+  return { content = content, etag = result.etag, render_map = result.renderMap }
+end
+
+local function show_umbra_projection(logical_path, result)
+  local projection = parse_umbra_projection(logical_path, result)
+  if not projection then
     return nil
   end
   local buffer = vim.api.nvim_create_buf(false, true)
@@ -421,11 +468,11 @@ local function show_umbra_projection(logical_path, result)
   vim.bo[buffer].modeline = false
   vim.bo[buffer].modifiable = true
   vim.api.nvim_buf_set_name(buffer, "inex-umbra://" .. logical_path)
-  vim.api.nvim_buf_set_lines(buffer, 0, -1, false, vim.split(content, "\n", { plain = true }))
-  content = ""
+  vim.api.nvim_buf_set_lines(buffer, 0, -1, false, vim.split(projection.content, "\n", { plain = true }))
+  projection.content = ""
   vim.bo[buffer].modifiable = false
   vim.bo[buffer].modified = false
-  private_buffers[buffer] = true
+  private_buffers[buffer] = { logical_path = logical_path, etag = projection.etag, render_map = projection.render_map }
   vim.api.nvim_create_autocmd("BufWipeout", { buffer = buffer, once = true, callback = function()
     private_buffers[buffer] = nil
   end })
@@ -438,6 +485,109 @@ local function show_umbra_projection(logical_path, result)
   end
   vim.api.nvim_set_current_buf(buffer)
   return buffer
+end
+
+local function replace_umbra_projection(buffer, document, result)
+  local projection, reason = parse_umbra_projection(document.logical_path, {
+    contentBase64 = result.contentBase64,
+    etag = result.etag,
+    metadata = result.metadata,
+    renderMap = result.renderMap,
+  })
+  if not projection then
+    return false, reason
+  end
+  if not vim.api.nvim_buf_is_valid(buffer) or private_buffers[buffer] ~= document then
+    return false, "buffer identity"
+  end
+  vim.bo[buffer].modifiable = true
+  vim.api.nvim_buf_set_lines(buffer, 0, -1, false, vim.split(projection.content, "\n", { plain = true }))
+  projection.content = ""
+  vim.bo[buffer].modifiable = false
+  vim.bo[buffer].modified = false
+  document.etag = projection.etag
+  document.render_map = projection.render_map
+  return true
+end
+
+local function mutate_private_annotation(method, selections, spec)
+  if not session or not umbra_unlocked then
+    vim.notify("Unlock Inex Umbra before changing a private annotation", vim.log.levels.ERROR)
+    return
+  end
+  if type(selections) ~= "table" or #selections == 0 or #selections > 4096 then
+    vim.notify("Inex private annotation selections are invalid", vim.log.levels.ERROR)
+    return
+  end
+  if spec and not valid_annotation_spec(spec) then
+    vim.notify("Inex private annotation specification is invalid", vim.log.levels.ERROR)
+    return
+  end
+  local buffer = vim.api.nvim_get_current_buf()
+  local document = private_buffers[buffer]
+  if not document or vim.bo[buffer].modified or not valid_render_map(document.render_map, #table.concat(vim.api.nvim_buf_get_lines(buffer, 0, -1, false), "\n")) then
+    vim.notify("Current buffer is not a clean authenticated Umbra projection", vim.log.levels.ERROR)
+    return
+  end
+  local content = table.concat(vim.api.nvim_buf_get_lines(buffer, 0, -1, false), "\n")
+  local content_base64 = encode_base64url(content)
+  content = ""
+  if not content_base64 then
+    vim.notify("Inex Umbra projection exceeds its limit", vim.log.levels.ERROR)
+    return
+  end
+  local checked_selections = {}
+  for _, selection in ipairs(selections) do
+    if not has_exact_keys(selection, { startByte = true, endByte = true, count = 2 }) or not valid_range(selection.startByte, selection.endByte) then
+      content_base64 = ""
+      vim.notify("Inex private annotation selections are invalid", vim.log.levels.ERROR)
+      return
+    end
+    table.insert(checked_selections, { startByte = selection.startByte, endByte = selection.endByte })
+  end
+  local active_session, expected_etag = session, document.etag
+  local params = {
+    session = active_session,
+    logicalPath = document.logical_path,
+    ifMatch = expected_etag,
+    contentBase64 = content_base64,
+    renderMap = document.render_map,
+    selections = checked_selections,
+    mergeAdjacent = false,
+  }
+  if spec then
+    params.spec = spec
+  end
+  rpc.request(method, params, function(result, error)
+    content_base64 = ""
+    if error then
+      vim.notify(error, vim.log.levels.ERROR)
+      return
+    end
+    if session ~= active_session or not umbra_unlocked or private_buffers[buffer] ~= document then
+      vim.notify("Inex private annotation result arrived after lock or buffer replacement", vim.log.levels.ERROR)
+      return
+    end
+    if not has_exact_keys(result, { contentBase64 = true, etag = true, metadata = true, renderMap = true, durability = true, count = 5 })
+      or (result.durability ~= "synced" and result.durability ~= "notSynced") then
+      vim.notify("Inex private annotation response is invalid", vim.log.levels.ERROR)
+      return
+    end
+    local replaced, reason = replace_umbra_projection(buffer, document, result)
+    if not replaced then
+      vim.notify("Inex private annotation projection is invalid: " .. (reason or "unknown"), vim.log.levels.ERROR)
+      return
+    end
+    vim.notify("Inex private annotation updated", vim.log.levels.INFO)
+  end)
+end
+
+function M.apply_private_annotation(selections, spec)
+  mutate_private_annotation("umbra.annotation.apply", selections, spec)
+end
+
+function M.remove_private_annotation(selections)
+  mutate_private_annotation("umbra.annotation.remove", selections, nil)
 end
 
 function M.open_umbra_document(logical_path)
@@ -800,6 +950,19 @@ end
 
 function M.is_umbra_buffer(buffer)
   return private_buffers[buffer] ~= nil
+end
+
+function M.private_slot_ranges(buffer)
+  buffer = buffer or vim.api.nvim_get_current_buf()
+  local document = private_buffers[buffer]
+  if not document or not umbra_unlocked then
+    return {}
+  end
+  local ranges = {}
+  for _, slot in ipairs(document.render_map.privateSlots) do
+    table.insert(ranges, { startByte = slot.startByte, endByte = slot.endByte })
+  end
+  return ranges
 end
 
 return M
