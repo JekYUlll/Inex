@@ -16,7 +16,7 @@ use std::fmt;
 use super::{
     CandidateSealContext, CandidateSealError, CandidateSealManifest, encode_candidate_seal_v1,
 };
-use crate::repository_import::candidate_git::FreshGitManifest;
+use crate::repository_import::candidate_git::FreshRuntimeObjectProof;
 use crate::repository_import::candidate_manifest::MarkerFreePhysicalManifest;
 use crate::repository_import::candidate_worktree::{FreshTrackedManifest, FreshTreeManifest};
 
@@ -48,9 +48,11 @@ pub(in crate::repository_import) fn aggregate_candidate_content_seal_v1<'physica
     physical: &'physical MarkerFreePhysicalManifest,
     tracked: &FreshTrackedManifest<'physical>,
     trees: &FreshTreeManifest<'physical>,
-    git: &FreshGitManifest<'physical>,
+    runtime: &FreshRuntimeObjectProof<'_, 'physical>,
 ) -> Result<CandidateContentSeal, CandidateSealError> {
-    if !tracked.is_bound_to(physical) || !trees.is_bound_to(physical) || !git.is_bound_to(physical)
+    if !tracked.is_bound_to(physical)
+        || !trees.is_bound_to(physical)
+        || !runtime.is_bound_to(physical)
     {
         return Err(CandidateSealError::InvalidRecord);
     }
@@ -58,7 +60,7 @@ pub(in crate::repository_import) fn aggregate_candidate_content_seal_v1<'physica
     let physical_projection = physical.project(context.scheme)?;
     let (worktree, index) = tracked.project(context.scheme)?;
     let tree_records = trees.project()?;
-    let git_projection = git.project_for_seal(context.scheme, tracked, trees)?;
+    let git_projection = runtime.project_for_seal(context.scheme, tracked, trees)?;
 
     let manifest = CandidateSealManifest {
         physical: &physical_projection.physical,
@@ -91,7 +93,8 @@ mod tests {
     use super::super::{CandidateSealManifest, ObjectKind, ObjectRecord, encode_candidate_seal_v1};
     use super::*;
     use crate::repository_import::candidate_git::{
-        FreshRootCommitEvidence, collect_fresh_git_evidence, parse_canonical_root_commit,
+        FreshGitManifest, FreshRootCommitEvidence, collect_fresh_git_evidence,
+        parse_canonical_root_commit, prove_fresh_runtime_objects_for_test,
     };
     use crate::repository_import::candidate_manifest::collect_marker_free_physical_manifest;
     use crate::repository_import::candidate_worktree::{
@@ -127,7 +130,6 @@ mod tests {
 
     struct Fixture {
         target: TestDirectory,
-        raw_index: Vec<u8>,
         root_commit: FreshRootCommitEvidence,
     }
 
@@ -292,7 +294,6 @@ mod tests {
         }
         Fixture {
             target,
-            raw_index,
             root_commit,
         }
     }
@@ -309,8 +310,8 @@ mod tests {
         let physical = collect_marker_free_physical_manifest(fixture.target.path())
             .expect("physical evidence collects");
         let held = open_secure_source_root(fixture.target.path()).expect("target root holds");
-        let tracked = collect_fresh_tracked_evidence(&physical, &held, &fixture.raw_index)
-            .expect("tracked evidence collects");
+        let tracked =
+            collect_fresh_tracked_evidence(&physical, &held).expect("tracked evidence collects");
         let trees = construct_fresh_tree_evidence(&tracked).expect("tree evidence constructs");
         let git = collect_fresh_git_evidence(&physical, &tracked, &trees, fixture.root_commit)
             .expect("Git evidence collects from opaque views");
@@ -321,8 +322,10 @@ mod tests {
     fn one_shot_projection_matches_private_golden_encoder() {
         let fixture = fixture("golden");
         with_evidence(&fixture, |physical, tracked, trees, git| {
+            let runtime = prove_fresh_runtime_objects_for_test(&git, tracked, trees)
+                .expect("test runtime object proof constructs");
             let actual =
-                aggregate_candidate_content_seal_v1(context(), physical, tracked, trees, &git)
+                aggregate_candidate_content_seal_v1(context(), physical, tracked, trees, &runtime)
                     .expect("one-shot aggregate hashes");
 
             let physical_projection = physical
@@ -330,9 +333,9 @@ mod tests {
                 .expect("physical projects");
             let (worktree, index) = tracked.project(context().scheme).expect("tracked projects");
             let tree_records = trees.project().expect("trees project");
-            let git_projection = git
+            let git_projection = runtime
                 .project_for_seal(context().scheme, tracked, trees)
-                .expect("Git projects against the same views");
+                .expect("runtime proof projects against the same views");
             let expected = encode_candidate_seal_v1(
                 context(),
                 CandidateSealManifest {
@@ -359,13 +362,16 @@ mod tests {
         let second = fixture("mix-second");
         with_evidence(&first, |first_physical, _, _, _| {
             with_evidence(&second, |_, second_tracked, second_trees, second_git| {
+                let second_runtime =
+                    prove_fresh_runtime_objects_for_test(&second_git, second_tracked, second_trees)
+                        .expect("second runtime object proof constructs");
                 assert_eq!(
                     aggregate_candidate_content_seal_v1(
                         context(),
                         first_physical,
                         second_tracked,
                         second_trees,
-                        &second_git,
+                        &second_runtime,
                     ),
                     Err(CandidateSealError::InvalidRecord)
                 );
@@ -376,12 +382,12 @@ mod tests {
     #[test]
     fn forged_git_object_union_is_rejected_against_opaque_content_views() {
         let fixture = fixture("forged-union");
-        with_evidence(&fixture, |physical, tracked, trees, mut git| {
+        with_evidence(&fixture, |_, tracked, trees, mut git| {
             git.forge_object_union_for_test();
-            assert_eq!(
-                aggregate_candidate_content_seal_v1(context(), physical, tracked, trees, &git),
+            assert!(matches!(
+                prove_fresh_runtime_objects_for_test(&git, tracked, trees),
                 Err(CandidateSealError::InvalidRecord)
-            );
+            ));
         });
     }
 
@@ -389,8 +395,10 @@ mod tests {
     fn content_seal_debug_never_reveals_digest_or_paths() {
         let fixture = fixture("redaction");
         with_evidence(&fixture, |physical, tracked, trees, git| {
+            let runtime = prove_fresh_runtime_objects_for_test(&git, tracked, trees)
+                .expect("test runtime object proof constructs");
             let seal =
-                aggregate_candidate_content_seal_v1(context(), physical, tracked, trees, &git)
+                aggregate_candidate_content_seal_v1(context(), physical, tracked, trees, &runtime)
                     .expect("aggregate hashes");
             let mut digest_hex = String::new();
             for byte in seal.into_digest() {

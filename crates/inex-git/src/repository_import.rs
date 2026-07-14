@@ -60,6 +60,12 @@ mod candidate_worktree;
 )]
 mod candidate_git;
 
+#[allow(
+    dead_code,
+    reason = "held control snapshots are integrated by the unified candidate assembler in the next slice"
+)]
+mod candidate_control;
+
 #[cfg(target_os = "linux")]
 use super::raw_index::{RawIndex, parse_sha1_index};
 use super::raw_index::{RawIndexError, TargetRawIndexSummary, validate_target_sha1_index_paths};
@@ -1266,13 +1272,7 @@ fn command_path(
 
 #[cfg(target_os = "linux")]
 fn validate_source_config(runner: &GitRunner, config: &[u8]) -> Result<(), RepositoryImportError> {
-    let output = runner.run_without_prefix(
-        RepositoryGitOperation::InspectConfiguration,
-        &os_args(["config", "--file", "-", "--no-includes", "--null", "--list"]),
-        Some(config),
-        MAX_CONFIG_BYTES.saturating_mul(2),
-        None,
-    )?;
+    let output = runner.run_isolated_stdin_config(config, MAX_CONFIG_BYTES.saturating_mul(2))?;
     let mut critical = BTreeSet::new();
     for record in nul_records(&output)? {
         let newline = record
@@ -3820,26 +3820,36 @@ impl GitRunner {
             identity,
             true,
             true,
+            false,
         )
     }
 
+    /// Parse one bounded config body from stdin without discovering any Git
+    /// repository or reopening a config pathname below `self.root`.
+    ///
+    /// The six arguments and repository-isolation environment are fixed here;
+    /// callers can supply only the already-held config bytes and output bound.
     #[cfg(target_os = "linux")]
-    fn run_without_prefix(
+    fn run_isolated_stdin_config(
         &self,
-        operation: RepositoryGitOperation,
-        arguments: &[OsString],
-        input: Option<&[u8]>,
+        input: &[u8],
         maximum_output: usize,
-        identity: Option<&GitIdentityEnvironment<'_>>,
     ) -> Result<Zeroizing<Vec<u8>>, RepositoryImportError> {
+        if input.len() > MAX_CONFIG_BYTES
+            || maximum_output == 0
+            || maximum_output > MAX_CONFIG_BYTES.saturating_mul(2)
+        {
+            return Err(RepositoryImportError::ResourceLimit);
+        }
         self.run_inner(
-            operation,
-            arguments,
-            input,
+            RepositoryGitOperation::InspectConfiguration,
+            &os_args(["config", "--file", "-", "--no-includes", "--null", "--list"]),
+            Some(input),
             maximum_output,
-            identity,
+            None,
             false,
             false,
+            true,
         )
     }
 
@@ -3859,6 +3869,7 @@ impl GitRunner {
             identity,
             true,
             false,
+            false,
         )
     }
 
@@ -3872,7 +3883,11 @@ impl GitRunner {
         identity: Option<&GitIdentityEnvironment<'_>>,
         prefix: bool,
         repository_environment: bool,
+        isolate_repository_discovery: bool,
     ) -> Result<Zeroizing<Vec<u8>>, RepositoryImportError> {
+        if isolate_repository_discovery && repository_environment {
+            return Err(RepositoryImportError::UnsafeTarget);
+        }
         self.verify_runtime_bindings()?;
         let mut command = Command::new(&self.executable);
         command.current_dir(&self.root);
@@ -3918,6 +3933,9 @@ impl GitRunner {
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        if isolate_repository_discovery {
+            command.env("GIT_DIR", null_device());
+        }
         if self.target && repository_environment {
             command
                 .env("GIT_DIR", self.root.join(".git"))
@@ -4655,6 +4673,47 @@ mod tests {
             .status()
             .expect("test Git starts");
         assert!(status.success(), "test Git command failed: {arguments:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn isolated_stdin_config_ignores_malformed_repository_config() {
+        let directory = TestDirectory::new("isolated-stdin-config");
+        test_git(
+            directory.path(),
+            &["init", "--quiet", "--initial-branch=main"],
+        );
+        let executable = discover_git_executable().expect("Git executable resolves");
+        let runner = GitRunner::target_uninitialized(executable, directory.path().to_path_buf());
+
+        fs::write(
+            directory.path().join(".git/config"),
+            b"[core\n\trepositoryformatversion = 0\n",
+        )
+        .expect("repository config becomes malformed after runner construction");
+        let stdin_config = b"[core]\n\trepositoryformatversion = 0\n";
+        let arguments = os_args(["config", "--file", "-", "--no-includes", "--null", "--list"]);
+
+        assert!(matches!(
+            runner.run_inner(
+                RepositoryGitOperation::InspectConfiguration,
+                &arguments,
+                Some(stdin_config),
+                1024,
+                None,
+                false,
+                false,
+                false,
+            ),
+            Err(RepositoryImportError::GitCommandFailed {
+                operation: RepositoryGitOperation::InspectConfiguration
+            })
+        ));
+
+        let isolated = runner
+            .run_isolated_stdin_config(stdin_config, 1024)
+            .expect("isolated Git parses only the stdin config");
+        assert_eq!(isolated.as_slice(), b"core.repositoryformatversion\n0\0");
     }
 
     #[cfg(target_os = "linux")]

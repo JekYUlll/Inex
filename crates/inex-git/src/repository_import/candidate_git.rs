@@ -5,10 +5,13 @@
 //! validating or projecting a seal record. The object verifier hashes caller-
 //! supplied chunks and never retains them.
 //!
-//! This slice intentionally does not spawn or supervise `git cat-file`. A
-//! later held-process collector must feed each exact body into
-//! [`StreamingObjectVerifier`] while the mutation lock and Git runtime
-//! bindings remain held.
+//! Runtime object bodies can additionally be proven by the opaque
+//! [`FreshRuntimeObjectProof`]. That proof is currently a trusted-local Linux
+//! preview: the inherited legacy batch supervisor has a per-operation deadline
+//! for the direct child, but a hostile descendant that inherits stdout/stderr
+//! can still keep a reader join blocked after that child is killed. This module
+//! does not claim process-tree-safe termination until that supervisor is
+//! replaced.
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -26,6 +29,26 @@ use super::candidate_seal::{
     RootCommitRecord,
 };
 use super::candidate_worktree::{FreshTrackedManifest, FreshTreeManifest};
+
+mod runtime_object_proof;
+
+#[allow(
+    unused_imports,
+    reason = "the publication aggregate and runtime collector are wired in adjacent slices"
+)]
+pub(super) use runtime_object_proof::FreshRuntimeObjectProof;
+#[cfg(target_os = "linux")]
+#[allow(
+    unused_imports,
+    reason = "the runtime collector is wired into the publication transaction in the next slice"
+)]
+pub(super) use runtime_object_proof::prove_fresh_runtime_objects;
+#[cfg(test)]
+#[allow(
+    unused_imports,
+    reason = "aggregate integration tests consume the test-only proof witness"
+)]
+pub(super) use runtime_object_proof::prove_fresh_runtime_objects_for_test;
 
 const MAX_OBJECT_RECORDS: usize = 1_000_000;
 const MAX_GIT_CONTROL_RECORDS: usize = 1_000_000;
@@ -264,14 +287,11 @@ impl<'physical> FreshGitManifest<'physical> {
         })
     }
 
-    /// Project sections 3/6/7/8 only after re-deriving the complete object
-    /// union from the opaque tracked/tree views used by the aggregate.
-    pub(super) fn project_for_seal<'content>(
+    fn require_exact_content_objects<'content>(
         &self,
-        scheme: PublicationIdentityScheme,
         tracked: &FreshTrackedManifest<'content>,
         trees: &FreshTreeManifest<'content>,
-    ) -> Result<CandidateGitProjection<'physical>, CandidateSealError> {
+    ) -> Result<(), CandidateSealError> {
         if !tracked.is_bound_to(self.physical) || !trees.is_bound_to(self.physical) {
             return Err(CandidateSealError::InvalidRecord);
         }
@@ -285,13 +305,25 @@ impl<'physical> FreshGitManifest<'physical> {
         {
             return Err(CandidateSealError::InvalidRecord);
         }
+        Ok(())
+    }
+
+    /// Project sections 3/6/7/8 only after re-deriving the complete object
+    /// union from the opaque tracked/tree views used by the aggregate.
+    fn project_for_seal<'content>(
+        &self,
+        scheme: PublicationIdentityScheme,
+        tracked: &FreshTrackedManifest<'content>,
+        trees: &FreshTreeManifest<'content>,
+    ) -> Result<CandidateGitProjection<'physical>, CandidateSealError> {
+        self.require_exact_content_objects(tracked, trees)?;
         self.project(scheme)
     }
 
     #[cfg(test)]
     pub(super) fn forge_object_union_for_test(&mut self) {
         if let Some(object) = self.objects.first_mut() {
-            object.record.raw_sha256[0] ^= 0xff;
+            object.record.oid = [0; 20];
         }
     }
 }

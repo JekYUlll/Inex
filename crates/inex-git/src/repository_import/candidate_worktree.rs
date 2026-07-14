@@ -37,6 +37,8 @@ use zeroize::Zeroizing;
 #[cfg(target_os = "linux")]
 use crate::raw_index::{RawIndexError, validate_target_sha1_index_paths};
 
+#[cfg(target_os = "linux")]
+use super::candidate_control::{HeldTargetIndexSnapshot, with_held_target_index_snapshot};
 use super::candidate_manifest::{
     MarkerFreePhysicalManifest, PhysicalRecordId, PhysicalRecordKindRef,
 };
@@ -298,65 +300,81 @@ struct ClassifiedTracked {
     class: WorktreeClass,
 }
 
-/// Validate one transient raw index and bind every index OID to a freshly
-/// streamed file below the same already-held target-root descriptor.
+/// Capture the physical `.git/index`, validate it while its exact descriptor
+/// remains held, and bind every index OID to a freshly streamed worktree file
+/// below the same already-held target-root descriptor.
 ///
-/// The index body is borrowed and is never retained by the returned evidence.
-/// Its descriptor/identity/control-manifest binding remains a caller-owned
-/// section-8 responsibility.
+/// The index body is lent only inside the held snapshot callback and is never
+/// retained by the returned manifest-bound evidence. There is no production
+/// entry point accepting independently supplied raw index bytes.
 #[cfg(target_os = "linux")]
 pub(super) fn collect_fresh_tracked_evidence<'a>(
     physical: &'a MarkerFreePhysicalManifest,
     held_root: &SecureSourceDirectory,
-    raw_index: &[u8],
 ) -> Result<FreshTrackedManifest<'a>, CandidateSealError> {
-    if held_root.identity() != physical.root_identity() {
+    with_held_target_index_snapshot(physical, held_root, |snapshot| {
+        collect_fresh_tracked_evidence_from_held_index(physical, held_root, snapshot)
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn collect_fresh_tracked_evidence_from_held_index<'a>(
+    physical: &'a MarkerFreePhysicalManifest,
+    held_root: &SecureSourceDirectory,
+    snapshot: &HeldTargetIndexSnapshot<'a, '_>,
+) -> Result<FreshTrackedManifest<'a>, CandidateSealError> {
+    if !snapshot.is_bound_to(physical) {
         return Err(CandidateSealError::InvalidRecord);
     }
-    held_root
-        .verify_no_alternate_data_streams()
-        .map_err(|_| CandidateSealError::InvalidRecord)?;
-
-    let classified = classify_tracked_records(physical)?;
-    let mut expected_paths = Vec::new();
-    expected_paths
-        .try_reserve_exact(classified.len())
-        .map_err(|_| CandidateSealError::ResourceLimit)?;
-    for tracked in &classified {
-        let record = physical
-            .record(tracked.physical)
-            .ok_or(CandidateSealError::InvalidRecord)?;
-        expected_paths.push(record.path.as_bytes());
-    }
-    let summary = validate_target_sha1_index_paths(raw_index, &expected_paths)
-        .map_err(map_raw_index_error)?;
-    drop(expected_paths);
-    if summary.oids.len() != classified.len() {
-        return Err(CandidateSealError::InvalidRecord);
-    }
-
-    let mut evidence = Vec::new();
-    evidence
-        .try_reserve_exact(classified.len())
-        .map_err(|_| CandidateSealError::ResourceLimit)?;
-    for (tracked, index_oid) in classified.into_iter().zip(summary.oids) {
-        let blob_oid = stream_bound_blob(physical, held_root, tracked.physical)?;
-        if blob_oid != index_oid || is_zero_oid(&blob_oid) {
+    snapshot.inspect_bytes(|raw_index| {
+        if held_root.identity() != physical.root_identity() {
             return Err(CandidateSealError::InvalidRecord);
         }
-        evidence.push(FreshTrackedEvidence {
-            physical: tracked.physical,
-            class: tracked.class,
-            blob_oid,
-        });
-    }
-    held_root
-        .verify_no_alternate_data_streams()
-        .map_err(|_| CandidateSealError::InvalidRecord)?;
-    validate_fresh_tracked_evidence(physical, &evidence)?;
-    Ok(FreshTrackedManifest {
-        physical,
-        records: evidence,
+        held_root
+            .verify_no_alternate_data_streams()
+            .map_err(|_| CandidateSealError::InvalidRecord)?;
+
+        let classified = classify_tracked_records(physical)?;
+        let mut expected_paths = Vec::new();
+        expected_paths
+            .try_reserve_exact(classified.len())
+            .map_err(|_| CandidateSealError::ResourceLimit)?;
+        for tracked in &classified {
+            let record = physical
+                .record(tracked.physical)
+                .ok_or(CandidateSealError::InvalidRecord)?;
+            expected_paths.push(record.path.as_bytes());
+        }
+        let summary = validate_target_sha1_index_paths(raw_index, &expected_paths)
+            .map_err(map_raw_index_error)?;
+        drop(expected_paths);
+        if summary.oids.len() != classified.len() {
+            return Err(CandidateSealError::InvalidRecord);
+        }
+
+        let mut evidence = Vec::new();
+        evidence
+            .try_reserve_exact(classified.len())
+            .map_err(|_| CandidateSealError::ResourceLimit)?;
+        for (tracked, index_oid) in classified.into_iter().zip(summary.oids) {
+            let blob_oid = stream_bound_blob(physical, held_root, tracked.physical)?;
+            if blob_oid != index_oid || is_zero_oid(&blob_oid) {
+                return Err(CandidateSealError::InvalidRecord);
+            }
+            evidence.push(FreshTrackedEvidence {
+                physical: tracked.physical,
+                class: tracked.class,
+                blob_oid,
+            });
+        }
+        held_root
+            .verify_no_alternate_data_streams()
+            .map_err(|_| CandidateSealError::InvalidRecord)?;
+        validate_fresh_tracked_evidence(physical, &evidence)?;
+        Ok(FreshTrackedManifest {
+            physical,
+            records: evidence,
+        })
     })
 }
 
@@ -1339,6 +1357,7 @@ mod tests {
             [0_u8, 1, 2, 0xff],
         )
         .expect("encrypted asset writes");
+        install_canonical_index(&target);
         target
     }
 
@@ -1395,25 +1414,28 @@ mod tests {
         bytes
     }
 
+    fn install_canonical_index(target: &TestDirectory) {
+        let pre_index = collect_marker_free_physical_manifest(target.path())
+            .expect("pre-index physical fixture collects");
+        let index = index_v2(&manifest_index_entries(&pre_index, target.path()));
+        fs::write(target.path().join(".git/index"), index).expect("physical index writes");
+    }
+
     fn collect_fixture<'a>(
         target: &TestDirectory,
         physical: &'a MarkerFreePhysicalManifest,
-        index: &[u8],
     ) -> FreshTrackedManifest<'a> {
         let held_root = open_secure_source_root(target.path()).expect("held root opens");
-        collect_fresh_tracked_evidence(physical, &held_root, index)
+        collect_fresh_tracked_evidence(physical, &held_root)
             .expect("fresh tracked evidence collects")
     }
 
     #[test]
-    fn passed_held_root_and_transient_index_produce_manifest_bound_slice_evidence() {
+    fn held_physical_index_produces_manifest_bound_slice_evidence() {
         let target = populated_candidate("happy");
         let physical = collect_marker_free_physical_manifest(target.path())
             .expect("physical fixture collects");
-        let index = index_v2(&manifest_index_entries(&physical, target.path()));
-        // Binding these borrowed bytes to the physical `.git/index` record and
-        // section 8 deliberately belongs to the later caller-side assembler.
-        let tracked = collect_fixture(&target, &physical, &index);
+        let tracked = collect_fixture(&target, &physical);
 
         assert_eq!(tracked.records.len(), 5);
         let (worktree, projected_index) = tracked
@@ -1454,42 +1476,42 @@ mod tests {
 
     #[test]
     fn raw_index_path_oid_and_checksum_mismatches_fail_closed() {
-        let target = populated_candidate("bad-index");
+        assert_physical_index_rejected("wrong-index-path", |mut entries| {
+            entries[1].0 = b".gitignorf".to_vec();
+            index_v2(&entries)
+        });
+        assert_physical_index_rejected("wrong-index-oid", |mut entries| {
+            entries[0].1[0] ^= 1;
+            index_v2(&entries)
+        });
+        assert_physical_index_rejected("bad-index-checksum", |entries| {
+            let mut bytes = index_v2(&entries);
+            let last = bytes.len() - 1;
+            bytes[last] ^= 1;
+            bytes
+        });
+        assert_physical_index_rejected("zero-index-oid", |mut entries| {
+            entries[0].1 = [0_u8; 20];
+            index_v2(&entries)
+        });
+    }
+
+    fn assert_physical_index_rejected(
+        label: &str,
+        make_invalid: impl FnOnce(Vec<(Vec<u8>, [u8; 20])>) -> Vec<u8>,
+    ) {
+        let target = populated_candidate(label);
+        let baseline = collect_marker_free_physical_manifest(target.path())
+            .expect("baseline physical fixture collects");
+        let invalid = make_invalid(manifest_index_entries(&baseline, target.path()));
+        fs::write(target.path().join(".git/index"), invalid)
+            .expect("invalid physical index writes");
         let physical = collect_marker_free_physical_manifest(target.path())
-            .expect("physical fixture collects");
-        let entries = manifest_index_entries(&physical, target.path());
+            .expect("invalid index physical fixture collects");
         let held_root = open_secure_source_root(target.path()).expect("held root opens");
-
-        let mut wrong_path_entries = entries.clone();
-        wrong_path_entries[1].0 = b".gitignorf".to_vec();
         assert_eq!(
-            collect_fresh_tracked_evidence(&physical, &held_root, &index_v2(&wrong_path_entries))
-                .expect_err("wrong index path rejects"),
-            CandidateSealError::InvalidRecord
-        );
-
-        let mut wrong_oid_entries = entries.clone();
-        wrong_oid_entries[0].1[0] ^= 1;
-        assert_eq!(
-            collect_fresh_tracked_evidence(&physical, &held_root, &index_v2(&wrong_oid_entries))
-                .expect_err("unbound index oid rejects"),
-            CandidateSealError::InvalidRecord
-        );
-
-        let mut bad_checksum = index_v2(&entries);
-        let last = bad_checksum.len() - 1;
-        bad_checksum[last] ^= 1;
-        assert_eq!(
-            collect_fresh_tracked_evidence(&physical, &held_root, &bad_checksum)
-                .expect_err("bad checksum rejects"),
-            CandidateSealError::InvalidRecord
-        );
-
-        let mut zero_oid_entries = entries;
-        zero_oid_entries[0].1 = [0_u8; 20];
-        assert_eq!(
-            collect_fresh_tracked_evidence(&physical, &held_root, &index_v2(&zero_oid_entries))
-                .expect_err("zero oid rejects"),
+            collect_fresh_tracked_evidence(&physical, &held_root)
+                .expect_err("invalid physical index rejects"),
             CandidateSealError::InvalidRecord
         );
     }
@@ -1502,10 +1524,9 @@ mod tests {
         fs::write(target.path().join(path), &wrong).expect("same-size wrong metadata writes");
         let physical = collect_marker_free_physical_manifest(target.path())
             .expect("wrong metadata physical fixture collects");
-        let index = index_v2(&manifest_index_entries(&physical, target.path()));
         let held_root = open_secure_source_root(target.path()).expect("fixture root holds");
         assert_eq!(
-            collect_fresh_tracked_evidence(&physical, &held_root, &index)
+            collect_fresh_tracked_evidence(&physical, &held_root)
                 .expect_err("wrong managed metadata body rejects"),
             CandidateSealError::InvalidRecord
         );
@@ -1530,13 +1551,12 @@ mod tests {
         let changed = populated_candidate("content-drift");
         let changed_physical = collect_marker_free_physical_manifest(changed.path())
             .expect("changed fixture baseline collects");
-        let changed_index = index_v2(&manifest_index_entries(&changed_physical, changed.path()));
         let changed_root =
             open_secure_source_root(changed.path()).expect("changed fixture root holds");
         fs::write(changed.path().join("docs/deep/empty.md.enc"), b"changed")
             .expect("same inode content changes");
         assert_eq!(
-            collect_fresh_tracked_evidence(&changed_physical, &changed_root, &changed_index)
+            collect_fresh_tracked_evidence(&changed_physical, &changed_root)
                 .expect_err("same inode content drift rejects"),
             CandidateSealError::InvalidRecord
         );
@@ -1544,7 +1564,6 @@ mod tests {
         let replaced = populated_candidate("inode-drift");
         let replaced_physical = collect_marker_free_physical_manifest(replaced.path())
             .expect("replacement fixture baseline collects");
-        let replaced_index = index_v2(&manifest_index_entries(&replaced_physical, replaced.path()));
         let replaced_root =
             open_secure_source_root(replaced.path()).expect("replacement fixture root holds");
         let asset = replaced.path().join("images/field.bin.asset.enc");
@@ -1552,7 +1571,7 @@ mod tests {
         fs::remove_file(&asset).expect("old asset removes");
         fs::write(&asset, [0_u8, 1, 2, 0xff]).expect("same bytes replacement writes");
         assert_eq!(
-            collect_fresh_tracked_evidence(&replaced_physical, &replaced_root, &replaced_index)
+            collect_fresh_tracked_evidence(&replaced_physical, &replaced_root)
                 .expect_err("same bytes replacement inode rejects"),
             CandidateSealError::InvalidRecord
         );
@@ -1561,7 +1580,6 @@ mod tests {
         let rebound = populated_candidate("ancestor-drift");
         let rebound_physical = collect_marker_free_physical_manifest(rebound.path())
             .expect("ancestor fixture baseline collects");
-        let rebound_index = index_v2(&manifest_index_entries(&rebound_physical, rebound.path()));
         let rebound_root =
             open_secure_source_root(rebound.path()).expect("ancestor fixture root holds");
         fs::rename(
@@ -1573,7 +1591,7 @@ mod tests {
         fs::write(rebound.path().join("docs/deep/empty.md.enc"), [])
             .expect("replacement descendant writes");
         assert_eq!(
-            collect_fresh_tracked_evidence(&rebound_physical, &rebound_root, &rebound_index)
+            collect_fresh_tracked_evidence(&rebound_physical, &rebound_root)
                 .expect_err("ancestor identity drift rejects"),
             CandidateSealError::InvalidRecord
         );
@@ -1601,8 +1619,7 @@ mod tests {
         fs::create_dir(target.path().join("orphan")).expect("empty content directory creates");
         let physical = collect_marker_free_physical_manifest(target.path())
             .expect("empty-directory physical fixture collects");
-        let index = index_v2(&manifest_index_entries(&physical, target.path()));
-        let tracked = collect_fixture(&target, &physical, &index);
+        let tracked = collect_fixture(&target, &physical);
         assert_eq!(
             construct_fresh_tree_evidence(&tracked).expect_err("untracked empty directory rejects"),
             CandidateSealError::InvalidRecord
@@ -1619,10 +1636,10 @@ mod tests {
             .expect("prefix file ciphertext writes");
         fs::write(target.path().join("foo0.md.enc"), b"post-directory")
             .expect("post-directory ciphertext writes");
+        install_canonical_index(&target);
         let physical = collect_marker_free_physical_manifest(target.path())
             .expect("tree fixture physical manifest collects");
-        let index = index_v2(&manifest_index_entries(&physical, target.path()));
-        let tracked = collect_fixture(&target, &physical, &index);
+        let tracked = collect_fixture(&target, &physical);
         let trees = construct_fresh_tree_evidence(&tracked).expect("trees construct");
         let projected_trees = trees.project().expect("trees project");
         let projected_tracked = tracked
