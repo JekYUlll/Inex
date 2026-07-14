@@ -9751,6 +9751,11 @@ mod tests {
         let fixture = TestVault::new()?;
         let target = fixture.note("race.md.enc");
         fs::write(&target, OLD_CIPHERTEXT)?;
+        // Freeze the existing lock namespace before the two writers rendezvous.
+        // Otherwise one thread may conservatively reject `.vault-local`
+        // appearing during its pre-lock publication scan, which tests that
+        // scan's fail-closed behavior rather than OS-lock serialization.
+        drop(VaultMutationGuard::acquire(fixture.root()).map_err(io::Error::other)?);
         let condition = WriteCondition::IfMatch(digest_bytes(OLD_CIPHERTEXT));
         let rendezvous = Arc::new(Rendezvous {
             barrier: Barrier::new(2),
