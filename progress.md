@@ -937,3 +937,8 @@
 - 提交 `a94ce38`（`feat(vscode): manage encrypted private tags`）：抽取 `ensureUmbraReady`，annotation 和 tag 管理共享 vault unlock、不可恢复初始化警告、Umbra password、enable 与 session-epoch 检查。`Inex: Manage Private Tags` 可创建、重命名、归档 tag；每个 mutation 后重新向 daemon 读取 catalog。
 - 创建流程的 display label 与 stable ID 都经 sensitive input，第二次输入取消也会在 finally 中丢弃第一次的 label；UI 不缓存 catalog、不写 `.inex`。reorder/profile 管理未伪装为已完成。
 - 验证：`git diff --check`、VS Code check、55/55 tests、build 通过；PRD 与计划同步。
+
+## 2026-07-15 — VS Code 私密标签重排
+
+- 提交 `c8b6f10`（`feat(vscode): reorder encrypted private tags`）：新增 `Inex: Reorder Private Tags`，选择当前 tag 后可移动到 first/previous/next/last。UI 从 daemon 刚读回的完整 catalog 产生 exact ID permutation，再调用 `umbra.tag.reorder` 并 reload。
+- 修正管理器原本的普通 QuickPick：任何展示私密 tag label/description 的选择器均改用 sensitive QuickPick，在 Umbra 锁定时清空 items 并关闭；后续位置动作不显示 tag label。验证：VS Code check、55/55 tests、build、diff-check 通过。
