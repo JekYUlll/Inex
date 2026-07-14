@@ -947,3 +947,8 @@
 
 - 提交 `4594d6b`（`feat(umbra): manage encrypted annotation profiles`）：`UmbraConfigV1`/Vault 新增 create/edit/remove profile。edit 必须以同一 stable profile ID 回写，create/edit 都重新验证 encrypted tag references、kind/Outer/Cover prompt 语义；remove 会在同一 config 事务中清掉 matching default profile ID。
 - 核心 profile mutation 与 catalog/canary 回归、严格 core Clippy、fmt/diff-check 通过。下一步为 daemon RPC，编辑器仍不能直接改 `.inex/config.umbra.inex`。
+
+## 2026-07-15 — 加密 annotation profile daemon RPC
+
+- 提交 `657f697`（`feat(daemon): manage encrypted annotation profiles`）：新增 `umbra.profile.create/edit/remove`。profile id/label/kind/tag IDs/Outer 通过 strict sensitive nested object 解析；daemon 把 stable-ID/引用/cover 语义检查和加密写入全部委托 core。
+- lifecycle 回归在同一 Umbra session 内完成 create→edit（comment/drop 到 block/cover）→config get→remove，full daemon 71/71、严格 Clippy、fmt/diff-check 通过。下一步 VS Code typed client/UI。

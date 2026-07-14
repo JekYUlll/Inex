@@ -521,3 +521,4 @@
 - VS Code sidecar 的 tag mutator 也需要在 client 边界限制 canonical ID、UTF-8 文本与完整 reorder permutation；这不是替代 daemon 验证，而是防止 UI/extension bug 将超限或重复私密元数据送入本地 RPC。每次 mutation 后 UI 应重新从 daemon 加载 catalog，而不能合成持久状态。
 - Tag label/description 是 `K_umbra` 保护的私密 catalog 数据，即使在 VS Code UI 也不能用普通 `showQuickPick` 承载：普通 API 没有可由 lock event 主动清空/关闭的 picker handle。所有含私密 label 的选择必须使用 `showSensitiveQuickPick`; 后续非私密操作菜单不得把 label 拼入 title/detail。
 - Profile 的 stable ID 与 tag ID 同样是加密 catalog 内的语义；edit 不得实现为 remove+create，否则用户 keybindings/default profile 会失效。删除 profile 时必须在同一 authenticated config save 中清理 default reference，不能留下一个 schema 上悬空的 defaultProfileId。
+- Profile RPC 的 nested object 不能复用 annotation 的公开 cover-text spec：profile 仅保存 Outer mode 与 `promptForCover`，不保存任何实际 cover text。所有 profile field（包括 ID、label、selected tag IDs）是 K_umbra catalog 数据，必须经 sensitive 参数层读取且只把 validated values交给 core。
