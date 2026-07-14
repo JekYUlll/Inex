@@ -861,6 +861,13 @@ fn validate_path(
     Ok(())
 }
 
+/// Validate one section-1 path without exposing the encoder's generic path
+/// policy. The physical collector uses this before it creates role-typed
+/// records; the encoder repeats the same check as defense in depth.
+pub(super) fn validate_physical_record_path(path: &str) -> Result<(), CandidateSealError> {
+    validate_path(path, true, MAX_PHYSICAL_PATH_BYTES)
+}
+
 fn validate_component(component: &str) -> Result<(), CandidateSealError> {
     if component.is_empty()
         || matches!(component, "." | "..")

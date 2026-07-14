@@ -42,6 +42,12 @@ use zeroize::Zeroizing;
 )]
 mod candidate_seal;
 
+#[allow(
+    dead_code,
+    reason = "the marker-free physical collector is consumed by the publication assembler in the next slice"
+)]
+mod candidate_manifest;
+
 #[cfg(target_os = "linux")]
 use super::raw_index::{RawIndex, RawIndexError, parse_sha1_index};
 use super::{
@@ -1332,6 +1338,15 @@ fn inventory_namespace(
     root: &Path,
     policy: NamespacePolicy,
 ) -> Result<Vec<NamespaceSeal>, RepositoryImportError> {
+    inventory_namespace_with_file_limit(root, policy, None)
+}
+
+#[cfg(target_os = "linux")]
+fn inventory_namespace_with_file_limit(
+    root: &Path,
+    policy: NamespacePolicy,
+    maximum_file_bytes: Option<u64>,
+) -> Result<Vec<NamespaceSeal>, RepositoryImportError> {
     let directory = open_secure_source_root(root).map_err(|_| namespace_error(policy))?;
     let mut seals = Vec::new();
     let mut path_bytes = 0_usize;
@@ -1340,6 +1355,7 @@ fn inventory_namespace(
         Path::new(""),
         0,
         policy,
+        maximum_file_bytes,
         &mut seals,
         &mut path_bytes,
     )?;
@@ -1356,6 +1372,7 @@ fn inventory_secure_namespace_directory(
     relative: &Path,
     depth: usize,
     policy: NamespacePolicy,
+    maximum_file_bytes: Option<u64>,
     seals: &mut Vec<NamespaceSeal>,
     path_bytes: &mut usize,
 ) -> Result<(), RepositoryImportError> {
@@ -1393,6 +1410,7 @@ fn inventory_secure_namespace_directory(
                     &child_relative,
                     depth.saturating_add(1),
                     policy,
+                    maximum_file_bytes,
                     seals,
                     path_bytes,
                 )?;
@@ -1401,7 +1419,14 @@ fn inventory_secure_namespace_directory(
                     .map_err(|_| namespace_error(policy))?;
             }
             SecureSourceChild::File(file) => {
-                let (identity, size, digest) = hash_secure_file(file, namespace_error(policy))?;
+                if let Some(maximum) = maximum_file_bytes {
+                    let observed = file.observed_len().map_err(|_| namespace_error(policy))?;
+                    if observed > maximum {
+                        return Err(RepositoryImportError::ResourceLimit);
+                    }
+                }
+                let (identity, size, digest) =
+                    hash_secure_file(file, namespace_error(policy), maximum_file_bytes)?;
                 seals.push(NamespaceSeal {
                     relative_path: relative_text,
                     kind: NamespaceKind::File(identity),
@@ -1422,6 +1447,15 @@ fn inventory_namespace(
     root: &Path,
     policy: NamespacePolicy,
 ) -> Result<Vec<NamespaceSeal>, RepositoryImportError> {
+    inventory_namespace_with_file_limit(root, policy, None)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn inventory_namespace_with_file_limit(
+    root: &Path,
+    policy: NamespacePolicy,
+    maximum_file_bytes: Option<u64>,
+) -> Result<Vec<NamespaceSeal>, RepositoryImportError> {
     let root_metadata = fs::symlink_metadata(root)
         .map_err(|error| io_error(RepositoryIoOperation::InspectNamespace, &error))?;
     if root_metadata.file_type().is_symlink() || !root_metadata.file_type().is_dir() {
@@ -1436,6 +1470,7 @@ fn inventory_namespace(
         Path::new(""),
         0,
         policy,
+        maximum_file_bytes,
         &mut seals,
         &mut path_bytes,
     )?;
@@ -1452,6 +1487,7 @@ fn inventory_namespace_directory(
     relative: &Path,
     depth: usize,
     policy: NamespacePolicy,
+    maximum_file_bytes: Option<u64>,
     seals: &mut Vec<NamespaceSeal>,
     path_bytes: &mut usize,
 ) -> Result<(), RepositoryImportError> {
@@ -1496,15 +1532,20 @@ fn inventory_namespace_directory(
                 &child_relative,
                 depth.saturating_add(1),
                 policy,
+                maximum_file_bytes,
                 seals,
                 path_bytes,
             )?;
         } else if metadata.file_type().is_file() {
-            let (identity, digest) = hash_bound_regular_file(&path, namespace_error(policy))?;
+            if maximum_file_bytes.is_some_and(|maximum| metadata.len() > maximum) {
+                return Err(RepositoryImportError::ResourceLimit);
+            }
+            let (identity, size, digest) =
+                hash_bound_regular_file(&path, namespace_error(policy), maximum_file_bytes)?;
             seals.push(NamespaceSeal {
                 relative_path: relative_text,
                 kind: NamespaceKind::File(identity),
-                size: metadata.len(),
+                size,
                 sha256: Some(digest),
             });
         } else {
@@ -1858,8 +1899,12 @@ fn secure_relative_directory_identity(
 fn hash_secure_file(
     mut file: SecureSourceFile,
     unsafe_error: RepositoryImportError,
+    maximum_file_bytes: Option<u64>,
 ) -> Result<(FilesystemFileIdentity, u64, [u8; 32]), RepositoryImportError> {
     let expected = file.observed_len().map_err(|_| unsafe_error.clone())?;
+    if maximum_file_bytes.is_some_and(|maximum| expected > maximum) {
+        return Err(RepositoryImportError::ResourceLimit);
+    }
     file.verify_binding().map_err(|_| unsafe_error.clone())?;
     let identity = file.identity().map_err(|_| unsafe_error.clone())?;
     let mut digest = Sha256::new();
@@ -1872,12 +1917,15 @@ fn hash_secure_file(
         if read == 0 {
             break;
         }
-        observed = observed
-            .checked_add(read as u64)
-            .ok_or(RepositoryImportError::ResourceLimit)?;
+        advance_bounded_stream_observation(&mut observed, read, maximum_file_bytes)?;
         digest.update(&buffer[..read]);
     }
+    let final_length = file.observed_len().map_err(|_| unsafe_error.clone())?;
+    if maximum_file_bytes.is_some_and(|maximum| final_length > maximum) {
+        return Err(RepositoryImportError::ResourceLimit);
+    }
     if observed != expected
+        || final_length != expected
         || file.identity().map_err(|_| unsafe_error.clone())? != identity
         || file.verify_binding().is_err()
     {
@@ -1930,10 +1978,14 @@ fn read_bound_regular_file(
 fn hash_bound_regular_file(
     path: &Path,
     unsafe_error: RepositoryImportError,
-) -> Result<(FilesystemFileIdentity, [u8; 32]), RepositoryImportError> {
+    maximum_file_bytes: Option<u64>,
+) -> Result<(FilesystemFileIdentity, u64, [u8; 32]), RepositoryImportError> {
     let metadata = fs::symlink_metadata(path).map_err(|_| unsafe_error.clone())?;
     if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
         return Err(unsafe_error.clone());
+    }
+    if maximum_file_bytes.is_some_and(|maximum| metadata.len() > maximum) {
+        return Err(RepositoryImportError::ResourceLimit);
     }
     let mut file =
         File::open(path).map_err(|error| io_error(RepositoryIoOperation::ReadFile, &error))?;
@@ -1953,19 +2005,41 @@ fn hash_bound_regular_file(
         if read == 0 {
             break;
         }
-        observed = observed
-            .checked_add(read as u64)
-            .ok_or(RepositoryImportError::ResourceLimit)?;
+        advance_bounded_stream_observation(&mut observed, read, maximum_file_bytes)?;
         digest.update(&buffer[..read]);
     }
+    let final_length = file
+        .metadata()
+        .map_err(|error| io_error(RepositoryIoOperation::ReadFile, &error))?
+        .len();
+    if maximum_file_bytes.is_some_and(|maximum| final_length > maximum) {
+        return Err(RepositoryImportError::ResourceLimit);
+    }
     if observed != metadata.len()
+        || final_length != metadata.len()
         || !open_file_matches_path_and_is_single_link(path, &file)
             .map_err(|_| unsafe_error.clone())?
         || filesystem_file_identity(&file).ok().as_ref() != Some(&identity)
     {
         return Err(unsafe_error);
     }
-    Ok((identity, digest.finalize().into()))
+    Ok((identity, observed, digest.finalize().into()))
+}
+
+fn advance_bounded_stream_observation(
+    observed: &mut u64,
+    read: usize,
+    maximum_file_bytes: Option<u64>,
+) -> Result<(), RepositoryImportError> {
+    let read = u64::try_from(read).map_err(|_| RepositoryImportError::ResourceLimit)?;
+    let next = observed
+        .checked_add(read)
+        .ok_or(RepositoryImportError::ResourceLimit)?;
+    if maximum_file_bytes.is_some_and(|maximum| next > maximum) {
+        return Err(RepositoryImportError::ResourceLimit);
+    }
+    *observed = next;
+    Ok(())
 }
 
 fn canonical_normal_directory(
