@@ -84,7 +84,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
   - [x] 实现 Outer document container 与 K_umbra private-slot payload 基础：kind/tag/time/Markdown 均只在 slot ciphertext 内，Outer strategy 被 AAD 绑定（`f20d2b6`）
   - [x] EDRY 现可严格识别 feature-2 Outer container，只有已认证 metadata 声明 `[2]` 才可加密此类文档（`72b639d`）
   - [x] Umbra live session 可原子提交 feature-2 authenticated metadata 升级；锁定状态拒绝升级（`538168d`）
-  - [ ] 将 v2 document container 接入 Vault 文档读写与 feature-2 协商，形成实际 Outer/Umbra 双投影
+  - [x] 将 v2 document container 接入 Vault 专用读写与 feature-2 协商：常规 Markdown API 拒绝 feature-2 envelope，Outer projection 只经专用 API 读取，创建/保存必须有 live Umbra session（本轮）
   - [ ] 将 Umbra 启用事务与feature-2 document-container协商同时接入，避免未支持的读者误开私密文档
   - [ ] 实现core私密slot、TagId、catalog/profile和RenderMap选择事务，并证明canary不进入磁盘Outer面
   - [ ] 扩展daemon session/RPC及VS Code QuickPick/命令/可配置keybindings

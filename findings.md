@@ -503,3 +503,5 @@
 - Vault 层的 Umbra session 必须持有 slot 的 ciphertext etag，以在已解锁会话中用 CAS 原子替换 password slot；不能在外层 mutation guard 内再次调用独立 atomic writer，否则会造成重入锁风险。内部目录须在同一 guard 下创建并验证类型、挂载和大小写别名。
 - 配置 envelope 必须把 vault ID、`K_umbra` 的 key ID、canonical `.inex/config.umbra.inex` 路径和 schema version 作为 AAD/derivation context；只用单一 Umbra key 而不做 domain separation 会让 config 与 private-slot 密文跨用途替换缺少明确边界。
 - Private slot ciphertext 的 AAD 必须覆盖公开 Outer strategy；否则攻击者可把 `drop`、`placeholder`、cover text 等公开语义替换而仍让私密正文解密成功。slot key 还须绑定 logical document path 与 slot ID，禁止 slot 在文档间移植。
+- feature negotiation 必须按能力包含关系判断、而不是比较整个 feature vector：启用 Umbra 后已有 opaque-asset vault 的 authenticated metadata 合法值是 `[1,2]`。但每个 Umbra Outer EDRY envelope 仍必须精确声明 `[2]`，确保容器 reader 选择不会与普通 Markdown/asset 混淆。
+- Outer projection 不需要 `K_umbra` 才能读取（它只含公开 Markdown、slot ID、公开 outer strategy 和 slot ciphertext），但创建或保存 feature-2 container 必须要求 live Umbra session；常规 `Vault::read` 必须拒绝 feature-2 envelope，避免普通客户端把内部 JSON 误当 Markdown 展示或回存。
