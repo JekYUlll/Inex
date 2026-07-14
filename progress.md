@@ -1,5 +1,11 @@
 # Inex Progress Log
 
+## 2026-07-15 — 加密 Umbra catalog/profile 信封
+
+- 提交 `d0b6b13`：新增 `UmbraConfigV1`、tag/profile/defaults 模型和 `.inex/config.umbra.inex` 的 AEAD envelope。配置专用 subkey 从 live `K_umbra` domain-separated 派生，AAD 绑定 vault ID、key ID、canonical internal path 与版本。
+- tag 标签、profile 名称、tag IDs 和 defaults 只存在 config ciphertext 内；canary 测试确认 `INEX_SECRET_TAG_CANARY` 不会进入磁盘 JSON，跨 vault decrypt 失败且不返回部分配置。
+- 尚未把 envelope 连接到 Vault load/save API，因此当前阶段不宣称 catalog 已可由客户端持久同步。
+
 ## 2026-07-15 — Vault Umbra 会话与密码槽生命周期
 
 - 提交 `67e87cf`：`Vault` 现在拥有 memory-only Umbra session，并提供初始化、独立解锁、锁定和已解锁会话的密码重设。锁定或丢弃 Vault 会释放 protected `K_umbra`；Outer password 从未传入这些路径。

@@ -79,6 +79,8 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
   - [x] 冻结独立K_umbra层级、唯一`umbra-default`密码槽、不可恢复语义与`.inex/config.umbra.inex`边界（`docs/spec/umbra-v1.md`）
   - [x] 实现随机K_umbra、Argon2id KEK 包装/解包、vault/path-bound AEAD、受保护内存清理，以及已解锁会话密码重包装基础（`f96f656`）
   - [x] 将密码槽初始化/替换接入Vault会话与受控`.inex/keyslots`目录创建；独立unlock/lock和live-session重设密码均已验证（`67e87cf`）
+  - [x] 实现 K_umbra domain-separated、vault/key-ID/path-bound 的加密 tag catalog/profile envelope，并通过磁盘 canary 与跨 vault 认证测试（`d0b6b13`）
+  - [ ] 将 encrypted catalog/profile envelope 接入 Vault `load/save` 原子存储 API
   - [ ] 将 Umbra 启用事务与feature-2 document-container协商同时接入，避免未支持的读者误开私密文档
   - [ ] 实现core私密slot、TagId、catalog/profile和RenderMap选择事务，并证明canary不进入磁盘Outer面
   - [ ] 扩展daemon session/RPC及VS Code QuickPick/命令/可配置keybindings
