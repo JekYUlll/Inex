@@ -31,6 +31,9 @@ use crate::search::{
 };
 use crate::sodium::Argon2idParams;
 use crate::tree::{self, TreeEntryKind, TreeError, VaultTree, VaultTreeProfile};
+use crate::umbra_keyslot::{
+    UMBRA_DEFAULT_KEYSLOT_PATH, UmbraKey, UmbraKeyslotError, UmbraKeyslotV1,
+};
 use crate::vault_config::{
     ConfigError, ConfigWarning, KdfPolicy, MAX_VAULT_JSON_BYTES, VaultConfig,
 };
@@ -189,6 +192,18 @@ pub enum VaultError {
     /// password failed. The on-disk metadata is retained for recovery.
     #[error("password-slot metadata committed but post-commit verification failed")]
     PasswordCommitVerificationFailed,
+    /// Umbra keyslot creation, authentication, or persistence failed.
+    #[error(transparent)]
+    UmbraKeyslot(#[from] UmbraKeyslotError),
+    /// An operation requires a currently unlocked Umbra session.
+    #[error("Umbra is locked")]
+    UmbraLocked,
+    /// The sole Umbra password slot is not initialized for this vault.
+    #[error("Umbra is not initialized")]
+    UmbraNotInitialized,
+    /// Umbra initialization was requested even though the slot already exists.
+    #[error("Umbra is already initialized")]
+    UmbraAlreadyInitialized,
 }
 
 /// Non-plaintext metadata returned after a committed document mutation.
@@ -245,6 +260,23 @@ pub struct Vault {
     search_index: MemorySearchIndex,
     search_index_ready: bool,
     search_fingerprint: Option<[u8; 32]>,
+    umbra: Option<UmbraSession>,
+}
+
+/// Memory-only Umbra state. Dropping it clears the protected data key.
+struct UmbraSession {
+    slot: UmbraKeyslotV1,
+    key: UmbraKey,
+    slot_etag: [u8; 32],
+}
+
+/// Non-secret Umbra session state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UmbraStatus {
+    /// Whether a valid sole v1 password slot exists on disk.
+    pub initialized: bool,
+    /// Whether the current process session holds `K_umbra`.
+    pub unlocked: bool,
 }
 
 impl fmt::Debug for Vault {
@@ -261,6 +293,7 @@ impl fmt::Debug for Vault {
             .field("search_index", &self.search_index)
             .field("search_index_ready", &self.search_index_ready)
             .field("search_fingerprint", &self.search_fingerprint.is_some())
+            .field("umbra_unlocked", &self.umbra.is_some())
             .finish()
     }
 }
@@ -475,6 +508,7 @@ impl Vault {
             search_index: MemorySearchIndex::new(),
             search_index_ready: false,
             search_fingerprint: None,
+            umbra: None,
         })
     }
 
@@ -506,6 +540,120 @@ impl Vault {
     #[must_use]
     pub fn config_etag(&self) -> String {
         encode_etag(self.config_etag)
+    }
+
+    /// Return only the current Umbra initialization and memory-lock state.
+    ///
+    /// This validates only public password-slot metadata when no live session
+    /// exists; it never derives a KEK or decrypts `K_umbra`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unsafe, malformed, or resource-exhausting
+    /// public keyslot path.
+    pub fn umbra_status(&self) -> Result<UmbraStatus, VaultError> {
+        if self.umbra.is_some() {
+            return Ok(UmbraStatus {
+                initialized: true,
+                unlocked: true,
+            });
+        }
+        match load_umbra_keyslot(&self.root) {
+            Ok(_) => Ok(UmbraStatus {
+                initialized: true,
+                unlocked: false,
+            }),
+            Err(VaultError::UmbraNotInitialized) => Ok(UmbraStatus {
+                initialized: false,
+                unlocked: false,
+            }),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Initialize the sole v1 Umbra slot and retain its fresh key in memory.
+    ///
+    /// The caller must have already displayed and confirmed the unrecoverable
+    /// password warning. This method never treats the Outer password as an
+    /// Umbra credential.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a slot already exists, internal storage is unsafe,
+    /// the password is invalid, or atomic persistence fails.
+    pub fn initialize_umbra(&mut self, password: &[u8]) -> Result<UmbraStatus, VaultError> {
+        let keyslot_target = self.root.join(UMBRA_DEFAULT_KEYSLOT_PATH);
+        let guard = self.acquire_mutation_guard()?;
+        ensure_umbra_keyslot_parent(&self.root)?;
+        match entry_state(&keyslot_target)? {
+            EntryState::Absent => {}
+            EntryState::Regular => return Err(VaultError::UmbraAlreadyInitialized),
+            EntryState::Unsafe => return Err(VaultError::UnsafeFilesystemEntry),
+        }
+        let (slot, key) = UmbraKeyslotV1::initialize(self.config.vault_id, password)?;
+        let bytes = slot.to_json()?;
+        let outcome = guard
+            .write(&keyslot_target, &bytes, WriteCondition::IfNoneMatch)
+            .map_err(map_atomic_error)?;
+        drop(guard);
+        self.umbra = Some(UmbraSession {
+            slot,
+            key,
+            slot_etag: outcome.etag,
+        });
+        self.umbra_status()
+    }
+
+    /// Unlock `K_umbra` independently of the Outer vault password.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if Umbra is not initialized, public slot storage is
+    /// unsafe, or the supplied password cannot authenticate the slot.
+    pub fn unlock_umbra(&mut self, password: &[u8]) -> Result<UmbraStatus, VaultError> {
+        let (slot, slot_etag) = load_umbra_keyslot(&self.root)?;
+        let key = slot.unlock(self.config.vault_id, password)?;
+        self.umbra = Some(UmbraSession {
+            slot,
+            key,
+            slot_etag,
+        });
+        self.umbra_status()
+    }
+
+    /// Clear `K_umbra` and all future private caches from this vault session.
+    ///
+    /// Private projections/indexes are added with the document-container
+    /// milestone; this state transition already clears their key authority.
+    pub fn lock_umbra(&mut self) {
+        self.umbra = None;
+    }
+
+    /// Rewrap the live `K_umbra` with a new password without re-encrypting
+    /// private slots or configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError::UmbraLocked`] without a live Umbra session, or an
+    /// error if the replacement slot cannot be authenticated and committed.
+    pub fn change_umbra_password(&mut self, new_password: &[u8]) -> Result<(), VaultError> {
+        let session = self.umbra.as_ref().ok_or(VaultError::UmbraLocked)?;
+        let replacement =
+            session
+                .slot
+                .rewrap_unlocked(self.config.vault_id, new_password, &session.key)?;
+        let bytes = replacement.to_json()?;
+        let target = self.root.join(UMBRA_DEFAULT_KEYSLOT_PATH);
+        let expected = session.slot_etag;
+        let guard = self.acquire_mutation_guard()?;
+        let outcome = guard
+            .write(&target, &bytes, WriteCondition::IfMatch(expected))
+            .map_err(map_atomic_error)?;
+        drop(guard);
+        let session = self.umbra.as_mut().ok_or(VaultError::UmbraLocked)?;
+        session.slot = replacement;
+        session.slot_etag = outcome.etag;
+        Ok(())
     }
 
     /// Discover a deterministic logical tree without opening document bytes.
@@ -1819,6 +1967,90 @@ fn ensure_exact_entry_name(
     }
 }
 
+fn ensure_umbra_keyslot_parent(root: &Path) -> Result<(), VaultError> {
+    let internal = root.join(".inex");
+    ensure_private_directory(root, &internal)?;
+    let keyslots = internal.join("keyslots");
+    ensure_private_directory(root, &keyslots)
+}
+
+fn ensure_private_directory(root: &Path, directory: &Path) -> Result<(), VaultError> {
+    let parent = directory
+        .parent()
+        .ok_or(VaultError::UnsafeFilesystemEntry)?;
+    let name = directory
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or(VaultError::UnsafeFilesystemEntry)?;
+    reject_ascii_case_alias(parent, name)?;
+    match fs::create_dir(directory) {
+        Ok(()) => restrict_directory_permissions_best_effort(directory),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(io_error(VaultIoOperation::CreateDirectory, &error)),
+    }
+    let metadata = fs::symlink_metadata(directory)
+        .map_err(|error| io_error(VaultIoOperation::Inspect, &error))?;
+    if is_link_or_reparse_point(&metadata) || !metadata.file_type().is_dir() {
+        return Err(VaultError::UnsafeFilesystemEntry);
+    }
+    ensure_same_mount(root, directory)
+}
+
+fn load_umbra_keyslot(root: &Path) -> Result<(UmbraKeyslotV1, [u8; 32]), VaultError> {
+    let internal = root.join(".inex");
+    let keyslots = internal.join("keyslots");
+    for directory in [&internal, &keyslots] {
+        let parent = directory
+            .parent()
+            .ok_or(VaultError::UnsafeFilesystemEntry)?;
+        let name = directory
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .ok_or(VaultError::UnsafeFilesystemEntry)?;
+        reject_ascii_case_alias(parent, name)?;
+        let metadata = fs::symlink_metadata(directory).map_err(|error| match error.kind() {
+            io::ErrorKind::NotFound => VaultError::UmbraNotInitialized,
+            _ => io_error(VaultIoOperation::Inspect, &error),
+        })?;
+        if is_link_or_reparse_point(&metadata) || !metadata.file_type().is_dir() {
+            return Err(VaultError::UnsafeFilesystemEntry);
+        }
+        ensure_same_mount(root, directory)?;
+    }
+    let path = root.join(UMBRA_DEFAULT_KEYSLOT_PATH);
+    reject_ascii_case_alias(&keyslots, "umbra-default.inex-keyslot")?;
+    if !exact_child_exists(
+        &keyslots,
+        std::ffi::OsStr::new("umbra-default.inex-keyslot"),
+    )? {
+        return match entry_state(&path)? {
+            EntryState::Absent => Err(VaultError::UmbraNotInitialized),
+            EntryState::Regular | EntryState::Unsafe => Err(VaultError::UnsafeFilesystemEntry),
+        };
+    }
+    ensure_same_mount(root, &path)?;
+    let bytes = read_regular_bounded(&path, 16 * 1024)?;
+    let etag = digest(&bytes);
+    let slot = UmbraKeyslotV1::from_json(&bytes)?;
+    Ok((slot, etag))
+}
+
+fn reject_ascii_case_alias(parent: &Path, expected: &str) -> Result<(), VaultError> {
+    for entry in
+        fs::read_dir(parent).map_err(|error| io_error(VaultIoOperation::Inspect, &error))?
+    {
+        let entry = entry.map_err(|error| io_error(VaultIoOperation::Inspect, &error))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return Err(VaultError::UnsafeFilesystemEntry);
+        };
+        if name != expected && name.eq_ignore_ascii_case(expected) {
+            return Err(VaultError::CaseFoldCollision);
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EntryState {
     Absent,
@@ -2052,6 +2284,63 @@ mod tests {
             test_policy(),
         )
         .unwrap_or_else(|error| panic!("test asset vault creation failed: {error}"))
+    }
+
+    #[test]
+    fn umbra_slot_is_independent_and_password_reset_requires_live_session() {
+        let directory = TestDirectory::new();
+        let mut vault = create_test_vault(&directory);
+        assert_eq!(
+            vault.umbra_status().expect("inspect uninitialized state"),
+            UmbraStatus {
+                initialized: false,
+                unlocked: false,
+            }
+        );
+
+        let initialized = vault
+            .initialize_umbra(b"first Umbra password")
+            .expect("initialize Umbra");
+        assert_eq!(
+            initialized,
+            UmbraStatus {
+                initialized: true,
+                unlocked: true,
+            }
+        );
+        assert!(directory.path().join(UMBRA_DEFAULT_KEYSLOT_PATH).is_file());
+        assert!(matches!(
+            vault.initialize_umbra(b"another Umbra password"),
+            Err(VaultError::UmbraAlreadyInitialized)
+        ));
+
+        vault.lock_umbra();
+        assert!(matches!(
+            vault.change_umbra_password(b"new Umbra password"),
+            Err(VaultError::UmbraLocked)
+        ));
+        assert!(matches!(
+            vault.unlock_umbra(b"wrong Umbra password"),
+            Err(VaultError::UmbraKeyslot(
+                UmbraKeyslotError::AuthenticationFailed
+            ))
+        ));
+        vault
+            .unlock_umbra(b"first Umbra password")
+            .expect("unlock Umbra independently");
+        vault
+            .change_umbra_password(b"new Umbra password")
+            .expect("reset from live session");
+        vault.lock_umbra();
+        assert!(matches!(
+            vault.unlock_umbra(b"first Umbra password"),
+            Err(VaultError::UmbraKeyslot(
+                UmbraKeyslotError::AuthenticationFailed
+            ))
+        ));
+        vault
+            .unlock_umbra(b"new Umbra password")
+            .expect("unlock with reset password");
     }
 
     #[test]
