@@ -571,6 +571,16 @@ export class InexCustomEditorProvider
       : { logicalPath: document.logicalPath, session: document.session, range };
   }
 
+  public activeSelectionIsCompletePrivateBlock(): boolean {
+    const document = this.activeDocument;
+    const selection = document?.currentSelection();
+    const renderMap = document?.renderMap();
+    return document?.isUmbraProjection === true && selection !== undefined && renderMap !== undefined &&
+      renderMap.privateSlots.some(
+        (slot) => slot.range.startByte === selection.startByte && slot.range.endByte === selection.endByte,
+      );
+  }
+
   public resolveCustomEditor(
     document: InexDocument,
     webviewPanel: vscode.WebviewPanel,

@@ -225,6 +225,17 @@ export function activate(
     }),
     vscode.commands.registerCommand("inex.togglePrivateAnnotation", async () => {
       await runUiAction(async () => {
+        if (editor.activeSelectionIsCompletePrivateBlock()) {
+          const choice = await vscode.window.showWarningMessage(
+            "Remove the selected private annotation? Its Markdown will become ordinary Umbra content after save.",
+            { modal: true },
+            "Remove Private Annotation",
+          );
+          if (choice === "Remove Private Annotation") {
+            await editor.removePrivateAnnotationFromActive();
+          }
+          return;
+        }
         await applyChosenPrivateAnnotation(controller, editor);
       });
     }),
