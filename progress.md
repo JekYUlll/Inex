@@ -47,6 +47,11 @@
 - `inex.applyPrivateAnnotationProfile` 接受 `{ profileId }` command args，并只接受 canonical stable ID。profile 由 Umbra-unlocked encrypted config 返回，找不到/锁定/session 改变均拒绝。
 - profile 复用普通 chooser 的 initialization/unlock/feature-2 conversion/verified selection/apply 流程；`promptForCover` 仅收集明确公开的 cover text。`pnpm --dir editors/vscode check` 和 50/50 tests 通过。
 
+## 2026-07-15 — Comment-like toggle resolution
+
+- `togglePrivateAnnotation` 不再无条件打开 chooser：CustomEditor 以当前 authenticated RenderMap 的 exact range 判断 active selection 是否覆盖完整 private block。只有该情形才显示确认并调用 remove；普通/空/partial selection 不会据 slot ID 猜测解包。
+- VS Code typecheck 与 50/50 tests 通过。后续仍需实现 cursor-inside metadata edit、multi-cursor adapter、tag/profile management 和 Sublime/Nvim 客户端。
+
 ## 2026-07-15 — Vault feature-2 启用事务
 
 - 提交 `538168d`：`Vault::enable_umbra_private_annotations` 只接受 live Umbra session；它调用已认证 core metadata upgrader，并以 vault.json etag CAS 提交，随后重新 parse 确认 exact committed metadata 才更新内存 config。锁定 session 的调用被拒绝。
