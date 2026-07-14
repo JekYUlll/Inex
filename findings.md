@@ -541,3 +541,5 @@
 - normal→Umbra transition 的安全顺序是 daemon CAS convert、daemon authenticated projection open、main-thread identity recheck、model transition、再关闭旧 normal handle。任何 dirty/locked/stale model 都要在 transition 前拒绝，且传入 projection 必须 wipe。
 - 当 `umbra.document.convert` 已成功后，普通 document buffer 已不能安全继续作为 normal document 保存。若随后 projection open、UI identity recheck 或 transition 失败，Sublime 必须锁定并 scrub 全部 managed buffer，而不能仅恢复 view 可编辑性。
 - Sublime selection points 是 host character offsets，annotation RPC 却要求 canonical UTF-8 byte ranges；必须从当前 view 前缀编码计算每个 selection 的 start/end，而不使用 Python character index。apply completion 必须同时检查 Outer 与 Umbra generation，否则 Umbra lock 后异步响应可重新安装私密文本。
+- Sublime annotation picker/confirmation 可跨越异步 worker；因此 RPC worker 不得读取可变的 `ManagedDocument.content`。必须在主线程验证 view 与 model 一致后复制 projection，明确为 success/cancel/error 三条路径分配清零所有权；remove 仍只把 selection/ETag/RenderMap 交给 daemon，客户端不从 fence 或坐标推断 slot ID。
+- Neovim 是正式但最后优先级的客户端目标：Lua 端只能作为 `inexd` JSON-RPC 的受控消费者，沿用 same-vault Outer/Umbra key lifecycle、ETag/RenderMap mutation boundary 与宿主残留 gate；任何直接解密 EDRY/feature-2 或重做密码学的实现都超出冻结架构。

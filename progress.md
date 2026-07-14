@@ -1061,3 +1061,9 @@
 
 - 提交 `950c692`（`feat(sublime): apply private annotations from projections`）：`Inex: Choose Private Annotation` 仅接受 clean active Umbra projection 的一个或多个显式 selection，使用 UTF-8 byte offsets，加载已解锁 encrypted catalog，再以完整 current projection/ETag/RenderMap 调用 daemon apply。
 - apply response 仅在 Outer client、Outer generation、独立 Umbra generation、document identity、ETag/RenderMap 均未变化时安装；Umbra lock 期间完成的旧 callback 无法回写私密 projection。成功后清空 undo stack并采用 daemon projection，不推导 slot/marker。验证：完整 Sublime 92/92、1 项 pidfd platform skip、compile/JSON/diff-check 通过。
+
+## 2026-07-15 — Sublime private annotation removal
+
+- 新增 `Inex: Remove Private Annotation`。命令只接受 clean active Umbra projection 的明确 selection，并在确认后把主线程捕获的 UTF-8 projection 副本、ETag 和完整 RenderMap 交给 `umbra.annotation.remove`；daemon 是唯一判定完整 private block/slot 的一方，客户端不读取或推导 slot ID。
+- 同时修正 apply 的 worker 所有权：主线程在弹出 picker 前复制并验证 projection，RPC worker 只消费该副本；picker cancel、成功提交及 worker finally 都会清零对应 bytearray。验证：完整 Sublime 92/92（1 项 pidfd platform skip）、Python compile、`Main.sublime-commands` JSON 和 `git diff --check` 通过。
+- Neovim 已作为正式但最后优先级的 Lua 插件 MVP 写入 active goal/计划：仅在 CLI/daemon、VS Code 与本轮 Sublime 范围稳定后开始，复用同一 `inexd` JSON-RPC 与 Outer/Umbra 生命周期，不创建第二套密码学或容器实现。
