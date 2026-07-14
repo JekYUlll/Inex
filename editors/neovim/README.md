@@ -33,3 +33,11 @@ cmdline, undo, shada, LSP, plugins, terminal, and OS memory remain separate
 residue boundaries; do not enable other plugins on an Inex buffer until the
 explicit Neovim host-residue gate is implemented. Do not point the plugin at a
 shell wrapper or a relative path.
+
+Run the transport smoke with an exact sidecar binary:
+
+```sh
+INEX_SIDECAR=/absolute/path/to/inexd \
+  nvim --headless --clean --cmd 'set rtp^=/path/to/Inex/editors/neovim' \
+  -l /path/to/Inex/editors/neovim/tests/headless_smoke.lua
+```
