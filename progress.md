@@ -1112,3 +1112,8 @@
 
 - 在独立 `--no-local` clean checkout（origin 固定为 canonical Git URL）中，以显式 `/usr/bin/gcc` 构建当前 `739b9f0` 的 `inex`/`inexd`；两者 ELF interpreter 都是标准 `/lib64/ld-linux-x86-64.so.2`。该 checkout 内以 lockfile offline 安装 VS Code/vsce deps 并生成 production bundle，然后 `package_release.py` 成功构建 Linux x64 Rust ZIP、Sublime ZIP 与 VSIX。
 - `audit_release_artifacts.py` 通过：artifact hashes 为 Rust `9892df55…`、Sublime `caa35300…`、VSIX `738effbc…`、SHA256SUMS `63d501ab…`；共享 CLI `4dbd6433…`、sidecar `f0f50b06…`，source 绑定 clean commit `739b9f0`。报告明确仍不覆盖签名/发布、独立法律审查或 native runtime/install/editor behavior；pidfd lifecycle gate 仍未通过本机环境。
+
+## 2026-07-15 — Current candidate isolated VSIX install and bundled-runtime smoke
+
+- 在同一 standalone checkout 中执行 `smoke_release_artifacts.py`，传入系统 `/usr/bin/code`。脚本对当前 `739b9f0` Linux x64 candidate 的 portable archives、隔离 extensions directory 内 VSIX 安装、installed layout/executable modes 和 bundled CLI/daemon runtime probes 返回 `packageSmoke: passed`。
+- 这是当前精确 artifact 的本地 install/bundled-runtime evidence，补上 structure audit 不运行 executable 的边界；仍不覆盖持久 profile、Extension Host CRUD/recovery、pidfd lifecycle、签名、跨平台和独立可重复构建。
