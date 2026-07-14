@@ -904,3 +904,9 @@
 - 提交 `aefd789`（`feat(umbra): edit private annotation metadata atomically`）：新增 Vault `edit_private_annotation`。它先重认证当前 ETag/完整 projection/RenderMap，再只接受单一 private block 内的非空 selection；解密原 payload，保留 Markdown、slot ID 与 created time，更新 kind、tag IDs、updated time 和 Outer 策略后一次性重加密保存。plain/complete/mixed/stale 不会触发写入。
 - 提交 `860227d`（`feat(daemon): edit private annotations over RPC`）：协议增加 `umbra.annotation.edit`，handler 沿用严格 JSON 资源限制与 apply/remove 的 response shape。生命周期回归现在是 apply → edit（block/tag/placeholder）→ remove，remove 只消费 edit 返回的 ETag/projection/RenderMap。
 - 首轮测试错误地将零长度 cursor 送入 core，但 `TextRange` 故意禁止空范围；已改为在 private block 内使用一字节 marker 范围。验证：core 295/295、core strict Clippy；daemon 71/71、daemon strict Clippy、fmt/diff-check 全通过。
+
+## 2026-07-15 — VS Code 原位编辑私密标注
+
+- 提交 `57487c4`（`feat(vscode): edit private annotations in place`）：新增 `inex.editPrivateAnnotation`、sidecar `umbra.annotation.edit` client 与 canonical private-block parser。命令只以当前 active Umbra projection 的 RenderMap 确定单一 slot；零长度 cursor 规范为 block 开头的安全 ASCII marker byte，非空 selection 必须完整位于 block 内且不能是 complete block。
+- Picker 会预选当前 kind、catalog 中可解析的 tag IDs（含当前引用的 archived tag）和 Outer mode；Cover 仍重新要求公开文字。客户端不推导或传入 slot ID，daemon 保留 ID/private Markdown 并重新认证所有提交输入。
+- 验证：`git diff --check`、`pnpm --dir editors/vscode check`、tests 55/55、build 通过。PRD 已同步。

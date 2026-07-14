@@ -516,3 +516,4 @@
 - `noSelectionTarget: paragraph` 必须按 UTF-8 byte buffer 的连续非空行解析，不能用“当前行”冒充；以纯函数返回不含换行符的 range，blank/whitespace-only line 返回 undefined，使 host 在复制 snapshot 后立刻清零，而不会把空白段提交给 daemon。
 - 编辑器本地偏好只允许影响交互（`paragraph`/`line`/`reject` 与 unwrap confirmation）；其解析必须对非法值安全回退。不能将“上次 tags/profile”塞入 VS Code settings，因为那些是受 `K_umbra` 保护的语义数据；若未来实现 useLast，必须仅保留可在锁定时清理的 session 内存状态并配套回归。
 - Cursor-inside-private 编辑不能把零长度 cursor 直接作为 RPC `TextRange`：core 的 canonical range type 故意拒绝空范围。客户端应由 authenticated RenderMap 确认 slot 后选择该 canonical fenced block 开头的一个 ASCII marker byte，作为严格 `InsidePrivateSlot` 的非空证明；绝不能由 slot ID 或未认证 UI 坐标直接编辑。
+- VS Code 的 edit picker 可从已解锁、canonical projection 的 fence header 预选 kind/tag/Outer，但这只是 UX 初值：被解析的 tag IDs 必须仍属于加载后的 encrypted catalog，实际 edit 绝不能信任 header/slot ID 而跳过 daemon 的 projection+RenderMap+ETag 复核。Cover text 只作为明确公开字段重新询问，不从私密 payload 猜测。

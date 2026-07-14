@@ -102,8 +102,8 @@ keyboard events. Profile shortcuts use ordinary command arguments, for example
 ### Current VS Code MVP status
 
 The current VS Code implementation contributes `togglePrivateAnnotation`,
-`choosePrivateAnnotation`, `applyPrivateAnnotationProfile`, and
-`removePrivateAnnotation`. `Ctrl+Alt+/` and `Ctrl+Alt+Shift+/` are contributed
+`choosePrivateAnnotation`, `applyPrivateAnnotationProfile`,
+`editPrivateAnnotation`, and `removePrivateAnnotation`. `Ctrl+Alt+/` and `Ctrl+Alt+Shift+/` are contributed
 through normal keybinding metadata. A profile binding can be added in the user
 keybindings file:
 
@@ -125,6 +125,13 @@ expansion, cursor-inside metadata edit, shortcut `toggleBehavior`, and tag/profi
 management commands remain pending. Outer projection editing
 and Umbra draft recovery are deliberately fail-closed until their dedicated
 authenticated save paths are implemented.
+
+`Inex: Edit Private Annotation` requires the cursor or a non-complete selection
+inside exactly one private block. It preselects the block's current kind, tags,
+and Outer strategy from the unlocked canonical projection, then sends a
+non-empty marker range plus the full RenderMap to the daemon. The daemon
+preserves the slot ID and private Markdown while it re-authenticates and
+rewrites the encrypted metadata.
 
 ## Selection transaction
 
