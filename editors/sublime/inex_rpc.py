@@ -595,6 +595,16 @@ class InexRpcClient:
                 raise RpcProtocolError("RPC Umbra render map is invalid")
             if not isinstance(render_map["privateSlots"], list) or not isinstance(render_map["outerSegments"], list):
                 raise RpcProtocolError("RPC Umbra render map is invalid")
+            if not isinstance(render_map["projectionBytes"], int) or render_map["projectionBytes"] != len(content):
+                raise RpcProtocolError("RPC Umbra render map projection is invalid")
+            if not isinstance(render_map["generationBase64"], str):
+                raise RpcProtocolError("RPC Umbra render map generation is invalid")
+            for slot in render_map["privateSlots"]:
+                if not isinstance(slot, dict) or set(slot) != {"slotId", "startByte", "endByte"} or not isinstance(slot.get("slotId"), str):
+                    raise RpcProtocolError("RPC Umbra private slot is invalid")
+            for segment in render_map["outerSegments"]:
+                if not isinstance(segment, dict) or set(segment) != {"projectionStartByte", "projectionEndByte", "outerStartByte", "outerEndByte"}:
+                    raise RpcProtocolError("RPC Umbra outer segment is invalid")
             return content, etag, render_map
         except RpcProtocolError as error:
             wipe(content)
