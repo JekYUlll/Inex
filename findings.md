@@ -543,3 +543,4 @@
 - Sublime selection points 是 host character offsets，annotation RPC 却要求 canonical UTF-8 byte ranges；必须从当前 view 前缀编码计算每个 selection 的 start/end，而不使用 Python character index。apply completion 必须同时检查 Outer 与 Umbra generation，否则 Umbra lock 后异步响应可重新安装私密文本。
 - Sublime annotation picker/confirmation 可跨越异步 worker；因此 RPC worker 不得读取可变的 `ManagedDocument.content`。必须在主线程验证 view 与 model 一致后复制 projection，明确为 success/cancel/error 三条路径分配清零所有权；remove 仍只把 selection/ETag/RenderMap 交给 daemon，客户端不从 fence 或坐标推断 slot ID。
 - Neovim 是正式但最后优先级的客户端目标：Lua 端只能作为 `inexd` JSON-RPC 的受控消费者，沿用 same-vault Outer/Umbra key lifecycle、ETag/RenderMap mutation boundary 与宿主残留 gate；任何直接解密 EDRY/feature-2 或重做密码学的实现都超出冻结架构。
+- Sublime edit 的 visible fence header 只能用作已解锁 UI 预选，绝不是授权输入：客户端先以 authenticated RenderMap 找到 slot，再将完整 projection、ETag 和同一 map 发给 daemon。cursor 是零长度，必须转换为 block 内最小非空 byte range；完整 block selection 则必须拒绝 edit 并走需确认的 remove。

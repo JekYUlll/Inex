@@ -1067,3 +1067,8 @@
 - 新增 `Inex: Remove Private Annotation`。命令只接受 clean active Umbra projection 的明确 selection，并在确认后把主线程捕获的 UTF-8 projection 副本、ETag 和完整 RenderMap 交给 `umbra.annotation.remove`；daemon 是唯一判定完整 private block/slot 的一方，客户端不读取或推导 slot ID。
 - 同时修正 apply 的 worker 所有权：主线程在弹出 picker 前复制并验证 projection，RPC worker 只消费该副本；picker cancel、成功提交及 worker finally 都会清零对应 bytearray。验证：完整 Sublime 92/92（1 项 pidfd platform skip）、Python compile、`Main.sublime-commands` JSON 和 `git diff --check` 通过。
 - Neovim 已作为正式但最后优先级的 Lua 插件 MVP 写入 active goal/计划：仅在 CLI/daemon、VS Code 与本轮 Sublime 范围稳定后开始，复用同一 `inexd` JSON-RPC 与 Outer/Umbra 生命周期，不创建第二套密码学或容器实现。
+
+## 2026-07-15 — Sublime private annotation metadata edit
+
+- 新增 `Inex: Edit Private Annotation`。命令只接受一条位于 RenderMap 私密块内部（不是完整块）的 selection；空 cursor 以该 block 首个可认证非空 byte 作为 daemon `umbra.annotation.edit` 的 proof。完整 block 继续只属于 remove 流程。
+- picker 从 canonical visible fence header 读取 kind/tag IDs/Outer mode 作为预选值；header 不含 slot ID 传递路径，tag IDs 仍必须存在于已解锁 encrypted catalog，最终 mutation 始终发送 projection/ETag/完整 RenderMap 并只安装 daemon 回包。投影副本在 cancel、session 变化和 RPC finally 中清零。验证：94/94 Sublime tests（1 项 pidfd platform skip）、Python compile、JSON 与 diff-check 通过。
