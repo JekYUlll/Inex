@@ -1482,6 +1482,11 @@
 - `inex-git` 新增 `HistoricalRevision::{Head, HeadParent}` 与 `read_historical_document`。该公共 bridge 不接收任意 Git revision、OID、pathspec 或物理路径：它绑定 vault root、canonical logical Markdown path 和两种固定历史角色，读取树中 canonical `.md.enc` blob 后仍由 `Vault::authenticate_committed_envelope` 验证 vault/path/epoch/AAD。
 - 真实临时 Git 双提交回归证明 HEAD=`ours`、first parent=`base`；缺失历史路径返回固定 `HistoricalRevisionUnavailable`。`cargo fmt`、定向测试、`cargo clippy -p inex-git --all-targets -- -D warnings` 与 whitespace gate 通过。该 slice 尚未把 plaintext 交给 daemon/VS Code，下一步才接收严格 RPC 投影。
 
+## 2026-07-16 — Daemon Outer historical compare RPC
+
+- 新增 `revision.compare.outer`。它只接收 session 与 canonical logicalPath，固定读取 authenticated `HEAD` 与 `HEAD^1`，且响应只含 fixed role (`head`/`headParent`) 与 bounded Base64URL projection bytes；没有 client-supplied revision/OID/pathspec/physical path。
+- 普通历史 document 返回认证 plaintext；feature-2 历史 document 仅 parse 已认证 outer container 并 render public Drop/Cover/Placeholder，完全不接触 `K_umbra`。daemon 编译、format 和 `-D warnings` Clippy 已通过。尚无 VS Code parser/UI 或 dedicated handler Git fixture，因此这不是可用 compare UI 的声明。
+
 ## 2026-07-16 — Outer-only Umbra export projection
 
 - `umbra_render::render_outer_projection` 现在只根据已认证的公开 Outer slot 策略替换 marker：Drop 输出空内容、Cover 输出明确公开的 cover text、Placeholder 输出固定无标识文本。它严格验证 marker/slot 一一对应和 Cover/Placeholder metadata，永不读取 private payload、kind、tag、slot ID 或 `K_umbra`。

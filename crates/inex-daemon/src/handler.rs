@@ -29,16 +29,20 @@ use inex_core::tree::{TreeEntryKind, TreeError};
 use inex_core::umbra_config::{
     AnnotationProfile, OuterMode, PrivateAnnotationKind, PrivateTagDefinition,
 };
+use inex_core::umbra_document::UmbraDocumentV1;
 use inex_core::umbra_document::{OuterSlotStrategy, PrivateAnnotationSpec};
 use inex_core::umbra_keyslot::UmbraKeyslotError;
 use inex_core::umbra_render::OwnedRenderMap;
+use inex_core::umbra_render::render_outer_projection;
 use inex_core::umbra_render::{RenderedOuterSegment, RenderedPrivateSlot, TextRange};
 use inex_core::vault::{
     DocumentMetadata, MAX_EDRY_ENVELOPE_BYTES, RenameOutcome, UmbraStatus, Vault, VaultError,
 };
 use inex_core::vault_config::{ConfigError, ConfigWarning, KdfPolicy};
+use inex_git::{HistoricalRevision, read_historical_document};
 use serde_json::{Value, json};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::PROTOCOL_MAJOR;
 use crate::framing::{JsonObject, MAX_FRAME_BYTES};
@@ -190,6 +194,7 @@ impl<C: MonotonicClock> RpcService<C> {
             Method::DraftDecrypt => self.draft_decrypt(params),
             Method::SearchQuery => self.search_query(params),
             Method::UmbraSearchQuery => self.umbra_search_query(params),
+            Method::RevisionCompareOuter => self.revision_compare_outer(params),
             Method::CacheEvict => self.cache_evict(params),
         }
     }
@@ -1188,6 +1193,42 @@ impl<C: MonotonicClock> RpcService<C> {
         self.search_query_inner(params, false)
     }
 
+    /// Compare exactly `HEAD` with its first parent through authenticated
+    /// ciphertext-only Git plumbing. The request has no revision parameter on
+    /// purpose: clients cannot turn this into arbitrary Git object access.
+    fn revision_compare_outer(&mut self, params: Params) -> RpcResult {
+        let mut params = ParamObject::new(params);
+        let session = required_session(&mut params)?;
+        let logical_path = params.required_logical_path("logicalPath")?;
+        params.finish()?;
+        if self
+            .sessions
+            .asset_count(session.as_str())
+            .map_err(map_session_error)?
+            != 0
+        {
+            return Err(ErrorObject::new(ErrorCode::Busy));
+        }
+        let vault = self
+            .sessions
+            .vault(session.as_str())
+            .map_err(map_session_error)?;
+        let head = read_historical_document(vault, HistoricalRevision::Head, &logical_path)
+            .map_err(|error| map_git_error(error, ErrorContext::Document))?;
+        let parent = read_historical_document(vault, HistoricalRevision::HeadParent, &logical_path)
+            .map_err(|error| map_git_error(error, ErrorContext::Document))?;
+        let head = outer_compare_projection(head)
+            .map_err(|error| map_vault_error(error, ErrorContext::Document))?;
+        let parent = outer_compare_projection(parent)
+            .map_err(|error| map_vault_error(error, ErrorContext::Document))?;
+        Ok(json!({
+            "leftRole": "head",
+            "leftContentBase64": encode_base64url(head.as_slice()).as_str(),
+            "rightRole": "headParent",
+            "rightContentBase64": encode_base64url(parent.as_slice()).as_str(),
+        }))
+    }
+
     fn umbra_search_query(&mut self, params: Params) -> RpcResult {
         self.search_query_inner(params, true)
     }
@@ -1699,6 +1740,41 @@ fn map_session_error(error: SessionError) -> ErrorObject {
         | SessionError::InvalidExportCapability => ErrorCode::InvalidParams,
     };
     ErrorObject::new(code)
+}
+
+fn map_git_error(error: inex_git::GitError, context: ErrorContext) -> ErrorObject {
+    let code = match error {
+        inex_git::GitError::HistoricalRevisionUnavailable => ErrorCode::NotFound,
+        inex_git::GitError::UnsupportedGitVersion => ErrorCode::Unsupported,
+        inex_git::GitError::GitOutputTooLarge { .. } => ErrorCode::LimitExceeded,
+        inex_git::GitError::Vault(error) => return map_vault_error(error, context),
+        inex_git::GitError::UnsafeRoot
+        | inex_git::GitError::NotRepositoryRoot
+        | inex_git::GitError::UnsafeRepositoryMetadata
+        | inex_git::GitError::SplitIndexUnsupported
+        | inex_git::GitError::MalformedGitOutput
+        | inex_git::GitError::UnsupportedConflictEntry => ErrorCode::VaultInvalid,
+        inex_git::GitError::Io { .. } | inex_git::GitError::GitCommandFailed { .. } => {
+            ErrorCode::IoFailed
+        }
+        _ => ErrorCode::IntegrityFailed,
+    };
+    ErrorObject::new(code)
+}
+
+fn outer_compare_projection(document: DecryptedDocument) -> Result<Zeroizing<Vec<u8>>, VaultError> {
+    if document.header.required_features.is_empty() {
+        return Ok(document.plaintext);
+    }
+    if document.header.required_features.as_slice()
+        != [inex_core::features::UMBRA_PRIVATE_ANNOTATIONS_V1]
+    {
+        return Err(CryptoError::DocumentContextMismatch.into());
+    }
+    let outer = UmbraDocumentV1::from_json(document.plaintext.as_slice())?;
+    Ok(Zeroizing::new(
+        render_outer_projection(&outer)?.into_bytes(),
+    ))
 }
 
 fn map_vault_error(error: VaultError, context: ErrorContext) -> ErrorObject {

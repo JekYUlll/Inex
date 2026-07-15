@@ -18,6 +18,7 @@ path = "src/bin/inexd.rs"
 [dependencies]
 base64.workspace = true
 inex-core = { path = "../inex-core" }
+inex-git = { path = "../inex-git" }
 serde_json.workspace = true
 uuid.workspace = true
 zeroize.workspace = true

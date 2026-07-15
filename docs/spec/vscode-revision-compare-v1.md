@@ -60,9 +60,11 @@ revision.compare.umbra
 ```
 
 Required parameters are an authenticated session, canonical logical path, and
-a closed `RevisionPair` enum. A v1 client cannot submit arbitrary revision
-expressions, object IDs, `--pathspec`, command arguments, environment values,
-or physical paths. The daemon maps a logical Markdown path to its canonical
+a closed `RevisionPair` enum. The first implemented Outer endpoint is even
+narrower: `revision.compare.outer` accepts only `session` and `logicalPath` and
+always compares `HEAD` with its first parent. A v1 client cannot submit
+arbitrary revision expressions, object IDs, `--pathspec`, command arguments,
+environment values, or physical paths. The daemon maps a logical Markdown path to its canonical
 encrypted repository path and invokes Git without a shell, bounded stdout and
 stderr, interactive prompts, pager, external diff/textconv/filter helpers,
 replacement refs, global/system configuration, or lazy fetch.
@@ -75,7 +77,9 @@ authentication, and unsupported document features fail closed without a
 partial projection.
 
 Responses carry two bounded `Zeroizing<String>` projections, fixed revision
-roles, and no Git object identifier. The extension must validate exact response
+roles, and no Git object identifier. The current wire response uses bounded
+Base64URL fields `leftContentBase64`/`rightContentBase64` with fixed roles
+`head`/`headParent`; the extension must validate exact response
 shape and dispose these values on all error/lock paths.
 
 ## Git-state boundary
