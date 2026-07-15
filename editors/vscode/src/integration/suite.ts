@@ -48,6 +48,7 @@ interface InexIntegrationTestApi {
   readonly verifyUmbraPasswordChange: (oldPassword: string, newPassword: string) => Promise<void>;
   readonly verifyUmbraLock: (password: string) => Promise<void>;
   readonly verifyOuterRevisionCompare: () => Promise<void>;
+  readonly verifyOuterRevisionCompareFromScm: (logicalPath: string) => Promise<void>;
   readonly verifyUmbraRevisionCompare: () => Promise<void>;
   readonly verifyOuterProjection: () => Promise<void>;
   readonly verifyOuterProjectionFromTree: (logicalPath: string) => Promise<void>;
@@ -202,10 +203,11 @@ async function runBackupRecoveryCycle(
   const tab = await waitForCustomTab(fixture.vaultPath, LOGICAL_PATH);
   assertNoPlaintextTextDocument(tab.input.uri, fixture.sourcePath);
   await api.verifyOuterRevisionCompare();
+  await api.verifyOuterRevisionCompareFromScm(LOGICAL_PATH);
   await waitForSidecarTrace(
     fixture,
-    (entries) => entries.some((entry) => entry.method === "revision.compare.outer"),
-    "VS Code Outer revision compare did not reach the authenticated sidecar",
+    (entries) => entries.filter((entry) => entry.method === "revision.compare.outer").length >= 2,
+    "VS Code active-editor and Source Control Outer revision compares did not reach the authenticated sidecar",
   );
   assertNoPlaintextTextDocument(tab.input.uri, fixture.sourcePath);
 
@@ -704,6 +706,7 @@ function assertIntegrationApi(value: unknown): asserts value is InexIntegrationT
     "verifyUmbraAnnotationLifecycle",
     "verifyUmbraLock",
     "verifyOuterRevisionCompare",
+    "verifyOuterRevisionCompareFromScm",
     "verifyUmbraRevisionCompare",
     "verifyOuterProjection",
     "verifyOuterProjectionFromTree",

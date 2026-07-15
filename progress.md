@@ -1624,3 +1624,8 @@
 
 - clean standalone source `80403fe` 的 Linux x64 package 与 release-set audit 已完成，VSIX 已覆盖安装：[inex-vscode-0.1.0-linux-x64.vsix](/home/horeb/_code/Inex/target/release-artifacts/80403fe-linux-x64/inex-vscode-0.1.0-linux-x64.vsix)。SHA-256：`cbad14fbdc489c91b44ef1957e4caacd376c271499b6c7d7e21e3f0333621aef`。
 - isolated smoke 的 temporary root 已在 VS Code CLI 子进程结束后清理，但本环境的 command supervisor 没有返回该次子进程最终 stdout/exit 文本；因此该记录不把 smoke 当作新增强证据。显式 `code --install-extension --force` 成功，唯一输出为宿主 Node `DEP0169` warning；运行中的窗口仍需 reload。
+
+## 2026-07-16 — Source Control entry for secure revision compare
+
+- `Inex: Compare HEAD with Parent (Outer)` 现在出现在 Source Control 的 `*.md.enc` resource context menu。它接收 VS Code 提供的 resource URI 或 Inex Tree node，并通过 `logicalPathForSession` 重新绑定到当前 vault root 和 canonical `.md.enc` logical path；其他对象不能成为 compare 输入。原有 active clean CustomEditor 路径保持兼容。
+- 该命令仍固定比较 HEAD/first parent，不把当前工作副本、未保存 textarea 或原生 SCM plaintext diff 引入生命周期。Extension Host 在 active-editor compare 之后用 ciphertext URI 调用该命令，并要求 sidecar 出现第二条 `revision.compare.outer` trace。typecheck、73/73 unit 与 local host gate 通过。

@@ -55,6 +55,7 @@ export interface InexIntegrationTestApi {
   readonly verifyUmbraPasswordChange: (oldPassword: string, newPassword: string) => Promise<void>;
   readonly verifyUmbraLock: (password: string) => Promise<void>;
   readonly verifyOuterRevisionCompare: () => Promise<void>;
+  readonly verifyOuterRevisionCompareFromScm: (logicalPath: string) => Promise<void>;
   readonly verifyUmbraRevisionCompare: () => Promise<void>;
   readonly verifyOuterProjection: () => Promise<void>;
   readonly verifyOuterProjectionFromTree: (logicalPath: string) => Promise<void>;
@@ -330,12 +331,22 @@ export function activate(
         );
       });
     }),
-    vscode.commands.registerCommand("inex.compareOuterRevision", async () => {
+    vscode.commands.registerCommand("inex.compareOuterRevision", async (resource?: unknown) => {
       await runUiAction(async () => {
         if (!(await ensureVaultUnlocked(controller))) return;
-        const target = editor.currentRevisionCompareTarget();
+        const treeTarget = isTreeNode(resource) && resource.entry.kind === "file"
+          ? { logicalPath: resource.entry.logicalPath, session: resource.session }
+          : undefined;
+        const resourceUri = resourceUriFromArgument(resource);
+        const scmTarget = resourceUri === undefined
+          ? undefined
+          : (() => {
+            const session = controller.acquireSession();
+            return { logicalPath: controller.logicalPathForSession(resourceUri, session), session };
+          })();
+        const target = treeTarget ?? scmTarget ?? editor.currentRevisionCompareTarget();
         if (target === undefined) {
-          throw new Error("Open a clean Inex Markdown editor before comparing its HEAD revision");
+          throw new Error("Choose an encrypted Markdown resource in Source Control or the Inex tree, or open a clean Inex Markdown editor before comparing its HEAD revision");
         }
         const compared = await target.session.sidecar.compareOuterRevision(target.logicalPath);
         if (!controller.isSessionCurrent(target.session)) {
@@ -646,6 +657,13 @@ export function activate(
     verifyOuterRevisionCompare: async () => {
       await vscode.commands.executeCommand("inex.compareOuterRevision");
     },
+    verifyOuterRevisionCompareFromScm: async (logicalPath: string) => {
+      const session = controller.acquireSession();
+      await vscode.commands.executeCommand(
+        "inex.compareOuterRevision",
+        controller.ciphertextUriForSession(logicalPath, session),
+      );
+    },
     verifyUmbraRevisionCompare: async () => {
       await vscode.commands.executeCommand("inex.compareUmbraRevision");
     },
@@ -837,6 +855,20 @@ function isTreeNode(value: unknown): value is import("./tree.ts").InexTreeNode {
       candidate.entry?.kind === "asset") &&
     typeof candidate.entry.logicalPath === "string"
   );
+}
+
+/** Accept only VS Code's resource URI shapes; the controller canonicalizes it. */
+function resourceUriFromArgument(value: unknown): vscode.Uri | undefined {
+  if (value instanceof vscode.Uri) {
+    return value;
+  }
+  if (value !== null && typeof value === "object") {
+    const candidate = value as { readonly resourceUri?: unknown };
+    if (candidate.resourceUri instanceof vscode.Uri) {
+      return candidate.resourceUri;
+    }
+  }
+  return undefined;
 }
 
 async function ensureVaultUnlocked(controller: VaultController): Promise<boolean> {

@@ -728,3 +728,8 @@
 
 - A controlled editor can improve common Markdown readability without registering a plaintext language document: front matter, task lists, strikethrough, autolinks and table separators are all line-local display transforms over the existing textarea value. They must remain non-authoritative; canonical parsing, navigation and persistence stay in the authenticated host/core paths.
 - The overlay still uses an HTML sink, so each new formatter must preserve the single escaped-span construction route. A VM test that includes both the new syntax and a literal script-shaped string is stronger evidence than class-name presence alone.
+
+## 2026-07-16 Source Control compare boundary
+
+- A Source Control context menu can improve the ciphertext-diff workflow without taking ownership of native SCM: accept only the Extension Host's `vscode.Uri` (or its `resourceUri` wrapper), rebind it through the current controller's root/canonical-path validator, and invoke the pre-existing daemon-owned fixed historical comparison.
+- Resource selection must not be mistaken for a request to compare the mutable worktree. Keeping the closed HEAD/parent pair preserves the no-plaintext-Git and no-unsaved-snapshot boundary while giving users a direct secure history view beside their changed ciphertext file.

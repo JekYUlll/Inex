@@ -13,8 +13,10 @@ vault. It is a separate command, not an override of Git's SCM/diff behavior.
 ## User flow
 
 `Inex: Compare HEAD with Parent (Outer)` is available only while the Outer
-vault is unlocked. It accepts exactly one active, clean Inex Markdown custom
-editor and always uses the fixed public revision pair:
+vault is unlocked. It accepts either one active, clean Inex Markdown custom
+editor, an Inex Tree Markdown node, or a `*.md.enc` resource selected in VS
+Code Source Control. Resource URIs are accepted only after canonical
+vault-root/path validation. It always uses the fixed public revision pair:
 
 1. `HEAD`
 2. `HEAD`'s first parent (the command fails closed when no parent exists)
@@ -101,9 +103,11 @@ linked/external gitdir, active merge/rebase/cherry-pick state, split index,
 submodule, or non-regular encrypted target. It never writes the worktree,
 index, refs, configuration, attributes, or a temporary plaintext file.
 
-The current v1 commands do not compare a working copy. Unsaved changes remain
-the custom editor's ordinary dirty-state concern; v1 refuses a dirty active
-document rather than copying its plaintext into another lifecycle.
+The current v1 commands do not compare a working copy. The Source Control menu
+is an entry point for the same fixed historical pair, not an override of the
+native ciphertext diff. Unsaved changes remain the custom editor's ordinary
+dirty-state concern; v1 refuses a dirty active document rather than copying its
+plaintext into another lifecycle.
 
 ## Required evidence
 

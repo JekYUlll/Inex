@@ -284,6 +284,13 @@
           "when": "explorerResourceIsFolder && resourceScheme == file && !inex.vaultUnlocked",
           "group": "inex@1"
         }
+      ],
+      "scm/resourceState/context": [
+        {
+          "command": "inex.compareOuterRevision",
+          "when": "inex.vaultUnlocked && resourceFilename =~ /.*\\.md\\.enc$/",
+          "group": "inex@1"
+        }
       ]
     },
     "customEditors": [
