@@ -31,6 +31,30 @@ test("Markdown presentation remains display-only while covering common Markdown 
   );
 });
 
+test("Markdown presentation escapes content while rendering common tokens", () => {
+  assert.ok(presentationRuntime, "Markdown presentation runtime was not found");
+  const editor = fakeElement() as Record<string, unknown>;
+  editor.value = "# Title\n- **bold** and *em* with `code`\n[link](https://example.invalid)\n> quote\n---\n<script>alert(1)</script>\n";
+  editor.scrollLeft = 0;
+  editor.scrollTop = 0;
+  const layer = fakeElement() as Record<string, unknown>;
+  layer.style = {};
+  const context = runtimeContext(
+    (id) => id === "editor" ? editor : layer,
+    () => undefined,
+  );
+  runInNewContext(presentationRuntime, context);
+  const html = layer.innerHTML;
+  if (typeof html !== "string") {
+    throw new Error("Markdown presentation did not render text into its display layer");
+  }
+  for (const token of ["md-heading", "md-list", "md-strong", "md-em", "md-inline-code", "md-link", "md-quote", "md-rule"]) {
+    assert.match(html, new RegExp(token, "u"));
+  }
+  assert.match(html, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/u);
+  assert.doesNotMatch(html, /<script>alert/u);
+});
+
 test("webview raster validator executes and blocks active or malformed formats", () => {
   assert.ok(runtime, "editor webview runtime was not found");
   const element = {

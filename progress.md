@@ -1390,6 +1390,11 @@
 - `package_release.py`、`audit_release_artifacts.py`、`audit_native_dependencies.py` 与 isolated `smoke_release_artifacts.py` 均通过。当前可安装 VSIX：`target/release-artifacts/8dd7d70-linux-x64/inex-vscode-0.1.0-linux-x64.vsix`，SHA-256 `32e9cea1b65bbc268fd3dc333fa548147da0f5b618a49d07dc8f7d09426b7852`。
 - 已以 `/usr/bin/code --install-extension … --force` 覆盖当前 profile；扩展登记为 `horeb.inex-vscode@0.1.0`。因版本号不变，运行中的 VS Code window 需执行 Developer: Reload Window。
 
+## 2026-07-16 — Markdown presentation render-safety regression
+
+- 呈现 overlay 使用 `innerHTML` 但所有 source text 必须经过 escape。新增 VM regression 实际渲染 heading/list/emphasis/inline-code/link/quote/rule 与 literal `<script>alert(1)</script>`，断言各 Markdown class 出现，同时后者只能成为 `&lt;script&gt;…` 文本，绝不成为 DOM script。
+- 首次 TypeScript gate 正确指出 VM `innerHTML` 是 `unknown`；测试改用显式运行时 string guard，未改变产品路径。验证：`pnpm --dir editors/vscode check`、65/65 Node tests、真实 `pnpm --dir editors/vscode test:extension:local` 通过。
+
 ## 2026-07-16 — Current VS Code Linux x64 installable package
 
 - 从独立 `--no-local` clean checkout、canonical origin `https://github.com/JekYUlll/Inex` 的 `d5f7a394aa97e2e3881216fc0f8b9cb5234fce64`，使用 `/usr/bin/gcc` 构建 CLI/daemon 与 VS Code bundle。ELF interpreter 为系统 `/lib64/ld-linux-x86-64.so.2`，未出现开发机 xlings RPATH/RUNPATH。
