@@ -2370,6 +2370,19 @@ mod tests {
         drop(vault);
         git(directory.path(), &["add", "private.md.enc"]);
         git(directory.path(), &["commit", "-q", "-m", "head"]);
+        let mut vault = Vault::unlock(directory.path(), outer_password, None, test_policy())
+            .expect("fixture vault unlocks for saved feature-two mutation");
+        vault
+            .unlock_umbra(umbra_password)
+            .expect("Umbra unlocks for saved mutation");
+        let (saved, mut worktree) = vault
+            .read_umbra_outer_document(&path)
+            .expect("feature-two saved worktree reads");
+        worktree.outer_markdown.push_str("WORKTREE_PUBLIC_CANARY\n");
+        vault
+            .save_umbra_outer_document(&path, &worktree, &saved.etag, 1_783_699_203_000)
+            .expect("feature-two saved worktree mutation succeeds");
+        drop(vault);
 
         let mut service = RpcService::with_clock_and_policy(SystemClock::new(), test_policy());
         hello(&mut service);
@@ -2401,6 +2414,25 @@ mod tests {
         assert!(!String::from_utf8_lossy(&outer_head).contains("HISTORICAL_PRIVATE_CANARY"));
         assert!(!String::from_utf8_lossy(&outer_head).contains("historical-private-tag"));
         scrub_object(&mut outer);
+        let mut working = response(
+            &mut service,
+            40,
+            "revision.compare.workingTreeOuter",
+            json!({"session": session, "logicalPath": "private.md"}),
+        );
+        let working_outer = URL_SAFE_NO_PAD
+            .decode(
+                working["result"]["leftContentBase64"]
+                    .as_str()
+                    .expect("saved feature-two Outer bytes"),
+            )
+            .expect("saved feature-two Outer decode");
+        let working_text = String::from_utf8_lossy(&working_outer);
+        assert!(working_text.contains("OUTER_PUBLIC_CANARY"));
+        assert!(working_text.contains("WORKTREE_PUBLIC_CANARY"));
+        assert!(!working_text.contains("HISTORICAL_PRIVATE_CANARY"));
+        assert!(!working_text.contains("historical-private-tag"));
+        scrub_object(&mut working);
         let mut denied = response(
             &mut service,
             4,

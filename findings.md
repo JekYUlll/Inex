@@ -769,3 +769,8 @@
 - The worktree reader must authenticate the envelope after the same secure bounded regular-file/path-chain checks used by Vault reads. A Git status output or a raw `fs::read` of `*.enc` is insufficient: neither proves vault/path/epoch binding, and the latter would bypass link/TOCTOU protections.
 - A normal dirty worktree is the intended left side, but active Git operation control state is not. Primary local `.git` validation plus explicit MERGE_HEAD/CHERRY_PICK_HEAD/REVERT_HEAD/rebase/sequencer refusal cleanly separates “saved document changed” from an incomplete repository transaction without invoking Git filters or user hooks.
 - The VS Code parser uses a separate exact `workingTree`/`head` response model rather than widening the historical `head`/`headParent` model. This makes an accidental revision/worktree substitution fail before any plaintext reaches the controlled webview.
+
+## 2026-07-16 Feature-2 saved-worktree evidence
+
+- A plain-document worktree fixture cannot establish the Umbra boundary. The correct test first commits a real Drop private slot, then changes only public Outer Markdown in the uncommitted saved envelope; a fresh Outer-only compare must retain the public delta while excluding both private-body and tag canaries.
+- This fixture demonstrates that the current on-disk feature-2 envelope still flows through the same authenticated Outer renderer as historical compare. It does not use a live Umbra projection as a shortcut, so an Outer session remains sufficient and cannot accidentally inherit `K_umbra`.

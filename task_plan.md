@@ -88,6 +88,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
   - 2026-07-16: `e6f5c85` clean standalone-source Linux x64 release set 已完成 package/release-set audit 并覆盖安装本机 VS Code；VSIX SHA-256 为 `891b50e90c740bb13e7ddb4a11c7d63266dd0a23eecc764880efa2ba5f7645b1`。该结构性审计不替代 quick-redact 的 host runtime/persistent-profile 门禁。
   - 2026-07-16: 冻结 `docs/spec/vscode-working-tree-compare-v1.md`，定义 Source Control 已保存工作树 vs HEAD 的下一安全切片；普通 SCM 仍只显示密文，禁止未保存 textarea/native diff/plaintext file，待 core/daemon/VS Code 实现。
   - 2026-07-16: `revision.compare.workingTreeOuter` 现已独立实现：daemon 只接收 authenticated session/canonical logicalPath，`inex-git` 验证 primary local Git worktree、HEAD 与无 merge/rebase/cherry-pick 控制状态后读取已保存的 authenticated envelope，再与 fixed HEAD blob 作 Outer-only projection。VS Code `Inex: Compare Saved Working Copy with HEAD (Outer)` 可从 clean CustomEditor 或 SCM ciphertext resource 启动，严格 role parser 和无脚本 buffer-wiping panel 均已接线；host/release runtime 证据仍在本轮验证中。
+  - 2026-07-16: real feature-2 saved-worktree daemon fixture 现覆盖 private body/tag canary：已提交的 Drop private slot 后仅修改并保存公开 Outer Markdown，`revision.compare.workingTreeOuter` 的 left projection 包含新旧 public canary、但不含 private body 或 tag；该路径保持 Outer-only session，未解锁 `K_umbra`。
 - **Status:** complete
 
 ### Phase 5: Sublime 轻量客户端

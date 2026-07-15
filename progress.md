@@ -1709,3 +1709,8 @@
 - clean detached canonical-source `ed0541f9ab9e5593ef7e4f4dd61a5a593e61db53` 以 explicit system GCC Rust linker 重建 Linux x64 CLI/daemon；首次 package audit 正确拒绝 xlings ELF interpreter，重链后 interpreter 为 `/lib64/ld-linux-x86-64.so.2`。
 - native dependency audit、`package_release.py`、release-set artifact audit 以及 `smoke_release_artifacts.py --vscode-cli /usr/bin/code` 均通过。VSIX 位于 [inex-vscode-0.1.0-linux-x64.vsix](/home/horeb/_code/Inex/target/release-artifacts/ed0541f-linux-x64/inex-vscode-0.1.0-linux-x64.vsix)，SHA-256 为 `dd86a9b407dc9cbf1252ea887a6954d0970cb96a7b27926405544b3bfc28d728`。
 - 已执行 `code --install-extension --force` 并确认 `horeb.inex-vscode@0.1.0` 已安装。唯一输出为 VS Code host Node 的 `DEP0169` warning；运行中的 VS Code 窗口仍需 `Developer: Reload Window`。该 artifact/smoke 不替代前述受环境卡住的完整 Extension Host runtime gate。
+
+## 2026-07-16 — Feature-2 saved-worktree Outer canary regression
+
+- 扩展真实 daemon Git fixture：提交含 Drop private slot 的 feature-2 head 后，仅通过 live Umbra session 保存公开 `WORKTREE_PUBLIC_CANARY` 作为未暂存工作副本。fresh Outer RPC session 的 `revision.compare.workingTreeOuter` 必须返回两个 public canary，且 private body/tag canary 均不存在。
+- `cargo test -p inex-daemon historical_umbra_compare_requires_second_unlock_and_outer_hides_head_private_canary -- --nocapture` 通过。由此证明 working-tree Outer compare 不因 feature-2 current document 而读取或泄漏 `K_umbra` 数据；仍不替代 VS Code full Extension Host gate。
