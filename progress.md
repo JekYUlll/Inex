@@ -1673,3 +1673,8 @@
 
 - 计划审计发现两条未勾选的 Umbra core 项实际已实现，而非待开发：`feature_two_requires_live_umbra_session_and_is_committed_to_metadata` 与 `feature_two_outer_projection_has_a_dedicated_safe_read_write_path` 证明 live Umbra gate、feature-2 metadata negotiation 和 dedicated Outer path；`private_slot_mutations_require_umbra_and_keep_canaries_out_of_outer_state` 证明私密 slot mutation/canary Outer 隔离。
 - 三个 targeted `cargo test -p inex-core --lib` 回归均通过，因此仅将计划勾选状态与现有证据对齐；跨编辑器/persistent-profile 残留矩阵仍未因此关闭。
+
+## 2026-07-16 — Repository-import regression and real-source dry-run
+
+- 对用户复制出的 `/home/horeb/_code/_blog`，CLI dry-run 在真实 clean SHA-1 Git 仓库中完整读取 324 tracked entries（307 Markdown、17 assets、46,643,446 asset bytes、最大 asset 25,074,521 bytes）；随后再次确认源 `git status --porcelain -uno` 为零、候选 destination 仍不存在。第一次使用不存在的 `/home/horeb/_code/inex-test` 父目录被安全路径策略拒绝，未产生输出目录。
+- 当前终端 supervisor 在实际 source 的最终 revalidation/exit 观测前中断其子进程，故不将这个 dry-run 记为完整成功。作为可重复完整事务证据，`cargo test -p inex-cli --test repository_import_cli -- --nocapture` 通过 5/5：包含 current tracked snapshot → one parentless ciphertext commit、dirty/untracked/empty-dir/LFS/symlink 拒绝、password failure terminal report，以及 existing target preflight 路由。

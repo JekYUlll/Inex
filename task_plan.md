@@ -241,6 +241,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
     - [x] core tree/Vault/locked verify与daemon status/tree/顺序asset RPC已贯通，严格feature negotiation、64 MiB上限、单session零化缓存及private staging recovery门禁通过
     - [x] VS Code协商feature-1能力、顺序读取相对图片并在受控webview预览，关闭/锁定/编辑/隐藏时撤销URL并释放句柄，不形成普通plaintext document或临时文件
   - [x] 由独立`import-repository`完整导入Markdown与全部受支持的tracked `100644`附件，验证计数/摘要/精确源字节，物理`.git`只读审计且任何unsupported状态均整体拒绝
+    - 2026-07-16: `repository_import_cli` 5/5 重新验证 current snapshot → parentless ciphertext commit 与全部早期拒绝；用户真实 `_blog` dry-run 亦完成 324-entry 分类输出且保持 source clean/destination absent，但当前 terminal supervisor 未提供最终 revalidation exit，故不代替持久 VS Code UI 的最终发布门禁。
   - [x] 在单一staging root内初始化全新object database、形成单个initial snapshot、完成当前Linux对象/无明文审计与整根原子发布；真实728提交只保留在只读源仓库，不复制refs/objects/alternates或伪造parent
   - [x] 将完整历史加密重写保留为独立experimental后续；当前产品与文档只承诺单个加密快照，不宣称“保留历史”
   - [ ] 完成VS Code locked首次交互的最终发布门禁

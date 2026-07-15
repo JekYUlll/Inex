@@ -748,3 +748,8 @@
 
 - Feature-2 negotiation is enforced at two layers: the vault configuration update requires a live Umbra session and is ETag-conditional, while a feature-2 document rejects the ordinary Markdown read path and exposes only the dedicated authenticated Outer or Umbra APIs. The targeted core tests exercise both locked failure and successful committed metadata.
 - Private-slot functionality is no longer a partial model stub: mutation requires live Umbra and the canary regression asserts private slot data never appears in the Outer container. Remaining work is matrix/runtime evidence, not a missing core transaction implementation.
+
+## 2026-07-16 Repository import evidence boundary
+
+- A real-source `--dry-run` is useful for proving the production source classifier sees the user's actual object format, tracked count, Markdown/asset limits, and clean HEAD policy. It is not enough to claim a finished encrypted publication unless the final source revalidation and exit result are observable.
+- The authoritative automated substitute for the full transactional contract remains the CLI integration test: it builds a real source repository, runs production import, verifies a fresh parentless ciphertext Git commit, and exercises the early rejection paths before destination creation. Persistent manual import remains required for the UI/password picker experience.
