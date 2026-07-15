@@ -1666,6 +1666,7 @@
 | Full Neovim lifecycle invocation initially omitted required absolute `INEX_SIDECAR`/test-vault/password environment. | 1 | Re-ran the transport smoke with the absolute local sidecar; retained the lifecycle test's explicit fixture requirement rather than weakening it. |
 | This environment's disposable VS Code Extension Host runner stopped advancing after its pre-existing `revision.compare.umbra` trace and did not reach the new saved-worktree command after more than one minute. | 1 | Terminated only the test process started for this run and retained `/tmp/inex-vscode-audit-I7UmP4` for diagnosis. Do not claim the host gate passed; TypeScript/unit/core evidence remains valid and the test source now contains the required command trace assertion. |
 | The unfiltered 381-test `inex-git` suite remained in a native child after its normal tests had printed, beyond the bounded verification window. | 1 | Terminated only the spawned cargo/test PIDs. The focused saved-worktree reader test had already passed; do not treat this interrupted full-suite attempt as a green result. |
+| The VS Code Host tmux launcher used zsh's reserved `status` parameter name before starting the test. | 1 | Use a non-reserved completion-file variable; no product command or fixture was launched. |
 
 ## 2026-07-16 — Installed Quick Redact bundle
 
@@ -1779,3 +1780,9 @@
 
 - `cargo clippy --workspace --all-targets -- -D warnings` 首次发现两个无运行时语义的问题：working-tree compare 的 `K_umbra` doc-markdown 格式，以及 real-Git historical compare test 超过 100 行。
 - 将密钥名改为 code span，并对该单一线性 fixture 添加说明性 `#[allow(clippy::too_many_lines)]`；fixture 保持可审计的 HEAD/first-parent setup。重新运行完整 Clippy 与 `revision_compare_outer_authenticates_two_real_git_revisions` 均通过。
+
+## 2026-07-16 — VS Code regression refresh
+
+- 当前源码重新通过 `pnpm --dir editors/vscode check`、75/75 client unit tests 与 `test:extension:build`。
+- 隔离 tmux `pnpm --dir editors/vscode test:extension:local` 以 exit 0 完成，输出 feature-1 import、asset preview、CRUD、backup/recovery 和 plaintext-residue audit passed。该 runner 同时覆盖现有 Outer/Umbra annotation、safe compare、export 和 cross-editor fixture trace；未发现需要修改的 VS Code 产品回归。
+- 这不替代用户持久 VS Code profile 的人工视觉/SCM 验收：仍需确认实际窗口内 Markdown 呈现、重复 Heading 跳转与 CRLF vault 在无操作时 `git status` 保持 clean。
