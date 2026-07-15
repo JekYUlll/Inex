@@ -16,6 +16,7 @@ import {
   resolveToggleAnnotationAction,
   type PrivateAnnotationPreferences,
 } from "./privateAnnotationPreferences.ts";
+import { validatePlaintextExportDirectoryName } from "./plaintextExport.ts";
 import type { PrivateAnnotationSpec, UmbraAnnotationProfile } from "./sidecar.ts";
 import { showSensitiveInputBox, showSensitiveQuickPick } from "./sensitiveUi.ts";
 import { InexTreeProvider } from "./tree.ts";
@@ -251,10 +252,13 @@ export function activate(
         if (parent === undefined || parent.length !== 1 || parent[0]?.scheme !== "file") return;
         const name = await vscode.window.showInputBox({
           title: "Plaintext export destination", prompt: "New folder name (must not already exist)",
-          ignoreFocusOut: true, validateInput: (value) => value.length > 0 && !/[\\/]/u.test(value)
-            ? undefined : "Enter one non-empty folder name without separators",
+          ignoreFocusOut: true, validateInput: validatePlaintextExportDirectoryName,
         });
         if (name === undefined) return;
+        const invalidName = validatePlaintextExportDirectoryName(name);
+        if (invalidName !== undefined) {
+          throw new Error(`Inex plaintext export destination is invalid: ${invalidName}`);
+        }
         const scope = await vscode.window.showQuickPick([
           { label: "Outer only", value: "outer" as const, description: "Excludes private Umbra content" },
           { label: "Include Umbra private content", value: "umbra" as const, description: "Requires Umbra password" },

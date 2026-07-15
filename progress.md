@@ -1313,6 +1313,12 @@
 - 回归在真实导入的密文 vault 上创建授权导出，验证 `canary.md` 的 authenticated projection SHA-256、PNG asset 签名、`.enc` 名称不进入导出树，以及 sidecar trace 的 `vault.export.prepare` 严格先于 `vault.export.commit`；finally 中删除导出目录，再执行既有全 profile plaintext-residue 扫描。
 - 验证：`pnpm --dir editors/vscode check`、61/61 Node tests、`pnpm --dir editors/vscode test:extension:local` 全部通过。
 
+## 2026-07-16 — VS Code plaintext-export destination containment
+
+- 抽出并测试 destination-name 验证：export UI 只接受一个非空、非 `.`/`..`、不含 `/`、`\\` 或控制字符的目录组件。即使 InputBox 验证被异常绕过，命令在 `path.join` 前仍会重新验证，避免选定的 parent 被 `.`/`..` 意外替换。
+- daemon 的 vault-outside/absent-destination 校验仍是权威安全边界；本次修复仅补足 editor UX 所声明的“在选择的 parent 下创建新目录”语义。
+- 验证：`pnpm --dir editors/vscode check`、62/62 Node tests、真实 `pnpm --dir editors/vscode test:extension:local` 通过。
+
 ## 2026-07-16 — Outer-only Umbra export projection
 
 - `umbra_render::render_outer_projection` 现在只根据已认证的公开 Outer slot 策略替换 marker：Drop 输出空内容、Cover 输出明确公开的 cover text、Placeholder 输出固定无标识文本。它严格验证 marker/slot 一一对应和 Cover/Placeholder metadata，永不读取 private payload、kind、tag、slot ID 或 `K_umbra`。
