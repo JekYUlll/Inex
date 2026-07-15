@@ -1758,3 +1758,8 @@
 - 独立 tmux Host runner 对 `75a7932` 以 exit 0 完成，并输出 `Inex VS Code feature-1 import, asset preview, CRUD, backup/recovery, and residue audit passed`。该证据覆盖 active-editor/SCM revision compare、asset-handle 释放、backup/recovery、lock/shutdown 与 plaintext residue scan。
 - clean detached canonical source `75a79329bb813369c04d658240888effaf23cdb9` 从客户端源码重建，复用先前 system-GCC 审计过且未在该提交中改动的 Linux CLI/daemon。native dependency audit、package release、release-set audit、`smoke_release_artifacts.py` 全部通过。
 - VSIX：[inex-vscode-0.1.0-linux-x64.vsix](/home/horeb/_code/Inex/target/release-artifacts/75a7932-linux-x64/inex-vscode-0.1.0-linux-x64.vsix)，SHA-256：`3d2d2e460242b8ff06a176bc4b8d83f653e82f9d09b633aafdddce272d9dbd3f`。已以 `code --install-extension --force` 覆盖安装，`horeb.inex-vscode@0.1.0` 枚举确认；唯一输出是 VS Code host Node `DEP0169` warning。
+
+## 2026-07-16 — Real maintained Markdown Git repository dry-run
+
+- 通过独立 tmux 完整执行真实 `/home/horeb/_code/_blog` 的 `import-repository --dry-run`，避免 terminal supervisor 截断。命令 exit 0：SHA-1 clean HEAD 的 324 tracked entries（307 Markdown、17 assets），Markdown 3,549,648 bytes、assets 46,643,446 bytes、最大附件 25,074,521 bytes。
+- 最终 `source-revalidated: yes`、`source-preserved: yes`、`import-writes: none`、`destination-created: no`，源仓库仍为 clean；目标 `/home/horeb/_code/inex-test/_blog-inex-real-dryrun` 保持 absent。该证据只证明读计划与 source immutability，不替代真实 import publication 或 VS Code persistent-profile folder-picker 门禁。
