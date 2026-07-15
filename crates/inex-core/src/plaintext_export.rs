@@ -445,4 +445,28 @@ mod tests {
             Err(PlaintextExportDestinationError::DestinationExists)
         ));
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn writer_rejects_symlinked_intermediate_directory() {
+        use std::os::unix::fs::symlink;
+
+        let root = TemporaryRoot::new();
+        let staging = root.0.join("staging");
+        let outside = root.0.join("outside");
+        fs::create_dir(&staging).unwrap_or_else(|error| panic!("staging: {error}"));
+        fs::create_dir(&outside).unwrap_or_else(|error| panic!("outside: {error}"));
+        symlink(&outside, staging.join("nested")).unwrap_or_else(|error| panic!("link: {error}"));
+        let mut manifest = PlaintextExportManifest::default();
+        assert!(
+            write_plaintext_export_file(
+                &staging,
+                std::path::Path::new("nested/entry.md"),
+                b"must not escape",
+                &mut manifest,
+            )
+            .is_err()
+        );
+        assert!(!outside.join("entry.md").exists());
+    }
 }
