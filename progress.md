@@ -1507,6 +1507,11 @@
 - `67549debeaea4b0f806b6bc61aa5de080bb55c7b` 已通过真实 `pnpm --dir editors/vscode test:extension:local` 基线；compare 专用 Extension Host fixture 尚未存在，不能把这条基线当作 compare command 的黑盒证明。
 - 从独立 `--no-local` clean checkout、canonical origin 与 `/usr/bin/gcc` 构建 Linux x64 release。artifact audit、release `inex`/`inexd` native dependency audit 和 isolated package smoke 全部通过。已覆盖安装 [inex-vscode-0.1.0-linux-x64.vsix](/home/horeb/_code/Inex/target/release-artifacts/67549de-linux-x64/inex-vscode-0.1.0-linux-x64.vsix)，VSIX SHA-256 为 `41b237f926c3aa55cecdea04c940ae3e8cc445e2ce64890c9f693206a0398eee`；包内与已安装 `inexd` 均为 `4e644e358383ea767724e4c8f1b17c6e8d403a3e8d5efa5b3982a5ed3f76293c`，`extension.js` 均为 `a3d512242a8f29139e79a1ac304b1df9f370ba85b566f7b8818a0be98678c883`。同版本窗口仍需 Developer: Reload Window；安装 CLI 的 `DEP0169` 是宿主 Node 警告。
 
+## 2026-07-16 — Historical Umbra canary isolation
+
+- 新增真实 feature-2 encrypted Git fixture：parent 是公开 body，head 把 `HISTORICAL_PRIVATE_CANARY` 包入带 `historical-private-tag` 的 Drop private slot。Outer historical compare 的 head 只含 public canary，两个私密 canary 均不出现；这避免将“父提交中此前公开内容”误当作 head Outer 泄露。
+- 同一 fresh Outer session 的 `revision.compare.umbra` 必须返回 AUTH_FAILED；仅在独立 `umbra.unlock` 成功后，full historical projection 才包含 private body/tag canary。定向 daemon test 与 strict Clippy 已通过；compare-specific Extension Host 仍待。
+
 ## 2026-07-16 — Real daemon historical compare fixture
 
 - daemon handler 现有真实 Git fixture：先创建加密 parent Markdown、`git init/add/commit`，再通过 vault CAS 保存新密文并建立 head commit，最后用 production `vault.unlock` RPC 与 `revision.compare.outer` RPC 验证 head/parent 两个 Base64URL projection。这证明 RPC 走的是受限 Git blob reader 而非工作区 plaintext 或伪造 response。

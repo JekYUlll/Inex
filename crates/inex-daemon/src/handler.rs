@@ -2190,6 +2190,149 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn historical_umbra_compare_requires_second_unlock_and_outer_hides_head_private_canary() {
+        let directory = TestDirectory::new();
+        let outer_password = b"historical compare outer password";
+        let umbra_password = b"historical compare Umbra password";
+        let path = LogicalPath::parse_canonical("private.md").expect("path is canonical");
+        let mut vault = Vault::create_with_params(
+            directory.path(),
+            outer_password,
+            1_783_699_200_000,
+            Argon2idParams {
+                ops_limit: 1,
+                mem_limit_bytes: 8 * 1024,
+            },
+            test_policy(),
+        )
+        .expect("fixture vault creates");
+        vault
+            .initialize_umbra(umbra_password)
+            .expect("Umbra initializes");
+        vault
+            .enable_umbra_private_annotations(test_policy())
+            .expect("feature two enables");
+        let created = vault
+            .create_umbra_outer_document(
+                &path,
+                &UmbraDocumentV1::new(
+                    "OUTER_PUBLIC_CANARY\nHISTORICAL_PRIVATE_CANARY\n".to_owned(),
+                ),
+                1_783_699_201_000,
+            )
+            .expect("parent Umbra document creates");
+        drop(vault);
+        git(directory.path(), &["init", "-q"]);
+        git(
+            directory.path(),
+            &["config", "user.email", "inex@example.invalid"],
+        );
+        git(directory.path(), &["config", "user.name", "Inex"]);
+        git(directory.path(), &["add", "--all"]);
+        git(directory.path(), &["commit", "-q", "-m", "parent"]);
+        let mut vault = Vault::unlock(directory.path(), outer_password, None, test_policy())
+            .expect("fixture vault unlocks");
+        vault.unlock_umbra(umbra_password).expect("Umbra unlocks");
+        let projection = vault
+            .render_umbra_projection(&path)
+            .expect("projection renders");
+        let private_start = projection
+            .markdown
+            .find("HISTORICAL_PRIVATE_CANARY")
+            .expect("private canary range");
+        vault
+            .apply_private_annotation(
+                &path,
+                &created.etag,
+                &projection.markdown,
+                &projection.render_map,
+                &[TextRange::new(
+                    private_start,
+                    private_start + "HISTORICAL_PRIVATE_CANARY".len(),
+                )
+                .expect("range")],
+                &PrivateAnnotationSpec {
+                    kind: PrivateAnnotationKind::Comment,
+                    tag_ids: vec!["historical-private-tag".to_owned()],
+                    outer: OuterSlotStrategy {
+                        mode: OuterMode::Drop,
+                        cover_text: None,
+                    },
+                },
+                false,
+                1_783_699_202_000,
+            )
+            .expect("private annotation applies");
+        drop(vault);
+        git(directory.path(), &["add", "private.md.enc"]);
+        git(directory.path(), &["commit", "-q", "-m", "head"]);
+
+        let mut service = RpcService::with_clock_and_policy(SystemClock::new(), test_policy());
+        hello(&mut service);
+        let mut unlocked = response(
+            &mut service,
+            2,
+            "vault.unlock",
+            json!({"vaultPath": directory.path().to_string_lossy(), "password": String::from_utf8_lossy(outer_password)}),
+        );
+        let session = unlocked["result"]["session"]
+            .as_str()
+            .expect("session")
+            .to_owned();
+        scrub_object(&mut unlocked);
+        let mut outer = response(
+            &mut service,
+            3,
+            "revision.compare.outer",
+            json!({"session": session, "logicalPath": "private.md"}),
+        );
+        let outer_head = URL_SAFE_NO_PAD
+            .decode(
+                outer["result"]["leftContentBase64"]
+                    .as_str()
+                    .expect("outer head"),
+            )
+            .expect("outer decode");
+        assert!(String::from_utf8_lossy(&outer_head).contains("OUTER_PUBLIC_CANARY"));
+        assert!(!String::from_utf8_lossy(&outer_head).contains("HISTORICAL_PRIVATE_CANARY"));
+        assert!(!String::from_utf8_lossy(&outer_head).contains("historical-private-tag"));
+        scrub_object(&mut outer);
+        let mut denied = response(
+            &mut service,
+            4,
+            "revision.compare.umbra",
+            json!({"session": session, "logicalPath": "private.md"}),
+        );
+        assert_eq!(denied["error"]["code"], ErrorCode::AuthFailed.number());
+        scrub_object(&mut denied);
+        let mut umbra_unlocked = response(
+            &mut service,
+            5,
+            "umbra.unlock",
+            json!({"session": session, "password": String::from_utf8_lossy(umbra_password)}),
+        );
+        assert_eq!(umbra_unlocked["result"]["unlocked"], true);
+        scrub_object(&mut umbra_unlocked);
+        let mut compared = response(
+            &mut service,
+            6,
+            "revision.compare.umbra",
+            json!({"session": session, "logicalPath": "private.md"}),
+        );
+        let umbra_head = URL_SAFE_NO_PAD
+            .decode(
+                compared["result"]["leftContentBase64"]
+                    .as_str()
+                    .expect("Umbra head"),
+            )
+            .expect("Umbra decode");
+        assert!(String::from_utf8_lossy(&umbra_head).contains("HISTORICAL_PRIVATE_CANARY"));
+        assert!(String::from_utf8_lossy(&umbra_head).contains("historical-private-tag"));
+        scrub_object(&mut compared);
+    }
+
+    #[test]
     fn creation_kdf_resolution_calibrates_only_when_absent() {
         let policy = KdfPolicy::default();
         let mut calls = 0;

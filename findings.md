@@ -674,3 +674,8 @@
 
 - Historical Umbra rendering cannot call the ordinary on-disk `render_umbra_projection`: that would compare the worktree instead of the selected Git blob. The vault therefore needs a separate envelope-taking API which authenticates the historical envelope first and decrypts its slots only with an existing live Umbra session.
 - Outer and Umbra compare must remain separate RPC methods. Returning a full historical Umbra projection from the Outer method would make a client-side scope mistake a private-data disclosure; a locked Umbra request must fail rather than degrade to a public result.
+
+## 2026-07-16 Historical Umbra canary semantics
+
+- A parent revision may legitimately contain text that later becomes private, so an Outer compare test cannot require a canary to be absent from both sides. The correct assertion is that the head projection, after the text is wrapped as Drop private content, excludes body and tag canaries while preserving unrelated public text.
+- Umbra compare isolation needs two assertions: an Outer-only session must receive `AUTH_FAILED`, and only a separately unlocked Umbra session may receive the historical private projection. Testing only the successful unlock path would not prove the independent password boundary.

@@ -66,6 +66,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
   - 2026-07-16: daemon compare 现已由真实 encrypted Git 双提交 fixture 覆盖：production `vault.unlock` 后 RPC 返回正确 HEAD/parent projection；不依赖工作区明文或 mock response。feature-2 Outer canary、Extension Host 命令驱动与 Umbra compare 仍待完成。
   - 2026-07-16: historical Umbra core bridge 与 `revision.compare.umbra` 已实现：fixed historical ciphertext envelope 必须先绑定 vault/path/epoch，再由 live `K_umbra` 解密 slots 和 render full projection；locked Umbra fail closed。VS Code 明确 scope UI 与 private canary regression 仍待完成。
   - 2026-07-16: VS Code 已接 `inex.compareUmbraRevision`：仅 active clean Umbra projection 可执行，先走独立 Umbra unlock gate 后调用 `revision.compare.umbra`，使用同一无脚本 owned panel/lock wipe 生命周期；不会把 Outer command 静默升级。private canary historical fixture 与 Extension Host 仍待完成。
+  - 2026-07-16: real historical feature-2 Git fixture 已验证 Outer head projection 不含 private body/tag canary，`revision.compare.umbra` 未解锁返回 AUTH_FAILED，独立 Umbra unlock 后才包含二者。compare 专用 Extension Host 仍待完成。
   - 2026-07-16: 当前可安装 Linux x64 VSIX 已更新为 clean canonical-source `8dd7d70`，包含 richer display-only Markdown highlighting；package/audit/native-dependency/isolated-install smoke 通过并已覆盖本机 profile。运行中的窗口仍需 reload。
 - **Status:** complete
 
