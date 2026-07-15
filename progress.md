@@ -1629,3 +1629,8 @@
 
 - `Inex: Compare HEAD with Parent (Outer)` 现在出现在 Source Control 的 `*.md.enc` resource context menu。它接收 VS Code 提供的 resource URI 或 Inex Tree node，并通过 `logicalPathForSession` 重新绑定到当前 vault root 和 canonical `.md.enc` logical path；其他对象不能成为 compare 输入。原有 active clean CustomEditor 路径保持兼容。
 - 该命令仍固定比较 HEAD/first parent，不把当前工作副本、未保存 textarea 或原生 SCM plaintext diff 引入生命周期。Extension Host 在 active-editor compare 之后用 ciphertext URI 调用该命令，并要求 sidecar 出现第二条 `revision.compare.outer` trace。typecheck、73/73 unit 与 local host gate 通过。
+
+## 2026-07-16 — Installed Source Control compare bundle
+
+- clean standalone source `b68d745` 的 Linux x64 package 和 release-set audit 已完成，产物已覆盖安装：[inex-vscode-0.1.0-linux-x64.vsix](/home/horeb/_code/Inex/target/release-artifacts/b68d745-linux-x64/inex-vscode-0.1.0-linux-x64.vsix)。SHA-256：`f992a68c9edf0ae7265d3e8e31968dde0b71d76dcf994cca2c3f5bb18e01c86f`。
+- `code --install-extension --force` 成功；唯一诊断为宿主 Node 的 `DEP0169` warning。需 reload 运行中的 VS Code 窗口后，在 Source Control 中右键一个变更的 `*.md.enc` 测试入口。
