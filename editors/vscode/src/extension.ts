@@ -48,6 +48,7 @@ export interface InexIntegrationTestApi {
   readonly listTree: () => Promise<readonly import("./sidecar.ts").TreeEntry[]>;
   readonly failNextMutationClose: () => void;
   readonly exportOuterCopy: (destination: string) => Promise<void>;
+  readonly verifyUmbraLock: (password: string) => Promise<void>;
   readonly lock: () => Promise<void>;
 }
 
@@ -119,24 +120,10 @@ export function activate(
     }),
     vscode.commands.registerCommand("inex.lockUmbra", async () => {
       await runUiAction(async () => {
-        if (!controller.isUnlocked) {
-          await vscode.window.showInformationMessage("Unlock the Inex vault before locking Umbra.");
-          return;
+        const locked = await lockUmbra(controller, editor);
+        if (locked) {
+          await vscode.window.showInformationMessage("Umbra locked; private projections and related preview state were cleared.");
         }
-        const session = controller.acquireSession();
-        try {
-          const status = await session.sidecar.umbraStatus();
-          if (!status.unlocked) {
-            await vscode.window.showInformationMessage("Umbra is already locked.");
-            return;
-          }
-          await session.sidecar.lockUmbra();
-        } finally {
-          // A transport failure leaves remote lock state unknown. Never retain
-          // an Umbra projection locally in that case.
-          editor.wipeUmbraForLock();
-        }
-        await vscode.window.showInformationMessage("Umbra locked; private projections and related preview state were cleared.");
       });
     }),
     vscode.commands.registerCommand("inex.importRepository", async (source?: unknown) => {
@@ -432,8 +419,49 @@ export function activate(
         throw new Error("Inex vault session changed after integration plaintext export");
       }
     },
+    verifyUmbraLock: async (password: string) => {
+      const session = controller.acquireSession();
+      let status = await session.sidecar.umbraStatus();
+      if (!status.initialized) {
+        status = await session.sidecar.initializeUmbra(password);
+      }
+      if (!status.unlocked) {
+        status = await session.sidecar.unlockUmbra(password);
+      }
+      await session.sidecar.enableUmbra();
+      if (!(await lockUmbra(controller, editor))) {
+        throw new Error("Inex integration Umbra lock unexpectedly found no unlocked Umbra session");
+      }
+      if ((await session.sidecar.umbraStatus()).unlocked) {
+        throw new Error("Inex integration Umbra lock retained K_umbra in the sidecar");
+      }
+    },
     lock: () => controller.lock(),
   });
+}
+
+async function lockUmbra(
+  controller: VaultController,
+  editor: InexCustomEditorProvider,
+): Promise<boolean> {
+  if (!controller.isUnlocked) {
+    await vscode.window.showInformationMessage("Unlock the Inex vault before locking Umbra.");
+    return false;
+  }
+  const session = controller.acquireSession();
+  try {
+    const status = await session.sidecar.umbraStatus();
+    if (!status.unlocked) {
+      await vscode.window.showInformationMessage("Umbra is already locked.");
+      return false;
+    }
+    await session.sidecar.lockUmbra();
+    return true;
+  } finally {
+    // A transport failure leaves remote lock state unknown. Never retain an
+    // Umbra projection locally in that case.
+    editor.wipeUmbraForLock();
+  }
 }
 
 export async function deactivate(): Promise<void> {

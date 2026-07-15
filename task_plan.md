@@ -148,7 +148,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
     - [x] `cover` profile 一律先收集非空公开 cover text，不能让 legacy/malformed `promptForCover: false` 构造无效请求；daemon 生命周期回归覆盖 apply 后从 daemon 返回的 exact RenderMap 范围 remove 并恢复原 Umbra 投影（`b75f9ed`）
     - [x] daemon 已新增 `umbra.annotation.edit`，复用完整 projection/RenderMap/ETag/spec 边界并由 apply→edit→remove 生命周期测试覆盖（`860227d`）
     - [x] VS Code 已提供 `inex.editPrivateAnnotation`：只接受 RenderMap 认证的单一 private block 内 cursor/selection，预选 canonical kind/tag/Outer 值后提交 daemon edit；slot ID 与私密 Markdown 不经 UI 重写（`57487c4`）
-    - [x] VS Code 已提供 `inex.lockUmbra`：成功锁定或 Umbra RPC outcome 不确定时均 wipe 当前私密 projection/preview，不影响已打开的 Outer 文档（本轮）
+    - [x] VS Code 已提供 `inex.lockUmbra`：成功锁定或 Umbra RPC outcome 不确定时均 wipe 当前私密 projection/preview，不影响已打开的 Outer 文档；真实 Extension Host 已覆盖 initialize→enable→lock→`umbra.status.unlocked=false`（本轮）
     - [x] VS Code 贡献式 keybinding 已补 `Ctrl+Alt+H` → `inex.choosePrivateAnnotation`；不处理原始键盘事件（`175d865`）
     - [x] `togglePrivateAnnotation` 现按 active RenderMap 分类：完整 private block 走确认解包，其他选区走 chooser；不以裸 slot ID 判定（本轮）
     - [x] VS Code 空选区可安全扩展到当前 Markdown paragraph（光标所在连续非空行），临时 plaintext snapshot 会立即清零；heading/multicursor 策略仍 deferred（`f34e0dc`）

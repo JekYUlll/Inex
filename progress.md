@@ -1355,6 +1355,12 @@
 - 从 clean detached canonical-origin release checkout 的 `acf714c89b8ff58dd50b1f749d17e383e6790212` 重新打包并完成 strict audit 与隔离 VS Code install smoke。
 - 最新可安装 VSIX：`target/release-artifacts/acf714c-linux-x64/inex-vscode-0.1.0-linux-x64.vsix`，SHA-256 为 `e71b6d1f3b703d2f031d3b9fd75e85a052116357d2858989d5fefcf0824ddaf7`。包含 `Inex: Lock Umbra` 和 webview reveal UTF-8 boundary 修复；未自动安装到用户 profile。
 
+## 2026-07-16 — VS Code Umbra lock Extension Host lifecycle
+
+- 将 production `Inex: Lock Umbra` 的锁定逻辑收敛为同一 fail-closed helper；命令与测试路径均先读取 authenticated `umbra.status`，执行 `umbra.lock`，并在成功或 RPC outcome 不确定时 wipe 本地 Umbra projection/preview。
+- 真实隔离 Extension Host fixture 现覆盖 Umbra initialize（或已初始化时 unlock）→ enable → lock，并在同一 authenticated sidecar session 上断言最终 `umbra.status.unlocked=false`。验证：`pnpm --dir editors/vscode check`、63/63 Node tests、`pnpm --dir editors/vscode test:extension:local` 全部通过。
+- 此项验证的是 sidecar `K_umbra` lock 状态和客户端 fail-closed 清理路径；尚未替代含真实 private projection 的跨窗口/persistent-profile 人工隔离验收。
+
 ## 2026-07-16 — Outer-only Umbra export projection
 
 - `umbra_render::render_outer_projection` 现在只根据已认证的公开 Outer slot 策略替换 marker：Drop 输出空内容、Cover 输出明确公开的 cover text、Placeholder 输出固定无标识文本。它严格验证 marker/slot 一一对应和 Cover/Placeholder metadata，永不读取 private payload、kind、tag、slot ID 或 `K_umbra`。

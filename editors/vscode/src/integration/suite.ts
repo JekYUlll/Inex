@@ -40,6 +40,7 @@ interface InexIntegrationTestApi {
   }[]>;
   readonly failNextMutationClose: () => void;
   readonly exportOuterCopy: (destination: string) => Promise<void>;
+  readonly verifyUmbraLock: (password: string) => Promise<void>;
   readonly lock: () => Promise<void>;
 }
 
@@ -151,6 +152,7 @@ async function runBackupRecoveryCycle(
       fixture.expectedSha256,
       "The provider backupId recovery path did not restore the unsaved EDRY draft",
     );
+    await api.verifyUmbraLock(fixture.password);
     await api.lock();
     assertNoPlaintextTextDocument(tab.input.uri, fixture.sourcePath);
     console.log(
@@ -562,6 +564,7 @@ function assertIntegrationApi(value: unknown): asserts value is InexIntegrationT
     "listTree",
     "failNextMutationClose",
     "exportOuterCopy",
+    "verifyUmbraLock",
     "lock",
   ]) {
     assert.equal(typeof candidate[method], "function", `Integration-test API lacks ${method}`);
