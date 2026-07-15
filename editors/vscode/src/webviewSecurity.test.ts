@@ -225,6 +225,59 @@ test("rapid input suspends previews without outrunning host generations", () => 
   });
 });
 
+test("webview applies consecutive reveals, synchronizes selection, and scrolls later headings", () => {
+  const windowListeners = new Map<string, Array<(event: { data: unknown }) => void>>();
+  const messages: unknown[] = [];
+  const editor = fakeElement() as Record<string, unknown>;
+  let selection: readonly [number, number] | undefined;
+  let focusCount = 0;
+  editor.clientHeight = 60;
+  editor.scrollTop = 0;
+  editor.setSelectionRange = (start: number, end: number) => {
+    selection = [start, end];
+    editor.selectionStart = start;
+    editor.selectionEnd = end;
+  };
+  editor.focus = () => { focusCount += 1; };
+  const context = runtimeContext(
+    (id) => id === "editor" ? editor : fakeElement(),
+    (type, listener) => {
+      const listeners = windowListeners.get(type) ?? [];
+      listeners.push(listener);
+      windowListeners.set(type, listeners);
+    },
+  );
+  context.acquireVsCodeApi = () => ({ postMessage: (message: unknown) => messages.push(message) });
+  runInNewContext(runtime!, context);
+  const post = (data: unknown) => {
+    for (const listener of windowListeners.get("message") ?? []) {
+      listener({ data });
+    }
+  };
+  const content = "zero\n第二\nthird\n";
+  post({ type: "content", content, readOnly: false });
+  const firstStart = Buffer.byteLength("zero\n", "utf8");
+  const firstEnd = firstStart + Buffer.byteLength("第二", "utf8");
+  const secondStart = Buffer.byteLength("zero\n第二\n", "utf8");
+  const secondEnd = secondStart + Buffer.byteLength("third", "utf8");
+  post({ type: "reveal", startByte: firstStart, endByte: firstEnd });
+  assert.deepEqual(selection, [5, 7]);
+  post({ type: "reveal", startByte: secondStart, endByte: secondEnd });
+  assert.deepEqual(selection, [8, 13]);
+  assert.equal(focusCount, 2);
+  assert.equal(editor.scrollTop, 20);
+  const selectionMessages = messages.filter((message) =>
+    typeof message === "object" && message !== null && (message as { type?: unknown }).type === "selection",
+  ) as Array<{ selections: readonly { readonly startByte: number; readonly endByte: number }[] }>;
+  assert.deepEqual(selectionMessages.map((message) => {
+    const range = message.selections.at(-1);
+    return range === undefined ? undefined : { startByte: range.startByte, endByte: range.endByte };
+  }), [
+    { startByte: firstStart, endByte: firstEnd },
+    { startByte: secondStart, endByte: secondEnd },
+  ]);
+});
+
 function minimalPng(width: number, height: number): Uint8Array {
   return Buffer.concat([
     Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),

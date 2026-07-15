@@ -1324,6 +1324,12 @@
 - 从独立、clean、canonical-origin checkout 的 `db35a8b4de9493ab18b182615fe51dcee4dd7fc4` 以 system GCC 重新构建 Linux x64 release set；`package_release.py`、严格 artifact audit 和隔离 VS Code install smoke 均通过。
 - 最新可安装 VSIX：`target/release-artifacts/db35a8b-linux-x64/inex-vscode-0.1.0-linux-x64.vsix`，SHA-256 为 `f92a0fc18b5a9cbabf56c41129f48f7dfd1fc15e3450f0ff63c3b99ce4674ded`。该包包含 destination containment 修复，替代此前的 `ff0bd23` 包；未自动安装到用户 profile。
 
+## 2026-07-16 — VS Code repeated Heading reveal repair
+
+- CustomEditor webview 的 reveal 路径现显式将 selection 回传 host，并按目标逻辑行滚动 textarea；连续 Heading / link fragment reveal 不再依赖浏览器是否自动触发 `select` 或把新 selection 滚入视口。
+- 修复了此前未被 extension-host 发现的模板字符串陷阱：嵌入 webview 的 `/\\n/` 正则会被 TS template literal 变为物理换行，造成 webview script 在 `ready` 前语法失效。实现改为 `String.fromCharCode(10)` 的无转义换行计数。
+- 新 runtime regression 使用 Unicode heading 内容连续发送两次 reveal，验证 UTF-8 byte→UTF-16 selection、host selection 回传和第二个目标的 scrollTop。`pnpm --dir editors/vscode check`、63/63 Node tests 与真实 `test:extension:local` 均通过。持久用户 profile 的视觉验收仍需用户实际确认。
+
 ## 2026-07-16 — Outer-only Umbra export projection
 
 - `umbra_render::render_outer_projection` 现在只根据已认证的公开 Outer slot 策略替换 marker：Drop 输出空内容、Cover 输出明确公开的 cover text、Placeholder 输出固定无标识文本。它严格验证 marker/slot 一一对应和 Cover/Placeholder metadata，永不读取 private payload、kind、tag、slot ID 或 `K_umbra`。
