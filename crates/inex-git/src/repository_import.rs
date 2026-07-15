@@ -2622,7 +2622,14 @@ fn normalize_target_paths(paths: &[PathBuf]) -> Result<Vec<PathBuf>, RepositoryI
     if normalized.len() > MAX_TARGET_ENTRIES {
         return Err(RepositoryImportError::ResourceLimit);
     }
-    Ok(normalized.into_iter().collect())
+    let mut paths = normalized.into_iter().collect::<Vec<_>>();
+    paths.sort_by(|left, right| {
+        slash_path(left)
+            .expect("validated target path")
+            .as_bytes()
+            .cmp(slash_path(right).expect("validated target path").as_bytes())
+    });
+    Ok(paths)
 }
 
 fn validate_target_relative_path(path: &Path) -> Result<(), RepositoryImportError> {
@@ -5861,6 +5868,23 @@ mod tests {
                 .windows(b"merge\0unset\0".len())
                 .any(|window| { window == b"merge\0unset\0" })
         );
+    }
+
+    #[test]
+    fn target_paths_use_git_raw_byte_order_not_path_component_order() {
+        let paths = super::normalize_target_paths(&[
+            PathBuf::from("means.md.enc"),
+            PathBuf::from("means/C++.md.enc"),
+            PathBuf::from("vault.json"),
+        ])
+        .expect("target paths normalize");
+        let names = paths
+            .iter()
+            .map(|path| super::slash_path(path).expect("portable path"))
+            .collect::<Vec<_>>();
+        let means_file = names.iter().position(|path| path == "means.md.enc");
+        let means_child = names.iter().position(|path| path == "means/C++.md.enc");
+        assert!(means_file < means_child);
     }
 
     #[cfg(not(target_os = "linux"))]

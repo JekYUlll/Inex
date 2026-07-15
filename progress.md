@@ -1177,6 +1177,12 @@
 - 此问题暴露此前 artifact 门禁只覆盖 fixture、dry-run、package install/runtime smoke，未以真实规模仓库进行最终全流程验收。不得再把该 VSIX 表述为已验证的可用 repository-import demo。已在 Phase 7 新增“真实规模 Git 仓库副本全流程 import/reopen/residue”作为每个候选 VSIX 的硬门禁；当前优先复现并修复该 candidate audit failure。
 - 已从 `_blog` 创建只读隔离 clone，以已安装 VSIX 的 bundled CLI 复现同一 `TargetAuditFailed`，排除用户目录、口令和 VS Code 任务包装因素。候选的初始 raw-index audit 失败；失败后对保留候选执行 Git path list 的独立 parser 复核可通过，因此下一步必须捕获 audit 当时的 exact index bytes/control manifest，不能根据事后被 Git 读取可能更新的 index 推断原因。一次“目录分隔符排序”假设已被独立 Git 顺序对比否定并完全撤回，未进入产品代码。
 
+## 2026-07-15 — Real-repository import regression fixed and verified
+
+- 根因是 CLI 在 `tracked_target_paths` 中依赖 `PathBuf` 的组件排序；Git index 则要求 canonical slash-path 的原始 UTF-8 byte order。真实仓库同时含 `means.md` 与 `means/…`，使第 308 个 target raw-index entry 与预期次序不一致，候选 audit fail closed。现在显式按 canonical path bytes 排序，并加入回归测试。
+- 以 `/home/horeb/_code/_blog` 的独立只读 clone、debug CLI 重跑完整导入：324 tracked source entries（307 Markdown、17 assets、Markdown 3,549,648 bytes、assets 46,643,446 bytes、最大 asset 25,074,521 bytes）全部成功；结果为 published vault、无 parent Git root `9aa15ca…`、307 密文 Markdown、17 密文 assets、candidate vault/Git object audit passed、source revalidated/preserved。
+- 随后由新 CLI process 执行 locked `verify`（7 dirs/307 docs/17 assets）、password-protected `search`（0 matches）和 `git fsck --full --strict`；目标没有 `.md`/`.png`/`.jpg` 明文文件名，非密文文件扫描未命中测试内容。该证据只覆盖当前修复源码 CLI；VSIX 必须在该 commit 打包并重跑同一门禁后才能交付用户安装。
+
 ## 2026-07-15 — Neovim final-priority Lua transport skeleton
 
 - 新增 `editors/neovim` runtime plugin。Lua `rpc` 模块只启动 absolute regular `inexd`、使用 bounded Content-Length JSON-RPC framing、绑定 pending request callbacks，并在 stdout/protocol/process failure 时清理；插件提供 `:InexStart`、`:InexStatus`、`:InexStop`，`system.hello` 发送 frozen `client/clientVersion/protocolMajor` 参数。
