@@ -157,6 +157,7 @@ impl<C: MonotonicClock> RpcService<C> {
             Method::UmbraStatus => self.umbra_status(params),
             Method::UmbraInitialize => self.umbra_initialize(params),
             Method::UmbraUnlock => self.umbra_unlock(params),
+            Method::UmbraPasswordChange => self.umbra_password_change(params),
             Method::UmbraLock => self.umbra_lock(params),
             Method::UmbraEnable => self.umbra_enable(params),
             Method::UmbraDocumentOpen => self.umbra_document_open(params),
@@ -526,6 +527,20 @@ impl<C: MonotonicClock> RpcService<C> {
             .map_err(|error| map_vault_error(error, ErrorContext::Authentication))?;
         drop(password);
         Ok(umbra_status_value(status))
+    }
+
+    fn umbra_password_change(&mut self, params: Params) -> RpcResult {
+        let mut params = ParamObject::new(params);
+        let session = required_session(&mut params)?;
+        let password = params.required_sensitive_string("password", 1, MAX_PASSWORD_BYTES)?;
+        params.finish()?;
+        self.sessions
+            .vault_mut(session.as_str())
+            .map_err(map_session_error)?
+            .change_umbra_password(password.as_bytes())
+            .map_err(|error| map_vault_error(error, ErrorContext::Authentication))?;
+        drop(password);
+        Ok(acknowledgement())
     }
 
     fn umbra_lock(&mut self, params: Params) -> RpcResult {
@@ -2810,6 +2825,19 @@ mod tests {
         let disk = String::from_utf8_lossy(&disk);
         assert!(!disk.contains("private outer text"));
         assert!(!disk.contains("comment-content"));
+        let replacement_password = b"replacement Umbra handler password";
+        let mut changed = response(
+            &mut service,
+            72,
+            "umbra.password.change",
+            json!({
+                "session": session.as_str(),
+                "password": String::from_utf8_lossy(replacement_password),
+            }),
+        );
+        assert_eq!(changed["result"], json!({"ok": true}));
+        assert!(!format!("{changed:?}").contains("replacement Umbra handler password"));
+        scrub_object(&mut changed);
         let mut locked = response(
             &mut service,
             7,
@@ -2843,8 +2871,24 @@ mod tests {
             "umbra.unlock",
             json!({"session": session.as_str(), "password": String::from_utf8_lossy(umbra_password)}),
         );
-        assert_eq!(reopened["result"]["unlocked"], true);
+        assert_eq!(reopened["error"]["code"], ErrorCode::AuthFailed.number());
         scrub_object(&mut reopened);
+        let mut reopened_replacement = response(
+            &mut service,
+            10,
+            "umbra.unlock",
+            json!({"session": session.as_str(), "password": String::from_utf8_lossy(replacement_password)}),
+        );
+        assert_eq!(reopened_replacement["result"]["unlocked"], true);
+        scrub_object(&mut reopened_replacement);
+        let mut reopened_private = response(
+            &mut service,
+            11,
+            "umbra.document.open",
+            json!({"session": session.as_str(), "logicalPath": "private.md"}),
+        );
+        assert!(reopened_private.get("result").is_some());
+        scrub_object(&mut reopened_private);
         session.zeroize();
     }
 

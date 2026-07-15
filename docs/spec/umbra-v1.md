@@ -158,6 +158,7 @@ RPC v1 gains explicit Umbra session methods before editor wiring:
 ```text
 umbra.enable
 umbra.unlock
+umbra.password.change
 umbra.lock
 umbra.status
 umbra.config.load

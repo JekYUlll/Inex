@@ -430,6 +430,17 @@ export class InexSidecar {
     }
   }
 
+  public async changeUmbraPassword(password: string): Promise<void> {
+    this.requireUmbraV1();
+    try {
+      expectAcknowledgement(
+        await this.callRaw("umbra.password.change", { ...this.protectedParams(), password }),
+      );
+    } finally {
+      password = "";
+    }
+  }
+
   public async lockUmbra(): Promise<void> {
     this.requireUmbraV1();
     const result = expectObject(

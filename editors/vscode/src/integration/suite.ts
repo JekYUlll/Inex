@@ -45,6 +45,7 @@ interface InexIntegrationTestApi {
   readonly exportOuterCopy: (destination: string) => Promise<void>;
   readonly exportUmbraCopy: (destination: string) => Promise<void>;
   readonly verifyUmbraAnnotationLifecycle: (logicalPath: string, password: string) => Promise<void>;
+  readonly verifyUmbraPasswordChange: (oldPassword: string, newPassword: string) => Promise<void>;
   readonly verifyUmbraLock: (password: string) => Promise<void>;
   readonly lock: () => Promise<void>;
 }
@@ -119,13 +120,16 @@ async function runBackupRecoveryCycle(
   await api.openDocument(SECONDARY_LOGICAL_PATH);
   await api.verifyUmbraAnnotationLifecycle(SECONDARY_LOGICAL_PATH, fixture.password);
   await runUmbraPlaintextExportCycle(api, fixture);
-  await api.verifyUmbraLock(fixture.password);
+  const replacementUmbraPassword = "Inex integration replacement Umbra password";
+  await api.verifyUmbraPasswordChange(fixture.password, replacementUmbraPassword);
+  await api.verifyUmbraLock(replacementUmbraPassword);
   const umbraTrace = await waitForSidecarTrace(
     fixture,
     (entries) => entries.some((entry) => entry.method === "umbra.document.convert")
       && entries.filter((entry) => entry.method === "umbra.annotation.apply").length >= 2
       && entries.some((entry) => entry.method === "umbra.annotation.edit")
       && entries.filter((entry) => entry.method === "umbra.annotation.remove").length >= 2
+      && entries.some((entry) => entry.method === "umbra.password.change")
       && entries.some((entry) => entry.method === "umbra.lock"),
     "VS Code Umbra annotation lifecycle did not reach the authenticated sidecar",
   );
@@ -138,6 +142,7 @@ async function runBackupRecoveryCycle(
     all("umbra.annotation.remove")[0],
     all("umbra.annotation.apply")[1],
     all("umbra.annotation.remove")[1],
+    first("umbra.password.change"),
     first("umbra.lock"),
   ];
   let previousUmbraSequence = -1;

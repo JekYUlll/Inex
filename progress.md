@@ -1444,6 +1444,11 @@
 - 从独立 `--no-local` clean checkout、canonical origin `https://github.com/JekYUlll/Inex` 的 `f5dae0719e6ce94729f240703a1cd3a9ee490be4` 用 `/usr/bin/gcc` 构建 Linux x64 release。release artifact audit、对 release `inex`/`inexd` 的 native dependency audit，以及 package smoke 均通过。
 - 已将 [inex-vscode-0.1.0-linux-x64.vsix](/home/horeb/_code/Inex/target/release-artifacts/f5dae07-linux-x64/inex-vscode-0.1.0-linux-x64.vsix) 用 `/usr/bin/code --install-extension --force` 覆盖安装。VSIX SHA-256 为 `0999b7491470343199eb3c3f0ff7f43c187dfddfea25c1afd4d56472e6f569eb`；其中 `extension.js` SHA-256 与已安装副本同为 `4f3744399cee7857bb8f9a7b719e0a96104206fdb5a51e6186e7f6fc2d70099d`。`horeb.inex-vscode@0.1.0` 已被 VS Code 列出；同版号窗口仍须 Developer: Reload Window。
 
+## 2026-07-16 — Umbra password change reaches VS Code
+
+- `inex.changeUmbraPassword` 只在已有 live Umbra session 时收集新密码和确认；它不要求旧密码，因此符合当前解锁会话内可恢复访问但忘记旧密码的冻结语义。daemon 新增严格的 `umbra.password.change` RPC，调用核心的条件原子 keyslot rewrap，返回无敏感字段 acknowledgement。
+- 回归覆盖 daemon 改密后锁定、旧密码认证失败、新密码解锁并重新读取既有私密投影；VS Code Extension Host 覆盖 production sidecar 的改密→lock→旧密码拒绝→新密码解锁→lock，且 trace 强制包含 `umbra.password.change`。验证：`cargo fmt --check`、73 daemon tests、daemon `-D warnings` Clippy、67/67 VS Code tests、typecheck、真实 Extension Host 回归全部通过。
+
 ## 2026-07-16 — Outer-only Umbra export projection
 
 - `umbra_render::render_outer_projection` 现在只根据已认证的公开 Outer slot 策略替换 marker：Drop 输出空内容、Cover 输出明确公开的 cover text、Placeholder 输出固定无标识文本。它严格验证 marker/slot 一一对应和 Cover/Placeholder metadata，永不读取 private payload、kind、tag、slot ID 或 `K_umbra`。

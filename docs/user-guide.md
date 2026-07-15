@@ -189,6 +189,11 @@ the following checks:
    projection must be replaced by the locked page while ordinary Outer tabs
    remain available. Then use **Inex: Lock Vault** and confirm all Inex
    plaintext views close or become locked.
+   To replace the independent password while Umbra is still unlocked, run
+   **Inex: Change Umbra Password** and enter/confirm the new password. It
+   rewraps the already-live `K_umbra`; it does not re-encrypt every private
+   document and does not ask for the old password. Once Umbra is locked or the
+   application exits, the new password is the only way to unlock it.
 5. If testing export, select a new directory outside the vault. Confirm that
    **Outer only** omits private content and **Include Umbra private content**
    requires the independent password and shows its high-risk confirmation.

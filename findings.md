@@ -635,3 +635,8 @@
 
 - `audit_native_dependencies.py` accepts the standalone release `inex` and `inexd` paths, not the packaged Rust ZIP. Passing the ZIP stopped the first post-package chain before smoke/install; artifact structure audit had already passed but no installation claim was made. Re-running the audit with both release binaries, then package smoke, then explicit VSIX install completed successfully.
 - VS Code CLI emitted host-owned Node `DEP0169` `url.parse()` deprecation text during install, while installation exited successfully and package-vs-installed `extension.js` digests matched. Treat this as host CLI noise unless a trace attributes it to Inex.
+
+## 2026-07-16 Umbra password-reset editor boundary
+
+- The frozen Umbra v1 semantics permit a password reset only while `K_umbra` is live; the editor must therefore not route this command through the normal unlock/initialize helper. It first authenticates the current sidecar session's `umbra.status`, rejects a locked status, and collects only a new password plus confirmation.
+- The RPC receives the new password as a bounded sensitive parameter and returns only `{"ok": true}`. A post-change lock must make the old password fail while the replacement unlocks the same private document; this proves a slot rewrap rather than a new-key/private-data rewrite.

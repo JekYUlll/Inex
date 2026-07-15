@@ -51,6 +51,7 @@ export interface InexIntegrationTestApi {
   readonly exportOuterCopy: (destination: string) => Promise<void>;
   readonly exportUmbraCopy: (destination: string) => Promise<void>;
   readonly verifyUmbraAnnotationLifecycle: (logicalPath: string, password: string) => Promise<void>;
+  readonly verifyUmbraPasswordChange: (oldPassword: string, newPassword: string) => Promise<void>;
   readonly verifyUmbraLock: (password: string) => Promise<void>;
   readonly lock: () => Promise<void>;
 }
@@ -127,6 +128,11 @@ export function activate(
         if (locked) {
           await vscode.window.showInformationMessage("Umbra locked; private projections and related preview state were cleared.");
         }
+      });
+    }),
+    vscode.commands.registerCommand("inex.changeUmbraPassword", async () => {
+      await runUiAction(async () => {
+        await changeUmbraPassword(controller);
       });
     }),
     vscode.commands.registerCommand("inex.importRepository", async (source?: unknown) => {
@@ -451,6 +457,16 @@ export function activate(
       await session.sidecar.enableUmbra();
       await editor.verifyIntegrationUmbraAnnotationLifecycle(logicalPath);
     },
+    verifyUmbraPasswordChange: async (oldPassword: string, newPassword: string) => {
+      const session = controller.acquireSession();
+      if (!(await session.sidecar.umbraStatus()).unlocked) {
+        throw new Error("Inex integration Umbra password change requires an unlocked Umbra session");
+      }
+      await session.sidecar.changeUmbraPassword(newPassword);
+      await session.sidecar.lockUmbra();
+      await assertIntegrationUmbraUnlockFails(session.sidecar, oldPassword);
+      await session.sidecar.unlockUmbra(newPassword);
+    },
     verifyUmbraLock: async (password: string) => {
       const session = controller.acquireSession();
       let status = await session.sidecar.umbraStatus();
@@ -493,6 +509,86 @@ async function lockUmbra(
     // A transport failure leaves remote lock state unknown. Never retain an
     // Umbra projection locally in that case.
     editor.wipeUmbraForLock();
+  }
+}
+
+async function changeUmbraPassword(controller: VaultController): Promise<void> {
+  if (!(await ensureVaultUnlocked(controller))) return;
+  const session = controller.acquireSession();
+  const status = await session.sidecar.umbraStatus();
+  if (!controller.isSessionCurrent(session)) {
+    throw new Error("Inex vault session changed before Umbra password change");
+  }
+  if (!status.unlocked) {
+    throw new Error("Unlock Umbra before changing its password.");
+  }
+  let password = await promptForNewUmbraPassword(controller);
+  if (password === undefined) return;
+  try {
+    await session.sidecar.changeUmbraPassword(password);
+    if (!controller.isSessionCurrent(session)) {
+      throw new Error("Inex vault session changed during Umbra password change");
+    }
+    await vscode.window.showInformationMessage(
+      "Umbra password changed. Existing private content was not re-encrypted.",
+    );
+  } finally {
+    password = undefined;
+  }
+}
+
+async function promptForNewUmbraPassword(controller: VaultController): Promise<string | undefined> {
+  let password = await showSensitiveInputBox(
+    {
+      ignoreFocusOut: true,
+      password: true,
+      prompt: "New Umbra password (cannot be recovered)",
+      title: "Change Umbra Password",
+      validateInput: validateUmbraPassword,
+    },
+    controller.onDidLock,
+  );
+  if (password === undefined) return undefined;
+  let confirmation = await showSensitiveInputBox(
+    {
+      ignoreFocusOut: true,
+      password: true,
+      prompt: "Confirm new Umbra password",
+      title: "Change Umbra Password",
+      validateInput: validateUmbraPassword,
+    },
+    controller.onDidLock,
+  );
+  try {
+    if (confirmation === undefined) return undefined;
+    if (password !== confirmation) {
+      throw new Error("Umbra password confirmation does not match");
+    }
+    return password;
+  } finally {
+    password = "";
+    confirmation = "";
+  }
+}
+
+function validateUmbraPassword(value: string): string | undefined {
+  const bytes = Buffer.byteLength(value, "utf8");
+  return bytes >= 1 && bytes <= 1024 ? undefined : "Password must be 1–1024 UTF-8 bytes";
+}
+
+async function assertIntegrationUmbraUnlockFails(
+  sidecar: VaultSession["sidecar"],
+  password: string,
+): Promise<void> {
+  let unlocked = false;
+  try {
+    await sidecar.unlockUmbra(password);
+    unlocked = true;
+  } catch {
+    // The previous password must no longer unwrap the unchanged K_umbra keyslot.
+  }
+  if (unlocked) {
+    throw new Error("Inex integration old Umbra password unexpectedly remained valid");
   }
 }
 

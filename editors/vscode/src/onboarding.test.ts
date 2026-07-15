@@ -33,6 +33,10 @@ test("locked vault onboarding exposes unlock/import and gates CRUD by context", 
       "inex.vaultUnlocked",
     );
   }
+  assert.equal(
+    packageJson.contributes.commands.find((entry) => entry.command === "inex.changeUmbraPassword")?.enablement,
+    "inex.vaultUnlocked",
+  );
   const titleCommands = packageJson.contributes.menus["view/title"];
   assert.match(
     titleCommands.find((entry) => entry.command === "inex.newFolder")?.when ?? "",

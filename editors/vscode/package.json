@@ -32,6 +32,7 @@
     "onCommand:inex.exportPlaintextCopy",
     "onCommand:inex.unlockVault",
     "onCommand:inex.lockUmbra",
+    "onCommand:inex.changeUmbraPassword",
     "onCommand:inex.importRepository",
     "onCommand:inex.newEncryptedMarkdown",
     "onCommand:inex.newFolder",
@@ -71,6 +72,11 @@
       {
         "command": "inex.lockUmbra",
         "title": "Inex: Lock Umbra",
+        "enablement": "inex.vaultUnlocked"
+      },
+      {
+        "command": "inex.changeUmbraPassword",
+        "title": "Inex: Change Umbra Password",
         "enablement": "inex.vaultUnlocked"
       },
       {
