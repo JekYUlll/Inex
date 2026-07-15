@@ -1639,3 +1639,15 @@
 
 - 新增 window-local `inex.privateAnnotation.mergeAdjacentSelections`，默认 `false`。它不保存任何标签、profile 或内容；只决定 toggle/explicit remove/chosen/profile-apply 所走的 authenticated annotation RPC 是否带 `mergeAdjacent: true`。
 - 因而默认的相邻多范围仍产生独立 private slots；用户显式启用后才由 daemon 在 RenderMap 验证后合并相邻范围。`pnpm --dir editors/vscode check`、73/73 unit 与 `test:extension:local` 均成功；后者完成 build、integration build 和 Rust CLI/daemon preparation 并以零退出返回。
+
+## 2026-07-16 — Installed adjacent-selection bundle
+
+- `982363d` 从 detached clean standalone checkout 打包 Linux x64 release set；artifact audit 通过，声明的 source commit 为 `982363ddd251dbf8d0367ddc8d25bdd1c1a18760` 且 `dirtySourceTree: false`。VSIX：[inex-vscode-0.1.0-linux-x64.vsix](/home/horeb/_code/Inex/target/release-artifacts/982363d-linux-x64/inex-vscode-0.1.0-linux-x64.vsix)，SHA-256：`23d8b13b350638ad0e0eca65917bdea690c357bfa9c0acc6ca621bc790b8b0c5`。
+- 已用 `code --install-extension --force` 覆盖安装；唯一输出是宿主 Node 的 `DEP0169` 弃用警告。需执行 `Developer: Reload Window` 后测试新增设置。
+
+## Errors Encountered
+
+| Error | Attempt | Resolution |
+|---|---:|---|
+| Standalone release construction initially returned from the terminal supervisor before its child Rust build had completed; the shell then exited before artifact copy. | 1 | Waited for the child process and rebuilt release binaries separately with visible status; no incomplete artifact was installed. |
+| Package provenance rejected the first detached clone because its local `origin` was the filesystem clone path. | 1 | Set that clone's local `remote.origin.url` to the canonical Inex repository before packaging; audit then recorded a clean canonical source. |

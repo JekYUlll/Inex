@@ -83,6 +83,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
   - 2026-07-16: `80403fe` standalone clean-source Linux x64 package 与 release-set audit 完成，VSIX 已覆盖本机 VS Code；isolated smoke 已执行并清理隔离根，但当前工具会在 VS Code CLI 子进程完成前返回，未把该次 smoke exit 文本作为额外发布证据。
   - 2026-07-16: 当前可安装 Linux x64 VSIX 已更新为 clean canonical-source `8dd7d70`，包含 richer display-only Markdown highlighting；package/audit/native-dependency/isolated-install smoke 通过并已覆盖本机 profile。运行中的窗口仍需 reload。
   - 2026-07-16: VS Code 现实际读取并传递 `inex.privateAnnotation.mergeAdjacentSelections`（默认 `false`）给三条 authenticated annotation mutation 路径；普通多选依旧各自成 slot，显式开启才让 daemon 合并相邻范围。TypeScript、73 unit 与 local Extension Host 回归通过。
+  - 2026-07-16: `982363d` clean standalone-source Linux x64 release set 已完成 package/release-set audit，并覆盖安装本机 VS Code；VSIX SHA-256 为 `23d8b13b350638ad0e0eca65917bdea690c357bfa9c0acc6ca621bc790b8b0c5`。运行中的窗口仍需 reload。
 - **Status:** complete
 
 ### Phase 5: Sublime 轻量客户端
