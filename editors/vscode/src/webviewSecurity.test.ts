@@ -9,6 +9,7 @@ const source = readFileSync(
   "utf8",
 );
 const runtime = /<script nonce="\$\{nonce\}">\n([\s\S]*?)\n<\/script>/u.exec(source)?.[1];
+const presentationRuntime = /\/\* Display-only Markdown presentation\. It never sends a message or owns content\. \*\/\n([\s\S]*?)\n<\/script>/u.exec(source)?.[1];
 
 test("editor webview keeps the exact closed network/filesystem CSP", () => {
   const csp = /Content-Security-Policy" content="([^"]+)"/u.exec(source)?.[1];
@@ -19,6 +20,15 @@ test("editor webview keeps the exact closed network/filesystem CSP", () => {
   assert.doesNotMatch(csp ?? "", /https?:|data:|file:|connect-src|media-src|frame-src/u);
   assert.match(source, /localResourceRoots: \[\]/u);
   assert.doesNotMatch(source, /asWebviewUri|registerFileSystemProvider/u);
+});
+
+test("Markdown presentation remains display-only while covering common Markdown tokens", () => {
+  assert.ok(presentationRuntime, "Markdown presentation runtime was not found");
+  assert.match(presentationRuntime, /md-inline-code|md-link|md-list|md-rule/u);
+  assert.doesNotMatch(
+    presentationRuntime,
+    /acquireVsCodeApi|postMessage|fetch|XMLHttpRequest|WebSocket|FileReader/u,
+  );
 });
 
 test("webview raster validator executes and blocks active or malformed formats", () => {

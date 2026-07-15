@@ -592,6 +592,12 @@
 - The isolated VS Code Extension Host fixture now imports a real CRLF Markdown file, opens it alongside an image-bearing note, hides/reveals both CustomEditors, closes them, and runs `git -C <vault> status --porcelain=v1 -z`. The output is required to be empty before any intentional mutation. This is a direct regression gate for the reported false `.md.enc` `M` state, rather than an inference from in-memory presentation mapping tests.
 - This evidence is limited to the disposable Extension Host profile. It does not claim that VS Code persistent-profile Local History/SCM extensions or a user-specific configuration cannot create independent side effects; those remain release-gate work.
 
+## 2026-07-16 Markdown presentation boundary
+
+- The CustomEditor display layer can offer substantially richer Markdown visual tokens without turning plaintext into a normal VS Code document: it reads only the already-present textarea string and writes escaped spans into its own `aria-hidden` overlay. The textarea remains the sole input/selection/snapshot path.
+- The presentation script must not receive `acquireVsCodeApi`, `postMessage`, network, file, or clipboard capability. A source-level regression now rejects those identifiers in the presentation script itself; the primary webview script remains the only host-message authority.
+- This improves highlighting but is intentionally not a Markdown language-server integration. LSP completion/diagnostics would require an explicit separate in-memory editor architecture and its own residue/lifecycle security proof.
+
 ## 2026-07-16 Plaintext Export v1 boundary
 
 - Plaintext export cannot share the normal CustomEditor or Git/SCM code path: a successful export deliberately creates user-visible plaintext on disk, whereas the editor pipeline must remain ciphertext-only on disk. The safe common boundary is therefore a daemon-owned, session-bound two-step transaction with a capability that is invalidated by Outer/Umbra lock rather than an editor-local confirmation boolean.

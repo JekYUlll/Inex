@@ -1378,6 +1378,12 @@
 - 同一真实 CRLF Umbra projection 现在先完成单 range apply/edit/remove，再经 production selection mapper 送入两个不相邻的 presentation-byte selections。daemon 返回的 RenderMap 必须包含两个独立 slot；测试以其完整 canonical ranges 一次提交 remove，并逐字节确认原投影恢复。
 - sidecar trace 不仅检查 RPC 存在，还要求精确发生 convert、第一组 apply/edit/remove、第二组 apply/remove、lock 的单调顺序，且 apply/remove 各至少两次。验证：`pnpm --dir editors/vscode check`、63/63 Node tests 与真实 `pnpm --dir editors/vscode test:extension:local` 通过。
 
+## 2026-07-16 — VS Code richer display-only Markdown presentation
+
+- 受控 textarea 上方的 `aria-hidden` overlay 现支持 headings、fenced/inline code、链接及图片语法、粗体/斜体、无序/有序列表、引用、分隔线和 HTML comment 的主题色呈现。它严格输出 escaped spans；不影响 canonical CRLF mapping、selection、snapshot、保存或 RenderMap。
+- 新 source-level isolation test 确认 presentation script 覆盖上述 token classes，且不含 `acquireVsCodeApi`、`postMessage`、`fetch`、`XMLHttpRequest`、`WebSocket` 或 `FileReader`。验证：`pnpm --dir editors/vscode check`、64/64 Node tests 与真实 `pnpm --dir editors/vscode test:extension:local` 通过。
+- 这不是将明文注册为普通 Markdown TextDocument 或 Markdown LSP；普通 Git/SCM 仍仅见密文 binary，LSP 架构与其残留证明仍是独立后续工作。
+
 ## 2026-07-16 — Current VS Code Linux x64 installable package
 
 - 从独立 `--no-local` clean checkout、canonical origin `https://github.com/JekYUlll/Inex` 的 `d5f7a394aa97e2e3881216fc0f8b9cb5234fce64`，使用 `/usr/bin/gcc` 构建 CLI/daemon 与 VS Code bundle。ELF interpreter 为系统 `/lib64/ld-linux-x86-64.so.2`，未出现开发机 xlings RPATH/RUNPATH。
