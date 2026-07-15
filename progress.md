@@ -1273,3 +1273,9 @@
 - 从独立、clean、canonical-origin checkout 的源码提交 `067f15295b36f7cd366f5ddad1be54fba845e9fd` 用 system GCC 重建 `inex`/`inexd`；VS Code TypeScript check、57/57 unit tests、release package audit 与 isolated VS Code install/runtime smoke 均通过。
 - 新产物为 `target/release-artifacts/067f152-linux-x64/inex-vscode-0.1.0-linux-x64.vsix`，SHA-256 为 `b916d8d0c73314ecd7c924f39fd327ec5fd415768a08290fabcc17f50220d5bb`。从该 VSIX 解出的 bundled CLI 对真实 `_blog` 的独立 Git clone 完成 import；locked verify 报告 7 directories / 307 documents / 17 assets，解锁 search 返回 0 matches，`git fsck --full --strict` 与 plaintext `.md`/`.png`/`.jpg` filename scan 均通过。
 - 已使用 `/usr/bin/code --install-extension … --force` 覆盖安装，`code --list-extensions --show-versions` 确认 `horeb.inex-vscode@0.1.0`。版本号仍是 pre-alpha `0.1.0`，本记录只说明本机 Linux artifact 的构建、包审计、真实仓库回归和安装，不覆盖持久 profile、签名或跨平台 GA 门禁。
+
+## 2026-07-16 — VS Code CRLF, navigation, and Markdown presentation repair
+
+- `InexDocument` 现在将 authenticated canonical plaintext 与浏览器 textarea 的 LF-only presentation 明确分离：CRLF 文档在 selection、navigation、snapshot 与 save 时通过受限 UTF-8 byte/UTF-16 offset mapping 往返，navigation/selection 不再把浏览器的 CRLF→LF 规范化误判为编辑。Heading/link 路径仍会先采纳真实未同步编辑，但仅在 canonical bytes 实际变化时才标记 dirty。
+- webview 增加独立的 display-only Markdown presentation layer，渲染 headings、fenced code、comments 和 block quotes；它不发送消息、不持有权限且不参与保存/RenderMap/路径决策。主受控编辑脚本先完成 `ready` handshake，因此 display-only 层故障不能阻断 unlock/open/save/lock lifecycle。
+- 验证：`pnpm --dir editors/vscode check`、59/59 Node tests（含 CRLF/UTF-8 offset regressions）及真实 `pnpm --dir editors/vscode test:extension:local` 均通过；后者重新覆盖 feature-1 import、asset preview、CRUD、encrypted backup/recovery 与 residue audit。尚需将这批源码打包、在用户的持久 profile 上人工确认视觉高亮、连续 Heading 跳转及现有 CRLF vault 的无操作 Git clean。

@@ -53,6 +53,8 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
 - [x] 实现 create/mkdir/etag-conditional rename/delete，并在 custom-editor 关闭或 RPC 失败时认证对账与恢复
 - [x] 使用真实 Extension Host 黑盒验证 encrypted backup/recovery 并扫描 isolated profile；持久 profile/Local History/crash 矩阵留作 Phase 7 发布门禁
 - [x] 添加 lint、类型检查、单元测试与 Extension Host 集成测试基础
+- [ ] 修复 CustomEditor 的 CRLF 展示/同步边界：导航、selection 与 snapshot 不得将浏览器 textarea 的 LF 规范化误认作用户编辑；补充真实加密 Git worktree 无操作不变回归
+- [ ] 在不降级 CustomEditor plaintext-residue 边界的前提下，实现 webview 内 Markdown 语法呈现并修复 Headings 的可重复跳转；普通 VS Code SCM 保持密文 binary diff，另行设计需解锁的安全 revision-compare UX
 - **Status:** complete
 
 ### Phase 5: Sublime 轻量客户端
@@ -93,6 +95,10 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
 - **Status:** in_progress（正式 goal；2026-07-15 已再次确认最后优先级：CLI/daemon 与 VS Code 为最高优先，Sublime 维持既定 experimental 范围后，才开始 Neovim；不得创建第二套协议/密码学实现）
 
 ### Phase 6: Git 合并、迁移与恢复工具
+
+  - [ ] 设计并实现显式 Plaintext Export Mode：统一由已认证 `inexd` 执行，所有编辑器仅调用同一 RPC；默认关闭、无密码绕过、拒绝导出到 vault 内或已存在目标，使用 staging→审计→atomic publish，并把 plaintext-residue/备份/Git 风险作为不可消除的确认语义
+    - [ ] 定义 Outer-only 与已解锁 Umbra-inclusive 两种导出范围、Markdown/附件导出一致性、私密标注投影规则与审计收据
+    - [ ] CLI/VS Code 首先接入，Sublime/Neovim 仅复用 RPC 与同一确认语义
 
   - [x] 设计并实现 Umbra 私密标注系统（`docs/prd-umbra-mode.md`）；冻结独立 `K_umbra`、加密 catalog/profile、feature-2 container、atomic RenderMap mutation 与 Outer 隔离，MVP defer 项保持在规范中
   - [x] 冻结产品交互、私密标签/profile加密边界、Outer隔离、selection原子性及MVP/延期范围

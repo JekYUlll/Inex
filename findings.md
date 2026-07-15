@@ -571,3 +571,18 @@
 - Neovim catalog 读取必须在私密 label 进入 picker 前完整验证 tag/profile/default 的 schema 与交叉引用；AEAD 认证不能替代语义验证。读取 API 只能把 result 交给同一 live Umbra callback，不能在 module state/editor setting 中缓存，以便 Umbra lock 不留下标签或 profile 名称。
 - Editor-local shortcut 不能承担 Umbra default profile/tag 配置；它最多触发一次 live encrypted catalog read，再将 validated defaults 作为 one-shot mutation spec 使用。
 - Repository-import Git plumbing 现在以 Unix `process_group(0)` 启动，并用 safe rustix `kill_process_group` 在超时/异常前清理同组的 inherited-pipe descendants；Linux shell+background-sleep 对抗回归验证 direct child 与 descendant 均被回收。该机制不能约束主动 escape group 的 hostile same-UID descendant，也没有替代 Windows Job、pid identity/TOCTOU 或完整 process-tree GA 门禁。
+
+## 2026-07-16 VS Code CustomEditor regression discovery
+
+- Browser `<textarea>` normalizes CRLF presentation text to LF. The existing navigation and selection message paths passed that presentation text into `InexDocument.applyEdit`; opening a CRLF Markdown ciphertext and merely invoking Headings could therefore mark the CustomDocument dirty and re-encrypt LF-normalized bytes. This exactly explains the observed unchanged-worktree `.md.enc` Git modifications and must be fixed at the webview/presentation boundary rather than by changing Git attributes.
+- Git's normal Source Control diff sees EDRY ciphertext and must remain binary/opaque: handing plaintext to Git textconv or a background SCM subprocess would bypass the authenticated Inex session and risks disclosure. A future diff feature must be an explicit authenticated Inex revision comparison view, not a normal Git plaintext diff contribution.
+
+## 2026-07-16 Cross-editor semantics and requested plaintext export
+
+- CodeMirror/Lezer (VS Code), Sublime syntax resources and Neovim Treesitter/UI need not share an implementation to share behavior: `inexd` remains the only source of document identity, authenticated Markdown navigation, private RenderMap semantics, searches and mutation authorization. Editor-local parsers are display-only and must never become persistence or authorization inputs.
+- A requested administrator/strengthened-mode Markdown export must not be modelled as an admin bypass. The safe product shape is an explicit plaintext export capability available only to an already authenticated Outer session (and an independently unlocked Umbra session for private content), with a distinct high-risk confirmation and a destination outside the vault. It necessarily creates user-authorized plaintext and therefore cannot preserve the normal no-plaintext-on-disk guarantee.
+
+## 2026-07-16 VS Code webview repair decisions
+
+- The CustomEditor now preserves canonical CRLF bytes by presenting LF-only text to textarea and mapping all presentation byte/UTF-16 offsets back to canonical plaintext. Selection messages no longer mutate content; navigation snapshots any genuine unsent edit through the same mapping, so heading/link interaction remains current without turning CRLF normalization into ciphertext rewrites.
+- Markdown presentation is intentionally a second, display-only webview script rather than a prerequisite editor runtime. An initial monolithic inline highlighter could make a webview syntax error prevent the `ready` handshake and thereby break backup/recovery integration. The main controlled editor starts first; the presentation layer has no host-message authority, no persistence path and cannot block lifecycle behavior. A future CodeMirror migration must retain this availability and authority separation.

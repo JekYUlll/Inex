@@ -6,6 +6,15 @@ import * as vscode from "vscode";
 import { AssetPreviewCoordinator } from "./assetPreviewCoordinator.ts";
 import { readBoundedRegularFile } from "./boundedFile.ts";
 import type { VaultController, VaultSession } from "./controller.ts";
+import {
+  canonicalByteToPresentationByte,
+  editorLineEnding,
+  fromEditorPresentation,
+  presentationByteToCanonicalByte,
+  presentationUtf16ToCanonicalUtf16,
+  toEditorPresentation,
+  type EditorLineEnding,
+} from "./editorPresentation.ts";
 import { emptySelectionRange, parseVisiblePrivateAnnotationBlock } from "./privateAnnotation.ts";
 import type { NoSelectionTarget } from "./privateAnnotationPreferences.ts";
 import {
@@ -65,6 +74,7 @@ class InexDocument implements vscode.CustomDocument {
   private nextSnapshotRequest = 1;
   private selections: readonly EditorSelection[] = [];
   private umbraRenderMap: RenderMap | undefined;
+  private lineEnding: EditorLineEnding;
 
   public constructor(
     public readonly uri: vscode.Uri,
@@ -81,6 +91,7 @@ class InexDocument implements vscode.CustomDocument {
   ) {
     this.savedRevision = restoredBackup ? -1 : 0;
     this.umbraRenderMap = umbraRenderMap;
+    this.lineEnding = editorLineEnding(content.toString("utf8"));
   }
 
   public get isUmbraProjection(): boolean {
@@ -122,18 +133,42 @@ class InexDocument implements vscode.CustomDocument {
 
   public updateSelections(text: string, selections: readonly EditorSelection[]): boolean {
     this.requireUsable();
+    const presentation = this.presentationText();
+    if (text !== presentation) {
+      throw new Error("Inex editor selection does not match the authenticated document");
+    }
     if (
       selections.length === 0 || selections.length > MAX_EDITOR_SELECTIONS ||
       selections.some(({ startByte, endByte }) => !Number.isSafeInteger(startByte) || !Number.isSafeInteger(endByte) || startByte < 0 || endByte < startByte || endByte > Buffer.byteLength(text, "utf8"))
     ) {
       throw new Error("Inex editor selection is invalid");
     }
-    const changed = this.applyEdit(text);
-    this.selections = selections.map(({ startByte, endByte }) => ({ startByte, endByte }));
-    return changed;
+    this.selections = selections.map(({ startByte, endByte }) => ({
+      startByte: presentationByteToCanonicalByte(presentation, startByte, this.lineEnding),
+      endByte: presentationByteToCanonicalByte(presentation, endByte, this.lineEnding),
+    }));
+    return false;
   }
 
-  public applyEdit(text: string): boolean {
+  public applyEditorEdit(text: string): boolean {
+    this.requireUsable();
+    const canonical = fromEditorPresentation(text, this.lineEnding);
+    const bytes = Buffer.byteLength(canonical, "utf8");
+    if (bytes > MAX_DOCUMENT_BYTES) {
+      throw new Error("Document exceeds the Inex v1 plaintext limit");
+    }
+    const replacement = Buffer.from(canonical, "utf8");
+    if (replacement.equals(this.content)) {
+      replacement.fill(0);
+      return false;
+    }
+    this.content.fill(0);
+    this.content = replacement;
+    this.revision += 1;
+    return true;
+  }
+
+  public applyCanonicalEdit(text: string): boolean {
     this.requireUsable();
     const bytes = Buffer.byteLength(text, "utf8");
     if (bytes > MAX_DOCUMENT_BYTES) {
@@ -146,8 +181,13 @@ class InexDocument implements vscode.CustomDocument {
     }
     this.content.fill(0);
     this.content = replacement;
+    this.lineEnding = editorLineEnding(text);
     this.revision += 1;
     return true;
+  }
+
+  public presentationUtf16ToCanonicalUtf16(offset: number): number {
+    return presentationUtf16ToCanonicalUtf16(this.presentationText(), offset, this.lineEnding);
   }
 
   public replaceFromCiphertext(
@@ -160,6 +200,7 @@ class InexDocument implements vscode.CustomDocument {
     this.umbraRenderMap?.generation.fill(0);
     this.umbraRenderMap = undefined;
     this.content = content;
+    this.lineEnding = editorLineEnding(content.toString("utf8"));
     this.etag = etag;
     this.metadata = metadata;
     this.revision += 1;
@@ -176,6 +217,7 @@ class InexDocument implements vscode.CustomDocument {
     this.content.fill(0);
     this.umbraRenderMap?.generation.fill(0);
     this.content = projection.content;
+    this.lineEnding = editorLineEnding(projection.content.toString("utf8"));
     this.etag = projection.etag;
     this.metadata = metadata;
     this.umbraRenderMap = projection.renderMap;
@@ -282,7 +324,7 @@ class InexDocument implements vscode.CustomDocument {
     clearTimeout(request.timer);
     request.cancellation.dispose();
     try {
-      const changed = this.applyEdit(text);
+      const changed = this.applyEditorEdit(text);
       request.resolve();
       return changed;
     } catch (error: unknown) {
@@ -295,19 +337,34 @@ class InexDocument implements vscode.CustomDocument {
     this.requireUsable();
     void panel.webview.postMessage({
       type: "content",
-      content: this.content.toString("utf8"),
+      content: this.presentationText(),
       revision: this.revision,
       readOnly: this.isUmbraProjection,
     });
     if (this.pendingReveal !== undefined) {
-      void panel.webview.postMessage({ type: "reveal", ...this.pendingReveal });
+      void panel.webview.postMessage({
+        type: "reveal",
+        startByte: canonicalByteToPresentationByte(
+          this.content.toString("utf8"),
+          this.pendingReveal.startByte,
+        ),
+        endByte: canonicalByteToPresentationByte(
+          this.content.toString("utf8"),
+          this.pendingReveal.endByte,
+        ),
+      });
     }
   }
 
   public reveal(startByte: number, endByte: number): void {
     this.pendingReveal = { startByte, endByte };
     for (const panel of this.panels) {
-      void panel.webview.postMessage({ type: "reveal", startByte, endByte });
+      const canonical = this.content.toString("utf8");
+      void panel.webview.postMessage({
+        type: "reveal",
+        startByte: canonicalByteToPresentationByte(canonical, startByte),
+        endByte: canonicalByteToPresentationByte(canonical, endByte),
+      });
     }
   }
 
@@ -376,6 +433,10 @@ class InexDocument implements vscode.CustomDocument {
     for (const panel of this.panels) {
       this.send(panel);
     }
+  }
+
+  private presentationText(): string {
+    return toEditorPresentation(this.content.toString("utf8"));
   }
 
   private requireUsable(): void {
@@ -605,6 +666,10 @@ export class InexCustomEditorProvider
       if (!isRecord(message)) {
         return;
       }
+      if (message.type === "webviewError" && typeof message.message === "string") {
+        void vscode.window.showErrorMessage(`Inex editor rendering failed: ${message.message.slice(0, 256)}`);
+        return;
+      }
       if (
         message.type === "edit" &&
         typeof message.content === "string" &&
@@ -612,7 +677,7 @@ export class InexCustomEditorProvider
         this.previews.acceptEditEpoch(document, webviewPanel, message.editEpoch)
       ) {
         try {
-          if (document.applyEdit(message.content)) {
+          if (document.applyEditorEdit(message.content)) {
             this.controller.noteUserActivity(document.session);
             this.changeEmitter.fire({ document });
           }
@@ -653,9 +718,7 @@ export class InexCustomEditorProvider
         this.previews.acceptEditEpoch(document, webviewPanel, message.editEpoch)
       ) {
         try {
-          if (document.updateSelections(message.content, parseEditorSelections(message)!)) {
-            this.changeEmitter.fire({ document });
-          }
+          document.updateSelections(message.content, parseEditorSelections(message)!);
           this.controller.noteUserActivity(document.session);
           this.previews.refreshDocument(document);
         } catch (error: unknown) {
@@ -692,7 +755,7 @@ export class InexCustomEditorProvider
         this.previews.acceptEditEpoch(document, webviewPanel, message.editEpoch)
       ) {
         try {
-          if (document.applyEdit(message.content)) {
+          if (document.applyEditorEdit(message.content)) {
             this.controller.noteUserActivity(document.session);
             this.changeEmitter.fire({ document });
           }
@@ -702,7 +765,10 @@ export class InexCustomEditorProvider
             Number.isSafeInteger(message.offset) &&
             typeof message.offset === "number"
           ) {
-            void this.followLink(document, message.offset).catch((error: unknown) => {
+            void this.followLink(
+              document,
+              document.presentationUtf16ToCanonicalUtf16(message.offset),
+            ).catch((error: unknown) => {
               void vscode.window.showErrorMessage(safeError(error));
             });
           } else if (message.type === "showHeadings") {
@@ -1251,7 +1317,7 @@ export class InexCustomEditorProvider
     const snapshot = document.snapshot();
     try {
       const content = `${snapshot.content.toString("utf8")}\n<!-- inex integration dirty -->\n`;
-      if (document.applyEdit(content)) {
+      if (document.applyCanonicalEdit(content)) {
         this.controller.noteUserActivity(document.session);
         this.changeEmitter.fire({ document });
         document.refreshPanels();
@@ -1658,10 +1724,11 @@ function editorHtml(): string {
 <html lang="en"><head><meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}'; img-src blob:">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<style nonce="${nonce}">html,body{box-sizing:border-box;width:100%;height:100%;margin:0}body{display:grid;grid-template-rows:auto minmax(10rem,1fr) auto;background:var(--vscode-editor-background)}nav{display:flex;gap:.4rem;padding:.35rem .6rem;border-bottom:1px solid var(--vscode-panel-border)}button{color:var(--vscode-button-foreground);background:var(--vscode-button-background);border:0;padding:.25rem .6rem}textarea{box-sizing:border-box;width:100%;height:100%;resize:none;border:0;padding:1rem;color:var(--vscode-editor-foreground);background:var(--vscode-editor-background);font:var(--vscode-editor-font-size) var(--vscode-editor-font-family);outline:none}#previews{display:flex;gap:.75rem;overflow:auto;max-height:40vh;padding:.6rem;border-top:1px solid var(--vscode-panel-border)}#previews[hidden]{display:none}figure{flex:0 0 auto;max-width:min(32rem,80vw);margin:0}figure img{display:block;max-width:100%;max-height:32vh}figcaption{overflow:hidden;margin-top:.25rem;color:var(--vscode-descriptionForeground);text-overflow:ellipsis;white-space:nowrap}.blocked{color:var(--vscode-descriptionForeground)}</style>
-</head><body><nav><button id="headings" type="button">Headings</button><button id="backlinks" type="button">Backlinks</button><button id="addRange" type="button">Add range</button><button id="clearRanges" type="button">Clear ranges</button></nav><textarea id="editor" aria-label="Encrypted Markdown editor" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off"></textarea><section id="previews" aria-label="Validated encrypted image previews" hidden></section>
+<style nonce="${nonce}">html,body{box-sizing:border-box;width:100%;height:100%;margin:0}body{display:grid;grid-template-rows:auto minmax(10rem,1fr) auto;background:var(--vscode-editor-background)}nav{display:flex;gap:.4rem;padding:.35rem .6rem;border-bottom:1px solid var(--vscode-panel-border)}button{color:var(--vscode-button-foreground);background:var(--vscode-button-background);border:0;padding:.25rem .6rem}#editorShell{position:relative;overflow:hidden;background:var(--vscode-editor-background)}#highlight,#editor{box-sizing:border-box;width:100%;min-height:100%;margin:0;border:0;padding:1rem;font:var(--vscode-editor-font-size) var(--vscode-editor-font-family);line-height:1.5;tab-size:4;white-space:pre-wrap;overflow-wrap:break-word}#highlight{position:absolute;inset:0;pointer-events:none;color:var(--vscode-editor-foreground);overflow:hidden}textarea{position:absolute;inset:0;resize:none;color:transparent;background:transparent;caret-color:var(--vscode-editor-foreground);outline:none}textarea::selection{background:var(--vscode-editor-selectionBackground)}.md-heading{color:var(--vscode-symbolIcon-keywordForeground);font-weight:700}.md-marker{color:var(--vscode-descriptionForeground)}.md-link{color:var(--vscode-textLink-foreground);text-decoration:underline}.md-code{color:var(--vscode-terminal-ansiGreen)}.md-fence{color:var(--vscode-descriptionForeground)}.md-comment{color:var(--vscode-editorLineNumber-foreground);font-style:italic}.md-quote{color:var(--vscode-terminal-ansiYellow)}.md-strong{font-weight:700}.md-em{font-style:italic}#previews{display:flex;gap:.75rem;overflow:auto;max-height:40vh;padding:.6rem;border-top:1px solid var(--vscode-panel-border)}#previews[hidden]{display:none}figure{flex:0 0 auto;max-width:min(32rem,80vw);margin:0}figure img{display:block;max-width:100%;max-height:32vh}figcaption{overflow:hidden;margin-top:.25rem;color:var(--vscode-descriptionForeground);text-overflow:ellipsis;white-space:nowrap}.blocked{color:var(--vscode-descriptionForeground)}</style>
+</head><body><nav><button id="headings" type="button">Headings</button><button id="backlinks" type="button">Backlinks</button><button id="addRange" type="button">Add range</button><button id="clearRanges" type="button">Clear ranges</button></nav><main id="editorShell"><pre id="highlight" aria-hidden="true"></pre><textarea id="editor" aria-label="Encrypted Markdown editor" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off"></textarea></main><section id="previews" aria-label="Validated encrypted image previews" hidden></section>
 <script nonce="${nonce}">
 const vscode=acquireVsCodeApi();
+window.addEventListener('error',event=>vscode.postMessage({type:'webviewError',message:String(event.message||'unknown webview error')}));
 const editor=document.getElementById('editor');
 const previews=document.getElementById('previews');
 const encoder=new TextEncoder();
@@ -1716,6 +1783,10 @@ document.getElementById('clearRanges').addEventListener('click',()=>{extraSelect
 window.addEventListener('message',(event)=>{const message=event.data;if(!message||typeof message!=='object')return;if(message.type==='content'&&typeof message.content==='string'&&typeof message.readOnly==='boolean'){cancelEditTimer();applying=true;editor.value=message.content;editor.readOnly=message.readOnly;applying=false;}else if(message.type==='reveal'&&Number.isSafeInteger(message.startByte)&&Number.isSafeInteger(message.endByte)){const start=byteIndex(editor.value,message.startByte);const end=byteIndex(editor.value,message.endByte);editor.focus();editor.setSelectionRange(start,end);}else if(message.type==='snapshotRequest'&&Number.isSafeInteger(message.requestId)){cancelEditTimer();vscode.postMessage({type:'snapshot',requestId:message.requestId,content:editor.value,editEpoch});}else if(message.type==='previewReset'){acceptPreviewReset(message);}else if(message.type==='assetStart'){acceptAssetStart(message);}else if(message.type==='assetChunk'){acceptAssetChunk(message);}else if(message.type==='assetEnd'){acceptAssetEnd(message);}else if(message.type==='assetRejected'&&!previewSuspended&&message.editEpoch===editEpoch&&message.generation===previewGeneration&&typeof message.logicalPath==='string'){if(typeof message.transferId==='string')rejectTransfer(message.transferId,false);blocked(message.logicalPath);}});
 window.addEventListener('beforeunload',suspendPreviews);
 vscode.postMessage({type:'ready',editEpoch});
+</script>
+<script nonce="${nonce}">
+/* Display-only Markdown presentation. It never sends a message or owns content. */
+(()=>{const editor=document.getElementById('editor'),layer=document.getElementById('highlight'),newline=String.fromCharCode(10),grave=String.fromCharCode(96);if(editor===null||layer===null)return;const escape=value=>value.replace(/[&<>"']/g,character=>character==='&'?'&amp;':character==='<'?'&lt;':character==='>'?'&gt;':character==='"'?'&quot;':'&#39;');const heading=line=>{let index=0;while(index<line.length&&line[index]===' '&&index<3)index+=1;const start=index;while(index<line.length&&line[index]==='#'&&index-start<6)index+=1;if(index===start||line[index]!==' ')return undefined;return [line.slice(0,start),line.slice(start,index),line.slice(index),line.slice(index+1)]};const render=value=>{let fenced=false;return value.split(newline).map(line=>{const trimmed=line.trimStart();if(trimmed.startsWith(grave+grave+grave)||trimmed.startsWith('~~~')){fenced=!fenced;return '<span class="md-fence">'+escape(line)+'</span>'}if(fenced)return '<span class="md-code">'+escape(line)+'</span>';if(trimmed.startsWith('<!--'))return '<span class="md-comment">'+escape(line)+'</span>';const title=heading(line);if(title!==undefined)return escape(title[0])+'<span class="md-marker">'+escape(title[1])+'</span>'+escape(title[2])+'<span class="md-heading">'+escape(title[3])+'</span>';if(trimmed.startsWith('>'))return '<span class="md-quote">'+escape(line)+'</span>';return escape(line)}).join(newline)};const sync=()=>{layer.innerHTML=render(editor.value);layer.style.transform='translate('+-editor.scrollLeft+'px,'+-editor.scrollTop+'px)'};editor.addEventListener('input',sync);editor.addEventListener('scroll',sync);window.addEventListener('message',event=>{if(event.data&&event.data.type==='content')sync()});sync()})();
 </script>
 </body></html>`;
 }
