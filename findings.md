@@ -652,3 +652,4 @@
 
 - The ordinary Markdown-only search rebuild rejected every feature-2 envelope, so one Umbra document could make Outer search unavailable. Rendering the authenticated public Outer container before indexing restores expected Outer search without weakening the key boundary.
 - The renderer has no private key input and emits only deliberate Outer strategy output. Regression must test both private Markdown and private tag identifiers as canaries; a successful public search alone does not prove metadata isolation. Umbra-private search must not be folded into `search.query` without a separate `K_umbra`-bound index contract.
+- The `cdc0ef7` release set was independently rebuilt and installed after this daemon/core change. The installed `inexd` binary was compared directly with the binary inside the VSIX; an unchanged extension JavaScript bundle would not be adequate evidence for this backend-only behavior.

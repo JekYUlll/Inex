@@ -1460,6 +1460,7 @@
 
 - 重建 Outer in-memory index 不再因 feature-2 文档失败：普通文档仍按原路径读取；feature-2 仅从已认证的 Outer container 渲染 Drop/Cover/Placeholder，再进入 index，绝不解密 `K_umbra` payload。
 - 核心回归以 `OUTER_SEARCH_PRIVATE_CANARY` 和 private tag canary 建立私密 slot，要求 public canary 命中、两个私密 canary 均为空结果。daemon Umbra RPC lifecycle 进一步验证 `search.query` 命中 Outer text、而 Drop 私密词没有结果。`cargo fmt --check`、定向 core/daemon 测试与两个 crate 的 `-D warnings` Clippy 通过；VS Code Extension Host 与重新打包待下一检查点。
+- 已从独立 clean `cdc0ef7937fe81034ae8369c600cb75848fd435d` 重新构建、artifact/native-dependency 审计、package smoke 并覆盖安装 [当前 VSIX](/home/horeb/_code/Inex/target/release-artifacts/cdc0ef7-linux-x64/inex-vscode-0.1.0-linux-x64.vsix)。VSIX SHA-256：`e636ea12a019291696bd6c2125e197311bb8696b4c0a373b8825fc52c37a7ae9`；包内与已安装 `inexd` SHA-256 同为 `2b767156604dff81ef47061eb9f6d88f5c56d29531b060f09d9381997a79c88c`。
 
 ## 2026-07-16 — Outer-only Umbra export projection
 
