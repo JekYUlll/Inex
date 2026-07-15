@@ -1378,6 +1378,12 @@
 - 同一真实 CRLF Umbra projection 现在先完成单 range apply/edit/remove，再经 production selection mapper 送入两个不相邻的 presentation-byte selections。daemon 返回的 RenderMap 必须包含两个独立 slot；测试以其完整 canonical ranges 一次提交 remove，并逐字节确认原投影恢复。
 - sidecar trace 不仅检查 RPC 存在，还要求精确发生 convert、第一组 apply/edit/remove、第二组 apply/remove、lock 的单调顺序，且 apply/remove 各至少两次。验证：`pnpm --dir editors/vscode check`、63/63 Node tests 与真实 `pnpm --dir editors/vscode test:extension:local` 通过。
 
+## 2026-07-16 — Current VS Code Linux x64 installable package
+
+- 从独立 `--no-local` clean checkout、canonical origin `https://github.com/JekYUlll/Inex` 的 `d5f7a394aa97e2e3881216fc0f8b9cb5234fce64`，使用 `/usr/bin/gcc` 构建 CLI/daemon 与 VS Code bundle。ELF interpreter 为系统 `/lib64/ld-linux-x86-64.so.2`，未出现开发机 xlings RPATH/RUNPATH。
+- `scripts/package_release.py`、`audit_release_artifacts.py`、`audit_native_dependencies.py` 和 `smoke_release_artifacts.py --vscode-cli /usr/bin/code` 全部通过。可安装 VSIX：`target/release-artifacts/d5f7a39-linux-x64/inex-vscode-0.1.0-linux-x64.vsix`，SHA-256 `03a829a0d02b7d92dec02117a8d885fdbec9b1446e0c8b409541deb77e2f64ec`。
+- 这是 local construction / isolated-install evidence，不是签名发布、持久 profile 行为或多平台 GA 证明。
+
 ## 2026-07-16 — Outer-only Umbra export projection
 
 - `umbra_render::render_outer_projection` 现在只根据已认证的公开 Outer slot 策略替换 marker：Drop 输出空内容、Cover 输出明确公开的 cover text、Placeholder 输出固定无标识文本。它严格验证 marker/slot 一一对应和 Cover/Placeholder metadata，永不读取 private payload、kind、tag、slot ID 或 `K_umbra`。
