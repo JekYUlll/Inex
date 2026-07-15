@@ -1417,6 +1417,11 @@
 - 对发布 vault 继续执行 locked `inex verify`、`git fsck --full --strict`、`git status --porcelain=v1 --untracked-files=all`，并以完整有效 UTF-8 source Markdown line 作 fixed-string canary scan；全部通过且临时 source/vault/pkg root 已删除。首次 canary 用 48-byte 前缀截断 UTF-8，`rg` 拒绝该无效 pattern，因此未计为证据；改用完整 line 后重跑完整 gate。
 - 运行中发现 shell tool 的输出窗口可能在长导入仍执行时提前返回；曾出现三个临时 import process groups，均在发现后立即终止并删除对应临时 roots。最终证据只来自一个单独、轮询至 exit 0 的 clean run。
 
+## 2026-07-16 — Installed VS Code bundle identity check
+
+- VS Code extension version 保持 `0.1.0`，因此 `code --list-extensions` 不能区分旧/new bundle。直接比较 `/home/horeb/.vscode/extensions/horeb.inex-vscode-0.1.0/dist/extension.js` 与 `8dd7d70` VSIX 的 `extension/dist/extension.js`，两者 SHA-256 均为 `9cb3985a40d00f82667f13834ae06b891dcad2d6d1d68d2590c3b6d8e0325338`。
+- 因此本机 profile 确实持有审计通过的 Markdown-presentation bundle；运行中 Extension Host 仍需 Developer: Reload Window 才会替换内存中的旧代码。
+
 ## 2026-07-16 — Current VS Code Linux x64 installable package
 
 - 从独立 `--no-local` clean checkout、canonical origin `https://github.com/JekYUlll/Inex` 的 `d5f7a394aa97e2e3881216fc0f8b9cb5234fce64`，使用 `/usr/bin/gcc` 构建 CLI/daemon 与 VS Code bundle。ELF interpreter 为系统 `/lib64/ld-linux-x86-64.so.2`，未出现开发机 xlings RPATH/RUNPATH。
