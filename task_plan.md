@@ -83,6 +83,8 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
 - [x] 实现 Umbra encrypted catalog 临时读取：严格 schema、stable ID、canonical tags 和 profile/default 引用校验；只交给 live callback，不写 editor settings
 - [x] 将 encrypted defaults 接入 Neovim one-shot apply；不由 editor-local 设置提供默认 tag/profile 语义
 - [ ] 实现 Umbra 标签/profile 选择 UI；不得绕过 Outer/Umbra 隔离
+  - [x] Neovim live encrypted profile picker/apply commands（含一次性公开 cover text）
+  - [ ] Neovim custom kind/tag 多选 picker 与管理 UI
 - [ ] 使用 headless Neovim 回归验证，并对 swap、shada、undo、LSP 等宿主明文残留执行显式门控（当前 transport/Outer/Umbra lifecycle 已通过；完整 host-residue gate 仍未完成）
 - **Status:** in_progress（正式 goal；2026-07-15 已再次确认最后优先级：CLI/daemon 与 VS Code 为最高优先，Sublime 维持既定 experimental 范围后，才开始 Neovim；不得创建第二套协议/密码学实现）
 

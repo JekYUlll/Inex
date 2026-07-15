@@ -501,6 +501,69 @@ function M.apply_default_private_annotation(selections)
   end)
 end
 
+local function apply_profile_with_config(selections, config, profile_id)
+  local profile = nil
+  for _, candidate in ipairs(config.profiles) do
+    if candidate.id == profile_id then
+      profile = candidate
+      break
+    end
+  end
+  if not profile then
+    config = nil
+    vim.notify("Inex private annotation profile is unavailable", vim.log.levels.ERROR)
+    return
+  end
+  local spec = { kind = profile.kind, tagIds = profile.tagIds, outer = { mode = profile.outer } }
+  if profile.promptForCover then
+    vim.ui.input({ prompt = "Public cover text: " }, function(cover_text)
+      if type(cover_text) == "string" and #cover_text > 0 and #cover_text <= 4096 and not cover_text:find("%z") then
+        spec.outer.coverText = cover_text
+        M.apply_private_annotation(selections, spec)
+      elseif cover_text ~= nil then
+        vim.notify("Inex public cover text is invalid", vim.log.levels.ERROR)
+      end
+      cover_text, spec, config = nil, nil, nil
+    end)
+    return
+  end
+  M.apply_private_annotation(selections, spec)
+  spec, config = nil, nil
+end
+
+-- Profile names and tag IDs originate only in the live Umbra RPC response.
+-- They are retained by the picker callback for this one interaction and are
+-- never copied into Neovim options, globals, shada, or module state.
+function M.apply_private_annotation_profile(selections, profile_id)
+  if not valid_tag_id(profile_id) then
+    vim.notify("Inex private annotation profile ID is invalid", vim.log.levels.ERROR)
+    return
+  end
+  M.load_umbra_annotation_config(function(config)
+    apply_profile_with_config(selections, config, profile_id)
+  end)
+end
+
+function M.choose_private_annotation_profile(selections)
+  M.load_umbra_annotation_config(function(config)
+    if #config.profiles == 0 then
+      config = nil
+      vim.notify("No Inex private annotation profiles are configured", vim.log.levels.WARN)
+      return
+    end
+    vim.ui.select(config.profiles, {
+      prompt = "Inex private annotation profile",
+      format_item = function(profile) return profile.label end,
+    }, function(profile)
+      if profile then
+        apply_profile_with_config(selections, config, profile.id)
+      else
+        config = nil
+      end
+    end)
+  end)
+end
+
 local function parse_umbra_projection(logical_path, result)
   if not has_exact_keys(result, { contentBase64 = true, etag = true, metadata = true, renderMap = true, count = 4 })
     or type(result.etag) ~= "string" or not result.etag:match(ETAG_RE)

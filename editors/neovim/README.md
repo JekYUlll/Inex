@@ -56,8 +56,11 @@ Commands currently available:
   it, an in-block range uses the daemon edit route, and partial private overlap
   is rejected. It deliberately installs no hard-coded mapping; users may map
   the command normally. `:InexEditPrivateAnnotation startByte endByte` is the
-  equivalent explicit default-spec test surface. Tag/profile picker remains
-  the next Neovim MVP slice.
+  equivalent explicit default-spec test surface. `:InexChoosePrivateAnnotationProfile
+  startByte endByte` displays profiles only from the live encrypted Umbra
+  catalog; `:InexApplyPrivateAnnotationProfile startByte endByte profileId`
+  permits normal user mappings. Profile data is transient and is not cached in
+  Neovim settings or module state.
 - `:InexStop` terminates the local RPC process and drops pending callbacks.
 
 `InexOpen`, `InexNew`, and `InexMkdir` take Inex logical paths (for example,

@@ -1188,6 +1188,11 @@
 - 在 standalone clean clone（commit `ff41eb3`、canonical origin、无额外 worktree）中用 `/usr/bin/gcc` 显式重建 native pair，严格 package/audit 与 isolated VS Code install/bundled-runtime smoke 均通过。新 VSIX：`target/release-artifacts/ff41eb3-linux-x64/inex-vscode-0.1.0-linux-x64.vsix`，SHA-256 `fe3ff42f1944101e7901a9c204c4038776384d2d08ce084c5f39c36cbc9f434d`。
 - 从该 VSIX 解出其 bundled `inex`，对独立 `_blog` clone 再跑 exact package-binary repository import；307 encrypted Markdown/17 encrypted assets、candidate vault/Git object audits、source revalidation、whole-root publication与parentless Git root均通过。随后同一包内 CLI 的 locked verify（7/307/17）、fresh password search（0 match）、无 `.md`/`.png`/`.jpg` 明文文件名与 `git fsck --full --strict`均通过。
 
+## 2026-07-15 — Neovim encrypted annotation-profile picker
+
+- 新增 `:InexChoosePrivateAnnotationProfile startByte endByte` 与 `:InexApplyPrivateAnnotationProfile startByte endByte profileId`。两者只从 live `umbra.config.get` 的已验证响应读取 profile；picker 结束、取消或 cover prompt callback 完成后释放 config/spec/cover 临时引用，不写入 options、globals、shada 或 module cache。
+- cover profile 只在本次操作中通过 `vim.ui.input` 取得公开 cover text，再走现有 daemon-authenticated apply；非 cover profile 直接复用已验证 kind/tag IDs/outer。Neovim clean headless runtime load check 通过。自定义 kind/tag 多选 picker 与宿主 residue gate 仍未完成。
+
 ## 2026-07-15 — Neovim final-priority Lua transport skeleton
 
 - 新增 `editors/neovim` runtime plugin。Lua `rpc` 模块只启动 absolute regular `inexd`、使用 bounded Content-Length JSON-RPC framing、绑定 pending request callbacks，并在 stdout/protocol/process failure 时清理；插件提供 `:InexStart`、`:InexStatus`、`:InexStop`，`system.hello` 发送 frozen `client/clientVersion/protocolMajor` 参数。
