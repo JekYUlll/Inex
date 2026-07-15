@@ -85,6 +85,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
   - 2026-07-16: VS Code 现实际读取并传递 `inex.privateAnnotation.mergeAdjacentSelections`（默认 `false`）给三条 authenticated annotation mutation 路径；普通多选依旧各自成 slot，显式开启才让 daemon 合并相邻范围。TypeScript、73 unit 与 local Extension Host 回归通过。
   - 2026-07-16: `982363d` clean standalone-source Linux x64 release set 已完成 package/release-set audit，并覆盖安装本机 VS Code；VSIX SHA-256 为 `23d8b13b350638ad0e0eca65917bdea690c357bfa9c0acc6ca621bc790b8b0c5`。运行中的窗口仍需 reload。
   - 2026-07-16: `Ctrl+Alt+O` 现绑定 `inex.redactToOuter`：仅 clean active Umbra projection 可触发，先 `umbra.lock` 并 wipe private editor，再以同一 authenticated Outer session 打开 script-free public panel；不产生 plaintext TextDocument。TypeScript 与 73 unit 通过；本环境的 disposable Extension Host CLI 被 terminal supervisor 终止、留下 audit root，故不把该次 host run 计为成功，真实 persistent-profile 仍是门禁。
+  - 2026-07-16: `e6f5c85` clean standalone-source Linux x64 release set 已完成 package/release-set audit 并覆盖安装本机 VS Code；VSIX SHA-256 为 `891b50e90c740bb13e7ddb4a11c7d63266dd0a23eecc764880efa2ba5f7645b1`。该结构性审计不替代 quick-redact 的 host runtime/persistent-profile 门禁。
 - **Status:** complete
 
 ### Phase 5: Sublime 轻量客户端

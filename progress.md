@@ -1663,3 +1663,8 @@
 |---|---:|---|
 | `apply_patch` first matched stale prose context while updating the Umbra PRD. | 1 | Re-read the exact current paragraph and applied a narrow contextual patch. |
 | The disposable VS Code CLI/Extension Host process loses its parent terminal under this tool supervisor before a final exit result can be observed; its audit root is retained. | 1 | Tried normal, PTY, detached, and tmux launch paths; all were supervisor-terminated. Kept the automated assertion in source but do not treat this environment run as passing evidence. Persistent-profile/manual verification remains open. |
+
+## 2026-07-16 — Installed Quick Redact bundle
+
+- `e6f5c85` 的 detached clean standalone-source Linux x64 release set 已完成 package 和 release-set audit，source 记录为 `e6f5c858be54c5755ed6438de84d804e0c3883cf`、`dirtySourceTree: false`。VSIX：[inex-vscode-0.1.0-linux-x64.vsix](/home/horeb/_code/Inex/target/release-artifacts/e6f5c85-linux-x64/inex-vscode-0.1.0-linux-x64.vsix)，SHA-256：`891b50e90c740bb13e7ddb4a11c7d63266dd0a23eecc764880efa2ba5f7645b1`。
+- 已以 `code --install-extension --force` 覆盖安装；唯一诊断为宿主 Node `DEP0169` warning。该安装和 artifact audit 只证明结构/供应链输入，不能替代受 supervisor 限制的实际 Extension Host 通过证据；需 reload 后在持久窗口执行 `Ctrl+Alt+O` 验证。
