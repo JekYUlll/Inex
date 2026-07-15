@@ -2739,6 +2739,29 @@ mod tests {
             Some(1)
         );
         assert_ne!(annotated["result"]["etag"], base_etag);
+        let mut outer_search = response(
+            &mut service,
+            611,
+            "search.query",
+            json!({"session": session.as_str(), "query": "outer", "caseSensitive": true}),
+        );
+        assert_eq!(
+            outer_search["result"]["results"][0]["logicalPath"],
+            "private.md"
+        );
+        scrub_object(&mut outer_search);
+        let mut private_search = response(
+            &mut service,
+            612,
+            "search.query",
+            json!({"session": session.as_str(), "query": "private", "caseSensitive": true}),
+        );
+        assert!(
+            private_search["result"]["results"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+        );
+        scrub_object(&mut private_search);
         let mut annotated_etag = annotated["result"]["etag"]
             .as_str()
             .unwrap_or_default()

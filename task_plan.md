@@ -156,6 +156,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
     - [x] VS Code 已提供 `inex.lockUmbra`：成功锁定或 Umbra RPC outcome 不确定时均 wipe 当前私密 projection/preview，不影响已打开的 Outer 文档；真实 Extension Host 已覆盖 initialize→enable→lock→`umbra.status.unlocked=false`（本轮）
     - [x] VS Code 已提供 `inex.changeUmbraPassword`：只接受当前已解锁 Umbra session 的新密码/确认，daemon 通过 `umbra.password.change` 原子重包裹同一 `K_umbra`；不要求旧密码、不逐 slot 重加密，锁定后旧密码失败而新密码可重开（本轮）
     - [x] CLI 已提供 `inex umbra password change <vault> [--slot <outer-slot-uuid>]`：每次新进程显式解锁 Outer 与当前 Umbra 后通过同一 daemon RPC 改密；四次密码输入均不进入 argv/environment，真实子进程回归验证旧密码失效与新密码重开（本轮）
+    - [x] Outer `search.query` 对 feature-2 文档仅索引认证后的 public Outer projection：Drop/Cover/Placeholder 可见内容保持可搜，private Markdown/tag canary 不会进入 Outer index 或结果（本轮）；Umbra-private search 仍是独立未完成能力。
     - [x] VS Code 贡献式 keybinding 已补 `Ctrl+Alt+H` → `inex.choosePrivateAnnotation`；不处理原始键盘事件（`175d865`）
     - [x] `togglePrivateAnnotation` 现按 active RenderMap 分类：完整 private block 走确认解包，其他选区走 chooser；不以裸 slot ID 判定（本轮）
     - [x] VS Code 空选区可安全扩展到当前 Markdown paragraph（光标所在连续非空行），临时 plaintext snapshot 会立即清零；heading/multicursor 策略仍 deferred（`f34e0dc`）

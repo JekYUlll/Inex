@@ -2124,15 +2124,24 @@ impl Vault {
                 continue;
             }
             let logical_path = LogicalPath::parse_canonical(entry.logical_path())?;
-            let mut document = self.read(&logical_path)?;
-            let bytes = std::mem::take(&mut *document.plaintext);
-            let plaintext = match String::from_utf8(bytes) {
-                Ok(plaintext) => Zeroizing::new(plaintext),
-                Err(error) => {
-                    let mut bytes = error.into_bytes();
-                    bytes.zeroize();
-                    return Err(VaultError::SearchUtf8Invariant);
+            let mut document = self.read_kind(&logical_path, ExpectedEnvelopeKind::Committed)?;
+            let plaintext = if document.header.required_features.is_empty() {
+                let bytes = std::mem::take(&mut *document.plaintext);
+                match String::from_utf8(bytes) {
+                    Ok(plaintext) => Zeroizing::new(plaintext),
+                    Err(error) => {
+                        let mut bytes = error.into_bytes();
+                        bytes.zeroize();
+                        return Err(VaultError::SearchUtf8Invariant);
+                    }
                 }
+            } else if document.header.required_features.as_slice()
+                == [crate::features::UMBRA_PRIVATE_ANNOTATIONS_V1]
+            {
+                let outer = UmbraDocumentV1::from_json(document.plaintext.as_slice())?;
+                Zeroizing::new(render_outer_projection(&outer)?)
+            } else {
+                return Err(CryptoError::DocumentContextMismatch.into());
             };
             replacement.upsert(SearchDocument::new(logical_path, plaintext)?)?;
         }
@@ -3826,6 +3835,85 @@ mod tests {
             vault.convert_document_to_umbra_outer(&path, &upgraded.etag, 1_783_699_203_000),
             Err(VaultError::Crypto(CryptoError::DocumentContextMismatch))
         ));
+    }
+
+    #[test]
+    fn outer_search_indexes_only_authenticated_umbra_outer_projection() {
+        let directory = TestDirectory::new();
+        let mut vault = create_test_vault(&directory);
+        let path = logical("2026-07-outer-search.md");
+        vault
+            .initialize_umbra(b"outer search Umbra password")
+            .expect("initialize Umbra");
+        vault
+            .enable_umbra_private_annotations(test_policy())
+            .expect("enable feature two");
+        let created = vault
+            .create_umbra_outer_document(
+                &path,
+                &UmbraDocumentV1::new(
+                    "OUTER_SEARCH_PUBLIC_CANARY\nOUTER_SEARCH_PRIVATE_CANARY\n".to_owned(),
+                ),
+                1_783_699_201_000,
+            )
+            .expect("create Umbra document");
+        let projection = vault
+            .render_umbra_projection(&path)
+            .expect("render Umbra projection");
+        let private_start = projection
+            .markdown
+            .find("OUTER_SEARCH_PRIVATE_CANARY")
+            .expect("private canary selection");
+        vault
+            .apply_private_annotation(
+                &path,
+                &created.etag,
+                &projection.markdown,
+                &projection.render_map,
+                &[TextRange::new(
+                    private_start,
+                    private_start + "OUTER_SEARCH_PRIVATE_CANARY".len(),
+                )
+                .expect("private selection range")],
+                &PrivateAnnotationSpec {
+                    kind: crate::umbra_config::PrivateAnnotationKind::Comment,
+                    tag_ids: vec!["OUTER_SEARCH_SECRET_TAG".to_ascii_lowercase()],
+                    outer: OuterSlotStrategy {
+                        mode: crate::umbra_config::OuterMode::Drop,
+                        cover_text: None,
+                    },
+                },
+                false,
+                1_783_699_202_000,
+            )
+            .expect("apply private annotation");
+
+        assert_eq!(
+            vault
+                .rebuild_search_index()
+                .expect("Outer search index must render feature two outer projection"),
+            1
+        );
+        let public = SearchQuery::with_defaults(
+            Zeroizing::new("OUTER_SEARCH_PUBLIC_CANARY".to_owned()),
+            CaseSensitivity::Sensitive,
+        )
+        .expect("public query");
+        assert_eq!(vault.search(&public).expect("public Outer search").len(), 1);
+        for secret in ["OUTER_SEARCH_PRIVATE_CANARY", "outer_search_secret_tag"] {
+            let query = SearchQuery::with_defaults(
+                Zeroizing::new(secret.to_owned()),
+                CaseSensitivity::Sensitive,
+            )
+            .expect("private query");
+            assert!(
+                vault
+                    .search(&query)
+                    .expect("private search must be a valid empty result")
+                    .is_empty(),
+                "Outer search leaked {secret}",
+            );
+        }
     }
 
     #[test]

@@ -647,3 +647,8 @@
 - A CLI invocation does not inherit an editor's live `K_umbra`, so it cannot implement the no-old-password reset path. Its explicit command instead requires current Outer and Umbra credentials, then delegates only the rewrap to the same daemon RPC. The VS Code command remains the intended path for a user who forgot the old Umbra password but has not locked the existing session.
 - JSON-RPC optional fields must be omitted, not serialized as `null`: `vault.unlock` has strict optional UUID parsing. The CLI constructs `slotId` only when the user supplied `--slot`, preventing a silent protocol incompatibility.
 - Because the VS Code bundle embeds both CLI and daemon binaries, a CLI-only source change still requires release-set repackaging. The `499ac92` package was audited/smoke-tested and its embedded `inex`/`inexd` hashes were compared directly with the installed extension, not inferred from the unchanged TypeScript bundle hash.
+
+## 2026-07-16 Outer search feature-2 boundary
+
+- The ordinary Markdown-only search rebuild rejected every feature-2 envelope, so one Umbra document could make Outer search unavailable. Rendering the authenticated public Outer container before indexing restores expected Outer search without weakening the key boundary.
+- The renderer has no private key input and emits only deliberate Outer strategy output. Regression must test both private Markdown and private tag identifiers as canaries; a successful public search alone does not prove metadata isolation. Umbra-private search must not be folded into `search.query` without a separate `K_umbra`-bound index contract.

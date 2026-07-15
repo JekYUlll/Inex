@@ -175,6 +175,13 @@ only stable public classes such as `UMBRA_LOCKED`, `STALE_RENDER_MAP`,
 `PARTIAL_PRIVATE_SELECTION`, and `ANNOTATION_VALIDATION_FAILED`; user values
 and decrypted text are scrubbed.
 
+`search.query` in an Outer-only session indexes ordinary Markdown plus only the
+authenticated public Outer projection of feature-2 documents. It must render
+Drop/Cover/Placeholder from the Outer container without loading `K_umbra`; it
+must not index private Markdown, annotation kind, tag IDs, tag labels, private
+timestamps, links, or Umbra indexes. Umbra-private search remains a separate
+future RPC/index surface and cannot be enabled by changing this Outer method.
+
 ## Required test evidence
 
 - K_umbra/tag/config canaries are absent from the repository, Outer projection,

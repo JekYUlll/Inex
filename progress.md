@@ -1456,6 +1456,11 @@
 - 真实 CLI 子进程回归证明 stdout/stderr 不含四个输入密码，旧 Umbra password 在重包裹/锁定后失败，替换密码成功解锁。`cargo fmt --check`、定向真实进程测试和 CLI `-D warnings` Clippy 已通过。
 - 当前 Linux VSIX 已从独立 clean `499ac92870bd6398f5cbcb6e2dac050517f16032` 构建、审计、smoke 并覆盖安装：[inex-vscode-0.1.0-linux-x64.vsix](/home/horeb/_code/Inex/target/release-artifacts/499ac92-linux-x64/inex-vscode-0.1.0-linux-x64.vsix)，SHA-256 `dc56cc7ca3c3c58fdc05a5f1dc99e41e17b06a5cdd20d42f9de13de78cb10cba`。包内与实际安装的 `inex` SHA-256 同为 `6bc4d05331812c98e390bea2ae6a8397735c2d6ead3b553feb4f5be270b0fc2d`，`inexd` 同为 `2bfcfb0f71a4de3f66977fabf95719cdb661fe2fe159d592250fb4a36c019251`。
 
+## 2026-07-16 — Outer search supports Umbra public projections
+
+- 重建 Outer in-memory index 不再因 feature-2 文档失败：普通文档仍按原路径读取；feature-2 仅从已认证的 Outer container 渲染 Drop/Cover/Placeholder，再进入 index，绝不解密 `K_umbra` payload。
+- 核心回归以 `OUTER_SEARCH_PRIVATE_CANARY` 和 private tag canary 建立私密 slot，要求 public canary 命中、两个私密 canary 均为空结果。daemon Umbra RPC lifecycle 进一步验证 `search.query` 命中 Outer text、而 Drop 私密词没有结果。`cargo fmt --check`、定向 core/daemon 测试与两个 crate 的 `-D warnings` Clippy 通过；VS Code Extension Host 与重新打包待下一检查点。
+
 ## 2026-07-16 — Outer-only Umbra export projection
 
 - `umbra_render::render_outer_projection` 现在只根据已认证的公开 Outer slot 策略替换 marker：Drop 输出空内容、Cover 输出明确公开的 cover text、Placeholder 输出固定无标识文本。它严格验证 marker/slot 一一对应和 Cover/Placeholder metadata，永不读取 private payload、kind、tag、slot ID 或 `K_umbra`。
