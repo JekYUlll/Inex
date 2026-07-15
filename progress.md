@@ -1340,6 +1340,11 @@
 - 新增贡献式 `Inex: Lock Umbra` 命令与 activation event。它调用当前 authenticated sidecar 的 `umbra.status`/`umbra.lock`；无论 lock RPC 成功还是网络/进程故障导致结果未知，都会立即 wipe 所有已打开的 Umbra projection、RenderMap、selection 与相关 preview。普通 Outer document 不会被该命令关闭。
 - 这补齐了 Umbra v1 的“退出时清理 K_umbra 相关编辑器缓冲”客户端路径。验证：`pnpm --dir editors/vscode check`、63/63 Node tests、真实 `test:extension:local` 通过；专门的 Umbra projection lock Extension Host matrix 仍列为后续隔离验收工作，未把一般 feature-1 回归冒充该证据。
 
+## 2026-07-16 — Updated VS Code Umbra-lock package
+
+- 从独立、clean、canonical-origin checkout 的 `6f9847f3fab7adee4ae92cdb55e8d1a8d154c930` 以 system GCC 构建 Linux x64 release set；package/audit 与隔离 VS Code install smoke 全部通过。
+- 最新可安装 VSIX：`target/release-artifacts/6f9847f-linux-x64/inex-vscode-0.1.0-linux-x64.vsix`，SHA-256 为 `56025a5ce2d465f27395039333ee6e9f140d025c2ec64deb3fa8299e89a20f35`。它替代 `e593440` 包并包含 `Inex: Lock Umbra`；未自动安装到用户 profile。
+
 ## 2026-07-16 — Outer-only Umbra export projection
 
 - `umbra_render::render_outer_projection` 现在只根据已认证的公开 Outer slot 策略替换 marker：Drop 输出空内容、Cover 输出明确公开的 cover text、Placeholder 输出固定无标识文本。它严格验证 marker/slot 一一对应和 Cover/Placeholder metadata，永不读取 private payload、kind、tag、slot ID 或 `K_umbra`。
