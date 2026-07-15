@@ -646,3 +646,4 @@
 
 - A CLI invocation does not inherit an editor's live `K_umbra`, so it cannot implement the no-old-password reset path. Its explicit command instead requires current Outer and Umbra credentials, then delegates only the rewrap to the same daemon RPC. The VS Code command remains the intended path for a user who forgot the old Umbra password but has not locked the existing session.
 - JSON-RPC optional fields must be omitted, not serialized as `null`: `vault.unlock` has strict optional UUID parsing. The CLI constructs `slotId` only when the user supplied `--slot`, preventing a silent protocol incompatibility.
+- Because the VS Code bundle embeds both CLI and daemon binaries, a CLI-only source change still requires release-set repackaging. The `499ac92` package was audited/smoke-tested and its embedded `inex`/`inexd` hashes were compared directly with the installed extension, not inferred from the unchanged TypeScript bundle hash.

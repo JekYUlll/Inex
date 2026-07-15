@@ -1454,6 +1454,7 @@
 
 - 新增 `inex umbra password change <vault> [--slot <outer-slot-uuid>]`。fresh CLI process 依次读取 Outer、当前 Umbra、新 Umbra、确认密码，通过 `umbra.unlock` 与 `umbra.password.change` RPC 复用同一受认证实现；不接受 argv 或 environment password。
 - 真实 CLI 子进程回归证明 stdout/stderr 不含四个输入密码，旧 Umbra password 在重包裹/锁定后失败，替换密码成功解锁。`cargo fmt --check`、定向真实进程测试和 CLI `-D warnings` Clippy 已通过。
+- 当前 Linux VSIX 已从独立 clean `499ac92870bd6398f5cbcb6e2dac050517f16032` 构建、审计、smoke 并覆盖安装：[inex-vscode-0.1.0-linux-x64.vsix](/home/horeb/_code/Inex/target/release-artifacts/499ac92-linux-x64/inex-vscode-0.1.0-linux-x64.vsix)，SHA-256 `dc56cc7ca3c3c58fdc05a5f1dc99e41e17b06a5cdd20d42f9de13de78cb10cba`。包内与实际安装的 `inex` SHA-256 同为 `6bc4d05331812c98e390bea2ae6a8397735c2d6ead3b553feb4f5be270b0fc2d`，`inexd` 同为 `2bfcfb0f71a4de3f66977fabf95719cdb661fe2fe159d592250fb4a36c019251`。
 
 ## 2026-07-16 — Outer-only Umbra export projection
 
