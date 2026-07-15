@@ -1565,3 +1565,8 @@
 
 - `scripts/package_release.py` 的 strict `DOCUMENTATION_FILES` 已加入 `spec/vscode-revision-compare-v1.md`，使 VSIX 的 `docs/spec/` 包含已交付 Outer/Umbra compare 的 scope、锁定与明文边界。规范同时删除未实现的 working-copy compare 表述，准确限定 v1 为 fixed HEAD/first-parent。
 - 验证：release tooling 86/86 unittest 与 VS Code `tsc --noEmit` 通过。下一 packaging checkpoint 会从干净 source 重建并审计新文档清单。
+
+## 2026-07-16 — Installed documentation-complete VSIX
+
+- clean standalone source `4001f8a` package/audit/isolated-install smoke 已通过；VSIX 的 `docs/spec/` 现有 9 个文件，并由 ZIP inspection 确认包含 `vscode-revision-compare-v1.md`。本机 VS Code profile 已覆盖安装 [inex-vscode-0.1.0-linux-x64.vsix](/home/horeb/_code/Inex/target/release-artifacts/4001f8a-linux-x64/inex-vscode-0.1.0-linux-x64.vsix)。
+- VSIX SHA-256：`86463c3e9eae9b98eb7cd9ca859d5dc3fcba0d28cb9ad000096af5f6cd54e62e`。安装 CLI 再次仅出现宿主 Node `DEP0169` warning；安装命令成功。
