@@ -1183,6 +1183,11 @@
 - 以 `/home/horeb/_code/_blog` 的独立只读 clone、debug CLI 重跑完整导入：324 tracked source entries（307 Markdown、17 assets、Markdown 3,549,648 bytes、assets 46,643,446 bytes、最大 asset 25,074,521 bytes）全部成功；结果为 published vault、无 parent Git root `9aa15ca…`、307 密文 Markdown、17 密文 assets、candidate vault/Git object audit passed、source revalidated/preserved。
 - 随后由新 CLI process 执行 locked `verify`（7 dirs/307 docs/17 assets）、password-protected `search`（0 matches）和 `git fsck --full --strict`；目标没有 `.md`/`.png`/`.jpg` 明文文件名，非密文文件扫描未命中测试内容。该证据只覆盖当前修复源码 CLI；VSIX 必须在该 commit 打包并重跑同一门禁后才能交付用户安装。
 
+## 2026-07-15 — Fixed Linux x64 VSIX package and exact bundled CLI gate
+
+- 在 standalone clean clone（commit `ff41eb3`、canonical origin、无额外 worktree）中用 `/usr/bin/gcc` 显式重建 native pair，严格 package/audit 与 isolated VS Code install/bundled-runtime smoke 均通过。新 VSIX：`target/release-artifacts/ff41eb3-linux-x64/inex-vscode-0.1.0-linux-x64.vsix`，SHA-256 `fe3ff42f1944101e7901a9c204c4038776384d2d08ce084c5f39c36cbc9f434d`。
+- 从该 VSIX 解出其 bundled `inex`，对独立 `_blog` clone 再跑 exact package-binary repository import；307 encrypted Markdown/17 encrypted assets、candidate vault/Git object audits、source revalidation、whole-root publication与parentless Git root均通过。随后同一包内 CLI 的 locked verify（7/307/17）、fresh password search（0 match）、无 `.md`/`.png`/`.jpg` 明文文件名与 `git fsck --full --strict`均通过。
+
 ## 2026-07-15 — Neovim final-priority Lua transport skeleton
 
 - 新增 `editors/neovim` runtime plugin。Lua `rpc` 模块只启动 absolute regular `inexd`、使用 bounded Content-Length JSON-RPC framing、绑定 pending request callbacks，并在 stdout/protocol/process failure 时清理；插件提供 `:InexStart`、`:InexStatus`、`:InexStop`，`system.hello` 发送 frozen `client/clientVersion/protocolMajor` 参数。
