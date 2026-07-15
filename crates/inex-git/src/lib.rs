@@ -134,6 +134,18 @@ pub struct RecoveryStatus {
     pub retained_candidate_scratch_count: usize,
 }
 
+/// One fixed historical revision accepted by the read-only compare bridge.
+///
+/// This intentionally is not a string: editor clients cannot pass arbitrary
+/// revision expressions, object IDs, pathspecs, or Git arguments.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HistoricalRevision {
+    /// The current `HEAD` commit.
+    Head,
+    /// The unique first parent of the current `HEAD` commit.
+    HeadParent,
+}
+
 /// Read-only recovery classification for the v5 transaction prefix before
 /// the final candidate replaces the real Git index lock.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -334,6 +346,9 @@ pub enum GitError {
     /// The selected vault is not exactly the repository worktree root.
     #[error("the vault must be the top-level Git worktree")]
     NotRepositoryRoot,
+    /// The requested fixed historical revision or path is absent.
+    #[error("the requested encrypted revision is unavailable")]
+    HistoricalRevisionUnavailable,
     /// A bounded Git plumbing command failed.
     #[error("Git plumbing failed during {operation}")]
     GitCommandFailed {
@@ -463,6 +478,37 @@ impl fmt::Display for GitIoOperation {
             Self::CommunicateGit => "communicating with Git plumbing",
         })
     }
+}
+
+/// Read and authenticate one fixed historical encrypted Markdown revision.
+///
+/// The function owns all Git plumbing. It accepts only [`HistoricalRevision`]
+/// and a canonical [`LogicalPath`], maps that path to its ciphertext name, and
+/// never creates a plaintext filesystem object.
+///
+/// # Errors
+///
+/// Returns [`GitError`] when the repository, fixed revision, tree entry, or
+/// bounded Git object is unsafe or unavailable, or when the selected envelope
+/// cannot be authenticated by `vault` for the exact logical path.
+pub fn read_historical_document(
+    vault: &Vault,
+    revision: HistoricalRevision,
+    logical_path: &LogicalPath,
+) -> Result<DecryptedDocument, GitError> {
+    let git = Git::open(vault.root())?;
+    let commit = git.resolve_historical_revision(revision)?;
+    let physical = logical_path.to_ciphertext_relative_path();
+    let physical = physical
+        .to_str()
+        .ok_or(GitError::UnsupportedConflictEntry)?;
+    let entry = git
+        .tree_entry(&commit, physical)?
+        .ok_or(GitError::HistoricalRevisionUnavailable)?;
+    let ciphertext = git.read_object(&entry.oid)?;
+    vault
+        .authenticate_committed_envelope(logical_path, &ciphertext)
+        .map_err(GitError::from)
 }
 
 /// Install the locked-safe merge driver into one repository only.
@@ -2967,6 +3013,35 @@ impl Git {
         let oid = one_text_line(&output)?.to_owned();
         self.validate_oid(&oid)?;
         Ok(oid)
+    }
+
+    fn resolve_historical_revision(
+        &self,
+        revision: HistoricalRevision,
+    ) -> Result<String, GitError> {
+        let fixed = match revision {
+            HistoricalRevision::Head => "HEAD^{commit}",
+            HistoricalRevision::HeadParent => "HEAD^1^{commit}",
+        };
+        let output = self.run_os(
+            GitOperation::InspectHistory,
+            &[
+                OsString::from("rev-parse"),
+                OsString::from("--verify"),
+                OsString::from(fixed),
+            ],
+            None,
+            256,
+        );
+        match output {
+            Ok(output) => {
+                let oid = one_text_line(&output)?.to_owned();
+                self.validate_oid(&oid)?;
+                Ok(oid)
+            }
+            Err(GitError::GitCommandFailed { .. }) => Err(GitError::HistoricalRevisionUnavailable),
+            Err(error) => Err(error),
+        }
     }
 
     fn single_merge_head(&self) -> Result<String, GitError> {
@@ -10109,6 +10184,23 @@ mod tests {
 
     fn create_conflicted_repository() -> (TestDirectory, Vault) {
         create_conflicted_repository_with_format(GitObjectFormat::Sha1)
+    }
+
+    #[test]
+    fn historical_revision_reader_authenticates_only_fixed_head_roles() {
+        let (_directory, vault) = create_conflicted_repository();
+        let path = LogicalPath::parse_canonical("entry.md").expect("path is canonical");
+        let head = read_historical_document(&vault, HistoricalRevision::Head, &path)
+            .expect("read fixed HEAD revision");
+        assert_eq!(head.plaintext.as_slice(), b"ours\n");
+        let parent = read_historical_document(&vault, HistoricalRevision::HeadParent, &path)
+            .expect("read fixed HEAD parent revision");
+        assert_eq!(parent.plaintext.as_slice(), b"base\n");
+        let missing = LogicalPath::parse_canonical("missing.md").expect("path is canonical");
+        assert!(matches!(
+            read_historical_document(&vault, HistoricalRevision::Head, &missing),
+            Err(GitError::HistoricalRevisionUnavailable)
+        ));
     }
 
     fn create_conflicted_repository_with_format(

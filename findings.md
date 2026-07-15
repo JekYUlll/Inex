@@ -659,3 +659,8 @@
 - Outer search and Umbra search must never share an index: a shared index would retain decrypted projection text after Umbra lock or make private matches reachable through the ordinary command. `umbra.search.query` therefore owns a second zeroizing memory index and rejects locked sessions before either rebuild or query.
 - Every persisted-document mutation already invalidates the Outer index. Making that invalidation also clear the Umbra index ensures private projection results cannot survive a write that changes their byte ranges; `lock_umbra` independently clears it before dropping `K_umbra`.
 - The VS Code command uses the normal command contribution/keybinding model, not raw key handling. It invokes the normal independent Umbra unlock gate, keeps the query in the existing sensitive input path, and opens selected hits only through the CustomEditor so no private result becomes a plaintext VS Code TextDocument.
+
+## 2026-07-16 Historical Git compare boundary
+
+- A revision-compare API must not expose a `String` revision parameter. Even with shell-free spawning, arbitrary revision expressions expand the Git attack surface and make response provenance difficult to audit. The first bridge therefore exposes only a closed enum for `HEAD` and its first parent.
+- Reading a Git blob is not sufficient: a valid Git object can still be another vault, another epoch, or a ciphertext path substitution. The bridge maps the canonical logical path itself and sends every returned blob through `authenticate_committed_envelope`, which binds those cryptographic contexts without materializing a plaintext file.

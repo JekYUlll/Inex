@@ -1477,6 +1477,11 @@
 - 完成当前 VS Code SCM/diff 边界审计：现有行为正确地仅向 Source Control 暴露 `*.enc` binary diff；尚无历史 ciphertext blob 的受控 daemon reader。为避免把明文交给原生 diff/TextDocument，新增 `docs/spec/vscode-revision-compare-v1.md`，冻结 future RPC、Outer/Umbra 作用域、Git subprocess hardening、dirty refusal、webview-only display 与所需 residue evidence。
 - 此项是设计/验证边界的实质推进，尚未声称 compare UI 已交付；下一切片必须按该规格实现，并不得以命令行 `git show`、普通 VS Code diff URI 或临时明文文件替代。
 
+## 2026-07-16 — Restricted historical Git reader
+
+- `inex-git` 新增 `HistoricalRevision::{Head, HeadParent}` 与 `read_historical_document`。该公共 bridge 不接收任意 Git revision、OID、pathspec 或物理路径：它绑定 vault root、canonical logical Markdown path 和两种固定历史角色，读取树中 canonical `.md.enc` blob 后仍由 `Vault::authenticate_committed_envelope` 验证 vault/path/epoch/AAD。
+- 真实临时 Git 双提交回归证明 HEAD=`ours`、first parent=`base`；缺失历史路径返回固定 `HistoricalRevisionUnavailable`。`cargo fmt`、定向测试、`cargo clippy -p inex-git --all-targets -- -D warnings` 与 whitespace gate 通过。该 slice 尚未把 plaintext 交给 daemon/VS Code，下一步才接收严格 RPC 投影。
+
 ## 2026-07-16 — Outer-only Umbra export projection
 
 - `umbra_render::render_outer_projection` 现在只根据已认证的公开 Outer slot 策略替换 marker：Drop 输出空内容、Cover 输出明确公开的 cover text、Placeholder 输出固定无标识文本。它严格验证 marker/slot 一一对应和 Cover/Placeholder metadata，永不读取 private payload、kind、tag、slot ID 或 `K_umbra`。
