@@ -1406,6 +1406,11 @@
 - 授权输出的 `plain.md` 必须包含 canonical `:::inex-private` block、`kind: comment` metadata 与被 private slot 包裹的原始 `#`；这证明 Umbra export 没有意外降为 Outer/drop 投影。trace 同时要求 Outer 与 Umbra 两次 commit 已发生；finally 删除导出目录后保留既有 residue audit。
 - 验证：`pnpm --dir editors/vscode check`、65/65 Node tests 与真实 `pnpm --dir editors/vscode test:extension:local` 通过。
 
+## 2026-07-16 — VS Code plaintext-export user workflow documented
+
+- 用户指南现给出 `Inex: Export Plaintext Copy…` 的实际流程：vault 外 parent/new child、Outer-only 与 Umbra-inclusive 范围的内容差异、独立 Umbra unlock、modal risk confirmation 及 tag catalog/profile 不随文档导出。
+- 文档明确该能力是授权明文导出而非 preview/recovery，解释 staging→audit→no-replace publish，并提示 pre-confirmation cancellation 不写 plaintext、而包含已授权明文的失败 staging 需按 incident handling 处理。
+
 ## 2026-07-16 — Current VS Code Linux x64 installable package
 
 - 从独立 `--no-local` clean checkout、canonical origin `https://github.com/JekYUlll/Inex` 的 `d5f7a394aa97e2e3881216fc0f8b9cb5234fce64`，使用 `/usr/bin/gcc` 构建 CLI/daemon 与 VS Code bundle。ELF interpreter 为系统 `/lib64/ld-linux-x86-64.so.2`，未出现开发机 xlings RPATH/RUNPATH。

@@ -114,6 +114,35 @@ it; shortly before expiry the client warns, and expiry locks the session,
 clears owned models, closes sensitive UI, and replaces open editor webviews
 with a fixed locked page. Reopen a tab after unlocking again.
 
+### Exporting an authorized plaintext copy
+
+Use **Inex: Export Plaintext Copy…** only when deliberately creating an
+ordinary Markdown copy outside the vault is acceptable. It is an export, not a
+preview and not a password-recovery mechanism.
+
+1. Unlock the vault, run the command, and select an existing parent directory
+   outside the vault.
+2. Enter one new export-directory name. Existing destinations, vault-relative
+   destinations, separators, `.`/`..`, and control characters are rejected.
+3. Choose a scope:
+   - **Outer only** exports ordinary Markdown and assets. Umbra slots use only
+     their deliberate public Outer strategy; private Markdown, private tag IDs,
+     annotation kind, catalog, profiles, and Umbra search data are excluded.
+   - **Include Umbra private content** asks for the independent Umbra password
+     if needed, then exports canonical private annotation blocks containing the
+     private Markdown and selected tag IDs. Tag labels, the tag catalog, and
+     annotation profiles are not exported as a separate configuration file.
+4. Read the modal warning and choose **Export plaintext copy** only after
+   accepting that Git, backups, desktop indexing, synchronization, history,
+   and deletion residue can retain the resulting plaintext.
+
+The daemon first reserves a sibling staging directory, then performs the
+authenticated export and audit before one no-replace publication to the chosen
+new destination. Cancellation before the final confirmation writes no
+plaintext. A failed export can deliberately retain a staging directory for
+incident handling; do not treat it as safe to delete without first deciding
+whether its authorized plaintext must be recovered or securely handled.
+
 ### VS Code backup and recovery behavior
 
 For a dirty custom document, VS Code asks the Inex provider for a backup. Inex
