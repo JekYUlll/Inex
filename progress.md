@@ -1614,3 +1614,8 @@
 
 - clean standalone source `496e864` 使用 system GCC release binaries 完成 package、release-set audit 与 isolated VS Code install smoke；Linux x64 VSIX 已覆盖安装：[inex-vscode-0.1.0-linux-x64.vsix](/home/horeb/_code/Inex/target/release-artifacts/496e864-linux-x64/inex-vscode-0.1.0-linux-x64.vsix)。SHA-256：`c5ac2828454504fb03f67b8387fdcbcbf4e1ee465df7fdf62e43d9e2330ca425`。
 - `code --install-extension --force` 成功；唯一输出为宿主 Node 的 `DEP0169` 弃用警告。正在运行的 VS Code 窗口仍需要 `Developer: Reload Window` 才能载入新 bundle。
+
+## 2026-07-16 — Expanded display-only Markdown highlighting
+
+- Inex CustomEditor 的受控 overlay 新增 YAML front matter、task checkbox、删除线、autolink 与表格分隔符的主题化显示；原有 headings、links/images、code、emphasis、lists、quotes、rules 与 comments 保持不变。该层仍只读取 textarea 的现存字符串、输出 escaped `aria-hidden` spans，既不处理编辑内容，也不拥有 host-message、网络或文件能力。
+- VM regression 同时渲染上述 token 与 literal `<script>`，确认前者都得到相应 class、后者只作为 escaped text。`pnpm --dir editors/vscode check`、73/73 unit 和 local Extension Host gate 均通过。

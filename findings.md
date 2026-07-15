@@ -723,3 +723,8 @@
 
 - A tree context-menu command can preserve the same boundary as the editor command when it consumes the provider's session-bound `InexTreeNode`, rechecks that session against the controller, and passes only its canonical logical path to the existing authenticated public RPC. It must not derive a `file:` URI or synthesize a normal Markdown TextDocument.
 - The meaningful regression is not merely command registration: lock Umbra first, then invoke the tree path and require a new `umbra.document.openOuter` trace. That demonstrates the visible Drop/Cover/Placeholder viewer does not silently depend on residual `K_umbra` or a still-open Umbra document.
+
+## 2026-07-16 Expanded Markdown presentation without LSP
+
+- A controlled editor can improve common Markdown readability without registering a plaintext language document: front matter, task lists, strikethrough, autolinks and table separators are all line-local display transforms over the existing textarea value. They must remain non-authoritative; canonical parsing, navigation and persistence stay in the authenticated host/core paths.
+- The overlay still uses an HTML sink, so each new formatter must preserve the single escaped-span construction route. A VM test that includes both the new syntax and a literal script-shaped string is stronger evidence than class-name presence alone.

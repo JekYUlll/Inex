@@ -79,8 +79,9 @@ complete.
 4. Select a file to open the `Inex Markdown` custom editor. The real tab
    resource remains the `*.md.enc` file; decrypted text is not registered as a
    writable VS Code `TextDocument`. Its controlled display layer highlights
-   headings, links/images, inline/fenced code, emphasis, lists, quotes, rules,
-   and comments while the underlying editor remains the authenticated Inex
+   YAML front matter, headings, links/images/autolinks, inline/fenced code,
+   emphasis/strikethrough, lists/task items, tables, quotes, rules, and comments
+   while the underlying editor remains the authenticated Inex
    textarea.
 5. Edit and use the normal Save command. Save takes a fresh snapshot from the
    webview, performs an etag-conditional encrypted write, and reports a conflict

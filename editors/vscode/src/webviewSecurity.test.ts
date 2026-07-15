@@ -24,7 +24,7 @@ test("editor webview keeps the exact closed network/filesystem CSP", () => {
 
 test("Markdown presentation remains display-only while covering common Markdown tokens", () => {
   assert.ok(presentationRuntime, "Markdown presentation runtime was not found");
-  assert.match(presentationRuntime, /md-inline-code|md-link|md-list|md-rule/u);
+  assert.match(presentationRuntime, /md-inline-code|md-link|md-list|md-rule|md-frontmatter|md-task|md-strike|md-autolink|md-table/u);
   assert.doesNotMatch(
     presentationRuntime,
     /acquireVsCodeApi|postMessage|fetch|XMLHttpRequest|WebSocket|FileReader/u,
@@ -34,7 +34,7 @@ test("Markdown presentation remains display-only while covering common Markdown 
 test("Markdown presentation escapes content while rendering common tokens", () => {
   assert.ok(presentationRuntime, "Markdown presentation runtime was not found");
   const editor = fakeElement() as Record<string, unknown>;
-  editor.value = "# Title\n- **bold** and *em* with `code`\n[link](https://example.invalid)\n> quote\n---\n<script>alert(1)</script>\n";
+  editor.value = "---\ntitle: Private note\ntags:\n  - diary\n---\n# Title\n- [x] **bold** and *em* with `code` and ~~done~~\n[link](https://example.invalid) <https://example.invalid>\n| left | right |\n> quote\n---\n<script>alert(1)</script>\n";
   editor.scrollLeft = 0;
   editor.scrollTop = 0;
   const layer = fakeElement() as Record<string, unknown>;
@@ -48,7 +48,7 @@ test("Markdown presentation escapes content while rendering common tokens", () =
   if (typeof html !== "string") {
     throw new Error("Markdown presentation did not render text into its display layer");
   }
-  for (const token of ["md-heading", "md-list", "md-strong", "md-em", "md-inline-code", "md-link", "md-quote", "md-rule"]) {
+  for (const token of ["md-frontmatter", "md-yaml-key", "md-yaml-value", "md-heading", "md-list", "md-task", "md-strong", "md-em", "md-inline-code", "md-link", "md-autolink", "md-strike", "md-table", "md-quote", "md-rule"]) {
     assert.match(html, new RegExp(token, "u"));
   }
   assert.match(html, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/u);
