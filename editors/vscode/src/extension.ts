@@ -48,6 +48,7 @@ export interface InexIntegrationTestApi {
   readonly listTree: () => Promise<readonly import("./sidecar.ts").TreeEntry[]>;
   readonly failNextMutationClose: () => void;
   readonly exportOuterCopy: (destination: string) => Promise<void>;
+  readonly exportUmbraCopy: (destination: string) => Promise<void>;
   readonly verifyUmbraAnnotationLifecycle: (logicalPath: string, password: string) => Promise<void>;
   readonly verifyUmbraLock: (password: string) => Promise<void>;
   readonly lock: () => Promise<void>;
@@ -418,6 +419,17 @@ export function activate(
       await session.sidecar.commitPlaintextExport(prepared);
       if (!controller.isSessionCurrent(session)) {
         throw new Error("Inex vault session changed after integration plaintext export");
+      }
+    },
+    exportUmbraCopy: async (destination: string) => {
+      const session = controller.acquireSession();
+      const prepared = await session.sidecar.preparePlaintextExport(destination, "umbra");
+      if (!controller.isSessionCurrent(session)) {
+        throw new Error("Inex vault session changed during integration Umbra plaintext export");
+      }
+      await session.sidecar.commitPlaintextExport(prepared);
+      if (!controller.isSessionCurrent(session)) {
+        throw new Error("Inex vault session changed after integration Umbra plaintext export");
       }
     },
     verifyUmbraAnnotationLifecycle: async (logicalPath: string, password: string) => {

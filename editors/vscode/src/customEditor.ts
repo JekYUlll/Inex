@@ -1472,6 +1472,14 @@ export class InexCustomEditorProvider
       } finally {
         multiRemoved.content.fill(0);
       }
+      document.restoreSelection({ startByte: 0, endByte: 1 });
+      await this.applyPrivateAnnotationToActive(
+        { kind: "comment", tagIds: [], outer: { mode: "drop" } },
+        "reject",
+      );
+      if ((document.renderMap()?.privateSlots.length ?? 0) !== 1) {
+        throw new Error("Inex integration Umbra export fixture did not retain one private slot");
+      }
     } finally {
       before.content.fill(0);
     }

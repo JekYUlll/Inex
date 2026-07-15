@@ -1400,6 +1400,12 @@
 - 用户指南现在说明 Inex CustomEditor 的 richer display-only Markdown token 呈现及其边界：`*.md.enc` 真实资源不被注册为可写 plaintext `TextDocument`，因此不会承诺普通 Markdown LSP、第三方 TextDocument extension 或普通 preview。
 - 该限制是有意的安全设计，而不是遗漏 file-association：将解密文本虚拟注册为 Markdown document 以启动语言服务可让 VS Code/扩展索引、缓存、backup 或保留明文。后续若实现 Inex 内部语言服务，必须以独立的 in-memory/residue-lifecycle 证明交付。
 
+## 2026-07-16 — VS Code Umbra-inclusive plaintext-export regression
+
+- Extension Host integration fixture 在同一 authenticated Umbra session 中完成 convert/apply/edit/remove/multi-range remove 后保留一个 comment/drop private slot，再通过 production sidecar `vault.export.prepare`/`vault.export.commit` 以 `scope=umbra` 导出。
+- 授权输出的 `plain.md` 必须包含 canonical `:::inex-private` block、`kind: comment` metadata 与被 private slot 包裹的原始 `#`；这证明 Umbra export 没有意外降为 Outer/drop 投影。trace 同时要求 Outer 与 Umbra 两次 commit 已发生；finally 删除导出目录后保留既有 residue audit。
+- 验证：`pnpm --dir editors/vscode check`、65/65 Node tests 与真实 `pnpm --dir editors/vscode test:extension:local` 通过。
+
 ## 2026-07-16 — Current VS Code Linux x64 installable package
 
 - 从独立 `--no-local` clean checkout、canonical origin `https://github.com/JekYUlll/Inex` 的 `d5f7a394aa97e2e3881216fc0f8b9cb5234fce64`，使用 `/usr/bin/gcc` 构建 CLI/daemon 与 VS Code bundle。ELF interpreter 为系统 `/lib64/ld-linux-x86-64.so.2`，未出现开发机 xlings RPATH/RUNPATH。

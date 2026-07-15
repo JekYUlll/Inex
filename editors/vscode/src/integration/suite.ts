@@ -43,6 +43,7 @@ interface InexIntegrationTestApi {
   }[]>;
   readonly failNextMutationClose: () => void;
   readonly exportOuterCopy: (destination: string) => Promise<void>;
+  readonly exportUmbraCopy: (destination: string) => Promise<void>;
   readonly verifyUmbraAnnotationLifecycle: (logicalPath: string, password: string) => Promise<void>;
   readonly verifyUmbraLock: (password: string) => Promise<void>;
   readonly lock: () => Promise<void>;
@@ -117,6 +118,7 @@ async function runBackupRecoveryCycle(
   await api.unlock(fixture.vaultPath, fixture.password, fixture.sidecarPath);
   await api.openDocument(SECONDARY_LOGICAL_PATH);
   await api.verifyUmbraAnnotationLifecycle(SECONDARY_LOGICAL_PATH, fixture.password);
+  await runUmbraPlaintextExportCycle(api, fixture);
   await api.verifyUmbraLock(fixture.password);
   const umbraTrace = await waitForSidecarTrace(
     fixture,
@@ -244,6 +246,32 @@ async function runPlaintextExportCycle(
     await fs.rm(destination, { recursive: true, force: true });
   }
   await assert.rejects(fs.lstat(destination), "test plaintext export was retained for the residue scan");
+}
+
+async function runUmbraPlaintextExportCycle(
+  api: InexIntegrationTestApi,
+  fixture: FixtureEnvironment,
+): Promise<void> {
+  const destination = path.join(path.dirname(fixture.vaultPath), "authorized-umbra-plaintext-export");
+  await assert.rejects(fs.lstat(destination), "Umbra plaintext export destination unexpectedly exists");
+  try {
+    await api.exportUmbraCopy(destination);
+    const markdown = await fs.readFile(path.join(destination, SECONDARY_LOGICAL_PATH), "utf8");
+    assert.match(markdown, /:::inex-private\n/u, "Umbra export did not include the private annotation block");
+    assert.match(markdown, /kind: comment\n/u, "Umbra export did not include private annotation metadata");
+    assert.match(markdown, /---\n#\n:::/u, "Umbra export did not retain private Markdown content");
+    const trace = await waitForSidecarTrace(
+      fixture,
+      (entries) => entries.some((entry) => entry.method === "vault.export.prepare")
+        && entries.some((entry) => entry.method === "vault.export.commit"),
+      "VS Code Umbra plaintext export did not issue the prepare/commit transaction",
+    );
+    const commits = trace.filter((entry) => entry.method === "vault.export.commit");
+    assert.equal(commits.length >= 2, true, "VS Code did not commit both Outer and Umbra export transactions");
+  } finally {
+    await fs.rm(destination, { recursive: true, force: true });
+  }
+  await assert.rejects(fs.lstat(destination), "test Umbra plaintext export was retained for the residue scan");
 }
 
 async function runFeatureOneAssetLifecycle(
@@ -617,6 +645,7 @@ function assertIntegrationApi(value: unknown): asserts value is InexIntegrationT
     "listTree",
     "failNextMutationClose",
     "exportOuterCopy",
+    "exportUmbraCopy",
     "verifyUmbraAnnotationLifecycle",
     "verifyUmbraLock",
     "lock",

@@ -115,6 +115,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
       - [x] VS Code `Inex: Export Plaintext Copy…` 已通过 sidecar prepare/commit、folder picker、Umbra gate 与 modal warning 接线；不创建 plaintext TextDocument 或 SCM/Git copy（本轮）
       - [x] VS Code sidecar 已对 prepare/commit exact response、capability、scope 与计数回显作严格验证；61/61 unit tests 与真实 Extension Host 回归通过（本轮）
       - [x] 隔离 Extension Host 现真实调用 VS Code Outer export transaction，核验 Markdown/asset 输出与 prepare→commit trace 顺序，并在残留审计前删除授权测试副本（本轮）
+      - [x] 隔离 Extension Host 已在 live Umbra session 中创建 private slot 后执行 VS Code `scope=umbra` prepare→commit，确认导出包含 canonical private block、kind metadata 和私密 Markdown；导出目录在 residue audit 前删除（本轮）
       - [x] VS Code export destination UI 仅接受一个非 `.`/`..` 的无分隔符、无控制字符目录组件，不能绕过用户选择的 parent（62/62 unit + Extension Host 回归，本轮）
 
   - [x] 设计并实现 Umbra 私密标注系统（`docs/prd-umbra-mode.md`）；冻结独立 `K_umbra`、加密 catalog/profile、feature-2 container、atomic RenderMap mutation 与 Outer 隔离，MVP defer 项保持在规范中
