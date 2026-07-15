@@ -1171,6 +1171,12 @@
 - 在同一 standalone checkout 中执行 `smoke_release_artifacts.py`，传入系统 `/usr/bin/code`。脚本对当前 `739b9f0` Linux x64 candidate 的 portable archives、隔离 extensions directory 内 VSIX 安装、installed layout/executable modes 和 bundled CLI/daemon runtime probes 返回 `packageSmoke: passed`。
 - 这是当前精确 artifact 的本地 install/bundled-runtime evidence，补上 structure audit 不运行 executable 的边界；仍不覆盖持久 profile、Extension Host CRUD/recovery、pidfd lifecycle、签名、跨平台和独立可重复构建。
 
+## 2026-07-15 — Real repository-import gate failure reported by user
+
+- 用户以已安装 `739b9f0` Linux x64 VSIX 的 bundled CLI 对 `/home/horeb/_code/_blog`（324 tracked entries、307 Markdown、17 assets、最大 asset 25,074,521 bytes）执行真实导入。首次因 `.git/FETCH_HEAD`/`.git/gk/config` 在导入中变化而按设计 fail closed；停止自动 Git fetch 后第二次进入候选密文 Git 构建/审计并以 `GitCandidateFailed` 终止，最终 destination 未发布、staging retained。
+- 此问题暴露此前 artifact 门禁只覆盖 fixture、dry-run、package install/runtime smoke，未以真实规模仓库进行最终全流程验收。不得再把该 VSIX 表述为已验证的可用 repository-import demo。已在 Phase 7 新增“真实规模 Git 仓库副本全流程 import/reopen/residue”作为每个候选 VSIX 的硬门禁；当前优先复现并修复该 candidate audit failure。
+- 已从 `_blog` 创建只读隔离 clone，以已安装 VSIX 的 bundled CLI 复现同一 `TargetAuditFailed`，排除用户目录、口令和 VS Code 任务包装因素。候选的初始 raw-index audit 失败；失败后对保留候选执行 Git path list 的独立 parser 复核可通过，因此下一步必须捕获 audit 当时的 exact index bytes/control manifest，不能根据事后被 Git 读取可能更新的 index 推断原因。一次“目录分隔符排序”假设已被独立 Git 顺序对比否定并完全撤回，未进入产品代码。
+
 ## 2026-07-15 — Neovim final-priority Lua transport skeleton
 
 - 新增 `editors/neovim` runtime plugin。Lua `rpc` 模块只启动 absolute regular `inexd`、使用 bounded Content-Length JSON-RPC framing、绑定 pending request callbacks，并在 stdout/protocol/process failure 时清理；插件提供 `:InexStart`、`:InexStatus`、`:InexStop`，`system.hello` 发送 frozen `client/clientVersion/protocolMajor` 参数。
