@@ -718,3 +718,8 @@
 
 - Public feature-2 rendering must not be smuggled through the ordinary document API merely to make Outer strategies visible. A distinct daemon method can authenticate the container and render its public Drop/Cover/Placeholder output without accessing `K_umbra`; a distinct no-script VS Code panel then makes that output observable without turning it into an editable normal buffer.
 - The public response intentionally has no RenderMap. A RenderMap exposes opaque slot identities and exact private boundaries, which are not needed for a read-only Outer view and would violate the stated projection minimization boundary.
+
+## 2026-07-16 Tree-triggered Outer projection boundary
+
+- A tree context-menu command can preserve the same boundary as the editor command when it consumes the provider's session-bound `InexTreeNode`, rechecks that session against the controller, and passes only its canonical logical path to the existing authenticated public RPC. It must not derive a `file:` URI or synthesize a normal Markdown TextDocument.
+- The meaningful regression is not merely command registration: lock Umbra first, then invoke the tree path and require a new `umbra.document.openOuter` trace. That demonstrates the visible Drop/Cover/Placeholder viewer does not silently depend on residual `K_umbra` or a still-open Umbra document.

@@ -57,6 +57,7 @@ export interface InexIntegrationTestApi {
   readonly verifyOuterRevisionCompare: () => Promise<void>;
   readonly verifyUmbraRevisionCompare: () => Promise<void>;
   readonly verifyOuterProjection: () => Promise<void>;
+  readonly verifyOuterProjectionFromTree: (logicalPath: string) => Promise<void>;
   readonly createCrossEditorUmbraTag: () => Promise<void>;
   readonly createCrossEditorUmbraAnnotation: (logicalPath: string) => Promise<void>;
   readonly lock: () => Promise<void>;
@@ -386,12 +387,16 @@ export function activate(
         });
       });
     }),
-    vscode.commands.registerCommand("inex.openOuterProjection", async () => {
+    vscode.commands.registerCommand("inex.openOuterProjection", async (node?: unknown) => {
       await runUiAction(async () => {
         if (!(await ensureVaultUnlocked(controller))) return;
-        const target = editor.currentRevisionCompareTarget();
-        if (target === undefined || !target.umbra || !controller.isSessionCurrent(target.session)) {
-          throw new Error("Open a clean Umbra private projection before viewing its Outer projection");
+        const treeTarget = isTreeNode(node) && node.entry.kind === "file"
+          ? { logicalPath: node.entry.logicalPath, session: node.session }
+          : undefined;
+        const editorTarget = editor.currentRevisionCompareTarget();
+        const target = treeTarget ?? (editorTarget?.umbra === true ? editorTarget : undefined);
+        if (target === undefined || !controller.isSessionCurrent(target.session)) {
+          throw new Error("Choose an encrypted Markdown file in the Inex tree, or open a clean Umbra private projection before viewing its Outer projection");
         }
         const projection = await target.session.sidecar.openUmbraOuterProjection(target.logicalPath);
         if (!controller.isSessionCurrent(target.session)) {
@@ -646,6 +651,13 @@ export function activate(
     },
     verifyOuterProjection: async () => {
       await vscode.commands.executeCommand("inex.openOuterProjection");
+    },
+    verifyOuterProjectionFromTree: async (logicalPath: string) => {
+      const session = controller.acquireSession();
+      await vscode.commands.executeCommand("inex.openOuterProjection", {
+        entry: { kind: "file", logicalPath },
+        session,
+      } satisfies import("./tree.ts").InexTreeNode);
     },
     createCrossEditorUmbraTag: async () => {
       const session = controller.acquireSession();

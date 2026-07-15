@@ -1604,3 +1604,8 @@
 ## 2026-07-16 — Installed Outer Projection bundle
 
 - clean standalone source `cccb244` 使用 system GCC release binaries 完成 Linux x64 package/audit，VSIX 已覆盖安装：[inex-vscode-0.1.0-linux-x64.vsix](/home/horeb/_code/Inex/target/release-artifacts/cccb244-linux-x64/inex-vscode-0.1.0-linux-x64.vsix)。SHA-256：`2fdfa54e381e15d71b8fd5656744c6f9fd0d114df366cc0dba8ae06e098942cf`。VS Code CLI 的 `DEP0169` 为宿主 Node warning，安装成功。
+
+## 2026-07-16 — Outer-only Tree Projection entry point
+
+- `Inex: View Outer Projection` 现在也出现在 Inex Tree 的 encrypted Markdown 文件右键菜单。它只接受 tree provider 产生并仍属于 current vault session 的 file node，再以节点 logical path 调用既有 `umbra.document.openOuter`；不能借此打开目录、asset、普通 plaintext URI 或 Umbra projection。
+- Extension Host 回归将 tree command 安排在 `verifyUmbraLock` 之后：K_umbra 已清理、Umbra custom projections 已 wipe 时仍成功获得第二次 authenticated public RPC trace。TypeScript、73/73 unit 和 local Extension Host gate 均通过；panel 仍无 script/local resource、不可编辑，且 lock/dispose 时 zero-fill owned bytes。

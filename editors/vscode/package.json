@@ -271,6 +271,11 @@
           "command": "inex.delete",
           "when": "view == inex.vault && inex.vaultUnlocked && viewItem == inex.file",
           "group": "inex@2"
+        },
+        {
+          "command": "inex.openOuterProjection",
+          "when": "view == inex.vault && inex.vaultUnlocked && viewItem == inex.file",
+          "group": "inex@3"
         }
       ],
       "explorer/context": [

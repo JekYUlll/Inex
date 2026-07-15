@@ -50,6 +50,7 @@ interface InexIntegrationTestApi {
   readonly verifyOuterRevisionCompare: () => Promise<void>;
   readonly verifyUmbraRevisionCompare: () => Promise<void>;
   readonly verifyOuterProjection: () => Promise<void>;
+  readonly verifyOuterProjectionFromTree: (logicalPath: string) => Promise<void>;
   readonly createCrossEditorUmbraTag: () => Promise<void>;
   readonly createCrossEditorUmbraAnnotation: (logicalPath: string) => Promise<void>;
   readonly lock: () => Promise<void>;
@@ -129,7 +130,7 @@ async function runBackupRecoveryCycle(
   await waitForSidecarTrace(
     fixture,
     (entries) => entries.some((entry) => entry.method === "umbra.document.openOuter"),
-    "VS Code Outer projection did not reach the authenticated sidecar",
+    "VS Code active-editor Outer projection did not reach the authenticated sidecar",
   );
   await execFileAsync("git", ["-C", fixture.vaultPath, "add", "plain.md.enc"]);
   await execFileAsync("git", [
@@ -151,6 +152,12 @@ async function runBackupRecoveryCycle(
   const replacementUmbraPassword = "Inex integration replacement Umbra password";
   await api.verifyUmbraPasswordChange(fixture.password, replacementUmbraPassword);
   await api.verifyUmbraLock(replacementUmbraPassword);
+  await api.verifyOuterProjectionFromTree(SECONDARY_LOGICAL_PATH);
+  await waitForSidecarTrace(
+    fixture,
+    (entries) => entries.filter((entry) => entry.method === "umbra.document.openOuter").length >= 2,
+    "VS Code Outer-only tree projection did not reach the authenticated sidecar",
+  );
   await verifySublimeCatalogRead(
     fixture,
     replacementUmbraPassword,
@@ -699,6 +706,7 @@ function assertIntegrationApi(value: unknown): asserts value is InexIntegrationT
     "verifyOuterRevisionCompare",
     "verifyUmbraRevisionCompare",
     "verifyOuterProjection",
+    "verifyOuterProjectionFromTree",
     "createCrossEditorUmbraTag",
     "createCrossEditorUmbraAnnotation",
     "lock",

@@ -122,9 +122,11 @@ the first two resolve an empty selection without retaining content in settings.
 `inex.privateAnnotation.confirmBeforeUnwrap` defaults to `true` and governs
 both toggle unwrap and explicit removal. Multi-cursor adapters, heading-section
 expansion, cursor-inside metadata edit, shortcut `toggleBehavior`, and tag/profile
-management commands remain pending. `Inex: View Outer Projection` can open a
-script-free, read-only public rendering of an active clean Umbra document using
-only the Outer session; it applies Drop/Cover/Placeholder and never returns a
+management commands remain pending. `Inex: View Outer Projection` can open from
+an encrypted Markdown item's Inex Tree context menu (using only the unlocked
+Outer session), or from a clean active Umbra projection. It shows a
+script-free, read-only public rendering using only the Outer session; it
+applies Drop/Cover/Placeholder and never returns a
 RenderMap or private metadata. Outer projection editing and Umbra draft
 recovery are deliberately fail-closed until their dedicated authenticated save
 paths are implemented.
