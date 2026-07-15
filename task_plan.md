@@ -78,6 +78,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
   - 2026-07-16: `Inex: View Outer Projection` 已加入 Inex Tree 的 encrypted Markdown file context menu；命令只接受 current `InexTreeNode` session/path，Outer-only session 可直接查看 public Drop/Cover/Placeholder panel，不创建 TextDocument 或 Umbra projection。Extension Host 在 `K_umbra` lock 后从 tree node 再走一次 RPC；typecheck、73 unit 与 local host gate 通过。
   - 2026-07-16: `496e864` 已由 standalone clean-source system-GCC build package/audit/isolated-install smoke，并覆盖本机 VS Code；该 VSIX 包含 tree context-menu 的 Outer-only projection entry point。
   - 2026-07-16: display-only Markdown overlay 进一步覆盖 YAML front matter、task checkbox、strikethrough、autolink 与 table delimiter；仍仅读取 textarea、输出 escaped spans，没获得 host-message/network/file 权限。VM injection regression、73 unit 与 Extension Host gate 通过。
+  - 2026-07-16: `80403fe` standalone clean-source Linux x64 package 与 release-set audit 完成，VSIX 已覆盖本机 VS Code；isolated smoke 已执行并清理隔离根，但当前工具会在 VS Code CLI 子进程完成前返回，未把该次 smoke exit 文本作为额外发布证据。
   - 2026-07-16: 当前可安装 Linux x64 VSIX 已更新为 clean canonical-source `8dd7d70`，包含 richer display-only Markdown highlighting；package/audit/native-dependency/isolated-install smoke 通过并已覆盖本机 profile。运行中的窗口仍需 reload。
 - **Status:** complete
 

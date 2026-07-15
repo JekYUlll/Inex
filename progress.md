@@ -1619,3 +1619,8 @@
 
 - Inex CustomEditor 的受控 overlay 新增 YAML front matter、task checkbox、删除线、autolink 与表格分隔符的主题化显示；原有 headings、links/images、code、emphasis、lists、quotes、rules 与 comments 保持不变。该层仍只读取 textarea 的现存字符串、输出 escaped `aria-hidden` spans，既不处理编辑内容，也不拥有 host-message、网络或文件能力。
 - VM regression 同时渲染上述 token 与 literal `<script>`，确认前者都得到相应 class、后者只作为 escaped text。`pnpm --dir editors/vscode check`、73/73 unit 和 local Extension Host gate 均通过。
+
+## 2026-07-16 — Installed extended-highlighting bundle
+
+- clean standalone source `80403fe` 的 Linux x64 package 与 release-set audit 已完成，VSIX 已覆盖安装：[inex-vscode-0.1.0-linux-x64.vsix](/home/horeb/_code/Inex/target/release-artifacts/80403fe-linux-x64/inex-vscode-0.1.0-linux-x64.vsix)。SHA-256：`cbad14fbdc489c91b44ef1957e4caacd376c271499b6c7d7e21e3f0333621aef`。
+- isolated smoke 的 temporary root 已在 VS Code CLI 子进程结束后清理，但本环境的 command supervisor 没有返回该次子进程最终 stdout/exit 文本；因此该记录不把 smoke 当作新增强证据。显式 `code --install-extension --force` 成功，唯一输出为宿主 Node `DEP0169` warning；运行中的窗口仍需 reload。
