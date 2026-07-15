@@ -1575,3 +1575,8 @@
 
 - 受控 compare renderer 由共同 prefix/suffix 对齐升级为 deterministic patience-style anchors：每个 segment 只把两侧唯一的稳定行作为 anchor，取 parent positions 的 longest increasing sequence，并迭代处理 anchor 间区段；没有 anchor 的区段才走线性 paired fallback。因此两个相隔的修改之间的稳定 Markdown 行不再被错误高亮，同时不引入二次方 LCS 或外部 diff 进程。
 - 新 unit 覆盖 two separate edits 之间的 stable middle（两侧各恰好两行 change）；`tsc`、72/72 Node tests 与 real local Extension Host gate 通过。首次 typecheck 报告 discriminated union 的 `ChangedTask extends SegmentTask` 无效，已改为独立、同字段的 union member 后重跑通过。
+
+## 2026-07-16 — Installed multi-hunk comparison bundle
+
+- clean standalone source `63bd405` 的 Linux x64 package/audit/isolated-install smoke 已通过并覆盖安装。VSIX 为 [inex-vscode-0.1.0-linux-x64.vsix](/home/horeb/_code/Inex/target/release-artifacts/63bd405-linux-x64/inex-vscode-0.1.0-linux-x64.vsix)，SHA-256 为 `132b85b065d8f579f0523db41d02cbca611e9ac30adc387aedff6fc12c9741d4`。
+- 包内与已安装 `extension.js` 均为 `829a4a03fa7b7d66ac43c2608a89fa80ca6af73e29cc47062234942df1b0fd03`。VS Code CLI 的 `DEP0169` 是宿主 Node warning，安装成功。
