@@ -98,3 +98,13 @@ INEX_SIDECAR=/absolute/path/to/inexd \
   nvim --headless --clean --cmd 'set rtp^=/path/to/Inex/editors/neovim' \
   -l /path/to/Inex/editors/neovim/tests/headless_smoke.lua
 ```
+
+On Linux, run the real temporary-vault Outer/Umbra lifecycle regression with:
+
+```sh
+INEX_SIDECAR=/absolute/path/to/inexd \
+  /path/to/Inex/editors/neovim/tests/run_outer_lifecycle.sh
+```
+
+The runner derives the sibling `inex` CLI, creates a temporary encrypted vault,
+and deletes it on exit. It is a test helper, not an import or export command.
