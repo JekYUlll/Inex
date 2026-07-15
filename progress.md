@@ -1763,3 +1763,9 @@
 
 - 通过独立 tmux 完整执行真实 `/home/horeb/_code/_blog` 的 `import-repository --dry-run`，避免 terminal supervisor 截断。命令 exit 0：SHA-1 clean HEAD 的 324 tracked entries（307 Markdown、17 assets），Markdown 3,549,648 bytes、assets 46,643,446 bytes、最大附件 25,074,521 bytes。
 - 最终 `source-revalidated: yes`、`source-preserved: yes`、`import-writes: none`、`destination-created: no`，源仓库仍为 clean；目标 `/home/horeb/_code/inex-test/_blog-inex-real-dryrun` 保持 absent。该证据只证明读计划与 source immutability，不替代真实 import publication 或 VS Code persistent-profile folder-picker 门禁。
+
+## 2026-07-16 — Real maintained Markdown Git repository full import
+
+- 在全新 `/home/horeb/_code/inex-test/_blog-inex-real-import` 对同一 `_blog` source 完整运行 `import-repository`。独立 tmux 事务以 exit 0 完成：307 encrypted Markdown、17 encrypted assets，candidate vault audit 与 Git object audit 均通过，plaintext file objects 为 0。
+- publication 结果为 single atomic new Git root：`git-root-parent-count: 0`、无 tracked source plaintext files、`source-revalidated: yes`、`source-preserved: yes`、`recovery-required: none`。发布后 source 与 destination 都 clean，locked `inex verify` 报告 7 directories、307 documents、17 assets，且 root 顶层普通 `.md`/image 文件计数为 0。
+- 此项使用独立测试口令与用户源仓库的复制目录；它证明 CLI full import/atomic publication，仍不替代最终 VS Code persistent-profile folder-picker/manual UI 证据。
