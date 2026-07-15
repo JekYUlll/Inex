@@ -1449,5 +1449,10 @@ async function runUiAction(action: () => Promise<void>): Promise<void> {
     // leaves command execution (and a headless Extension Host) permanently
     // suspended whenever a user does not interact with the toast.
     void vscode.window.showErrorMessage(message);
+    // Do not hide a failed command from programmatic callers. In particular,
+    // the isolated Extension Host audit must be able to report the original
+    // authenticated-operation failure instead of timing out waiting for an
+    // expected sidecar trace entry.
+    throw error;
   }
 }

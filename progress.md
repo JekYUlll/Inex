@@ -1729,3 +1729,9 @@
 
 - clean detached canonical-source `f6c6803f6ce48ba1e61d67d637d1a32a0b29b1aa` 已重新 package。该提交不改变 Rust runtime，故复用已审计 system-GCC `inex`/`inexd`；VS Code/Sublime client 均从该 clean source 重建。native dependency audit、package release、release-set audit 与 isolated package smoke 全部通过。
 - VSIX：[inex-vscode-0.1.0-linux-x64.vsix](/home/horeb/_code/Inex/target/release-artifacts/f6c6803-linux-x64/inex-vscode-0.1.0-linux-x64.vsix)，SHA-256：`0ba8b870877e758414fd50172b631e748d02258484f59e6602449b2eae51a62d`。已 `code --install-extension --force` 覆盖安装并确认 `horeb.inex-vscode@0.1.0`；仅有宿主 Node `DEP0169` warning，需 reload 已运行窗口。
+
+## 2026-07-16 — VS Code historical-compare Host fixture hardening
+
+- `runUiAction` 现在在异步展示 VS Code error notification 后仍将原始失败回传给 command caller；这避免 headless Host 把实际 RPC 错误伪装成侧车 trace 超时，同时不再等待用户关闭 toast。
+- Umbra historical compare fixture 先通过正常 custom-editor save 持久化变更，并把 `vault.json`、`.inex/` 与 document envelope 一起提交；随后创建有效的第二个 feature-2 baseline commit。历史 Umbra compare 只接收 feature-2 两侧，拒绝 feature-1 parent 是既定安全契约。
+- 本轮完整 Host runner 因无参数 Outer compare 尚未获得 active custom tab 而明确失败；已为该分支加入 `tab.isActive` 前置断言，下一轮需重跑完整 Host/residue gate。`pnpm --dir editors/vscode check` 与 `test:extension:build` 已通过；尚未产生新安装包。

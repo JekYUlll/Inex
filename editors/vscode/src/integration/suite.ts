@@ -136,13 +136,35 @@ async function runBackupRecoveryCycle(
     (entries) => entries.some((entry) => entry.method === "umbra.document.openOuter"),
     "VS Code active-editor Outer projection did not reach the authenticated sidecar",
   );
-  await execFileAsync("git", ["-C", fixture.vaultPath, "add", "plain.md.enc"]);
+  // The annotation lifecycle intentionally leaves the custom document dirty.
+  // Persist it through VS Code before Git captures the ciphertext revision:
+  // staging an older envelope while the daemon owns newer session state makes
+  // a later authenticated historical comparison correctly reject the stale
+  // on-disk data.
+  await vscode.commands.executeCommand("workbench.action.files.save");
+  // An Umbra transition updates both the document envelope and vault-scoped
+  // encrypted/keyslot metadata. A historical revision must contain that whole
+  // authenticated state; committing only `plain.md.enc` deliberately creates
+  // an incoherent vault snapshot which the daemon must reject.
+  await execFileAsync("git", ["-C", fixture.vaultPath, "add", "--all"]);
   await execFileAsync("git", [
     "-C", fixture.vaultPath,
     "-c", "user.email=inex-vscode-integration@example.invalid",
     "-c", "user.name=Inex VS Code Integration",
     "-c", "commit.gpgSign=false",
     "commit", "-q", "-m", "encrypted Umbra revision compare fixture",
+  ]);
+  // `revision.compare.umbra` intentionally accepts feature-2 envelopes on
+  // both sides. The preceding commit upgrades the document from feature 1;
+  // create a second, valid Umbra revision for its HEAD/parent contract. The
+  // core suite separately covers a changed Umbra history; this Host check is
+  // concerned with the command's authenticated editor-to-sidecar route.
+  await execFileAsync("git", [
+    "-C", fixture.vaultPath,
+    "-c", "user.email=inex-vscode-integration@example.invalid",
+    "-c", "user.name=Inex VS Code Integration",
+    "-c", "commit.gpgSign=false",
+    "commit", "--allow-empty", "-q", "-m", "Umbra revision compare baseline",
   ]);
   await api.verifyUmbraRevisionCompare();
   await waitForSidecarTrace(
@@ -224,6 +246,10 @@ async function runBackupRecoveryCycle(
   await runCrudCycle(api, fixture);
   await api.openDocument(LOGICAL_PATH);
   const tab = await waitForCustomTab(fixture.vaultPath, LOGICAL_PATH);
+  await waitFor(
+    () => tab.isActive,
+    "The saved-worktree comparison fixture did not focus its Inex custom editor",
+  );
   assertNoPlaintextTextDocument(tab.input.uri, fixture.sourcePath);
   await api.verifyOuterRevisionCompare();
   await api.verifyOuterRevisionCompareFromScm(LOGICAL_PATH);
