@@ -1724,3 +1724,8 @@
 
 - 对完整 isolated Extension Host runner 的连续可诊断失败进行了逐项修复：cross-editor annotation 现在从 daemon RenderMap 的 ordinary Outer segment 选择，而非 partial private marker；Sublime helper 分别从 stdin 接受 Outer 与 Umbra 密码；其 private-slot range parser 不再将 `slotId` 误传给 exact range validator；catalog fixture 正确预期保留的旧 slot 加新 slot 共两个。
 - trace ordering assertion 也从硬编码 `apply[2]`/first lock 改为 tag/password-change 之后的对应 operation，消除 lifecycle 增长后的伪失败。手动 helper 在 retained feature-2 fixture 上已返回 `sublime-cross-editor-catalog-ok`；最新 full runner trace 已到 `vault.lock → system.shutdown`，正在执行其 profile residue cleanup，尚未把运行中状态记作通过。
+
+## 2026-07-16 — Installed cross-editor repair bundle
+
+- clean detached canonical-source `f6c6803f6ce48ba1e61d67d637d1a32a0b29b1aa` 已重新 package。该提交不改变 Rust runtime，故复用已审计 system-GCC `inex`/`inexd`；VS Code/Sublime client 均从该 clean source 重建。native dependency audit、package release、release-set audit 与 isolated package smoke 全部通过。
+- VSIX：[inex-vscode-0.1.0-linux-x64.vsix](/home/horeb/_code/Inex/target/release-artifacts/f6c6803-linux-x64/inex-vscode-0.1.0-linux-x64.vsix)，SHA-256：`0ba8b870877e758414fd50172b631e748d02258484f59e6602449b2eae51a62d`。已 `code --install-extension --force` 覆盖安装并确认 `horeb.inex-vscode@0.1.0`；仅有宿主 Node `DEP0169` warning，需 reload 已运行窗口。
