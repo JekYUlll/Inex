@@ -1350,6 +1350,11 @@
 - webview reveal 的 UTF-8 byte→UTF-16 映射现只接受精确 code-point 边界；负数、非整数、越界或落在多字节字符中间的 start/end 将 fail closed，不改变 textarea selection、focus 或 scroll。
 - 连续 Heading reveal runtime 回归新增 malformed range 场景；`pnpm --dir editors/vscode test`（63/63）与真实 `test:extension:local` 均通过。
 
+## 2026-07-16 — Updated VS Code reveal-boundary package
+
+- 从 clean detached canonical-origin release checkout 的 `acf714c89b8ff58dd50b1f749d17e383e6790212` 重新打包并完成 strict audit 与隔离 VS Code install smoke。
+- 最新可安装 VSIX：`target/release-artifacts/acf714c-linux-x64/inex-vscode-0.1.0-linux-x64.vsix`，SHA-256 为 `e71b6d1f3b703d2f031d3b9fd75e85a052116357d2858989d5fefcf0824ddaf7`。包含 `Inex: Lock Umbra` 和 webview reveal UTF-8 boundary 修复；未自动安装到用户 profile。
+
 ## 2026-07-16 — Outer-only Umbra export projection
 
 - `umbra_render::render_outer_projection` 现在只根据已认证的公开 Outer slot 策略替换 marker：Drop 输出空内容、Cover 输出明确公开的 cover text、Placeholder 输出固定无标识文本。它严格验证 marker/slot 一一对应和 Cover/Placeholder metadata，永不读取 private payload、kind、tag、slot ID 或 `K_umbra`。
