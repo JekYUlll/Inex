@@ -1703,3 +1703,9 @@
 - 新增独立 `revision.compare.workingTreeOuter`，避免扩宽历史 compare 的 revision 输入。daemon 只取得 authenticated session 与 canonical logical path；`inex-git::read_worktree_document` 拒绝 linked/external gitdir、无 HEAD、active merge/rebase/cherry-pick control state，并通过 Vault 的 bounded regular-file path 认证已保存 EDRY envelope。它不读取 CustomEditor textarea、不会运行 textconv/filter，也不写入 worktree/index/ref/config/temp 文件。
 - response 固定为 `workingTree`/`head` 两角色。两侧都经 Outer projection：feature-2 只渲染 Drop/Cover/Placeholder，不加载 `K_umbra`。VS Code 的新 command 可从 clean active editor 或 Source Control `*.md.enc` resource 启动，严格 parser 拒绝角色/字段替换，结果只进入 existing no-script local-resource-free Inex panel；lock/dispose 仍 zero-fill owned buffers。
 - 验证已通过：`cargo fmt`、`cargo test -p inex-git saved_worktree_reader_returns_only_persisted_ciphertext_and_rejects_active_merge -- --nocapture`、real daemon working/HEAD fixture、`pnpm --dir editors/vscode check`、75/75 VS Code unit tests 与 Extension Host bundle build。完整 disposable host run 与 release package 仍待，不以 build-only 代替。
+
+## 2026-07-16 — Installed saved-worktree comparison bundle
+
+- clean detached canonical-source `ed0541f9ab9e5593ef7e4f4dd61a5a593e61db53` 以 explicit system GCC Rust linker 重建 Linux x64 CLI/daemon；首次 package audit 正确拒绝 xlings ELF interpreter，重链后 interpreter 为 `/lib64/ld-linux-x86-64.so.2`。
+- native dependency audit、`package_release.py`、release-set artifact audit 以及 `smoke_release_artifacts.py --vscode-cli /usr/bin/code` 均通过。VSIX 位于 [inex-vscode-0.1.0-linux-x64.vsix](/home/horeb/_code/Inex/target/release-artifacts/ed0541f-linux-x64/inex-vscode-0.1.0-linux-x64.vsix)，SHA-256 为 `dd86a9b407dc9cbf1252ea887a6954d0970cb96a7b27926405544b3bfc28d728`。
+- 已执行 `code --install-extension --force` 并确认 `horeb.inex-vscode@0.1.0` 已安装。唯一输出为 VS Code host Node 的 `DEP0169` warning；运行中的 VS Code 窗口仍需 `Developer: Reload Window`。该 artifact/smoke 不替代前述受环境卡住的完整 Extension Host runtime gate。
