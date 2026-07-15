@@ -179,8 +179,14 @@ and decrypted text are scrubbed.
 authenticated public Outer projection of feature-2 documents. It must render
 Drop/Cover/Placeholder from the Outer container without loading `K_umbra`; it
 must not index private Markdown, annotation kind, tag IDs, tag labels, private
-timestamps, links, or Umbra indexes. Umbra-private search remains a separate
-future RPC/index surface and cannot be enabled by changing this Outer method.
+timestamps, links, or Umbra indexes.
+
+`umbra.search.query` is the separate private-search surface. It is available
+only after the independent Umbra password unlocks `K_umbra`; it indexes full
+Umbra projections only in a separate memory-only index. Locking Umbra and every
+document mutation clear that index before a later query can rebuild it. It must
+never change the Outer `search.query` result set or write an Umbra index to
+disk. It cannot be enabled by changing the Outer method.
 
 ## Required test evidence
 

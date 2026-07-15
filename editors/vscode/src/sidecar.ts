@@ -992,6 +992,19 @@ export class InexSidecar {
   }
 
   public async search(query: string, limit = 50): Promise<readonly SearchHit[]> {
+    return this.searchWithMethod("search.query", query, limit);
+  }
+
+  /** Search full Umbra projections while the independent Umbra session is unlocked. */
+  public async searchUmbra(query: string, limit = 50): Promise<readonly SearchHit[]> {
+    return this.searchWithMethod("umbra.search.query", query, limit);
+  }
+
+  private async searchWithMethod(
+    method: "search.query" | "umbra.search.query",
+    query: string,
+    limit: number,
+  ): Promise<readonly SearchHit[]> {
     if (
       Buffer.byteLength(query, "utf8") < 1 ||
       Buffer.byteLength(query, "utf8") > 4096 ||
@@ -1002,7 +1015,7 @@ export class InexSidecar {
       throw new RpcProtocolError("Search request exceeds the client limit");
     }
     const result = expectObject(
-      await this.callRaw("search.query", {
+      await this.callRaw(method, {
         ...this.protectedParams(),
         query,
         limit,

@@ -1459,8 +1459,13 @@
 ## 2026-07-16 — Outer search supports Umbra public projections
 
 - 重建 Outer in-memory index 不再因 feature-2 文档失败：普通文档仍按原路径读取；feature-2 仅从已认证的 Outer container 渲染 Drop/Cover/Placeholder，再进入 index，绝不解密 `K_umbra` payload。
-- 核心回归以 `OUTER_SEARCH_PRIVATE_CANARY` 和 private tag canary 建立私密 slot，要求 public canary 命中、两个私密 canary 均为空结果。daemon Umbra RPC lifecycle 进一步验证 `search.query` 命中 Outer text、而 Drop 私密词没有结果。`cargo fmt --check`、定向 core/daemon 测试与两个 crate 的 `-D warnings` Clippy 通过；VS Code Extension Host 与重新打包待下一检查点。
+- 核心回归以 `OUTER_SEARCH_PRIVATE_CANARY` 和 private tag canary 建立私密 slot，要求 public canary 命中、两个私密 canary 均为空结果。daemon Umbra RPC lifecycle 进一步验证 `search.query` 命中 Outer text、而 Drop 私密词没有结果。
 - 已从独立 clean `cdc0ef7937fe81034ae8369c600cb75848fd435d` 重新构建、artifact/native-dependency 审计、package smoke 并覆盖安装 [当前 VSIX](/home/horeb/_code/Inex/target/release-artifacts/cdc0ef7-linux-x64/inex-vscode-0.1.0-linux-x64.vsix)。VSIX SHA-256：`e636ea12a019291696bd6c2125e197311bb8696b4c0a373b8825fc52c37a7ae9`；包内与已安装 `inexd` SHA-256 同为 `2b767156604dff81ef47061eb9f6d88f5c56d29531b060f09d9381997a79c88c`。
+
+## 2026-07-16 — Umbra private search reaches VS Code
+
+- 新增独立 `umbra.search.query`，它只在 live `K_umbra` 会话中从完整 Umbra projection 构建 memory-only index；它不会改变 Outer `search.query`，不会落盘，且 Umbra lock 或任一文档 mutation 都清零。VS Code 新增 `Inex: Search Umbra Private Content`，以独立 Umbra password gate、masked query 和现有受控 CustomEditor reveal 展示结果。
+- 回归证明同一 private Markdown 与 tag canary 在 Outer 搜索中为空、在已解锁 Umbra 搜索中命中；Umbra lock 后 RPC 返回认证失败。`cargo fmt --check`、定向 core/daemon 测试、两个 crate `-D warnings` Clippy、VS Code typecheck 与 67/67 Node unit tests 已通过。Extension Host 与 Linux release repackage/install 将在本提交后的发布检查点执行。
 
 ## 2026-07-16 — Outer-only Umbra export projection
 

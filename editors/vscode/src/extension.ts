@@ -259,6 +259,62 @@ export function activate(
         }
       });
     }),
+    vscode.commands.registerCommand("inex.searchUmbra", async () => {
+      await runUiAction(async () => {
+        const ready = await ensureUmbraReady(controller);
+        if (ready === undefined) return;
+        const query = await showSensitiveInputBox(
+          {
+            ignoreFocusOut: true,
+            password: true,
+            prompt: "Private Umbra search query (hidden to avoid command/history persistence)",
+            title: "Search Umbra Private Content",
+            validateInput: (value) => {
+              const bytes = Buffer.byteLength(value, "utf8");
+              return bytes >= 1 && bytes <= 4096
+                ? undefined
+                : "Query must be 1–4096 UTF-8 bytes";
+            },
+          },
+          controller.onDidLock,
+        );
+        if (query === undefined) return;
+        if (!controller.isSessionCurrent(ready.session)) {
+          throw new Error("Inex vault session changed before Umbra search");
+        }
+        const hits = await ready.sidecar.searchUmbra(query);
+        if (!controller.isSessionCurrent(ready.session)) {
+          throw new Error("Inex vault session changed during Umbra search");
+        }
+        const selected = await showSensitiveQuickPick(
+          hits.map((hit) => ({
+            label: hit.logicalPath,
+            description: `${hit.line + 1}:${hit.utf16Column + 1}`,
+            detail: hit.snippet,
+            hit,
+          })),
+          { matchOnDescription: false, matchOnDetail: false, title: "Umbra Private Search Results" },
+          controller.onDidLock,
+        );
+        if (selected === undefined) return;
+        if (!controller.isSessionCurrent(ready.session)) {
+          throw new Error("Inex vault session changed before opening the Umbra search result");
+        }
+        await vscode.commands.executeCommand(
+          "vscode.openWith",
+          controller.ciphertextUri(selected.hit.logicalPath),
+          VIEW_TYPE,
+        );
+        if (!controller.isSessionCurrent(ready.session)) {
+          throw new Error("Inex vault session changed while opening the Umbra search result");
+        }
+        editor.reveal(
+          selected.hit.logicalPath,
+          selected.hit.startByte,
+          selected.hit.endByte,
+        );
+      });
+    }),
     vscode.commands.registerCommand("inex.exportPlaintextCopy", async () => {
       await runUiAction(async () => {
         if (!(await ensureVaultUnlocked(controller))) return;

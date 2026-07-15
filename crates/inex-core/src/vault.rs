@@ -314,6 +314,10 @@ pub struct Vault {
     search_index: MemorySearchIndex,
     search_index_ready: bool,
     search_fingerprint: Option<[u8; 32]>,
+    /// Private projections indexed only while `K_umbra` is live.
+    umbra_search_index: MemorySearchIndex,
+    umbra_search_index_ready: bool,
+    umbra_search_fingerprint: Option<[u8; 32]>,
     umbra: Option<UmbraSession>,
 }
 
@@ -348,6 +352,12 @@ impl fmt::Debug for Vault {
             .field("search_index", &self.search_index)
             .field("search_index_ready", &self.search_index_ready)
             .field("search_fingerprint", &self.search_fingerprint.is_some())
+            .field("umbra_search_index", &self.umbra_search_index)
+            .field("umbra_search_index_ready", &self.umbra_search_index_ready)
+            .field(
+                "umbra_search_fingerprint",
+                &self.umbra_search_fingerprint.is_some(),
+            )
             .field("umbra_unlocked", &self.umbra.is_some())
             .finish()
     }
@@ -563,6 +573,9 @@ impl Vault {
             search_index: MemorySearchIndex::new(),
             search_index_ready: false,
             search_fingerprint: None,
+            umbra_search_index: MemorySearchIndex::new(),
+            umbra_search_index_ready: false,
+            umbra_search_fingerprint: None,
             umbra: None,
         })
     }
@@ -683,6 +696,7 @@ impl Vault {
     /// Private projections/indexes are added with the document-container
     /// milestone; this state transition already clears their key authority.
     pub fn lock_umbra(&mut self) {
+        self.invalidate_umbra_search_index();
         self.umbra = None;
     }
 
@@ -2178,6 +2192,91 @@ impl Vault {
         Ok(self.search_index.search(query)?)
     }
 
+    /// Rebuild the private search index from fully unlocked Umbra projections.
+    ///
+    /// This index is memory-only, requires a live `K_umbra`, and is cleared on
+    /// every Umbra lock and document mutation. It intentionally has no disk
+    /// representation and is separate from the Outer search index.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError::UmbraLocked`] without `K_umbra`, or an error when
+    /// authenticated document reads, private-slot decryption, UTF-8 conversion,
+    /// or bounded index construction fails.
+    pub fn rebuild_umbra_search_index(&mut self) -> Result<usize, VaultError> {
+        if self.umbra.is_none() {
+            return Err(VaultError::UmbraLocked);
+        }
+        let guard = self.acquire_mutation_guard()?;
+        let tree = self.scan_tree()?;
+        let fingerprint = self.repository_fingerprint(&guard, &tree)?;
+        self.invalidate_umbra_search_index();
+        let mut replacement = MemorySearchIndex::new();
+        for entry in tree.entries() {
+            if entry.kind() != TreeEntryKind::File {
+                continue;
+            }
+            let logical_path = LogicalPath::parse_canonical(entry.logical_path())?;
+            let document = self.read_kind(&logical_path, ExpectedEnvelopeKind::Committed)?;
+            let plaintext = if document.header.required_features.is_empty() {
+                let mut bytes = document.plaintext;
+                match String::from_utf8(std::mem::take(&mut *bytes)) {
+                    Ok(plaintext) => Zeroizing::new(plaintext),
+                    Err(error) => {
+                        let mut bytes = error.into_bytes();
+                        bytes.zeroize();
+                        return Err(VaultError::SearchUtf8Invariant);
+                    }
+                }
+            } else if document.header.required_features.as_slice()
+                == [crate::features::UMBRA_PRIVATE_ANNOTATIONS_V1]
+            {
+                Zeroizing::new(self.render_umbra_projection(&logical_path)?.markdown)
+            } else {
+                return Err(CryptoError::DocumentContextMismatch.into());
+            };
+            replacement.upsert(SearchDocument::new(logical_path, plaintext)?)?;
+        }
+        let current_tree = self.scan_tree()?;
+        let current_fingerprint = self.repository_fingerprint(&guard, &current_tree)?;
+        if fingerprint != current_fingerprint {
+            return Err(VaultError::Conflict { current_etag: None });
+        }
+        let count = replacement.document_count();
+        self.umbra_search_index = replacement;
+        self.umbra_search_index_ready = true;
+        self.umbra_search_fingerprint = Some(fingerprint);
+        Ok(count)
+    }
+
+    /// Query the memory-only Umbra search index.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError::UmbraLocked`] when Umbra is locked,
+    /// [`VaultError::SearchIndexNotReady`] before a successful rebuild, or a
+    /// bounded query validation error.
+    pub fn search_umbra(
+        &mut self,
+        query: &SearchQuery,
+    ) -> Result<Zeroizing<Vec<SearchHit>>, VaultError> {
+        if self.umbra.is_none() {
+            return Err(VaultError::UmbraLocked);
+        }
+        let guard = self.acquire_mutation_guard()?;
+        if !self.umbra_search_index_ready {
+            return Err(VaultError::SearchIndexNotReady);
+        }
+        let tree = self.scan_tree()?;
+        let current_fingerprint = self.repository_fingerprint(&guard, &tree)?;
+        if self.umbra_search_fingerprint != Some(current_fingerprint) {
+            drop(guard);
+            self.invalidate_umbra_search_index();
+            return Err(VaultError::SearchIndexNotReady);
+        }
+        Ok(self.umbra_search_index.search(query)?)
+    }
+
     /// Clear and zeroize every indexed plaintext document.
     pub fn clear_search_index(&mut self) {
         self.invalidate_search_index();
@@ -2603,6 +2702,13 @@ impl Vault {
         self.search_index.clear();
         self.search_index_ready = false;
         self.search_fingerprint = None;
+        self.invalidate_umbra_search_index();
+    }
+
+    fn invalidate_umbra_search_index(&mut self) {
+        self.umbra_search_index.clear();
+        self.umbra_search_index_ready = false;
+        self.umbra_search_fingerprint = None;
     }
 
     fn repository_fingerprint(
@@ -3838,6 +3944,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn outer_search_indexes_only_authenticated_umbra_outer_projection() {
         let directory = TestDirectory::new();
         let mut vault = create_test_vault(&directory);
@@ -3914,6 +4021,37 @@ mod tests {
                 "Outer search leaked {secret}",
             );
         }
+        assert_eq!(
+            vault
+                .rebuild_umbra_search_index()
+                .expect("unlocked Umbra index"),
+            1
+        );
+        for private_term in ["OUTER_SEARCH_PRIVATE_CANARY", "outer_search_secret_tag"] {
+            let query = SearchQuery::with_defaults(
+                Zeroizing::new(private_term.to_owned()),
+                CaseSensitivity::Sensitive,
+            )
+            .expect("Umbra private query");
+            assert_eq!(
+                vault
+                    .search_umbra(&query)
+                    .expect("unlocked Umbra private search")
+                    .len(),
+                1,
+                "Umbra search must include {private_term}",
+            );
+        }
+        vault.lock_umbra();
+        let locked_query = SearchQuery::with_defaults(
+            Zeroizing::new("OUTER_SEARCH_PRIVATE_CANARY".to_owned()),
+            CaseSensitivity::Sensitive,
+        )
+        .expect("locked private query");
+        assert!(matches!(
+            vault.search_umbra(&locked_query),
+            Err(VaultError::UmbraLocked)
+        ));
     }
 
     #[test]

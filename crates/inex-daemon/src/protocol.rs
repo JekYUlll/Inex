@@ -82,11 +82,12 @@ pub enum Method {
     DraftEncrypt,
     DraftDecrypt,
     SearchQuery,
+    UmbraSearchQuery,
     CacheEvict,
 }
 
 impl Method {
-    const ALL: [Self; 45] = [
+    const ALL: [Self; 46] = [
         Self::SystemHello,
         Self::SystemPing,
         Self::SystemShutdown,
@@ -131,6 +132,7 @@ impl Method {
         Self::DraftEncrypt,
         Self::DraftDecrypt,
         Self::SearchQuery,
+        Self::UmbraSearchQuery,
         Self::CacheEvict,
     ];
 
@@ -182,6 +184,7 @@ impl Method {
             Self::DraftEncrypt => "draft.encrypt",
             Self::DraftDecrypt => "draft.decrypt",
             Self::SearchQuery => "search.query",
+            Self::UmbraSearchQuery => "umbra.search.query",
             Self::CacheEvict => "cache.evict",
         }
     }

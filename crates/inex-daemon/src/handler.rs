@@ -189,6 +189,7 @@ impl<C: MonotonicClock> RpcService<C> {
             Method::DraftEncrypt => self.draft_encrypt(params),
             Method::DraftDecrypt => self.draft_decrypt(params),
             Method::SearchQuery => self.search_query(params),
+            Method::UmbraSearchQuery => self.umbra_search_query(params),
             Method::CacheEvict => self.cache_evict(params),
         }
     }
@@ -1184,6 +1185,14 @@ impl<C: MonotonicClock> RpcService<C> {
     }
 
     fn search_query(&mut self, params: Params) -> RpcResult {
+        self.search_query_inner(params, false)
+    }
+
+    fn umbra_search_query(&mut self, params: Params) -> RpcResult {
+        self.search_query_inner(params, true)
+    }
+
+    fn search_query_inner(&mut self, params: Params, umbra: bool) -> RpcResult {
         let mut params = ParamObject::new(params);
         let session = required_session(&mut params)?;
         let query = params.required_sensitive_string("query", 1, MAX_SEARCH_QUERY_BYTES)?;
@@ -1228,15 +1237,28 @@ impl<C: MonotonicClock> RpcService<C> {
             .sessions
             .vault_mut(session.as_str())
             .map_err(map_session_error)?;
-        let hits = match vault.search(&query) {
+        let hits = match if umbra {
+            vault.search_umbra(&query)
+        } else {
+            vault.search(&query)
+        } {
             Ok(hits) => hits,
             Err(VaultError::SearchIndexNotReady) => {
-                vault
-                    .rebuild_search_index()
-                    .map_err(|error| map_vault_error(error, ErrorContext::Document))?;
-                vault
-                    .search(&query)
-                    .map_err(|error| map_vault_error(error, ErrorContext::Document))?
+                if umbra {
+                    vault
+                        .rebuild_umbra_search_index()
+                        .map_err(|error| map_vault_error(error, ErrorContext::Document))?;
+                    vault
+                        .search_umbra(&query)
+                        .map_err(|error| map_vault_error(error, ErrorContext::Document))?
+                } else {
+                    vault
+                        .rebuild_search_index()
+                        .map_err(|error| map_vault_error(error, ErrorContext::Document))?;
+                    vault
+                        .search(&query)
+                        .map_err(|error| map_vault_error(error, ErrorContext::Document))?
+                }
             }
             Err(error) => return Err(map_vault_error(error, ErrorContext::Document)),
         };
@@ -2762,6 +2784,17 @@ mod tests {
                 .is_some_and(Vec::is_empty)
         );
         scrub_object(&mut private_search);
+        let mut umbra_private_search = response(
+            &mut service,
+            613,
+            "umbra.search.query",
+            json!({"session": session.as_str(), "query": "private", "caseSensitive": true}),
+        );
+        assert_eq!(
+            umbra_private_search["result"]["results"][0]["logicalPath"],
+            "private.md"
+        );
+        scrub_object(&mut umbra_private_search);
         let mut annotated_etag = annotated["result"]["etag"]
             .as_str()
             .unwrap_or_default()
@@ -2869,6 +2902,17 @@ mod tests {
         );
         assert_eq!(locked["result"]["ok"], true);
         scrub_object(&mut locked);
+        let mut private_search_denied = response(
+            &mut service,
+            614,
+            "umbra.search.query",
+            json!({"session": session.as_str(), "query": "private"}),
+        );
+        assert_eq!(
+            private_search_denied["error"]["code"],
+            ErrorCode::AuthFailed.number()
+        );
+        scrub_object(&mut private_search_denied);
         let mut config_denied = response(
             &mut service,
             71,

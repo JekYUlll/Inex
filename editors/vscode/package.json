@@ -85,6 +85,11 @@
         "enablement": "inex.vaultUnlocked"
       },
       {
+        "command": "inex.searchUmbra",
+        "title": "Inex: Search Umbra Private Content",
+        "enablement": "inex.vaultUnlocked"
+      },
+      {
         "command": "inex.exportPlaintextCopy",
         "title": "Inex: Export Plaintext Copy…",
         "enablement": "inex.vaultUnlocked"
