@@ -44,8 +44,8 @@ use crate::umbra_keyslot::{
 };
 use crate::umbra_render::{
     OwnedRenderMap, RenderedUmbraProjection, SelectionClass, TextRange, UmbraRenderError,
-    map_plain_ranges_to_outer, normalize_and_classify_selections, render_umbra_projection,
-    validate_outer_marker_slots,
+    map_plain_ranges_to_outer, normalize_and_classify_selections, render_outer_projection,
+    render_umbra_projection, validate_outer_marker_slots,
 };
 use crate::vault_config::{
     ConfigError, ConfigWarning, KdfPolicy, MAX_VAULT_JSON_BYTES, VaultConfig,
@@ -945,6 +945,26 @@ impl Vault {
         }
         let outer = UmbraDocumentV1::from_json(document.plaintext.as_slice())?;
         Ok((document, outer))
+    }
+
+    /// Render one feature-2 document into its authenticated Outer-only
+    /// Markdown projection without requiring or loading `K_umbra`.
+    ///
+    /// This API intentionally omits every private slot payload, kind, tag and
+    /// slot identifier. It is suitable for an explicit Outer-only plaintext
+    /// export, but not for normal editor buffers (which use the separately
+    /// authenticated document/projection APIs).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the document is a canonical feature-2 Outer
+    /// container with a valid public marker/slot mapping.
+    pub fn render_umbra_outer_projection(
+        &self,
+        logical_path: &LogicalPath,
+    ) -> Result<Zeroizing<String>, VaultError> {
+        let (_, document) = self.read_umbra_outer_document(logical_path)?;
+        Ok(Zeroizing::new(render_outer_projection(&document)?))
     }
 
     /// Create and atomically commit one feature-2 Umbra Outer document.

@@ -100,6 +100,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
   - [ ] 设计并实现显式 Plaintext Export Mode：统一由已认证 `inexd` 执行，所有编辑器仅调用同一 RPC；默认关闭、无密码绕过、拒绝导出到 vault 内或已存在目标，使用 staging→审计→atomic publish，并把 plaintext-residue/备份/Git 风险作为不可消除的确认语义
     - [x] 冻结 v1 CLI/daemon/VS Code 共用的 prepare→显式确认→single-use commit 契约，以及 Outer-only/Umbra-inclusive 投影、staging 保留、receipt 和 no-plaintext-TextDocument 边界（`docs/spec/plaintext-export-v1.md`）
     - [x] 定义 Outer-only 与已解锁 Umbra-inclusive 两种导出范围、Markdown/附件导出一致性、私密标注投影规则与审计收据（`docs/spec/plaintext-export-v1.md`）
+    - [x] 实现仅 Outer 的 feature-2 Markdown projection：公开 drop/cover/placeholder 策略替换 marker，严格拒绝不一致 marker/slot/cover，且 API 不读取 `K_umbra` 或私密 payload（本轮）
     - [x] 核验通用 sibling-directory no-replace publisher：直接复用 `atomic_move_verified_directory_no_replace_checked`，它已提供身份重验/no-replace/fsync 且不依赖 `.vault-local`；export 不得调用 vault-specific import wrapper
     - [ ] CLI/VS Code 首先接入，Sublime/Neovim 仅复用 RPC 与同一确认语义
 

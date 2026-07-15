@@ -1291,3 +1291,8 @@
 - 将此前请求的管理员/加强模式导出明确冻结为高风险、用户显式授权的 Plaintext Export Mode，而非任何密码绕过。新增 `docs/spec/plaintext-export-v1.md`：daemon-only write、Outer/独立 Umbra scope、session-bound single-use prepare/commit capability、同级 staging 审计与 no-replace 原子发布、staging 保留、destination receipt 和 CLI/VS Code UX 边界均已定义。
 - 下一实现切片是 core transaction 与 daemon RPC；普通 VS Code SCM/textconv、`workspace.fs.copy` 或 plaintext `TextDocument` 均被明确排除，以免为了导出功能破坏日常编辑的无明文落盘边界。
 - 实现预审确认 vault-specific directory publisher 正确地绑定 `.vault-local` 与 import marker，不能用于明文 export staging；但其底层 `atomic_move_verified_directory_no_replace_checked` 已是所需的通用 no-replace/identity/fsync primitive。导出实现将直接使用它，避免重复或伪造 vault 恢复协议。
+
+## 2026-07-16 — Outer-only Umbra export projection
+
+- `umbra_render::render_outer_projection` 现在只根据已认证的公开 Outer slot 策略替换 marker：Drop 输出空内容、Cover 输出明确公开的 cover text、Placeholder 输出固定无标识文本。它严格验证 marker/slot 一一对应和 Cover/Placeholder metadata，永不读取 private payload、kind、tag、slot ID 或 `K_umbra`。
+- `Vault::render_umbra_outer_projection` 以 `Zeroizing<String>` 暴露该受限结果，作为后续 plaintext export staging 的唯一 feature-2 Outer 路径。`cargo fmt --check`、3 项 `umbra_render` 测试和 `cargo clippy -p inex-core --all-targets -- -D warnings` 已通过。

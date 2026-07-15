@@ -16,6 +16,10 @@ const MARKER_PREFIX: &str = "{{inex-private-slot:";
 const MARKER_SUFFIX: &str = "}}";
 const FENCE_START: &str = ":::inex-private\n";
 const FENCE_END: &str = ":::\n";
+/// Stable public replacement used by the Outer-only projection for a slot
+/// whose owner selected `placeholder`. It deliberately reveals neither slot
+/// ID nor annotation metadata.
+pub const OUTER_PRIVATE_PLACEHOLDER: &str = "[Inex private content omitted]";
 
 /// A validated byte range in an UTF-8 Umbra projection.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -157,6 +161,65 @@ pub fn render_umbra_projection(
         },
         markdown,
     })
+}
+
+/// Render the authenticated Outer-only Markdown projection of an Umbra
+/// container without decrypting private slot payloads.
+///
+/// The output contains only the ordinary Outer Markdown plus the deliberately
+/// public replacement specified for every private slot. In particular, it
+/// cannot expose a private annotation kind, tag ID, timestamp, slot ID, or
+/// encrypted payload. This is the only projection suitable for an Outer-only
+/// plaintext export.
+///
+/// # Errors
+///
+/// Returns an error when marker/slot mapping or public cover metadata is not
+/// canonical. No private key or private payload is required.
+pub fn render_outer_projection(document: &UmbraDocumentV1) -> Result<String, UmbraRenderError> {
+    let mut output = String::with_capacity(document.outer_markdown.len());
+    let mut cursor = 0;
+    let mut seen = BTreeSet::new();
+    while let Some(relative_start) = document.outer_markdown[cursor..].find(MARKER_PREFIX) {
+        let marker_start = cursor + relative_start;
+        output.push_str(&document.outer_markdown[cursor..marker_start]);
+        let id_start = marker_start + MARKER_PREFIX.len();
+        let relative_end = document.outer_markdown[id_start..]
+            .find(MARKER_SUFFIX)
+            .ok_or(UmbraRenderError::InvalidOuterMarker)?;
+        let id_end = id_start + relative_end;
+        let slot_id = &document.outer_markdown[id_start..id_end];
+        if !valid_slot_id(slot_id) || !seen.insert(slot_id.to_owned()) {
+            return Err(UmbraRenderError::InvalidOuterMarker);
+        }
+        let entry = document
+            .slots
+            .get(slot_id)
+            .ok_or(UmbraRenderError::MarkerSlotMismatch)?;
+        match entry.outer.mode {
+            OuterMode::Drop => {}
+            OuterMode::Cover => output.push_str(
+                entry
+                    .outer
+                    .cover_text
+                    .as_deref()
+                    .filter(|text| !text.is_empty())
+                    .ok_or(UmbraRenderError::InvalidOuterMarker)?,
+            ),
+            OuterMode::Placeholder => {
+                if entry.outer.cover_text.is_some() {
+                    return Err(UmbraRenderError::InvalidOuterMarker);
+                }
+                output.push_str(OUTER_PRIVATE_PLACEHOLDER);
+            }
+        }
+        cursor = id_end + MARKER_SUFFIX.len();
+    }
+    output.push_str(&document.outer_markdown[cursor..]);
+    if seen.len() != document.slots.len() {
+        return Err(UmbraRenderError::MarkerSlotMismatch);
+    }
+    Ok(output)
 }
 
 /// Map already-normalized plain projection ranges back to exact Outer
@@ -516,5 +579,53 @@ mod tests {
             ),
             Err(UmbraRenderError::StaleRenderMap)
         ));
+    }
+
+    #[test]
+    fn outer_projection_uses_only_public_slot_strategies() {
+        let mut document = UmbraDocumentV1::new(
+            "before {{inex-private-slot:p_01}} middle {{inex-private-slot:p_02}} after {{inex-private-slot:p_03}}\n".to_owned(),
+        );
+        let cipher = crate::umbra_document::UmbraSlotCipher {
+            alg: "xchacha20-poly1305".to_owned(),
+            nonce: crate::vault_config::EncodedBytes::new([0; 24]),
+            ciphertext: "AAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        };
+        document.slots.insert(
+            "p_01".to_owned(),
+            crate::umbra_document::OuterSlotEntry {
+                outer: crate::umbra_document::OuterSlotStrategy {
+                    mode: OuterMode::Drop,
+                    cover_text: None,
+                },
+                umbra_cipher: cipher.clone(),
+            },
+        );
+        document.slots.insert(
+            "p_02".to_owned(),
+            crate::umbra_document::OuterSlotEntry {
+                outer: crate::umbra_document::OuterSlotStrategy {
+                    mode: OuterMode::Cover,
+                    cover_text: Some("public cover".to_owned()),
+                },
+                umbra_cipher: cipher.clone(),
+            },
+        );
+        document.slots.insert(
+            "p_03".to_owned(),
+            crate::umbra_document::OuterSlotEntry {
+                outer: crate::umbra_document::OuterSlotStrategy {
+                    mode: OuterMode::Placeholder,
+                    cover_text: None,
+                },
+                umbra_cipher: cipher,
+            },
+        );
+        let rendered = render_outer_projection(&document).expect("outer render");
+        assert_eq!(
+            rendered,
+            format!("before  middle public cover after {OUTER_PRIVATE_PLACEHOLDER}\n")
+        );
+        assert!(!rendered.contains("p_01"));
     }
 }
