@@ -8,16 +8,17 @@
 
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::atomic::{
     AtomicDirectoryPublishError, AtomicDirectoryPublishOutcome, FilesystemDirectoryIdentity,
     atomic_move_verified_directory_no_replace_checked, filesystem_directory_identity,
-    path_is_supported_local_filesystem,
+    path_is_supported_local_filesystem, sync_directory,
 };
 
 /// Prefix reserved for a plaintext export staging directory. A failed export
@@ -67,6 +68,109 @@ pub struct PlaintextExportStaging {
     staging_identity: FilesystemDirectoryIdentity,
 }
 
+/// One audited plaintext file entry. The digest is intended for the
+/// destination-local receipt, never for logs or encrypted vault metadata.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlaintextExportEntry {
+    relative_path: PathBuf,
+    byte_len: u64,
+    sha256: [u8; 32],
+}
+
+/// Exact manifest accumulated while writing one staging tree.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PlaintextExportManifest {
+    entries: Vec<PlaintextExportEntry>,
+}
+
+impl PlaintextExportManifest {
+    /// Borrow the deterministic, caller-owned file entries.
+    #[must_use]
+    pub fn entries(&self) -> &[PlaintextExportEntry] {
+        &self.entries
+    }
+
+    /// Verify every recorded entry against its staged bytes and synchronize
+    /// every containing directory before publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a path is replaced, missing, oversized or differs
+    /// from its exact recorded digest.
+    pub fn audit(&self, staging: &Path) -> io::Result<()> {
+        for entry in &self.entries {
+            let path = staging.join(&entry.relative_path);
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink()
+                || !metadata.file_type().is_file()
+                || metadata.len() != entry.byte_len
+            {
+                return Err(io::Error::other("plaintext export staged file changed"));
+            }
+            let actual: [u8; 32] = Sha256::digest(fs::read(&path)?).into();
+            if actual != entry.sha256 {
+                return Err(io::Error::other("plaintext export staged digest changed"));
+            }
+            let parent = path
+                .parent()
+                .ok_or_else(|| io::Error::other("plaintext export staged path invalid"))?;
+            sync_directory(parent)?;
+        }
+        sync_directory(staging)
+    }
+}
+
+/// Create one file below a prepared staging root, with a create-new, synced
+/// write and a manifest entry. It accepts only portable relative components.
+///
+/// # Errors
+///
+/// Returns an error for an unsafe relative path/parent, an existing target or
+/// a failed restrictive write/synchronization. No manifest entry is appended
+/// unless the complete file write has been synchronized.
+pub fn write_plaintext_export_file(
+    staging: &Path,
+    relative_path: &Path,
+    bytes: &[u8],
+    manifest: &mut PlaintextExportManifest,
+) -> io::Result<()> {
+    if relative_path.as_os_str().is_empty()
+        || relative_path
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "plaintext export relative path invalid",
+        ));
+    }
+    let target = staging.join(relative_path);
+    let parent = target.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "plaintext export target parent missing",
+        )
+    })?;
+    fs::create_dir_all(parent)?;
+    let metadata = fs::symlink_metadata(parent)?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        return Err(io::Error::other("plaintext export parent unsafe"));
+    }
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    configure_restrictive_file_creation(&mut options);
+    let mut file = options.open(&target)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    restrict_file_permissions_best_effort(&file);
+    manifest.entries.push(PlaintextExportEntry {
+        relative_path: relative_path.to_path_buf(),
+        byte_len: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        sha256: Sha256::digest(bytes).into(),
+    });
+    Ok(())
+}
+
 impl fmt::Debug for PlaintextExportStaging {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -76,6 +180,24 @@ impl fmt::Debug for PlaintextExportStaging {
             .finish_non_exhaustive()
     }
 }
+
+#[cfg(unix)]
+fn configure_restrictive_file_creation(options: &mut fs::OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+    options.mode(0o600);
+}
+
+#[cfg(not(unix))]
+fn configure_restrictive_file_creation(_options: &mut fs::OpenOptions) {}
+
+#[cfg(unix)]
+fn restrict_file_permissions_best_effort(file: &fs::File) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
+}
+
+#[cfg(not(unix))]
+fn restrict_file_permissions_best_effort(_file: &fs::File) {}
 
 impl PlaintextExportStaging {
     /// Validate a new plaintext export destination and allocate an empty,
@@ -229,10 +351,11 @@ fn restrict_directory_permissions_best_effort(_path: &Path) {}
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        PlaintextExportDestinationError, PlaintextExportManifest, PlaintextExportStaging,
+        write_plaintext_export_file,
+    };
     use std::fs;
-    use std::io::Write;
-
-    use super::{PlaintextExportDestinationError, PlaintextExportStaging};
 
     struct TemporaryRoot(std::path::PathBuf);
 
@@ -267,20 +390,16 @@ mod tests {
         staging
             .revalidate()
             .unwrap_or_else(|error| panic!("revalidate: {error}"));
-        let mut file = fs::File::create(staging.staging().join("entry.md"))
-            .unwrap_or_else(|error| panic!("write fixture: {error}"));
-        file.write_all(b"intentional plaintext\n")
-            .unwrap_or_else(|error| panic!("write fixture bytes: {error}"));
-        file.sync_all()
-            .unwrap_or_else(|error| panic!("sync fixture: {error}"));
+        let mut manifest = PlaintextExportManifest::default();
+        write_plaintext_export_file(
+            staging.staging(),
+            std::path::Path::new("entry.md"),
+            b"intentional plaintext\n",
+            &mut manifest,
+        )
+        .unwrap_or_else(|error| panic!("write fixture: {error}"));
         staging
-            .publish(|current| {
-                if current.join("entry.md").is_file() {
-                    Ok(())
-                } else {
-                    Err(std::io::Error::other("missing audited export entry"))
-                }
-            })
+            .publish(|current| manifest.audit(current))
             .unwrap_or_else(|error| panic!("publish: {error}"));
         assert_eq!(
             fs::read(exports.join("copy/entry.md"))

@@ -603,3 +603,4 @@
 
 - Export staging cannot use an RAII delete-on-drop helper: after authenticated plaintext has been written, automatic cleanup risks deleting user-authorized output or hiding an incident. `PlaintextExportStaging` therefore deliberately retains the directory on every pre-publication failure while the generic no-replace move prevents replacing an existing final destination.
 - The generic mover alone does not audit export content. The caller-provided audit runs after the final identity/absence checks; the next export engine slice must write only create-new restrictive files, fsync and digest them, then make that manifest audit the publish callback.
+- The staged-file manifest now supplies that publish callback. It proves only the files recorded by the writer; the remaining Vault export engine must also make the expected logical tree exhaustive (including empty directories and assets) before treating the manifest as a complete destination audit.

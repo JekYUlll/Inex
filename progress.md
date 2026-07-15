@@ -1301,3 +1301,8 @@
 
 - 新增 `plaintext_export::PlaintextExportStaging`：导出只能指向 vault 外、已存在 parent 下的 absent child；它捕获 parent/staging directory identity、创建 `0700` 同级随机 staging root、发布前重验身份和最终 absent 状态，再调用 generic verified no-replace directory move。该结构没有 `Drop` cleanup，任何失败都保留可能已含用户授权明文的 staging，交给显式 incident handling。
 - 回归覆盖成功 staging→audit→publish，以及 vault 内/existing destination 拒绝。`cargo test -p inex-core plaintext_export` 与 pedantic core Clippy 通过。首次 Clippy 仅发现三个 public Result 文档段和一个 by-value error mapper；补齐 `# Errors`/借用 mapper 后重跑成功。
+
+## 2026-07-16 — Plaintext export staged-file manifest
+
+- `write_plaintext_export_file` 现在只接收 portable relative path，以 create-new、Unix `0600`、`sync_all` 写入 staging；`PlaintextExportManifest` 记录长度/SHA-256，publication audit 重新读取所有文件、拒绝 link/wrong-kind/长度或 digest 改变，并同步文件父目录和 staging root。成功 publish 回归改为真实 manifest audit。
+- 定向测试和 pedantic Clippy 均通过。第一次 Clippy 指出新 writer 缺少 `# Errors` 文档；补齐后重跑通过。
