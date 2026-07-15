@@ -1384,6 +1384,12 @@
 - 新 source-level isolation test 确认 presentation script 覆盖上述 token classes，且不含 `acquireVsCodeApi`、`postMessage`、`fetch`、`XMLHttpRequest`、`WebSocket` 或 `FileReader`。验证：`pnpm --dir editors/vscode check`、64/64 Node tests 与真实 `pnpm --dir editors/vscode test:extension:local` 通过。
 - 这不是将明文注册为普通 Markdown TextDocument 或 Markdown LSP；普通 Git/SCM 仍仅见密文 binary，LSP 架构与其残留证明仍是独立后续工作。
 
+## 2026-07-16 — VS Code Markdown-presentation package and installation
+
+- 从独立 clean canonical-origin checkout 的 `8dd7d70e6f4d931e01d4b9457f5ce566b35852d2` 使用显式 clone `--manifest-path`/`--target-dir` 与 `/usr/bin/gcc` 重建。首次 shell 链的 Cargo cwd 仍在主工作树，未生成可用 clone binary、未写入 package output；后续显式 clone target 重建成功，ELF interpreter 为 `/lib64/ld-linux-x86-64.so.2`。
+- `package_release.py`、`audit_release_artifacts.py`、`audit_native_dependencies.py` 与 isolated `smoke_release_artifacts.py` 均通过。当前可安装 VSIX：`target/release-artifacts/8dd7d70-linux-x64/inex-vscode-0.1.0-linux-x64.vsix`，SHA-256 `32e9cea1b65bbc268fd3dc333fa548147da0f5b618a49d07dc8f7d09426b7852`。
+- 已以 `/usr/bin/code --install-extension … --force` 覆盖当前 profile；扩展登记为 `horeb.inex-vscode@0.1.0`。因版本号不变，运行中的 VS Code window 需执行 Developer: Reload Window。
+
 ## 2026-07-16 — Current VS Code Linux x64 installable package
 
 - 从独立 `--no-local` clean checkout、canonical origin `https://github.com/JekYUlll/Inex` 的 `d5f7a394aa97e2e3881216fc0f8b9cb5234fce64`，使用 `/usr/bin/gcc` 构建 CLI/daemon 与 VS Code bundle。ELF interpreter 为系统 `/lib64/ld-linux-x86-64.so.2`，未出现开发机 xlings RPATH/RUNPATH。
