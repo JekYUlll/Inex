@@ -693,3 +693,8 @@
 
 - A usable secure compare view does not need VS Code's native diff editor. Once the daemon has returned its already bounded, authenticated fixed HEAD/parent bytes, a script-free Inex webview can render a deterministic linear line alignment. Common prefix/suffix rows are unchanged; only the unmatched middle ranges are highlighted. This avoids arbitrary revision controls, plaintext documents and quadratic LCS work.
 - The renderer is still a plaintext sink for the duration of the open Inex panel, so every line must be escaped and the existing panel lock/dispose buffer wipe remains mandatory. The added tests explicitly reject active script markup as output while retaining it as literal displayed Markdown text.
+
+## 2026-07-16 Multi-hunk revision alignment
+
+- A common-prefix/common-suffix-only presentation is safe but visually misleading for two independent edits: all stable lines between the first and last edit appear changed. A deterministic patience-style anchor pass improves this without granting a webview Git/script capability: only lines unique in both local segments are anchors, ordered by a longest-increasing sequence of Parent positions; unanchored regions retain a linear fallback rather than unbounded LCS work.
+- The alignment result remains view-only derived state. It does not alter the authenticated bytes, create a document URI, persist a diff cache, or relax the existing lock/dispose byte-buffer wipe path.

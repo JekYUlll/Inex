@@ -1570,3 +1570,8 @@
 
 - clean standalone source `4001f8a` package/audit/isolated-install smoke 已通过；VSIX 的 `docs/spec/` 现有 9 个文件，并由 ZIP inspection 确认包含 `vscode-revision-compare-v1.md`。本机 VS Code profile 已覆盖安装 [inex-vscode-0.1.0-linux-x64.vsix](/home/horeb/_code/Inex/target/release-artifacts/4001f8a-linux-x64/inex-vscode-0.1.0-linux-x64.vsix)。
 - VSIX SHA-256：`86463c3e9eae9b98eb7cd9ca859d5dc3fcba0d28cb9ad000096af5f6cd54e62e`。安装 CLI 再次仅出现宿主 Node `DEP0169` warning；安装命令成功。
+
+## 2026-07-16 — Multi-hunk controlled revision comparison
+
+- 受控 compare renderer 由共同 prefix/suffix 对齐升级为 deterministic patience-style anchors：每个 segment 只把两侧唯一的稳定行作为 anchor，取 parent positions 的 longest increasing sequence，并迭代处理 anchor 间区段；没有 anchor 的区段才走线性 paired fallback。因此两个相隔的修改之间的稳定 Markdown 行不再被错误高亮，同时不引入二次方 LCS 或外部 diff 进程。
+- 新 unit 覆盖 two separate edits 之间的 stable middle（两侧各恰好两行 change）；`tsc`、72/72 Node tests 与 real local Extension Host gate 通过。首次 typecheck 报告 discriminated union 的 `ChangedTask extends SegmentTask` 无效，已改为独立、同字段的 union member 后重跑通过。

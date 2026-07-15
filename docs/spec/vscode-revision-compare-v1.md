@@ -24,9 +24,10 @@ available only in a clean Umbra projection after independently unlocking
 Umbra. The authenticated daemon reads the exact Git blobs,
 authenticates/decrypts their envelopes for the active logical path, and returns
 bounded comparison projections. The extension renders them in an Inex-owned
-read-only webview. The view has a deterministic linear line alignment: shared
-prefix/suffix lines remain unmarked, while the intervening HEAD and Parent
-ranges are highlighted in their own panes. It must never put the selected
+read-only webview. The view has a deterministic patience-style line alignment:
+unique stable lines and shared edge ranges remain unmarked, while changed HEAD
+and Parent ranges are highlighted in their own panes. Its fallback is linear,
+so it does not run an unbounded quadratic LCS. It must never put the selected
 revision, object ID, logical path, or plaintext into a URI, window title,
 output channel, QuickPick detail cache, workspace state, or native VS Code
 diff editor.
