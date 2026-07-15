@@ -1542,3 +1542,14 @@
 - `write_plaintext_export_file` 现在只接收 portable relative path，以 create-new、Unix `0600`、`sync_all` 写入 staging；`PlaintextExportManifest` 记录长度/SHA-256，publication audit 重新读取所有文件、拒绝 link/wrong-kind/长度或 digest 改变，并同步文件父目录和 staging root。成功 publish 回归改为真实 manifest audit。
 - 定向测试和 pedantic Clippy 均通过。第一次 Clippy 指出新 writer 缺少 `# Errors` 文档；补齐后重跑通过。
 - staged writer 不再使用会跟随中间链接的 `create_dir_all`：现在逐级 create/`symlink_metadata` 验证每一父目录均为普通目录后才 create-new 文件。定向测试与 pedantic Clippy 重跑通过。
+
+## 2026-07-16 — Readable controlled revision comparison
+
+- 将 Inex owned compare panel 从两个纯文本栏升级为固定 HEAD/Parent 双栏的行级视图。实现仅作线性共同 prefix/suffix 对齐，避免大型 Markdown 的二次方 LCS 成本；中间变化块分别以 HEAD added 与 Parent removed 样式标识，单边新增/删除保留空白行对齐。
+- 该渲染器没有 script、网络、local resource、native diff URI 或 `TextDocument` 路径；所有 Markdown 内容在 HTML sink 前转义。新 unit regression 覆盖变化块、共享 suffix、单边行和 `<script>` 文本转义。`pnpm --dir editors/vscode check`、71/71 unit tests 与 local Extension Host gate 均成功。尚未把此代码称为最终 persistent-profile 视觉/残留发布证据。
+
+## Errors encountered
+
+| Error | Attempt | Resolution |
+|---|---:|---|
+| A diagnostic `rg` command used unescaped Markdown backticks, causing zsh to try to execute `inex.compareUmbraRevision` | 1 | No repository change or test was affected; subsequent searches avoid unescaped backticks. |

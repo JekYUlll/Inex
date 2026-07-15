@@ -17,6 +17,7 @@ import {
   type PrivateAnnotationPreferences,
 } from "./privateAnnotationPreferences.ts";
 import { validatePlaintextExportDirectoryName } from "./plaintextExport.ts";
+import { revisionCompareHtml } from "./revisionCompare.ts";
 import { formatSecurityStatus } from "./securityStatus.ts";
 import type { PrivateAnnotationSpec, UmbraAnnotationProfile } from "./sidecar.ts";
 import { showSensitiveInputBox, showSensitiveQuickPick } from "./sensitiveUi.ts";
@@ -1197,15 +1198,6 @@ function isProfileArguments(value: unknown): value is { readonly profileId: stri
   return value !== null && typeof value === "object" &&
     typeof (value as { readonly profileId?: unknown }).profileId === "string" &&
     /^[a-z0-9][a-z0-9._-]{0,63}$/.test((value as { readonly profileId: string }).profileId);
-}
-
-function revisionCompareHtml(head: Buffer, parent: Buffer): string {
-  const escape = (value: string): string => value.replace(/[&<>"']/gu, (character) => ({
-    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
-  })[character] ?? character);
-  const headText = escape(head.toString("utf8"));
-  const parentText = escape(parent.toString("utf8"));
-  return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'"><style>body{font-family:var(--vscode-editor-font-family);padding:1rem}section{width:49%;display:inline-block;vertical-align:top}pre{white-space:pre-wrap;overflow-wrap:anywhere;border:1px solid var(--vscode-panel-border);padding:.75rem}</style></head><body><section><h2>HEAD</h2><pre>${headText}</pre></section><section><h2>Parent</h2><pre>${parentText}</pre></section></body></html>`;
 }
 
 async function runUiAction(action: () => Promise<void>): Promise<void> {

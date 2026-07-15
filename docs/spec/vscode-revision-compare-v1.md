@@ -12,21 +12,24 @@ vault. It is a separate command, not an override of Git's SCM/diff behavior.
 
 ## User flow
 
-`Inex: Compare Encrypted Revision…` is available only while the Outer vault is
-unlocked. The command accepts exactly one active Inex Markdown custom editor
-and offers only public revision selectors initially:
+`Inex: Compare HEAD with Parent (Outer)` is available only while the Outer
+vault is unlocked. It accepts exactly one active, clean Inex Markdown custom
+editor and always uses the fixed public revision pair:
 
-1. `Working copy vs HEAD`
-2. `HEAD vs first parent` (disabled when HEAD has no parent)
+1. `HEAD`
+2. `HEAD`'s first parent (the command fails closed when no parent exists)
 
-Selecting a comparison asks the authenticated daemon to read the exact Git
-blob(s), authenticate/decrypt both envelopes for the active logical path, and
-return bounded comparison projections. The extension renders them in an
-Inex-owned read-only webview. The view displays only fixed labels (`Working
-copy`, `HEAD`, `Parent`) and line-oriented diff structure; it must never put
-the selected revision, object ID, logical path, or plaintext into a URI,
-window title, output channel, QuickPick detail cache, workspace state, or
-native VS Code diff editor.
+The explicit `Inex: Compare HEAD with Parent (Umbra Private)` command is
+available only in a clean Umbra projection after independently unlocking
+Umbra. The authenticated daemon reads the exact Git blobs,
+authenticates/decrypts their envelopes for the active logical path, and returns
+bounded comparison projections. The extension renders them in an Inex-owned
+read-only webview. The view has a deterministic linear line alignment: shared
+prefix/suffix lines remain unmarked, while the intervening HEAD and Parent
+ranges are highlighted in their own panes. It must never put the selected
+revision, object ID, logical path, or plaintext into a URI, window title,
+output channel, QuickPick detail cache, workspace state, or native VS Code
+diff editor.
 
 Closing the view, locking Outer, locking Umbra, switching vaults, daemon exit,
 or an RPC protocol failure replaces it with a script-free locked page and

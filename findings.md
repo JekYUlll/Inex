@@ -688,3 +688,8 @@
 ## 2026-07-16 Extension Host Umbra compare wiring
 
 - The host fixture may commit only the already encrypted feature-2 `plain.md.enc` output of the annotation lifecycle; committing or constructing a private plaintext body in the JavaScript runner would weaken the exact boundary being tested. The command trace then proves the UI reaches the independent Umbra RPC without exposing response content to the test harness.
+
+## 2026-07-16 Controlled compare rendering boundary
+
+- A usable secure compare view does not need VS Code's native diff editor. Once the daemon has returned its already bounded, authenticated fixed HEAD/parent bytes, a script-free Inex webview can render a deterministic linear line alignment. Common prefix/suffix rows are unchanged; only the unmatched middle ranges are highlighted. This avoids arbitrary revision controls, plaintext documents and quadratic LCS work.
+- The renderer is still a plaintext sink for the duration of the open Inex panel, so every line must be escaped and the existing panel lock/dispose buffer wipe remains mandatory. The added tests explicitly reject active script markup as output while retaining it as literal displayed Markdown text.

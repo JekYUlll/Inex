@@ -69,6 +69,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
   - 2026-07-16: real historical feature-2 Git fixture 已验证 Outer head projection 不含 private body/tag canary，`revision.compare.umbra` 未解锁返回 AUTH_FAILED，独立 Umbra unlock 后才包含二者。compare 专用 Extension Host 仍待完成。
   - 2026-07-16: isolated VS Code Extension Host compare regression 已新增：ciphertext vault 发布后 runner 创建 empty second Git commit，production `inex.compareOuterRevision` 必须触发 sidecar `revision.compare.outer`，并再次断言 active tab 不是 plaintext TextDocument；复用 residue audit。Umbra command Host fixture 仍待。
   - 2026-07-16: isolated Extension Host 现也驱动 production `inex.compareUmbraRevision`：annotation lifecycle 产生 feature-2 ciphertext 后只提交 `plain.md.enc`，等待 `revision.compare.umbra` trace；不在 runner 接触 private projection。daemon private-canary fixture继续是内容隔离的证据。
+  - 2026-07-16: Inex compare panel 已从两段无标识只读文本升级为 deterministic linear line comparison：共同前/后缀保持未标记，中间 HEAD/Parent range 分列绿色/红色显示；HTML 无脚本、无 local resource、无 native diff/TextDocument，输入转义与单侧新增均有单元回归。真实 Extension Host 全回归继续通过。
   - 2026-07-16: 当前可安装 Linux x64 VSIX 已更新为 clean canonical-source `8dd7d70`，包含 richer display-only Markdown highlighting；package/audit/native-dependency/isolated-install smoke 通过并已覆盖本机 profile。运行中的窗口仍需 reload。
 - **Status:** complete
 
