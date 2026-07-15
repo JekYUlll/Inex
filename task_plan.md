@@ -156,8 +156,8 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
   - [x] Umbra live session 可原子提交 feature-2 authenticated metadata 升级；锁定状态拒绝升级（`538168d`）
   - [x] 将 v2 document container 接入 Vault 专用读写与 feature-2 协商：常规 Markdown API 拒绝 feature-2 envelope，Outer projection 只经专用 API 读取，创建/保存必须有 live Umbra session（本轮）
   - [x] 实现普通 Markdown 到空 feature-2 Outer container 的 ETag 条件转换：保留 file ID/created time，要求 live `K_umbra` 与已协商 feature-2，已是 feature-2 或陈旧写入均拒绝（本轮）
-  - [ ] 将 Umbra 启用事务与feature-2 document-container协商同时接入，避免未支持的读者误开私密文档
-  - [ ] 实现core私密slot、TagId、catalog/profile和RenderMap选择事务，并证明canary不进入磁盘Outer面
+  - [x] 将 Umbra 启用事务与feature-2 document-container协商同时接入，避免未支持的读者误开私密文档（`Vault::enable_umbra_private_annotations` 要求 live Umbra 并以 config ETag 原子提交；`feature_two_requires_live_umbra_session_and_is_committed_to_metadata` 与 dedicated Outer read/write 回归复验通过，2026-07-16）
+  - [x] 实现core私密slot、TagId、catalog/profile和RenderMap选择事务，并证明canary不进入磁盘Outer面（private-slot live-session/canary regression 与 canonical projection/selection transaction 已实现；`private_slot_mutations_require_umbra_and_keep_canaries_out_of_outer_state` 复验通过，2026-07-16）
     - [x] Vault 已提供 live-session-only 的 private slot insert/read/replace/remove；slot payload 与标签的磁盘 canary 不进入 Outer projection（`3d6d6ef`）
   - [x] 实现 canonical Umbra projection、RenderMap generation、严格私密块范围分类，以及 marker/slot 一一对应的 ETag 原子变更；普通保存拒绝 dangling/duplicate/missing marker（`9d05c11`）
   - [x] 实现 `apply_private_annotation`：以 ETag 与完整 RenderMap/投影复核后，只对纯文本多选区从后向前创建独立 slot 与 marker，并一次性条件保存；过期、混合/私密选区零写入，slot/tag/正文 canary 不进入 Outer 或磁盘可读面（`ee77855`）

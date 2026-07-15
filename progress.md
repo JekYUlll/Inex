@@ -1668,3 +1668,8 @@
 
 - `e6f5c85` 的 detached clean standalone-source Linux x64 release set 已完成 package 和 release-set audit，source 记录为 `e6f5c858be54c5755ed6438de84d804e0c3883cf`、`dirtySourceTree: false`。VSIX：[inex-vscode-0.1.0-linux-x64.vsix](/home/horeb/_code/Inex/target/release-artifacts/e6f5c85-linux-x64/inex-vscode-0.1.0-linux-x64.vsix)，SHA-256：`891b50e90c740bb13e7ddb4a11c7d63266dd0a23eecc764880efa2ba5f7645b1`。
 - 已以 `code --install-extension --force` 覆盖安装；唯一诊断为宿主 Node `DEP0169` warning。该安装和 artifact audit 只证明结构/供应链输入，不能替代受 supervisor 限制的实际 Extension Host 通过证据；需 reload 后在持久窗口执行 `Ctrl+Alt+O` 验证。
+
+## 2026-07-16 — Umbra core plan reconciliation
+
+- 计划审计发现两条未勾选的 Umbra core 项实际已实现，而非待开发：`feature_two_requires_live_umbra_session_and_is_committed_to_metadata` 与 `feature_two_outer_projection_has_a_dedicated_safe_read_write_path` 证明 live Umbra gate、feature-2 metadata negotiation 和 dedicated Outer path；`private_slot_mutations_require_umbra_and_keep_canaries_out_of_outer_state` 证明私密 slot mutation/canary Outer 隔离。
+- 三个 targeted `cargo test -p inex-core --lib` 回归均通过，因此仅将计划勾选状态与现有证据对齐；跨编辑器/persistent-profile 残留矩阵仍未因此关闭。

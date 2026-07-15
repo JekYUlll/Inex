@@ -743,3 +743,8 @@
 
 - A public Outer viewer is not a mode transition by itself: it may coexist with a live private projection. The `Ctrl+Alt+O` contract must instead capture only a canonical logical path from a clean live Umbra editor, lock Umbra first, wipe the editor-side projection, then ask the Outer-only RPC for its deliberate public rendering.
 - Keeping the transition as its own command avoids changing the semantics of ordinary `openOuterProjection` from a tree node. The panel still owns its public byte buffer and joins the existing vault-lock/dispose wipe set; it must never turn its output into a VS Code plaintext `TextDocument`.
+
+## 2026-07-16 Umbra core completion evidence
+
+- Feature-2 negotiation is enforced at two layers: the vault configuration update requires a live Umbra session and is ETag-conditional, while a feature-2 document rejects the ordinary Markdown read path and exposes only the dedicated authenticated Outer or Umbra APIs. The targeted core tests exercise both locked failure and successful committed metadata.
+- Private-slot functionality is no longer a partial model stub: mutation requires live Umbra and the canary regression asserts private slot data never appears in the Outer container. Remaining work is matrix/runtime evidence, not a missing core transaction implementation.
