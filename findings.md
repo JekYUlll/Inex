@@ -698,3 +698,8 @@
 
 - A common-prefix/common-suffix-only presentation is safe but visually misleading for two independent edits: all stable lines between the first and last edit appear changed. A deterministic patience-style anchor pass improves this without granting a webview Git/script capability: only lines unique in both local segments are anchors, ordered by a longest-increasing sequence of Parent positions; unanchored regions retain a linear fallback rather than unbounded LCS work.
 - The alignment result remains view-only derived state. It does not alter the authenticated bytes, create a document URI, persist a diff cache, or relax the existing lock/dispose byte-buffer wipe path.
+
+## 2026-07-16 Cross-editor encrypted catalog evidence
+
+- Schema unit tests of two clients do not prove catalog portability. The meaningful boundary is a real ciphertext vault written through VS Code's typed sidecar and subsequently opened by a separately spawned Sublime RPC client. The cross-client test now binds the VS Code `umbra.tag.create` trace, a post-password-change Umbra lock, a fresh Sublime daemon unlock, and an encrypted config read.
+- Test orchestration itself must not normalize a private tag label into process metadata. The helper has a fixed test-only assertion and receives only executable/vault paths as argv; the dynamic Umbra password is piped on stdin, never placed in an environment variable or temporary file.

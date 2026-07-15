@@ -1580,3 +1580,8 @@
 
 - clean standalone source `63bd405` 的 Linux x64 package/audit/isolated-install smoke 已通过并覆盖安装。VSIX 为 [inex-vscode-0.1.0-linux-x64.vsix](/home/horeb/_code/Inex/target/release-artifacts/63bd405-linux-x64/inex-vscode-0.1.0-linux-x64.vsix)，SHA-256 为 `132b85b065d8f579f0523db41d02cbca611e9ac30adc387aedff6fc12c9741d4`。
 - 包内与已安装 `extension.js` 均为 `829a4a03fa7b7d66ac43c2608a89fa80ca6af73e29cc47062234942df1b0fd03`。VS Code CLI 的 `DEP0169` 是宿主 Node warning，安装成功。
+
+## 2026-07-16 — VS Code → Sublime Umbra catalog interoperability
+
+- Extension Host integration 新增真实跨客户端闭环：VS Code 在已解锁 Umbra session 通过 typed sidecar 创建测试 private tag，随后修改/验证 Umbra password 并锁定；独立 `InexRpcClient`（Sublime client）启动第二个 daemon，对同一 vault 输入 replacement password、独立 unlock Umbra、读取 encrypted catalog 并验证 tag 存在，最后 lock/shutdown。sidecar trace 必须包含并排序 `umbra.tag.create`，避免 test-only API 绕过客户端 RPC。
+- helper 只从 stdin 接收 password；测试 tag 的固定 ID/label 留在 helper source，绝不作为 argv、environment 或 temporary file 传递。其输出固定为 success token，runner 既不打印也不持久 catalog。验证：Sublime 96/96 unittest、Python 3.8 AST syntax gate、VS Code typecheck 与 local Extension Host gate 均通过。当前主机无 `python3.8` executable，因此解释器级运行不能声明；兼容性由现有 3.8 AST gate 覆盖。

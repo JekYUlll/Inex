@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import * as fs from "node:fs/promises";
@@ -49,6 +49,7 @@ interface InexIntegrationTestApi {
   readonly verifyUmbraLock: (password: string) => Promise<void>;
   readonly verifyOuterRevisionCompare: () => Promise<void>;
   readonly verifyUmbraRevisionCompare: () => Promise<void>;
+  readonly createCrossEditorUmbraTag: () => Promise<void>;
   readonly lock: () => Promise<void>;
 }
 
@@ -62,6 +63,7 @@ interface FixtureEnvironment {
   readonly userDataPath: string;
   readonly expectedSha256: string;
   readonly originalSha256: string;
+  readonly repositoryRoot: string;
 }
 
 interface SidecarTraceEntry {
@@ -136,15 +138,21 @@ async function runBackupRecoveryCycle(
     "VS Code Umbra revision compare did not reach the authenticated sidecar",
   );
   await runUmbraPlaintextExportCycle(api, fixture);
+  await api.createCrossEditorUmbraTag();
   const replacementUmbraPassword = "Inex integration replacement Umbra password";
   await api.verifyUmbraPasswordChange(fixture.password, replacementUmbraPassword);
   await api.verifyUmbraLock(replacementUmbraPassword);
+  await verifySublimeCatalogRead(
+    fixture,
+    replacementUmbraPassword,
+  );
   const umbraTrace = await waitForSidecarTrace(
     fixture,
     (entries) => entries.some((entry) => entry.method === "umbra.document.convert")
       && entries.filter((entry) => entry.method === "umbra.annotation.apply").length >= 2
       && entries.some((entry) => entry.method === "umbra.annotation.edit")
       && entries.filter((entry) => entry.method === "umbra.annotation.remove").length >= 2
+      && entries.some((entry) => entry.method === "umbra.tag.create")
       && entries.some((entry) => entry.method === "umbra.password.change")
       && entries.some((entry) => entry.method === "umbra.lock"),
     "VS Code Umbra annotation lifecycle did not reach the authenticated sidecar",
@@ -158,6 +166,7 @@ async function runBackupRecoveryCycle(
     all("umbra.annotation.remove")[0],
     all("umbra.annotation.apply")[1],
     all("umbra.annotation.remove")[1],
+    first("umbra.tag.create"),
     first("umbra.password.change"),
     first("umbra.lock"),
   ];
@@ -646,6 +655,7 @@ function fixtureEnvironment(): FixtureEnvironment {
     userDataPath: requiredEnvironment("INEX_TEST_USER_DATA_PATH"),
     expectedSha256,
     originalSha256,
+    repositoryRoot: requiredEnvironment("INEX_TEST_REPOSITORY_ROOT"),
   };
 }
 
@@ -678,10 +688,57 @@ function assertIntegrationApi(value: unknown): asserts value is InexIntegrationT
     "verifyUmbraLock",
     "verifyOuterRevisionCompare",
     "verifyUmbraRevisionCompare",
+    "createCrossEditorUmbraTag",
     "lock",
   ]) {
     assert.equal(typeof candidate[method], "function", `Integration-test API lacks ${method}`);
   }
+}
+
+async function verifySublimeCatalogRead(
+  fixture: FixtureEnvironment,
+  password: string,
+): Promise<void> {
+  const script = path.join(fixture.repositoryRoot, "editors", "sublime", "tests", "cross_editor_catalog.py");
+  const output = await runPasswordStdinChild(
+    "python3",
+    [script, fixture.sidecarPath, fixture.vaultPath],
+    password,
+  );
+  assert.equal(output.code, 0, "Sublime client could not read the VS Code-written Umbra catalog");
+  assert.equal(output.stdout, "sublime-cross-editor-catalog-ok\n", "Sublime cross-editor catalog result is invalid");
+  assert.equal(output.stderr, "", "Sublime cross-editor catalog emitted stderr");
+}
+
+async function runPasswordStdinChild(
+  executable: string,
+  childArguments: readonly string[],
+  password: string,
+): Promise<{ readonly code: number | null; readonly stdout: string; readonly stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(executable, childArguments, {
+      stdio: ["pipe", "pipe", "pipe"],
+      shell: false,
+      windowsHide: true,
+    });
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    child.stdout.on("data", (chunk: Buffer) => stdout.push(Buffer.from(chunk)));
+    child.stderr.on("data", (chunk: Buffer) => stderr.push(Buffer.from(chunk)));
+    child.once("error", reject);
+    child.once("close", (code) => {
+      const result = {
+        code,
+        stdout: Buffer.concat(stdout).toString("utf8"),
+        stderr: Buffer.concat(stderr).toString("utf8"),
+      };
+      for (const buffer of stdout) buffer.fill(0);
+      for (const buffer of stderr) buffer.fill(0);
+      resolve(result);
+    });
+    child.stdin.end(`${password}\n`);
+    password = "";
+  });
 }
 
 async function waitFor(predicate: () => boolean, message: string): Promise<void> {

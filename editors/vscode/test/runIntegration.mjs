@@ -356,6 +356,7 @@ async function runStage(
       INEX_TEST_USER_DATA_PATH: paths.userDataPath,
       INEX_TEST_EXPECTED_SHA256: expectedSha256,
       INEX_TEST_ORIGINAL_SHA256: originalSha256,
+      INEX_TEST_REPOSITORY_ROOT: REPOSITORY_ROOT,
     },
     stdout: output,
     stderr: errors,

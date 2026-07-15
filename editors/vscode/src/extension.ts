@@ -56,6 +56,7 @@ export interface InexIntegrationTestApi {
   readonly verifyUmbraLock: (password: string) => Promise<void>;
   readonly verifyOuterRevisionCompare: () => Promise<void>;
   readonly verifyUmbraRevisionCompare: () => Promise<void>;
+  readonly createCrossEditorUmbraTag: () => Promise<void>;
   readonly lock: () => Promise<void>;
 }
 
@@ -613,6 +614,26 @@ export function activate(
     },
     verifyUmbraRevisionCompare: async () => {
       await vscode.commands.executeCommand("inex.compareUmbraRevision");
+    },
+    createCrossEditorUmbraTag: async () => {
+      const session = controller.acquireSession();
+      if (!(await session.sidecar.umbraStatus()).unlocked) {
+        throw new Error("Inex integration cross-editor tag requires an unlocked Umbra session");
+      }
+      const tag = {
+        id: "cross-editor-catalog",
+        label: "Cross editor catalog",
+        description: "",
+        aliases: [],
+        sortOrder: 91,
+        defaultSelected: false,
+      };
+      await session.sidecar.createUmbraTag(tag);
+      const config = await session.sidecar.loadUmbraAnnotationConfig();
+      if (!config.tags.some((candidate) => candidate.id === tag.id && candidate.label === tag.label)) {
+        throw new Error("Inex integration cross-editor tag was not persisted");
+      }
+      return;
     },
     lock: () => controller.lock(),
   });

@@ -17,6 +17,7 @@ class Python38SyntaxTests(unittest.TestCase):
             "inex_markdown.py",
             "inex_password.py",
             "inex_rpc.py",
+            "tests/cross_editor_catalog.py",
             "test/build4200/InexQA.py",
             "test/build4200/run_build4200.py",
         ):
