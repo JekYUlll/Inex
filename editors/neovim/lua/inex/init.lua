@@ -564,6 +564,58 @@ function M.choose_private_annotation_profile(selections)
   end)
 end
 
+function M.choose_private_annotation(selections)
+  M.load_umbra_annotation_config(function(config)
+    local state = { kind = config.defaults.kind, outer = config.defaults.outer, tags = {} }
+    for _, tag_id in ipairs(config.defaults.tagIds) do state.tags[tag_id] = true end
+    local function apply()
+      local tag_ids = {}
+      for tag_id, selected in pairs(state.tags) do if selected then table.insert(tag_ids, tag_id) end end
+      table.sort(tag_ids)
+      local spec = { kind = state.kind, tagIds = tag_ids, outer = { mode = state.outer } }
+      if state.outer == "cover" then
+        vim.ui.input({ prompt = "Public cover text: " }, function(cover_text)
+          if type(cover_text) == "string" and #cover_text > 0 and #cover_text <= 4096 and not cover_text:find("%z") then
+            spec.outer.coverText = cover_text
+            M.apply_private_annotation(selections, spec)
+          elseif cover_text ~= nil then
+            vim.notify("Inex public cover text is invalid", vim.log.levels.ERROR)
+          end
+          cover_text, spec, state, config = nil, nil, nil, nil
+        end)
+      else
+        M.apply_private_annotation(selections, spec)
+        spec, state, config = nil, nil, nil
+      end
+    end
+    local show_picker
+    show_picker = function()
+      local items = {
+        { group = "kind", value = "comment", label = (state.kind == "comment" and "[x] " or "[ ] ") .. "Kind: private comment" },
+        { group = "kind", value = "block", label = (state.kind == "block" and "[x] " or "[ ] ") .. "Kind: private block" },
+      }
+      for _, tag in ipairs(config.tags) do
+        if not tag.archived then
+          table.insert(items, { group = "tag", value = tag.id, label = (state.tags[tag.id] and "[x] " or "[ ] ") .. "Tag: " .. tag.label })
+        end
+      end
+      for _, outer in ipairs({ "drop", "placeholder", "cover" }) do
+        table.insert(items, { group = "outer", value = outer, label = (state.outer == outer and "[x] " or "[ ] ") .. "Outer: " .. outer })
+      end
+      table.insert(items, { group = "done", label = "Apply" })
+      vim.ui.select(items, { prompt = "Configure Inex private annotation", format_item = function(item) return item.label end }, function(item)
+        if not item then state, config = nil, nil; return end
+        if item.group == "done" then apply(); return end
+        if item.group == "kind" then state.kind = item.value
+        elseif item.group == "outer" then state.outer = item.value
+        else state.tags[item.value] = not state.tags[item.value] end
+        show_picker()
+      end)
+    end
+    show_picker()
+  end)
+end
+
 local function parse_umbra_projection(logical_path, result)
   if not has_exact_keys(result, { contentBase64 = true, etag = true, metadata = true, renderMap = true, count = 4 })
     or type(result.etag) ~= "string" or not result.etag:match(ETAG_RE)

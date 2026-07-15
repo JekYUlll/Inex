@@ -1193,6 +1193,10 @@
 - 新增 `:InexChoosePrivateAnnotationProfile startByte endByte` 与 `:InexApplyPrivateAnnotationProfile startByte endByte profileId`。两者只从 live `umbra.config.get` 的已验证响应读取 profile；picker 结束、取消或 cover prompt callback 完成后释放 config/spec/cover 临时引用，不写入 options、globals、shada 或 module cache。
 - cover profile 只在本次操作中通过 `vim.ui.input` 取得公开 cover text，再走现有 daemon-authenticated apply；非 cover profile 直接复用已验证 kind/tag IDs/outer。Neovim clean headless runtime load check 通过。自定义 kind/tag 多选 picker 与宿主 residue gate 仍未完成。
 
+## 2026-07-15 — Neovim custom private-annotation picker
+
+- 新增 `:InexChoosePrivateAnnotation startByte endByte` 的 stateful `vim.ui.select` picker：kind 与 Outer 为单选，非 archived encrypted tags 可重复切换多选，Apply 才构造 canonical sorted tag IDs 并调用既有 authenticated daemon mutation；cover 仍只在一次 `vim.ui.input` 中获取公开文本。取消、完成或 cover callback 后均丢弃 config/state/spec 引用。clean headless runtime load check 通过。
+
 ## 2026-07-15 — Neovim final-priority Lua transport skeleton
 
 - 新增 `editors/neovim` runtime plugin。Lua `rpc` 模块只启动 absolute regular `inexd`、使用 bounded Content-Length JSON-RPC framing、绑定 pending request callbacks，并在 stdout/protocol/process failure 时清理；插件提供 `:InexStart`、`:InexStatus`、`:InexStop`，`system.hello` 发送 frozen `client/clientVersion/protocolMajor` 参数。
