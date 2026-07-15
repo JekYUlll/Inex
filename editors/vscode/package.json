@@ -29,6 +29,7 @@
     "onCustomEditor:inex.markdownEditor",
     "onView:inex.vault",
     "onCommand:inex.showSecurityStatus",
+    "onCommand:inex.exportPlaintextCopy",
     "onCommand:inex.unlockVault",
     "onCommand:inex.importRepository",
     "onCommand:inex.newEncryptedMarkdown",
@@ -69,6 +70,11 @@
       {
         "command": "inex.search",
         "title": "Inex: Search Encrypted Vault",
+        "enablement": "inex.vaultUnlocked"
+      },
+      {
+        "command": "inex.exportPlaintextCopy",
+        "title": "Inex: Export Plaintext Copy…",
         "enablement": "inex.vaultUnlocked"
       },
       {

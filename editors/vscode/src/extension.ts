@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import * as path from "node:path";
 
 import { VaultController, type VaultSession } from "./controller.ts";
 import { InexCrudActions } from "./crud.ts";
@@ -236,6 +237,41 @@ export function activate(
             selected.hit.endByte,
           );
         }
+      });
+    }),
+    vscode.commands.registerCommand("inex.exportPlaintextCopy", async () => {
+      await runUiAction(async () => {
+        if (!(await ensureVaultUnlocked(controller))) return;
+        const parent = await vscode.window.showOpenDialog({
+          canSelectFiles: false, canSelectFolders: true, canSelectMany: false,
+          title: "Choose parent folder for plaintext export",
+          openLabel: "Choose export parent",
+        });
+        if (parent === undefined || parent.length !== 1 || parent[0]?.scheme !== "file") return;
+        const name = await vscode.window.showInputBox({
+          title: "Plaintext export destination", prompt: "New folder name (must not already exist)",
+          ignoreFocusOut: true, validateInput: (value) => value.length > 0 && !/[\\/]/u.test(value)
+            ? undefined : "Enter one non-empty folder name without separators",
+        });
+        if (name === undefined) return;
+        const scope = await vscode.window.showQuickPick([
+          { label: "Outer only", value: "outer" as const, description: "Excludes private Umbra content" },
+          { label: "Include Umbra private content", value: "umbra" as const, description: "Requires Umbra password" },
+        ], { title: "Plaintext export scope", ignoreFocusOut: true });
+        if (scope === undefined) return;
+        if (scope.value === "umbra" && (await ensureUmbraReady(controller)) === undefined) return;
+        const session = controller.acquireSession();
+        if (!controller.isSessionCurrent(session)) throw new Error("Inex vault session changed before export");
+        const prepared = await session.sidecar.preparePlaintextExport(path.join(parent[0].fsPath, name), scope.value);
+        const action = "Export plaintext copy";
+        const confirmed = await vscode.window.showWarningMessage(
+          `This creates ${prepared.files} Markdown file(s), ${prepared.assets} asset(s), and ${prepared.directories} folder(s) outside Inex protection. Git, backups, indexing, history, and deletion residue may retain plaintext.`,
+          { modal: true, detail: "Inex cannot securely erase the exported copy." }, action,
+        );
+        if (confirmed !== action) return;
+        if (!controller.isSessionCurrent(session)) throw new Error("Inex vault session changed during export confirmation");
+        await session.sidecar.commitPlaintextExport(prepared.confirmation);
+        await vscode.window.showInformationMessage("Inex plaintext export completed.");
       });
     }),
     vscode.commands.registerCommand("inex.togglePrivateAnnotation", async () => {

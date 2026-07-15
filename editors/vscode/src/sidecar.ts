@@ -62,6 +62,14 @@ export interface UmbraStatus {
   readonly unlocked: boolean;
 }
 
+export interface PlaintextExportPrepare {
+  readonly confirmation: string;
+  readonly scope: "outer" | "umbra";
+  readonly files: number;
+  readonly assets: number;
+  readonly directories: number;
+}
+
 export interface TextRange {
   readonly startByte: number;
   readonly endByte: number;
@@ -368,6 +376,40 @@ export class InexSidecar {
       throw new RpcProtocolError("RPC authenticated vault feature is invalid");
     }
     return { opaqueAssetsV1: features.opaqueAssetsV1 };
+  }
+
+  public async preparePlaintextExport(
+    destination: string,
+    scope: "outer" | "umbra",
+  ): Promise<PlaintextExportPrepare> {
+    const result = expectObject(await this.callRaw("vault.export.prepare", {
+      ...this.protectedParams(), destination, scope,
+    }));
+    expectExactKeys(result, ["confirmation", "scope", "files", "assets", "directories"], "plaintext export prepare");
+    const confirmation = expectCapability(result.confirmation, "plaintext export confirmation", 43);
+    if ((result.scope !== "outer" && result.scope !== "umbra") || result.scope !== scope) {
+      throw new RpcProtocolError("RPC plaintext export scope is invalid");
+    }
+    return {
+      confirmation, scope: result.scope,
+      files: expectSafeInteger(result.files, "plaintext export files"),
+      assets: expectSafeInteger(result.assets, "plaintext export assets"),
+      directories: expectSafeInteger(result.directories, "plaintext export directories"),
+    };
+  }
+
+  public async commitPlaintextExport(confirmation: string): Promise<void> {
+    const result = expectObject(await this.callRaw("vault.export.commit", {
+      ...this.protectedParams(), confirmation,
+    }));
+    expectExactKeys(result, ["ok", "scope", "files", "assets", "directories", "durability"], "plaintext export commit");
+    if (result.ok !== true || (result.scope !== "outer" && result.scope !== "umbra")
+      || !["synced", "notSynced"].includes(String(result.durability))) {
+      throw new RpcProtocolError("RPC plaintext export commit is invalid");
+    }
+    expectSafeInteger(result.files, "plaintext export files");
+    expectSafeInteger(result.assets, "plaintext export assets");
+    expectSafeInteger(result.directories, "plaintext export directories");
   }
 
   public async umbraStatus(): Promise<UmbraStatus> {
