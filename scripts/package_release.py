@@ -67,6 +67,7 @@ DOCUMENTATION_FILES = (
     "spec/umbra-v1.md",
     "spec/vault-v1.md",
     "spec/vscode-revision-compare-v1.md",
+    "spec/vscode-working-tree-compare-v1.md",
 )
 PACKAGE_REPORT_NOT_COVERED = (
     "artifact-signing-and-publication",
