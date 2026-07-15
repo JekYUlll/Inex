@@ -616,6 +616,85 @@ function M.choose_private_annotation(selections)
   end)
 end
 
+local function umbra_config_mutation(method, params, success_message, callback)
+  if not session or not umbra_unlocked then
+    vim.notify("Unlock Inex Umbra before changing private tags", vim.log.levels.ERROR)
+    return
+  end
+  local active_session = session
+  params.session = active_session
+  rpc.request(method, params, function(result, error)
+    if error or session ~= active_session or not umbra_unlocked
+      or not has_exact_keys(result, { ok = true, count = 1 }) or result.ok ~= true then
+      vim.notify(error or "Inex private catalog update failed", vim.log.levels.ERROR)
+      return
+    end
+    vim.notify(success_message, vim.log.levels.INFO)
+    callback()
+  end)
+end
+
+-- The catalog is loaded anew after every mutation. Labels and IDs are never
+-- copied into Neovim options, globals, shada, or a module cache.
+function M.manage_private_tags()
+  local function show_menu()
+    M.load_umbra_annotation_config(function(config)
+      local items = {
+        { action = "create", label = "Create private tag" },
+        { action = "rename", label = "Rename private tag" },
+        { action = "archive", label = "Archive private tag" },
+        { action = "reorder", label = "Reorder private tags" },
+      }
+      vim.ui.select(items, {
+        prompt = "Manage Inex private tags",
+        format_item = function(item) return item.label end,
+      }, function(item)
+        if not item then config = nil; return end
+        if item.action == "create" then
+          vim.ui.input({ prompt = "Private tag label: " }, function(label)
+            if type(label) ~= "string" or #label == 0 or #label > 4096 or label:find("%z") then config = nil; return end
+            vim.ui.input({ prompt = "Stable private tag ID: ", default = "tag" }, function(tag_id)
+              if not valid_tag_id(tag_id) then vim.notify("Inex private tag ID is invalid", vim.log.levels.ERROR); config = nil; return end
+              umbra_config_mutation("umbra.tag.create", {
+                id = tag_id, label = label, description = "", aliases = {},
+                sortOrder = (#config.tags + 1) * 10, defaultSelected = false, archived = false,
+              }, "Inex private tag created", function() config = nil; show_menu() end)
+            end)
+          end)
+          return
+        end
+        if #config.tags == 0 then vim.notify("No Inex private tags are configured", vim.log.levels.WARN); config = nil; return end
+        vim.ui.select(config.tags, {
+          prompt = "Select Inex private tag",
+          format_item = function(tag) return tag.label .. (tag.archived and " (archived)" or "") end,
+        }, function(tag)
+          if not tag then config = nil; return end
+          if item.action == "rename" then
+            vim.ui.input({ prompt = "New private tag label: ", default = tag.label }, function(label)
+              if type(label) ~= "string" or #label == 0 or #label > 4096 or label:find("%z") then config = nil; return end
+              umbra_config_mutation("umbra.tag.rename", { tagId = tag.id, label = label }, "Inex private tag renamed", function() config = nil; show_menu() end)
+            end)
+          elseif item.action == "archive" then
+            umbra_config_mutation("umbra.tag.archive", { tagId = tag.id }, "Inex private tag archived", function() config = nil; show_menu() end)
+          else
+            local reordered = {}
+            for _, candidate in ipairs(config.tags) do table.insert(reordered, candidate.id) end
+            local old_index
+            for index, candidate in ipairs(reordered) do if candidate == tag.id then old_index = index end end
+            vim.ui.input({ prompt = "New tag position (1-" .. #reordered .. "): ", default = tostring(old_index) }, function(position)
+              local target = tonumber(position)
+              if not target or target % 1 ~= 0 or target < 1 or target > #reordered then config = nil; return end
+              table.remove(reordered, old_index); table.insert(reordered, target, tag.id)
+              umbra_config_mutation("umbra.tag.reorder", { tagIds = reordered }, "Inex private tags reordered", function() config, reordered = nil, nil; show_menu() end)
+            end)
+          end
+        end)
+      end)
+    end)
+  end
+  show_menu()
+end
+
 local function parse_umbra_projection(logical_path, result)
   if not has_exact_keys(result, { contentBase64 = true, etag = true, metadata = true, renderMap = true, count = 4 })
     or type(result.etag) ~= "string" or not result.etag:match(ETAG_RE)

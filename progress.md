@@ -1258,3 +1258,8 @@
 - repository-import 的普通 Git plumbing 与 `cat-file --batch` 均以独立 Unix process group 启动；timeout、oversized output、protocol mismatch 和 Drop 路径通过 safe rustix `kill_process_group` 先终止该组，再回收 direct child/reader。stdout acquisition 失败也会先执行同一清理，避免已启动 child 脱离所有权。
 - 新增 Linux 对抗回归：shell 启动一个继承 stdout 的 background descendant，记录其 PID 后触发 `kill_and_wait`；测试确认 direct child 非成功结束且 descendant 在两秒内为 `ESRCH`。`inex-git` 全 379 单测、all-targets Clippy `-D warnings` 与 diff check 通过。
 - 该闭合仅覆盖不主动逃离 dedicated group 的 Unix 后代；Windows Job、native process-tree evidence 和 hostile same-UID escape/TOCTOU 保持 GA 未完成门禁。
+
+## 2026-07-15 — Neovim encrypted private-tag management
+
+- 增加 `:InexManagePrivateTags`：stateful `vim.ui.select`/`vim.ui.input` 可创建、重命名、归档与重排私密标签；每次操作仅向 `umbra.tag.*` 发送 authenticated live-session RPC，严格要求 acknowledgement，成功后丢弃旧 catalog 并重新读取。Lua 不访问 catalog 文件、不缓存标签/ID 至 options、globals 或 shada。
+- UI 对 label/ID/position 均做界限验证，归档标签仍可管理。`annotation profile` 管理 UI 保持待办，避免把 tags 完成误报为完整 tag/profile 管理。

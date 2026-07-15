@@ -79,6 +79,10 @@ vim.api.nvim_create_user_command("InexChoosePrivateAnnotation", function(argumen
   }})
 end, { nargs = "*", desc = "Choose an encrypted Umbra annotation" })
 
+vim.api.nvim_create_user_command("InexManagePrivateTags", function()
+  inex.manage_private_tags()
+end, { desc = "Manage encrypted Inex private tags" })
+
 vim.api.nvim_create_user_command("InexApplyPrivateAnnotationProfile", function(arguments)
   if #arguments.fargs ~= 3 then
     vim.notify("InexApplyPrivateAnnotationProfile requires startByte endByte profileId", vim.log.levels.ERROR)

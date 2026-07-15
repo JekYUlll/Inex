@@ -64,6 +64,10 @@ Commands currently available:
   active tags can be toggled independently, and only `Apply` sends the final
   canonical spec to the daemon. Profile and picker data is transient and is
   not cached in Neovim settings or module state.
+- `:InexManagePrivateTags` provides create, rename, archive, and reorder
+  operations through live Umbra RPC only. Each successful mutation discards
+  the old catalog and reloads it before another menu is shown; no catalog file
+  is accessed by the plugin. Annotation-profile management remains pending.
 - `:InexStop` terminates the local RPC process and drops pending callbacks.
 
 `InexOpen`, `InexNew`, and `InexMkdir` take Inex logical paths (for example,
