@@ -1684,3 +1684,8 @@
 
 - `:InexManagePrivateAnnotationProfiles` 现在可创建或编辑完整 profile metadata：comment/block、未归档 encrypted tag 多选与 drop/placeholder/cover Outer strategy。create RPC 已修正为严格的 `{ profile = ... }` 嵌套协议；edit 保留 stable ID 并发送 `{ profileId, profile }`。
 - profile UI 不采集实例 public cover text；仅在 `outer == cover` 时写入 `promptForCover = true`。`nvim --headless --clean ... annotation_picker.lua` 通过，且 diff whitespace 检查通过。
+
+## 2026-07-16 — Neovim real Outer/Umbra lifecycle
+
+- 通过 `script` 的伪终端创建受限临时 Inex vault，随后以绝对 `target/debug/inexd`、独立 Outer/Umbra test password 运行 `outer_lifecycle.lua`。回归实际完成 Outer/Umbra unlock/lock、normal document create/save/search/mkdir、Outer lock/reopen、feature-2 enable 与 private annotation mutation；命令以 `neovim-outer-lifecycle-passed` 退出。
+- 临时 vault 在成功后删除。该证据覆盖真实 daemon 交互和 buffer lifecycle，但不扩大为 shada、LSP、第三方插件、swap 或 OS-level residue 的完整宿主安全声明。
