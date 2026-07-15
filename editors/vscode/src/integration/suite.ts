@@ -52,6 +52,7 @@ interface InexIntegrationTestApi {
   readonly verifyUmbraRevisionCompare: () => Promise<void>;
   readonly verifyOuterProjection: () => Promise<void>;
   readonly verifyOuterProjectionFromTree: (logicalPath: string) => Promise<void>;
+  readonly verifyRedactToOuter: (password: string) => Promise<void>;
   readonly createCrossEditorUmbraTag: () => Promise<void>;
   readonly createCrossEditorUmbraAnnotation: (logicalPath: string) => Promise<void>;
   readonly lock: () => Promise<void>;
@@ -110,6 +111,7 @@ export async function run(): Promise<void> {
     "inex.rename",
     "inex.delete",
     "inex.importRepository",
+    "inex.redactToOuter",
   ]) {
     assert.equal(registeredCommands.has(command), true, `Extension did not register ${command}`);
   }
@@ -146,6 +148,17 @@ async function runBackupRecoveryCycle(
     fixture,
     (entries) => entries.some((entry) => entry.method === "revision.compare.umbra"),
     "VS Code Umbra revision compare did not reach the authenticated sidecar",
+  );
+  await api.verifyRedactToOuter(fixture.password);
+  await waitForSidecarTrace(
+    fixture,
+    (entries) => {
+      const lock = entries.find((entry) => entry.method === "umbra.lock");
+      return lock !== undefined && entries.some(
+        (entry) => entry.method === "umbra.document.openOuter" && entry.sequence > lock.sequence,
+      );
+    },
+    "VS Code quick redaction did not lock Umbra before opening the Outer projection",
   );
   await runUmbraPlaintextExportCycle(api, fixture);
   await api.createCrossEditorUmbraTag();

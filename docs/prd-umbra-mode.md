@@ -133,6 +133,13 @@ RenderMap or private metadata. Outer projection editing and Umbra draft
 recovery are deliberately fail-closed until their dedicated authenticated save
 paths are implemented.
 
+`Inex: Redact Current Document to Outer Mode` is the `Ctrl+Alt+O` command. It
+requires a clean active Umbra projection, remembers only its logical path long
+enough to call `umbra.lock`, wipes the private editor projection, and then opens
+the same document's authenticated Drop/Cover/Placeholder Outer panel. It does
+not turn the document into a plaintext `TextDocument`, preserve an Umbra view,
+or silently leave `K_umbra` unlocked.
+
 `Inex: Manage Private Tags` uses the same Umbra unlock session as annotation
 commands. It supports create, rename, archive, and `Inex: Reorder Private Tags`
 can move a selected tag to the first/previous/next/last position. Each mutation

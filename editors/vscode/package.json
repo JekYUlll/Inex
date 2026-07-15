@@ -34,6 +34,7 @@
     "onCommand:inex.lockUmbra",
     "onCommand:inex.changeUmbraPassword",
     "onCommand:inex.openOuterProjection",
+    "onCommand:inex.redactToOuter",
     "onCommand:inex.importRepository",
     "onCommand:inex.newEncryptedMarkdown",
     "onCommand:inex.newFolder",
@@ -103,6 +104,11 @@
       {
         "command": "inex.openOuterProjection",
         "title": "Inex: View Outer Projection",
+        "enablement": "inex.vaultUnlocked"
+      },
+      {
+        "command": "inex.redactToOuter",
+        "title": "Inex: Redact Current Document to Outer Mode",
         "enablement": "inex.vaultUnlocked"
       },
       {
@@ -319,6 +325,11 @@
       {
         "command": "inex.choosePrivateAnnotation",
         "key": "ctrl+alt+h",
+        "when": "inex.vaultUnlocked"
+      },
+      {
+        "command": "inex.redactToOuter",
+        "key": "ctrl+alt+o",
         "when": "inex.vaultUnlocked"
       }
     ],

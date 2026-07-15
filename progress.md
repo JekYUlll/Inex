@@ -1651,3 +1651,15 @@
 |---|---:|---|
 | Standalone release construction initially returned from the terminal supervisor before its child Rust build had completed; the shell then exited before artifact copy. | 1 | Waited for the child process and rebuilt release binaries separately with visible status; no incomplete artifact was installed. |
 | Package provenance rejected the first detached clone because its local `origin` was the filesystem clone path. | 1 | Set that clone's local `remote.origin.url` to the canonical Inex repository before packaging; audit then recorded a clean canonical source. |
+
+## 2026-07-16 — Quick Redact to Outer Mode
+
+- 新增 `inex.redactToOuter` 和默认 `Ctrl+Alt+O`。它只接受 clean active Umbra custom projection：先保存 logical path、调用 `umbra.lock` 和既有 editor wipe，再用同一 Outer session 的 `umbra.document.openOuter` 生成无脚本只读 Drop/Cover/Placeholder panel。没有 native diff、普通 plaintext TextDocument 或保留的 Umbra projection。
+- Extension Host fixture 已增加 command registration、sidecar unlocked-state 与 `umbra.lock → umbra.document.openOuter` 顺序断言；`pnpm --dir editors/vscode check` 和 73/73 unit 通过。
+
+## Errors Encountered
+
+| Error | Attempt | Resolution |
+|---|---:|---|
+| `apply_patch` first matched stale prose context while updating the Umbra PRD. | 1 | Re-read the exact current paragraph and applied a narrow contextual patch. |
+| The disposable VS Code CLI/Extension Host process loses its parent terminal under this tool supervisor before a final exit result can be observed; its audit root is retained. | 1 | Tried normal, PTY, detached, and tmux launch paths; all were supervisor-terminated. Kept the automated assertion in source but do not treat this environment run as passing evidence. Persistent-profile/manual verification remains open. |

@@ -738,3 +738,8 @@
 
 - The core/daemon already own the only authoritative range normalization and accept `mergeAdjacent` as an authenticated operation parameter. The VS Code setting must therefore be a boolean interaction preference only: forward it to apply/remove (and never place selected ranges, tags, or profile data in settings) rather than reimplementing mutation normalization in the webview.
 - Defaulting it to `false` retains the frozen semantics that adjacent selections remain distinct. Opting in only changes whether touching ranges coalesce after daemon RenderMap validation, so overlapping, partial-private, stale-map, and atomic rollback checks remain in the common core path.
+
+## 2026-07-16 Quick redaction boundary
+
+- A public Outer viewer is not a mode transition by itself: it may coexist with a live private projection. The `Ctrl+Alt+O` contract must instead capture only a canonical logical path from a clean live Umbra editor, lock Umbra first, wipe the editor-side projection, then ask the Outer-only RPC for its deliberate public rendering.
+- Keeping the transition as its own command avoids changing the semantics of ordinary `openOuterProjection` from a tree node. The panel still owns its public byte buffer and joins the existing vault-lock/dispose wipe set; it must never turn its output into a VS Code plaintext `TextDocument`.

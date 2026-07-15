@@ -59,9 +59,15 @@ export interface InexIntegrationTestApi {
   readonly verifyUmbraRevisionCompare: () => Promise<void>;
   readonly verifyOuterProjection: () => Promise<void>;
   readonly verifyOuterProjectionFromTree: (logicalPath: string) => Promise<void>;
+  readonly verifyRedactToOuter: (password: string) => Promise<void>;
   readonly createCrossEditorUmbraTag: () => Promise<void>;
   readonly createCrossEditorUmbraAnnotation: (logicalPath: string) => Promise<void>;
   readonly lock: () => Promise<void>;
+}
+
+interface OwnedReadOnlyView {
+  readonly panel: vscode.WebviewPanel;
+  readonly buffers: readonly Buffer[];
 }
 
 export function activate(
@@ -74,7 +80,7 @@ export function activate(
   const tree = new InexTreeProvider(controller);
   const editor = new InexCustomEditorProvider(controller, integrationTestMode);
   const crud = new InexCrudActions(controller, tree, editor);
-  const compareViews = new Set<{ readonly panel: vscode.WebviewPanel; readonly buffers: readonly Buffer[] }>();
+  const compareViews = new Set<OwnedReadOnlyView>();
   // Tags/profile semantics are private catalog data. Keep only a best-effort
   // session-local copy for shortcut behavior; never write it to VS Code settings.
   let lastAnnotationSpec: PrivateAnnotationSpec | undefined;
@@ -409,24 +415,30 @@ export function activate(
         if (target === undefined || !controller.isSessionCurrent(target.session)) {
           throw new Error("Choose an encrypted Markdown file in the Inex tree, or open a clean Umbra private projection before viewing its Outer projection");
         }
-        const projection = await target.session.sidecar.openUmbraOuterProjection(target.logicalPath);
-        if (!controller.isSessionCurrent(target.session)) {
-          projection.content.fill(0);
-          throw new Error("Inex vault session changed while opening the Outer projection");
+        await showOuterProjection(controller, compareViews, target.session, target.logicalPath);
+      });
+    }),
+    vscode.commands.registerCommand("inex.redactToOuter", async () => {
+      await runUiAction(async () => {
+        if (!(await ensureVaultUnlocked(controller))) return;
+        // Capture only the public logical path while K_umbra is live. The lock
+        // below must wipe the private custom-editor projection before the
+        // public panel is built from the authenticated Outer container.
+        const target = editor.currentRevisionCompareTarget();
+        if (
+          target === undefined ||
+          !target.umbra ||
+          !controller.isSessionCurrent(target.session)
+        ) {
+          throw new Error("Open a clean Umbra private projection before switching it to Outer Mode");
         }
-        const panel = vscode.window.createWebviewPanel(
-          "inex.outerProjection",
-          "Inex: Outer Projection",
-          vscode.ViewColumn.Beside,
-          { enableScripts: false, retainContextWhenHidden: false, localResourceRoots: [] },
-        );
-        const view = { panel, buffers: [projection.content] };
-        compareViews.add(view);
-        panel.webview.html = outerProjectionHtml(projection.content);
-        panel.onDidDispose(() => {
-          for (const buffer of view.buffers) buffer.fill(0);
-          compareViews.delete(view);
-        });
+        const logicalPath = target.logicalPath;
+        const session = target.session;
+        if (!(await lockUmbra(controller, editor))) return;
+        if (!controller.isSessionCurrent(session)) {
+          throw new Error("Inex vault session changed while switching to Outer Mode");
+        }
+        await showOuterProjection(controller, compareViews, session, logicalPath);
       });
     }),
     vscode.commands.registerCommand("inex.exportPlaintextCopy", async () => {
@@ -679,6 +691,20 @@ export function activate(
         session,
       } satisfies import("./tree.ts").InexTreeNode);
     },
+    verifyRedactToOuter: async (password: string) => {
+      const session = controller.acquireSession();
+      if (!(await session.sidecar.umbraStatus()).unlocked) {
+        throw new Error("Inex integration quick redaction requires an unlocked Umbra session");
+      }
+      await vscode.commands.executeCommand("inex.redactToOuter");
+      if ((await session.sidecar.umbraStatus()).unlocked) {
+        throw new Error("Inex integration quick redaction retained K_umbra in the sidecar");
+      }
+      // Resume the fixture only after proving the command locked Umbra. This
+      // is test-only orchestration; production never retains a password here.
+      await session.sidecar.unlockUmbra(password);
+      await session.sidecar.enableUmbra();
+    },
     createCrossEditorUmbraTag: async () => {
       const session = controller.acquireSession();
       if (!(await session.sidecar.umbraStatus()).unlocked) {
@@ -750,6 +776,33 @@ async function lockUmbra(
     // Umbra projection locally in that case.
     editor.wipeUmbraForLock();
   }
+}
+
+/** Show deliberately public Drop/Cover/Placeholder content in an owned panel. */
+async function showOuterProjection(
+  controller: VaultController,
+  views: Set<OwnedReadOnlyView>,
+  session: VaultSession,
+  logicalPath: string,
+): Promise<void> {
+  const projection = await session.sidecar.openUmbraOuterProjection(logicalPath);
+  if (!controller.isSessionCurrent(session)) {
+    projection.content.fill(0);
+    throw new Error("Inex vault session changed while opening the Outer projection");
+  }
+  const panel = vscode.window.createWebviewPanel(
+    "inex.outerProjection",
+    "Inex: Outer Projection",
+    vscode.ViewColumn.Beside,
+    { enableScripts: false, retainContextWhenHidden: false, localResourceRoots: [] },
+  );
+  const view: OwnedReadOnlyView = { panel, buffers: [projection.content] };
+  views.add(view);
+  panel.webview.html = outerProjectionHtml(projection.content);
+  panel.onDidDispose(() => {
+    for (const buffer of view.buffers) buffer.fill(0);
+    views.delete(view);
+  });
 }
 
 async function changeUmbraPassword(controller: VaultController): Promise<void> {
