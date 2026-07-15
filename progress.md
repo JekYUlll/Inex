@@ -1302,6 +1302,11 @@
 - `commit` 现在接收完整 prepare 结果，并校验 scope、Markdown/asset/directory 计数完全一致后才向 UI 报告成功，防止扩展把不匹配的响应当作同一次导出完成。
 - 验证：`pnpm --dir editors/vscode check`、61/61 Node tests（新增 export parser 正反例）和真实 `pnpm --dir editors/vscode test:extension:local` 均通过。该 Extension Host 回归仍不代替最终 VSIX 内真实 folder picker / modal confirmation 的人工交互验收。
 
+## 2026-07-16 — VS Code plaintext-export package
+
+- 从独立、clean、canonical-origin checkout 的 `ff0bd232b9d6f8177887ac254fe84e02ef1d9980` 以 system GCC 构建 Linux x64 发布集；`package_release.py` 与 `audit_release_artifacts.py` 均通过，随后用 `/usr/bin/code` 在隔离 profile 完成 package smoke。
+- 最新可安装 VSIX：`target/release-artifacts/ff0bd23-linux-x64/inex-vscode-0.1.0-linux-x64.vsix`，SHA-256 为 `b52b8cb7d9ba1144eb670e2db36470376313c5a2b3dc77b3092afd37b8bb3c4c`。它包含本轮 plaintext-export RPC 契约修复；尚未自动覆盖用户正在使用的 VS Code 安装。
+
 ## 2026-07-16 — Outer-only Umbra export projection
 
 - `umbra_render::render_outer_projection` 现在只根据已认证的公开 Outer slot 策略替换 marker：Drop 输出空内容、Cover 输出明确公开的 cover text、Placeholder 输出固定无标识文本。它严格验证 marker/slot 一一对应和 Cover/Placeholder metadata，永不读取 private payload、kind、tag、slot ID 或 `K_umbra`。
