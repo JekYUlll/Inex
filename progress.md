@@ -1467,6 +1467,11 @@
 - 新增独立 `umbra.search.query`，它只在 live `K_umbra` 会话中从完整 Umbra projection 构建 memory-only index；它不会改变 Outer `search.query`，不会落盘，且 Umbra lock 或任一文档 mutation 都清零。VS Code 新增 `Inex: Search Umbra Private Content`，以独立 Umbra password gate、masked query 和现有受控 CustomEditor reveal 展示结果。
 - 回归证明同一 private Markdown 与 tag canary 在 Outer 搜索中为空、在已解锁 Umbra 搜索中命中；Umbra lock 后 RPC 返回认证失败。`cargo fmt --check`、定向 core/daemon 测试、两个 crate `-D warnings` Clippy、VS Code typecheck 与 67/67 Node unit tests 已通过。Extension Host 与 Linux release repackage/install 将在本提交后的发布检查点执行。
 
+## 2026-07-16 — Current installed VS Code bundle (Umbra private search)
+
+- `3512422e232f50c45e6ca8af99f7048339bc668e` 已经通过真实 `pnpm --dir editors/vscode test:extension:local`；随后从独立 `--no-local` clean checkout、canonical origin 与 `/usr/bin/gcc` 构建 Linux x64 release。artifact audit、release `inex`/`inexd` native dependency audit 与 isolated package smoke 全部通过。
+- 已用 `/usr/bin/code --install-extension --force` 覆盖安装 [inex-vscode-0.1.0-linux-x64.vsix](/home/horeb/_code/Inex/target/release-artifacts/3512422-linux-x64/inex-vscode-0.1.0-linux-x64.vsix)。VSIX SHA-256 为 `88ca16b9be7805d59f5aefa1888bbed0abe2e55de25f9696cf92308c6d51a523`；包内与已安装 `inexd` 均为 `c12d0e2cab0a239b135fe36675638988449f988b2977cb51ef5e1cc0726550ee`，`extension.js` 均为 `f4233810611968821ed0ccc6cbfa91939e2edc4b0b5b42e8180073569b89e2ab`。`horeb.inex-vscode@0.1.0` 已列出；同版本号正在运行的 VS Code 窗口仍必须执行 Developer: Reload Window。安装 CLI 的 `DEP0169` 是宿主 Node 警告，安装成功且哈希比对通过。
+
 ## 2026-07-16 — Outer-only Umbra export projection
 
 - `umbra_render::render_outer_projection` 现在只根据已认证的公开 Outer slot 策略替换 marker：Drop 输出空内容、Cover 输出明确公开的 cover text、Placeholder 输出固定无标识文本。它严格验证 marker/slot 一一对应和 Cover/Placeholder metadata，永不读取 private payload、kind、tag、slot ID 或 `K_umbra`。
