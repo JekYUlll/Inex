@@ -46,6 +46,7 @@ export interface InexIntegrationTestApi {
   readonly deleteDocument: (logicalPath: string) => Promise<void>;
   readonly listTree: () => Promise<readonly import("./sidecar.ts").TreeEntry[]>;
   readonly failNextMutationClose: () => void;
+  readonly exportOuterCopy: (destination: string) => Promise<void>;
   readonly lock: () => Promise<void>;
 }
 
@@ -394,6 +395,17 @@ export function activate(
     deleteDocument: (logicalPath: string) => crud.deleteFile(logicalPath),
     listTree: () => crud.listTree(),
     failNextMutationClose: () => editor.failNextMutationCloseForIntegrationTest(),
+    exportOuterCopy: async (destination: string) => {
+      const session = controller.acquireSession();
+      const prepared = await session.sidecar.preparePlaintextExport(destination, "outer");
+      if (!controller.isSessionCurrent(session)) {
+        throw new Error("Inex vault session changed during integration plaintext export");
+      }
+      await session.sidecar.commitPlaintextExport(prepared);
+      if (!controller.isSessionCurrent(session)) {
+        throw new Error("Inex vault session changed after integration plaintext export");
+      }
+    },
     lock: () => controller.lock(),
   });
 }

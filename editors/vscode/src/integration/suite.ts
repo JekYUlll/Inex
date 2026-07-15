@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -38,6 +39,7 @@ interface InexIntegrationTestApi {
     readonly logicalPath: string;
   }[]>;
   readonly failNextMutationClose: () => void;
+  readonly exportOuterCopy: (destination: string) => Promise<void>;
   readonly lock: () => Promise<void>;
 }
 
@@ -50,6 +52,7 @@ interface FixtureEnvironment {
   readonly sidecarTracePath: string;
   readonly userDataPath: string;
   readonly expectedSha256: string;
+  readonly originalSha256: string;
 }
 
 interface SidecarTraceEntry {
@@ -104,6 +107,7 @@ async function runBackupRecoveryCycle(
   fixture: FixtureEnvironment,
 ): Promise<void> {
   await api.unlock(fixture.vaultPath, fixture.password, fixture.sidecarPath);
+  await runPlaintextExportCycle(api, fixture);
   await runFeatureOneAssetLifecycle(api, fixture);
   await api.unlock(fixture.vaultPath, fixture.password, fixture.sidecarPath);
   await runCrudCycle(api, fixture);
@@ -155,6 +159,53 @@ async function runBackupRecoveryCycle(
   } finally {
     await fs.rm(recoveryBackupPath, { force: true });
   }
+}
+
+async function runPlaintextExportCycle(
+  api: InexIntegrationTestApi,
+  fixture: FixtureEnvironment,
+): Promise<void> {
+  const destination = path.join(path.dirname(fixture.vaultPath), "authorized-plaintext-export");
+  await assert.rejects(fs.lstat(destination), "plaintext export destination unexpectedly exists");
+  try {
+    await api.exportOuterCopy(destination);
+    const markdown = await fs.readFile(path.join(destination, LOGICAL_PATH));
+    assert.equal(
+      createHash("sha256").update(markdown).digest("hex"),
+      fixture.originalSha256,
+      "Outer plaintext export did not reproduce the authenticated Markdown projection",
+    );
+    markdown.fill(0);
+    const asset = await fs.readFile(path.join(destination, ASSET_LOGICAL_PATH));
+    try {
+      assert.equal(asset.subarray(0, 8).toString("hex"), "89504e470d0a1a0a");
+    } finally {
+      asset.fill(0);
+    }
+    await assert.rejects(
+      fs.lstat(path.join(destination, `${LOGICAL_PATH}.enc`)),
+      "plaintext export incorrectly retained an encrypted Markdown name",
+    );
+    assertNoPlaintextTextDocument(vscode.Uri.file(path.join(destination, LOGICAL_PATH)), fixture.sourcePath);
+    const trace = await waitForSidecarTrace(
+      fixture,
+      (entries) => entries.some((entry) => entry.method === "vault.export.prepare")
+        && entries.some((entry) => entry.method === "vault.export.commit"),
+      "VS Code outer plaintext export did not issue the prepare/commit RPC transaction",
+    );
+    const prepare = trace.find((entry) => entry.method === "vault.export.prepare");
+    const commit = trace.find((entry) => entry.method === "vault.export.commit");
+    assert.ok(prepare);
+    assert.ok(commit);
+    assert.equal(
+      commit.sequence > prepare.sequence,
+      true,
+      "VS Code plaintext export committed before prepare",
+    );
+  } finally {
+    await fs.rm(destination, { recursive: true, force: true });
+  }
+  await assert.rejects(fs.lstat(destination), "test plaintext export was retained for the residue scan");
 }
 
 async function runFeatureOneAssetLifecycle(
@@ -472,6 +523,8 @@ function fixtureEnvironment(): FixtureEnvironment {
   assert.equal(stage, "backup", "Invalid INEX_TEST_STAGE");
   const expectedSha256 = requiredEnvironment("INEX_TEST_EXPECTED_SHA256");
   assert.match(expectedSha256, /^[0-9a-f]{64}$/u, "Invalid expected content digest");
+  const originalSha256 = requiredEnvironment("INEX_TEST_ORIGINAL_SHA256");
+  assert.match(originalSha256, /^[0-9a-f]{64}$/u, "Invalid original content digest");
   return {
     stage,
     vaultPath: requiredEnvironment("INEX_TEST_VAULT_PATH"),
@@ -481,6 +534,7 @@ function fixtureEnvironment(): FixtureEnvironment {
     sidecarTracePath: requiredEnvironment("INEX_TEST_SIDECAR_TRACE_PATH"),
     userDataPath: requiredEnvironment("INEX_TEST_USER_DATA_PATH"),
     expectedSha256,
+    originalSha256,
   };
 }
 
@@ -507,6 +561,7 @@ function assertIntegrationApi(value: unknown): asserts value is InexIntegrationT
     "deleteDocument",
     "listTree",
     "failNextMutationClose",
+    "exportOuterCopy",
     "lock",
   ]) {
     assert.equal(typeof candidate[method], "function", `Integration-test API lacks ${method}`);

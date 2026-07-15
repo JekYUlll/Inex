@@ -72,6 +72,7 @@ const originalPlaintext = `# Inex residue audit\n\n${canary}\n\n![Encrypted pixe
 const secondaryPlaintext = `# Secondary encrypted note\n\n${canary}:secondary\n`;
 const dirtyPlaintext = `${originalPlaintext}${DIRTY_SUFFIX}`;
 const expectedSha256 = createHash("sha256").update(dirtyPlaintext, "utf8").digest("hex");
+const originalSha256 = createHash("sha256").update(originalPlaintext, "utf8").digest("hex");
 const signatures = residueSignatures(canary, [
   originalPlaintext,
   secondaryPlaintext,
@@ -338,6 +339,7 @@ async function runStage(
       INEX_TEST_SIDECAR_TRACE_PATH: paths.sidecarTracePath,
       INEX_TEST_USER_DATA_PATH: paths.userDataPath,
       INEX_TEST_EXPECTED_SHA256: expectedSha256,
+      INEX_TEST_ORIGINAL_SHA256: originalSha256,
     },
     stdout: output,
     stderr: errors,
