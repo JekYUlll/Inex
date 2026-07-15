@@ -758,3 +758,8 @@
 
 - `umbra.profile.create` does not accept profile fields at the top level: the daemon requires one exact nested `profile` object. `umbra.profile.edit` additionally requires top-level `profileId`. Keeping those shapes exact prevents a UI-only implementation from silently failing or broadening the protocol parser.
 - Reusable profiles carry only kind, tag IDs, Outer mode and the derived `promptForCover` boolean. Public cover text is per annotation instance and must remain outside profile editing, so the editor does not accidentally persist display text in semantic catalog metadata.
+
+## 2026-07-16 Working-tree compare boundary
+
+- A secure SCM comparison may decrypt an already persisted, authenticated worktree envelope, but must never treat the CustomEditor textarea as a Git revision. This preserves save semantics and prevents a second plaintext ownership path.
+- Working-tree/HEAD is distinct from the existing fixed historical HEAD/parent compare; keeping it a separate daemon method avoids widening historical revision input or silently adding private Umbra scope.

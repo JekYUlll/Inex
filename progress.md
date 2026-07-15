@@ -1690,3 +1690,8 @@
 - 通过 `script` 的伪终端创建受限临时 Inex vault，随后以绝对 `target/debug/inexd`、独立 Outer/Umbra test password 运行 `outer_lifecycle.lua`。回归实际完成 Outer/Umbra unlock/lock、normal document create/save/search/mkdir、Outer lock/reopen、feature-2 enable 与 private annotation mutation；命令以 `neovim-outer-lifecycle-passed` 退出。
 - 临时 vault 在成功后删除。该证据覆盖真实 daemon 交互和 buffer lifecycle，但不扩大为 shada、LSP、第三方插件、swap 或 OS-level residue 的完整宿主安全声明。
 - 新增 Linux helper `editors/neovim/tests/run_outer_lifecycle.sh`，从绝对 `INEX_SIDECAR` 推导 sibling `inex`，通过伪终端初始化临时 vault，运行同一 lifecycle test 并以 trap 删除 vault。helper 已实际通过，避免未来测试遗漏 vault/password 前置条件。
+
+## 2026-07-16 — Secure working-tree comparison contract
+
+- 新增并发布 allowlist `vscode-working-tree-compare-v1.md`：下一 compare 切片只比较已保存、认证的 worktree document 与 canonical HEAD blob；daemon 独占 worktree/Git 读取，extension 不得发送未保存 textarea 内容。
+- 普通 SCM 保持 ciphertext-only；结果只能进入 Inex script-free read-only webview。Outer scope 不加载 `K_umbra`，Umbra working-tree compare 必须是未来独立 second-unlock command。
