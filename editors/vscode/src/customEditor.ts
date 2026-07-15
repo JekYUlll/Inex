@@ -696,6 +696,13 @@ export class InexCustomEditorProvider
     webviewPanel.webview.options = { enableScripts: true, localResourceRoots: [] };
     webviewPanel.webview.html = editorHtml();
     document.attach(webviewPanel);
+    // A custom editor can already be active before this resolver installs the
+    // view-state listener. Record that initial state as well as future focus
+    // changes, otherwise commands that operate on the active Inex document
+    // fail until the user manually switches tabs away and back.
+    if (webviewPanel.active && this.documents.has(document)) {
+      this.activeDocument = document;
+    }
     webviewPanel.onDidChangeViewState((event) => {
       if (event.webviewPanel.active && this.documents.has(document)) {
         this.activeDocument = document;
@@ -984,6 +991,11 @@ export class InexCustomEditorProvider
     for (const document of this.documents) {
       document.wipeForLock();
     }
+  }
+
+  /** Release opaque asset preview handles before an asset-exclusive RPC. */
+  public async suspendAssetPreviewsForExclusiveOperation(): Promise<void> {
+    await this.previews.cancelAllAndWait();
   }
 
   /** Clear only private projections after K_umbra leaves the sidecar. */

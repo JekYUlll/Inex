@@ -355,6 +355,7 @@ export function activate(
         if (target === undefined) {
           throw new Error("Choose an encrypted Markdown resource in Source Control or the Inex tree, or open a clean Inex Markdown editor before comparing its HEAD revision");
         }
+        await editor.suspendAssetPreviewsForExclusiveOperation();
         const compared = await target.session.sidecar.compareOuterRevision(target.logicalPath);
         if (!controller.isSessionCurrent(target.session)) {
           compared.leftContent.fill(0);
@@ -384,6 +385,7 @@ export function activate(
         if (target === undefined || !target.umbra || !controller.isSessionCurrent(target.session)) {
           throw new Error("Open a clean Umbra private projection before comparing its HEAD revision");
         }
+        await editor.suspendAssetPreviewsForExclusiveOperation();
         const compared = await ready.sidecar.compareUmbraRevision(target.logicalPath);
         if (!controller.isSessionCurrent(ready.session)) {
           compared.leftContent.fill(0);
@@ -419,6 +421,7 @@ export function activate(
         if (target === undefined) {
           throw new Error("Choose an encrypted Markdown resource in Source Control or open a clean saved Inex Markdown editor before comparing its working copy with HEAD");
         }
+        await editor.suspendAssetPreviewsForExclusiveOperation();
         const compared = await target.session.sidecar.compareWorkingTreeOuter(target.logicalPath);
         if (!controller.isSessionCurrent(target.session)) {
           compared.leftContent.fill(0);

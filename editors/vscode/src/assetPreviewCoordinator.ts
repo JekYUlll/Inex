@@ -121,6 +121,17 @@ export class AssetPreviewCoordinator implements vscode.Disposable {
     }
   }
 
+  /**
+   * Stop every preview and wait until an in-flight asset transfer has closed
+   * its daemon handle. Operations which require an asset-free vault session
+   * (for example authenticated revision comparison) must use this fence
+   * rather than racing `asset.close`.
+   */
+  public async cancelAllAndWait(): Promise<void> {
+    this.cancelAll();
+    await this.queue;
+  }
+
   public dispose(): void {
     if (this.disposed) {
       return;

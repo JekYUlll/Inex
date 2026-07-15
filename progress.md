@@ -1735,3 +1735,9 @@
 - `runUiAction` 现在在异步展示 VS Code error notification 后仍将原始失败回传给 command caller；这避免 headless Host 把实际 RPC 错误伪装成侧车 trace 超时，同时不再等待用户关闭 toast。
 - Umbra historical compare fixture 先通过正常 custom-editor save 持久化变更，并把 `vault.json`、`.inex/` 与 document envelope 一起提交；随后创建有效的第二个 feature-2 baseline commit。历史 Umbra compare 只接收 feature-2 两侧，拒绝 feature-1 parent 是既定安全契约。
 - 本轮完整 Host runner 因无参数 Outer compare 尚未获得 active custom tab 而明确失败；已为该分支加入 `tab.isActive` 前置断言，下一轮需重跑完整 Host/residue gate。`pnpm --dir editors/vscode check` 与 `test:extension:build` 已通过；尚未产生新安装包。
+
+## 2026-07-16 — VS Code active editor and asset-exclusive compare repair
+
+- 修复首次打开 Inex custom editor 的 lifecycle gap：resolver 在注册 view-state listener 后立即采样 `webviewPanel.active`，因此无需先切换标签，active-editor compare/annotation 等命令即可取得当前 document。
+- 新增 AssetPreviewCoordinator 的可等待取消栅栏；三种 historical/working-tree compare 都先取消 preview 并等待 in-flight `asset.close`，保持 daemon 对同时存在 asset handle 的 `Busy` 拒绝不变。真实带图片 Markdown 现在无需用户手动关闭预览即可比较。
+- 最新 isolated Host trace 已覆盖两个 `revision.compare.outer`、asset open/close、draft backup、`document.close → vault.lock → system.shutdown`。测试 runner 仍保留 `/tmp/inex-vscode-audit-iTc86n` 而未输出最终 residue verdict；该状态不得计为完整 Host/residue gate 通过，尚未发布新 VSIX。
