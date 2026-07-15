@@ -1746,3 +1746,9 @@
 
 - 独立 tmux runner 排除了终端 supervisor 提前终止，给出两项可复现 Host fixture 修复：revision compare panel 会占据 focus，因此依赖 `workbench.action.files.revert` 的 recovery fixture 会对错误 tab 操作；已新增仅 integration-mode 的 bridge，调用相同 `revertCustomDocument` 实现而不依赖 VS Code active-tab 路由。
 - 该 bridge 不绕过生产逻辑：仍使用已打开的 `InexDocument`、正常 cancellation token 和 `revertCustomDocument`。`pnpm --dir editors/vscode check` 与 `test:extension:build` 通过；完整 runner 的下一阶段尚待重跑，继续不发布 VSIX。
+
+## 2026-07-16 — VS Code recovery and working-tree compare fixture correction
+
+- `revertCustomDocument` 已正确更新 Inex document 的 saved revision；直接调用 provider bridge 时，VS Code tab dirty flag 不会经过 Workbench 状态机同步，因此 fixture 现断言 provider document 的真实 dirty state，而非错误地要求未经过 Workbench 的 tab 变更。
+- recovery helper 保存后会 dispose 临时 custom document；saved-worktree compare 的 Host 回归相应改为传入 canonical ciphertext URI，验证同一 command 的 Source Control resource 路径。此前 active-editor compare 已在同一 runner 的历史 Outer compare 中得到覆盖。
+- `pnpm --dir editors/vscode check`、`test:extension:build` 通过；仍需完整 tmux Host/residue rerun，尚未发布 VSIX。

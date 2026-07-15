@@ -37,6 +37,7 @@ export interface InexIntegrationTestApi {
   readonly openDocument: (logicalPath: string) => Promise<void>;
   readonly waitUntilReady: (logicalPath: string) => Promise<void>;
   readonly revertDocument: (logicalPath: string) => Promise<void>;
+  readonly documentIsDirty: (logicalPath: string) => boolean;
   readonly markDirty: (logicalPath: string) => void;
   readonly waitForBackup: () => Promise<string>;
   readonly contentSha256: (logicalPath: string) => string;
@@ -57,7 +58,7 @@ export interface InexIntegrationTestApi {
   readonly verifyUmbraLock: (password: string) => Promise<void>;
   readonly verifyOuterRevisionCompare: () => Promise<void>;
   readonly verifyOuterRevisionCompareFromScm: (logicalPath: string) => Promise<void>;
-  readonly verifyWorkingTreeOuterCompare: () => Promise<void>;
+  readonly verifyWorkingTreeOuterCompare: (logicalPath: string) => Promise<void>;
   readonly verifyUmbraRevisionCompare: () => Promise<void>;
   readonly verifyOuterProjection: () => Promise<void>;
   readonly verifyOuterProjectionFromTree: (logicalPath: string) => Promise<void>;
@@ -634,6 +635,7 @@ export function activate(
       editor.waitForIntegrationDocument(logicalPath),
     revertDocument: (logicalPath: string) =>
       editor.revertIntegrationDocument(logicalPath),
+    documentIsDirty: (logicalPath: string) => editor.integrationDocumentIsDirty(logicalPath),
     markDirty: (logicalPath: string) => {
       editor.markIntegrationDocumentDirty(logicalPath);
     },
@@ -720,8 +722,12 @@ export function activate(
         controller.ciphertextUriForSession(logicalPath, session),
       );
     },
-    verifyWorkingTreeOuterCompare: async () => {
-      await vscode.commands.executeCommand("inex.compareWorkingTreeOuter");
+    verifyWorkingTreeOuterCompare: async (logicalPath: string) => {
+      const session = controller.acquireSession();
+      await vscode.commands.executeCommand(
+        "inex.compareWorkingTreeOuter",
+        controller.ciphertextUriForSession(logicalPath, session),
+      );
     },
     verifyUmbraRevisionCompare: async () => {
       await vscode.commands.executeCommand("inex.compareUmbraRevision");

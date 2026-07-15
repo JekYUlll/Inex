@@ -1388,6 +1388,17 @@ export class InexCustomEditorProvider
     }
   }
 
+  public integrationDocumentIsDirty(logicalPath: string): boolean {
+    this.requireIntegrationTestMode();
+    const document = [...this.documents].find(
+      (candidate) => candidate.logicalPath === logicalPath,
+    );
+    if (document === undefined) {
+      throw new Error("Inex integration document is not open");
+    }
+    return document.isDirty;
+  }
+
   public markIntegrationDocumentDirty(logicalPath: string): void {
     this.requireIntegrationTestMode();
     const document = [...this.documents].find(

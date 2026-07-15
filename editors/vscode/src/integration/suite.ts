@@ -27,6 +27,7 @@ interface InexIntegrationTestApi {
   readonly openDocument: (logicalPath: string) => Promise<void>;
   readonly waitUntilReady: (logicalPath: string) => Promise<void>;
   readonly revertDocument: (logicalPath: string) => Promise<void>;
+  readonly documentIsDirty: (logicalPath: string) => boolean;
   readonly markDirty: (logicalPath: string) => void;
   readonly waitForBackup: () => Promise<string>;
   readonly contentSha256: (logicalPath: string) => string;
@@ -50,7 +51,7 @@ interface InexIntegrationTestApi {
   readonly verifyUmbraLock: (password: string) => Promise<void>;
   readonly verifyOuterRevisionCompare: () => Promise<void>;
   readonly verifyOuterRevisionCompareFromScm: (logicalPath: string) => Promise<void>;
-  readonly verifyWorkingTreeOuterCompare: () => Promise<void>;
+  readonly verifyWorkingTreeOuterCompare: (logicalPath: string) => Promise<void>;
   readonly verifyUmbraRevisionCompare: () => Promise<void>;
   readonly verifyOuterProjection: () => Promise<void>;
   readonly verifyOuterProjectionFromTree: (logicalPath: string) => Promise<void>;
@@ -292,7 +293,11 @@ async function runBackupRecoveryCycle(
     // implementation directly so this recovery invariant does not depend on
     // VS Code's active-tab routing policy.
     await api.revertDocument(LOGICAL_PATH);
-    await waitFor(() => !tab.isDirty, "Inex custom-editor tab did not become clean after revert");
+    assert.equal(
+      api.documentIsDirty(LOGICAL_PATH),
+      false,
+      "Inex custom document remained dirty after its provider revert implementation",
+    );
     await api.lock();
     await api.unlock(fixture.vaultPath, fixture.password, fixture.sidecarPath);
     assert.equal(
@@ -300,7 +305,7 @@ async function runBackupRecoveryCycle(
       fixture.expectedSha256,
       "The provider backupId recovery path did not restore the unsaved EDRY draft",
     );
-    await api.verifyWorkingTreeOuterCompare();
+    await api.verifyWorkingTreeOuterCompare(LOGICAL_PATH);
     await waitForSidecarTrace(
       fixture,
       (entries) => entries.some((entry) => entry.method === "revision.compare.workingTreeOuter"),
@@ -752,6 +757,7 @@ function assertIntegrationApi(value: unknown): asserts value is InexIntegrationT
     "openDocument",
     "waitUntilReady",
     "revertDocument",
+    "documentIsDirty",
     "markDirty",
     "waitForBackup",
     "contentSha256",
