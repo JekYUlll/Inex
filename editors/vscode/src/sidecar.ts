@@ -92,6 +92,13 @@ export interface UmbraProjection {
   readonly renderMap: RenderMap;
 }
 
+/** Authenticated public-only feature-2 projection; never includes a RenderMap. */
+export interface UmbraOuterProjection {
+  readonly content: Buffer;
+  readonly etag: string;
+  readonly metadata: DocumentMetadata;
+}
+
 /** Authenticated, read-only historical Outer projections for one document. */
 export interface OuterRevisionCompare {
   readonly leftRole: "head";
@@ -597,6 +604,18 @@ export class InexSidecar {
     logicalFileComponents(logicalPath);
     return parseUmbraProjection(
       await this.callRaw("umbra.document.open", {
+        ...this.protectedParams(),
+        logicalPath,
+      }),
+      logicalPath,
+    );
+  }
+
+  public async openUmbraOuterProjection(logicalPath: string): Promise<UmbraOuterProjection> {
+    this.requireUmbraV1();
+    logicalFileComponents(logicalPath);
+    return parseUmbraOuterProjection(
+      await this.callRaw("umbra.document.openOuter", {
         ...this.protectedParams(),
         logicalPath,
       }),
@@ -1615,6 +1634,30 @@ export function parseUmbraProjection(
     }
     logicalFileComponents(expectedLogicalPath);
     return { content, etag, metadata: parseMetadata(result.metadata, expectedLogicalPath), renderMap };
+  } catch (error: unknown) {
+    content.fill(0);
+    throw error;
+  }
+}
+
+/** @internal Exported for exact public feature-2 projection response tests. */
+export function parseUmbraOuterProjection(
+  value: JsonValue,
+  expectedLogicalPath: string,
+): UmbraOuterProjection {
+  const result = expectObject(value);
+  expectExactKeys(result, ["contentBase64", "etag", "metadata"], "Umbra Outer projection");
+  const content = decodeCanonicalBase64url(
+    expectString(result.contentBase64, "Umbra Outer projection"),
+    MAX_DOCUMENT_BYTES,
+  );
+  try {
+    logicalFileComponents(expectedLogicalPath);
+    return {
+      content,
+      etag: expectEtag(result.etag, "Umbra Outer document etag"),
+      metadata: parseMetadata(result.metadata, expectedLogicalPath),
+    };
   } catch (error: unknown) {
     content.fill(0);
     throw error;

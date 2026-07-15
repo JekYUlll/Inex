@@ -53,6 +53,7 @@ pub enum Method {
     UmbraPasswordChange,
     UmbraLock,
     UmbraEnable,
+    UmbraDocumentOpenOuter,
     UmbraDocumentOpen,
     UmbraDocumentConvert,
     UmbraAnnotationApply,
@@ -89,7 +90,7 @@ pub enum Method {
 }
 
 impl Method {
-    const ALL: [Self; 48] = [
+    const ALL: [Self; 49] = [
         Self::SystemHello,
         Self::SystemPing,
         Self::SystemShutdown,
@@ -105,6 +106,7 @@ impl Method {
         Self::UmbraPasswordChange,
         Self::UmbraLock,
         Self::UmbraEnable,
+        Self::UmbraDocumentOpenOuter,
         Self::UmbraDocumentOpen,
         Self::UmbraDocumentConvert,
         Self::UmbraAnnotationApply,
@@ -159,6 +161,7 @@ impl Method {
             Self::UmbraPasswordChange => "umbra.password.change",
             Self::UmbraLock => "umbra.lock",
             Self::UmbraEnable => "umbra.enable",
+            Self::UmbraDocumentOpenOuter => "umbra.document.openOuter",
             Self::UmbraDocumentOpen => "umbra.document.open",
             Self::UmbraDocumentConvert => "umbra.document.convert",
             Self::UmbraAnnotationApply => "umbra.annotation.apply",

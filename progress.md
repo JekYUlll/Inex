@@ -1595,3 +1595,8 @@
 
 - 同一 fresh Sublime client 在仅 `vault.unlock`（Outer）后先调用 ordinary `document.open(plain.md)`；private-slot helper 只接受 `RpcRemoteError`，任何 normal-document 成功都 fail。随后才执行 `umbra.unlock` 和 `umbra.document.open`，继续验证 one-slot RenderMap 并 wipe projection。
 - 这绑定了 VS Code 写入 feature-2 文档与跨客户端 Outer/Umbra 双边界：普通 buffer 不会得到 Outer container 或 private projection，Umbra API 仍可在独立 key unlock 后读取。VS Code typecheck、Python 3.8 AST gate 与 local Extension Host regression 通过。
+
+## 2026-07-16 — Read-only VS Code Outer Projection
+
+- 新增 daemon `umbra.document.openOuter`，它只接受 authenticated session/logical path，调用专用 `render_umbra_outer_projection` 与 feature-2 authenticated metadata reader；响应 exact shape 为 public `contentBase64`、etag、metadata，不能携带 RenderMap、slot ID、tag/kind/timestamp 或任何 `K_umbra` 数据。普通 `document.open` 对 feature-2 的 fail-closed 语义不变。
+- VS Code 新增 `Inex: View Outer Projection`，仅 active clean Umbra CustomEditor 可调用。投影只进入 `enableScripts:false`/no-resource 的 read-only panel，并加入同一 lock/dispose owned-buffer wipe set；不创建 plaintext TextDocument，不使用 native diff，且不可编辑保存。验证：daemon 75/75、VS Code typecheck、73/73 unit 与 local Extension Host trace `umbra.document.openOuter` 均通过。

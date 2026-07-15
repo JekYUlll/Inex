@@ -73,6 +73,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
   - 2026-07-16: `e1a50ea` Linux x64 clean standalone-source package 已以 system GCC 重建，artifact/native dependency/isolated install smoke 均通过并已覆盖安装；该发布包包含可读受控 compare panel。持久 profile 手工视觉/SCM/residue 门禁仍未因此关闭。
   - 2026-07-16: revision-compare v1 规范已加入 VSIX `docs/spec/` release allowlist，避免可安装包缺少该命令的安全边界说明；发布工具 86/86、VS Code typecheck、clean-source package/audit/isolated-install smoke 均通过，Linux x64 文档完整包已覆盖安装。
   - 2026-07-16: multi-hunk compare alignment 已以 `63bd405` 重新 package/audit/isolated-install smoke 并覆盖安装。该实现仍只使用 Inex 无脚本 panel；持续 profile 人工门禁没有被自动回归替代。
+  - 2026-07-16: `Inex: View Outer Projection` 已接 `umbra.document.openOuter`：仅 Outer session 认证 feature-2 container 并 render Drop/Cover/Placeholder，响应无 RenderMap/slot/tag/kind/private payload；VS Code 只在 active clean Umbra custom editor 打开无脚本只读 panel，lock/dispose 复用 owned buffer wipe。daemon/VS Code tests 与 Extension Host trace 均通过。
   - 2026-07-16: 当前可安装 Linux x64 VSIX 已更新为 clean canonical-source `8dd7d70`，包含 richer display-only Markdown highlighting；package/audit/native-dependency/isolated-install smoke 通过并已覆盖本机 profile。运行中的窗口仍需 reload。
 - **Status:** complete
 

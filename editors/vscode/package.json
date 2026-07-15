@@ -33,6 +33,7 @@
     "onCommand:inex.unlockVault",
     "onCommand:inex.lockUmbra",
     "onCommand:inex.changeUmbraPassword",
+    "onCommand:inex.openOuterProjection",
     "onCommand:inex.importRepository",
     "onCommand:inex.newEncryptedMarkdown",
     "onCommand:inex.newFolder",
@@ -97,6 +98,11 @@
       {
         "command": "inex.compareUmbraRevision",
         "title": "Inex: Compare HEAD with Parent (Umbra Private)",
+        "enablement": "inex.vaultUnlocked"
+      },
+      {
+        "command": "inex.openOuterProjection",
+        "title": "Inex: View Outer Projection",
         "enablement": "inex.vaultUnlocked"
       },
       {

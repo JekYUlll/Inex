@@ -17,7 +17,7 @@ import {
   type PrivateAnnotationPreferences,
 } from "./privateAnnotationPreferences.ts";
 import { validatePlaintextExportDirectoryName } from "./plaintextExport.ts";
-import { revisionCompareHtml } from "./revisionCompare.ts";
+import { outerProjectionHtml, revisionCompareHtml } from "./revisionCompare.ts";
 import { formatSecurityStatus } from "./securityStatus.ts";
 import type { PrivateAnnotationSpec, UmbraAnnotationProfile } from "./sidecar.ts";
 import { showSensitiveInputBox, showSensitiveQuickPick } from "./sensitiveUi.ts";
@@ -56,6 +56,7 @@ export interface InexIntegrationTestApi {
   readonly verifyUmbraLock: (password: string) => Promise<void>;
   readonly verifyOuterRevisionCompare: () => Promise<void>;
   readonly verifyUmbraRevisionCompare: () => Promise<void>;
+  readonly verifyOuterProjection: () => Promise<void>;
   readonly createCrossEditorUmbraTag: () => Promise<void>;
   readonly createCrossEditorUmbraAnnotation: (logicalPath: string) => Promise<void>;
   readonly lock: () => Promise<void>;
@@ -385,6 +386,33 @@ export function activate(
         });
       });
     }),
+    vscode.commands.registerCommand("inex.openOuterProjection", async () => {
+      await runUiAction(async () => {
+        if (!(await ensureVaultUnlocked(controller))) return;
+        const target = editor.currentRevisionCompareTarget();
+        if (target === undefined || !target.umbra || !controller.isSessionCurrent(target.session)) {
+          throw new Error("Open a clean Umbra private projection before viewing its Outer projection");
+        }
+        const projection = await target.session.sidecar.openUmbraOuterProjection(target.logicalPath);
+        if (!controller.isSessionCurrent(target.session)) {
+          projection.content.fill(0);
+          throw new Error("Inex vault session changed while opening the Outer projection");
+        }
+        const panel = vscode.window.createWebviewPanel(
+          "inex.outerProjection",
+          "Inex: Outer Projection",
+          vscode.ViewColumn.Beside,
+          { enableScripts: false, retainContextWhenHidden: false, localResourceRoots: [] },
+        );
+        const view = { panel, buffers: [projection.content] };
+        compareViews.add(view);
+        panel.webview.html = outerProjectionHtml(projection.content);
+        panel.onDidDispose(() => {
+          for (const buffer of view.buffers) buffer.fill(0);
+          compareViews.delete(view);
+        });
+      });
+    }),
     vscode.commands.registerCommand("inex.exportPlaintextCopy", async () => {
       await runUiAction(async () => {
         if (!(await ensureVaultUnlocked(controller))) return;
@@ -615,6 +643,9 @@ export function activate(
     },
     verifyUmbraRevisionCompare: async () => {
       await vscode.commands.executeCommand("inex.compareUmbraRevision");
+    },
+    verifyOuterProjection: async () => {
+      await vscode.commands.executeCommand("inex.openOuterProjection");
     },
     createCrossEditorUmbraTag: async () => {
       const session = controller.acquireSession();

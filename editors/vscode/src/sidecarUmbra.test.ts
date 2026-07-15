@@ -5,6 +5,7 @@ import { RpcProtocolError, type JsonObject } from "./rpc.ts";
 import {
   parseUmbraAnnotationConfig,
   parseUmbraAnnotationResult,
+  parseUmbraOuterProjection,
   parseUmbraProjection,
 } from "./sidecar.ts";
 
@@ -59,6 +60,22 @@ test("Umbra projection parser binds content length and strict RenderMap shape", 
         },
         "private.md",
       ),
+    RpcProtocolError,
+  );
+});
+
+test("Umbra Outer projection parser accepts only the public bounded response", () => {
+  const parsed = parseUmbraOuterProjection(
+    { contentBase64: Buffer.from("public\n").toString("base64url"), etag: ETAG, metadata: METADATA },
+    "private.md",
+  );
+  assert.equal(parsed.content.toString(), "public\n");
+  parsed.content.fill(0);
+  assert.throws(
+    () => parseUmbraOuterProjection(
+      { contentBase64: "", etag: ETAG, metadata: METADATA, renderMap: {} },
+      "private.md",
+    ),
     RpcProtocolError,
   );
 });

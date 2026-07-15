@@ -164,6 +164,7 @@ impl<C: MonotonicClock> RpcService<C> {
             Method::UmbraPasswordChange => self.umbra_password_change(params),
             Method::UmbraLock => self.umbra_lock(params),
             Method::UmbraEnable => self.umbra_enable(params),
+            Method::UmbraDocumentOpenOuter => self.umbra_document_open_outer(params),
             Method::UmbraDocumentOpen => self.umbra_document_open(params),
             Method::UmbraDocumentConvert => self.umbra_document_convert(params),
             Method::UmbraAnnotationApply => self.umbra_annotation_apply(params),
@@ -596,6 +597,25 @@ impl<C: MonotonicClock> RpcService<C> {
             "etag": metadata.etag,
             "metadata": header_metadata_value(&metadata.header),
             "renderMap": render_map_value(&projection.render_map),
+        }))
+    }
+
+    fn umbra_document_open_outer(&mut self, params: Params) -> RpcResult {
+        let (session, logical_path) = parse_session_path(params)?;
+        let vault = self
+            .sessions
+            .vault(session.as_str())
+            .map_err(map_session_error)?;
+        let projection = vault
+            .render_umbra_outer_projection(&logical_path)
+            .map_err(|error| map_vault_error(error, ErrorContext::Document))?;
+        let (metadata, _) = vault
+            .read_umbra_outer_document(&logical_path)
+            .map_err(|error| map_vault_error(error, ErrorContext::Document))?;
+        Ok(json!({
+            "contentBase64": encode_base64url(projection.as_bytes()).as_str(),
+            "etag": metadata.etag,
+            "metadata": header_metadata_value(&metadata.header),
         }))
     }
 

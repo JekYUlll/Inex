@@ -713,3 +713,8 @@
 
 - Feature-2 Outer data is not a normal editor projection in this v1 contract. `Vault::read` rejects a required-feature document, while the separate `read_umbra_outer_document` API is reserved for explicit limited projections such as export. The cross-client test therefore expects ordinary Sublime `document.open` to fail before `K_umbra` is unlocked, rather than treating a public JSON container as Markdown.
 - A successful subsequent `umbra.document.open` after independent unlock proves this is scope separation rather than an unreadable/corrupt document. This is the correct observable test for “no feature-2 private projection reaches an Outer editor buffer.”
+
+## 2026-07-16 Read-only Outer projection viewer
+
+- Public feature-2 rendering must not be smuggled through the ordinary document API merely to make Outer strategies visible. A distinct daemon method can authenticate the container and render its public Drop/Cover/Placeholder output without accessing `K_umbra`; a distinct no-script VS Code panel then makes that output observable without turning it into an editable normal buffer.
+- The public response intentionally has no RenderMap. A RenderMap exposes opaque slot identities and exact private boundaries, which are not needed for a read-only Outer view and would violate the stated projection minimization boundary.

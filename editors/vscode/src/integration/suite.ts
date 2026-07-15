@@ -49,6 +49,7 @@ interface InexIntegrationTestApi {
   readonly verifyUmbraLock: (password: string) => Promise<void>;
   readonly verifyOuterRevisionCompare: () => Promise<void>;
   readonly verifyUmbraRevisionCompare: () => Promise<void>;
+  readonly verifyOuterProjection: () => Promise<void>;
   readonly createCrossEditorUmbraTag: () => Promise<void>;
   readonly createCrossEditorUmbraAnnotation: (logicalPath: string) => Promise<void>;
   readonly lock: () => Promise<void>;
@@ -124,6 +125,12 @@ async function runBackupRecoveryCycle(
   await api.unlock(fixture.vaultPath, fixture.password, fixture.sidecarPath);
   await api.openDocument(SECONDARY_LOGICAL_PATH);
   await api.verifyUmbraAnnotationLifecycle(SECONDARY_LOGICAL_PATH, fixture.password);
+  await api.verifyOuterProjection();
+  await waitForSidecarTrace(
+    fixture,
+    (entries) => entries.some((entry) => entry.method === "umbra.document.openOuter"),
+    "VS Code Outer projection did not reach the authenticated sidecar",
+  );
   await execFileAsync("git", ["-C", fixture.vaultPath, "add", "plain.md.enc"]);
   await execFileAsync("git", [
     "-C", fixture.vaultPath,
@@ -691,6 +698,7 @@ function assertIntegrationApi(value: unknown): asserts value is InexIntegrationT
     "verifyUmbraLock",
     "verifyOuterRevisionCompare",
     "verifyUmbraRevisionCompare",
+    "verifyOuterProjection",
     "createCrossEditorUmbraTag",
     "createCrossEditorUmbraAnnotation",
     "lock",
