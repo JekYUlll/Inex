@@ -1426,7 +1426,11 @@ def _parse_umbra_render_map(value: Any, projection_bytes: int) -> Dict[str, Any]
         slot_id = _expect_bounded_string(slot.get("slotId"), "Umbra slot id", 64)
         if slot_id in seen_slot_ids:
             raise RpcProtocolError("RPC Umbra private slots are duplicated")
-        item = _expect_umbra_range(slot, "Umbra private slot range", projection_bytes)
+        item = _expect_umbra_range(
+            {"startByte": slot.get("startByte"), "endByte": slot.get("endByte")},
+            "Umbra private slot range",
+            projection_bytes,
+        )
         if item["startByte"] < previous_end:
             raise RpcProtocolError("RPC Umbra private slot ranges overlap")
         seen_slot_ids.add(slot_id)

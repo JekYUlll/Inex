@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Verify a Sublime RPC process can read VS Code-written Umbra catalog data.
 
-This is an integration helper, not a standalone Sublime UI test. Its password
-is accepted only from stdin so the Extension Host runner never places it in an
-argument, environment variable, or temporary file.
+This is an integration helper, not a standalone Sublime UI test. Its Outer and
+Umbra passwords are accepted as two stdin lines so the Extension Host runner
+never places either in an argument, environment variable, or temporary file.
 """
 
 from __future__ import annotations
@@ -29,25 +29,34 @@ def main(arguments: List[str]) -> int:
     if len(arguments) != 3:
         return 2
     executable, vault_path = arguments[1:]
-    password = bytearray(sys.stdin.buffer.readline(4097))
-    if not password.endswith(b"\n"):
-        wipe(password)
+    outer_password = bytearray(sys.stdin.buffer.readline(4097))
+    umbra_password = bytearray(sys.stdin.buffer.readline(4097))
+    if not outer_password.endswith(b"\n") or not umbra_password.endswith(b"\n"):
+        wipe(outer_password)
+        wipe(umbra_password)
         return 2
-    password.pop()
-    if not password or b"\x00" in password:
-        wipe(password)
+    outer_password.pop()
+    umbra_password.pop()
+    if (
+        not outer_password
+        or not umbra_password
+        or b"\x00" in outer_password
+        or b"\x00" in umbra_password
+    ):
+        wipe(outer_password)
+        wipe(umbra_password)
         return 2
     client = InexRpcClient(executable, timeout_seconds=15.0)
     try:
         client.start("cross-editor-integration")
-        client.unlock(vault_path, password.decode("utf-8"))
+        client.unlock(vault_path, outer_password.decode("utf-8"))
         try:
             client.open_document(EXPECTED_DOCUMENT_PATH)
         except RpcRemoteError:
             pass
         else:
             return 1
-        client.unlock_umbra(password.decode("utf-8"))
+        client.unlock_umbra(umbra_password.decode("utf-8"))
         config = client.load_umbra_annotation_config()
         tags = config["tags"]
         if not any(
@@ -61,14 +70,17 @@ def main(arguments: List[str]) -> int:
         )
         try:
             slots = render_map.get("privateSlots")
-            if not isinstance(slots, list) or len(slots) != 1:
+            # VS Code's preceding lifecycle retains one slot and then adds a
+            # second tagged slot for this cross-editor proof.
+            if not isinstance(slots, list) or len(slots) != 2:
                 return 1
         finally:
             wipe(content)
         print("sublime-cross-editor-catalog-ok")
         return 0
     finally:
-        wipe(password)
+        wipe(outer_password)
+        wipe(umbra_password)
         try:
             client.lock_umbra()
         except Exception:

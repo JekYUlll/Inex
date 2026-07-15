@@ -772,17 +772,33 @@ export function activate(
       const projection = await session.sidecar.openUmbraDocument(logicalPath);
       const content = Buffer.from(projection.content);
       try {
-        const lineEnd = content.indexOf(0x0a);
-        if (lineEnd < 1) throw new Error("Inex integration cross-editor annotation needs a first Markdown line");
+        // Earlier lifecycle coverage intentionally leaves one private slot in
+        // this projection. Select only a daemon-authenticated Outer segment,
+        // never an apparent first line that might be a private-block marker.
+        const plain = projection.renderMap.outerSegments.find(
+          (segment) => segment.projectionRange.endByte > segment.projectionRange.startByte,
+        )?.projectionRange;
+        if (plain === undefined) {
+          throw new Error("Inex integration cross-editor annotation needs an ordinary Markdown range");
+        }
+        const newline = content.indexOf(0x0a, plain.startByte);
+        const endByte = newline >= plain.startByte && newline < plain.endByte
+          ? newline + 1
+          : plain.endByte;
+        if (endByte <= plain.startByte) {
+          throw new Error("Inex integration cross-editor annotation selected an empty Markdown range");
+        }
         const updated = await session.sidecar.applyUmbraAnnotation(
           logicalPath,
           projection,
-          [{ startByte: 0, endByte: lineEnd + 1 }],
+          [{ startByte: plain.startByte, endByte }],
           { kind: "comment", tagIds: ["cross-editor-catalog"], outer: { mode: "drop" } },
         );
         updated.content.fill(0);
-        if (updated.renderMap.privateSlots.length !== 1) {
-          throw new Error("Inex integration cross-editor annotation did not create one private slot");
+        // The prior annotation lifecycle deliberately retains one slot. This
+        // operation must add exactly one more without rewriting that slot.
+        if (updated.renderMap.privateSlots.length !== 2) {
+          throw new Error("Inex integration cross-editor annotation did not add one private slot");
         }
       } finally {
         content.fill(0);

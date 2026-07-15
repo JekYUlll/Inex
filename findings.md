@@ -778,3 +778,9 @@
 ## 2026-07-16 Command notification lifecycle
 
 - A command-level error notification is not a transaction result and must not be awaited. In headless Extension Host runs there is no user dismissal event, so awaiting `showErrorMessage` turns an otherwise diagnosable command failure into an unbounded hang. Fire-and-forget preserves user feedback while leaving the test runner and command dispatch observable.
+
+## 2026-07-16 Cross-editor fixture invariants
+
+- A RenderMap private-slot record has `{slotId,startByte,endByte}`, while a generic range validator intentionally accepts only `{startByte,endByte}`. The Sublime adapter must project the two range fields before validation; passing the full record caused every valid private projection to fail closed.
+- Cross-editor fixture passwords must mirror production's independent key hierarchy: Outer unlock uses the unchanged vault password, while Umbra unlock uses the replacement Umbra password. A single-password helper silently tests the wrong security model after a password change.
+- Lifecycle trace checks should bind causal relationships by sequence (the first apply after tag creation, the first lock after password change), not brittle global occurrence indexes; unrelated valid prior operations otherwise invalidate the test itself.

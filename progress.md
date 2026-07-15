@@ -1719,3 +1719,8 @@
 
 - 修复 `runUiAction` 的 failure path：保留 VS Code error notification，但不再 await 用户关闭 toast。此前 isolation host 在 compare error 后可无限等待 notification interaction，掩盖实际 RPC/fixture failure 并阻塞 60-second runner deadline。
 - `pnpm --dir editors/vscode check`、75/75 unit tests 与 Extension Host bundle build 通过；下一 Host run 若仍失败应返回可审计错误，而非静默卡住。
+
+## 2026-07-16 — Cross-editor Umbra host regression repair
+
+- 对完整 isolated Extension Host runner 的连续可诊断失败进行了逐项修复：cross-editor annotation 现在从 daemon RenderMap 的 ordinary Outer segment 选择，而非 partial private marker；Sublime helper 分别从 stdin 接受 Outer 与 Umbra 密码；其 private-slot range parser 不再将 `slotId` 误传给 exact range validator；catalog fixture 正确预期保留的旧 slot 加新 slot 共两个。
+- trace ordering assertion 也从硬编码 `apply[2]`/first lock 改为 tag/password-change 之后的对应 operation，消除 lifecycle 增长后的伪失败。手动 helper 在 retained feature-2 fixture 上已返回 `sublime-cross-editor-catalog-ok`；最新 full runner trace 已到 `vault.lock → system.shutdown`，正在执行其 profile residue cleanup，尚未把运行中状态记作通过。

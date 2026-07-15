@@ -175,12 +175,13 @@ async function runBackupRecoveryCycle(
   );
   await verifySublimeCatalogRead(
     fixture,
+    fixture.password,
     replacementUmbraPassword,
   );
   const umbraTrace = await waitForSidecarTrace(
     fixture,
     (entries) => entries.some((entry) => entry.method === "umbra.document.convert")
-      && entries.filter((entry) => entry.method === "umbra.annotation.apply").length >= 3
+      && entries.filter((entry) => entry.method === "umbra.annotation.apply").length >= 4
       && entries.some((entry) => entry.method === "umbra.annotation.edit")
       && entries.filter((entry) => entry.method === "umbra.annotation.remove").length >= 2
       && entries.some((entry) => entry.method === "umbra.tag.create")
@@ -190,6 +191,14 @@ async function runBackupRecoveryCycle(
   );
   const first = (method: string) => umbraTrace.find((entry) => entry.method === method);
   const all = (method: string) => umbraTrace.filter((entry) => entry.method === method);
+  const createdTag = first("umbra.tag.create");
+  const crossEditorApply = createdTag === undefined
+    ? undefined
+    : all("umbra.annotation.apply").find((entry) => entry.sequence > createdTag.sequence);
+  const changedPassword = first("umbra.password.change");
+  const lockAfterPasswordChange = changedPassword === undefined
+    ? undefined
+    : all("umbra.lock").find((entry) => entry.sequence > changedPassword.sequence);
   const orderedEntries = [
     first("umbra.document.convert"),
     all("umbra.annotation.apply")[0],
@@ -197,10 +206,10 @@ async function runBackupRecoveryCycle(
     all("umbra.annotation.remove")[0],
     all("umbra.annotation.apply")[1],
     all("umbra.annotation.remove")[1],
-    first("umbra.tag.create"),
-    all("umbra.annotation.apply")[2],
-    first("umbra.password.change"),
-    first("umbra.lock"),
+    createdTag,
+    crossEditorApply,
+    changedPassword,
+    lockAfterPasswordChange,
   ];
   let previousUmbraSequence = -1;
   for (const entry of orderedEntries) {
@@ -742,13 +751,14 @@ function assertIntegrationApi(value: unknown): asserts value is InexIntegrationT
 
 async function verifySublimeCatalogRead(
   fixture: FixtureEnvironment,
-  password: string,
+  outerPassword: string,
+  umbraPassword: string,
 ): Promise<void> {
   const script = path.join(fixture.repositoryRoot, "editors", "sublime", "tests", "cross_editor_catalog.py");
   const output = await runPasswordStdinChild(
     "python3",
     [script, fixture.sidecarPath, fixture.vaultPath],
-    password,
+    `${outerPassword}\n${umbraPassword}`,
   );
   assert.equal(output.code, 0, "Sublime client could not read the VS Code-written Umbra catalog");
   assert.equal(output.stdout, "sublime-cross-editor-catalog-ok\n", "Sublime cross-editor catalog result is invalid");
