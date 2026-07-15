@@ -390,6 +390,23 @@ the new slot was committed but old-slot retirement was deferred, do not repeat
 the whole change blindly: retain the printed new-slot UUID, prove it unlocks,
 then remove the old slot explicitly.
 
+### Umbra password
+
+The independent Umbra password is not an Outer vault password slot. In a new
+CLI process, change it with:
+
+```sh
+"$INEX" umbra password change /absolute/inex-vault
+```
+
+The command prompts in this exact order: Outer vault password, current Umbra
+password, new Umbra password, confirmation. It unlocks Umbra through the same
+local daemon RPC used by editor clients, then atomically rewraps the existing
+`K_umbra`. It does not re-encrypt private documents, private tags, or profiles.
+The command cannot reset a forgotten Umbra password because a fresh CLI process
+has no existing live Umbra session; use the VS Code command only before locking
+an already-unlocked Umbra session.
+
 The new slot uses at least the calibrated v1 baseline and at least the
 operations and memory costs of the authenticated old slot. A stronger
 reader-compatible slot can therefore make add/change slower than fresh vault

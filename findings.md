@@ -641,3 +641,8 @@
 - The frozen Umbra v1 semantics permit a password reset only while `K_umbra` is live; the editor must therefore not route this command through the normal unlock/initialize helper. It first authenticates the current sidecar session's `umbra.status`, rejects a locked status, and collects only a new password plus confirmation.
 - The RPC receives the new password as a bounded sensitive parameter and returns only `{"ok": true}`. A post-change lock must make the old password fail while the replacement unlocks the same private document; this proves a slot rewrap rather than a new-key/private-data rewrite.
 - The current Linux bundle was rebuilt from a clean `03f5011` checkout after this protocol addition. Artifact/native-dependency/smoke gates passed and the package extension hash exactly matches the installed VS Code extension. The VS Code CLI again emitted the host Node `DEP0169` warning; it did not alter the successful install or hash comparison.
+
+## 2026-07-16 CLI Umbra password change boundary
+
+- A CLI invocation does not inherit an editor's live `K_umbra`, so it cannot implement the no-old-password reset path. Its explicit command instead requires current Outer and Umbra credentials, then delegates only the rewrap to the same daemon RPC. The VS Code command remains the intended path for a user who forgot the old Umbra password but has not locked the existing session.
+- JSON-RPC optional fields must be omitted, not serialized as `null`: `vault.unlock` has strict optional UUID parsing. The CLI constructs `slotId` only when the user supplied `--slot`, preventing a silent protocol incompatibility.

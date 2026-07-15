@@ -30,7 +30,7 @@ use inex_core::vault_config::{ConfigWarning, KdfPolicy};
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
-use crate::args::{Cli, Command, ExportScope, GitCommand, PasswordCommand};
+use crate::args::{Cli, Command, ExportScope, GitCommand, PasswordCommand, UmbraCommand};
 use crate::password::{PasswordInput, read_confirmed_password, read_password};
 use crate::query::{QueryInput, read_query};
 
@@ -90,6 +90,7 @@ fn execute(command: Command) -> Result<ExitCode, AppError> {
             dry_run,
         } => command_import_repository(&source, &vault, dry_run),
         Command::Password(command) => command_password(command, PasswordInput::from_environment()?),
+        Command::Umbra(command) => command_umbra(command, PasswordInput::from_environment()?),
         Command::Search {
             vault,
             slot,
@@ -122,6 +123,62 @@ fn execute(command: Command) -> Result<ExitCode, AppError> {
         Command::Serve => command_serve(),
         Command::Help | Command::Version | Command::RuntimeInfo | Command::KdfCalibrationInfo => {
             unreachable!("handled before password input setup")
+        }
+    }
+}
+
+fn command_umbra(command: UmbraCommand, input: PasswordInput) -> Result<ExitCode, AppError> {
+    match command {
+        UmbraCommand::PasswordChange { vault, outer_slot } => {
+            let mut daemon = inex_daemon::handler::RpcService::new();
+            let _ = daemon_call(
+                &mut daemon,
+                1,
+                "system.hello",
+                json!({"client":"inex-cli", "clientVersion":env!("CARGO_PKG_VERSION"), "protocolMajor":1}),
+            )?;
+            let outer_password = read_password(input, "Vault password: ")?;
+            let outer_password_text =
+                String::from_utf8_lossy(outer_password.as_slice()).into_owned();
+            let mut unlock_params = json!({"vaultPath": vault, "password": outer_password_text});
+            if let Some(slot) = outer_slot
+                && let Some(object) = unlock_params.as_object_mut()
+            {
+                object.insert("slotId".to_owned(), Value::String(slot.to_string()));
+            }
+            let mut unlocked = daemon_call(&mut daemon, 2, "vault.unlock", unlock_params)?;
+            drop(outer_password);
+            let session = daemon_sensitive_string(&mut unlocked, "session")?;
+            inex_daemon::sensitive::scrub_object(&mut unlocked);
+            let umbra_password = read_password(input, "Current Umbra password: ")?;
+            let umbra_password_text =
+                String::from_utf8_lossy(umbra_password.as_slice()).into_owned();
+            let umbra_unlocked = daemon_call(
+                &mut daemon,
+                3,
+                "umbra.unlock",
+                json!({"session": session.as_str(), "password": umbra_password_text}),
+            );
+            drop(umbra_password);
+            let mut umbra_unlocked = umbra_unlocked?;
+            inex_daemon::sensitive::scrub_object(&mut umbra_unlocked);
+            let new_password = read_confirmed_password(input, "New Umbra password: ")?;
+            let new_password_text = String::from_utf8_lossy(new_password.as_slice()).into_owned();
+            let changed = daemon_call(
+                &mut daemon,
+                4,
+                "umbra.password.change",
+                json!({"session": session.as_str(), "password": new_password_text}),
+            );
+            drop(new_password);
+            let mut changed = changed?;
+            let changed_ok = changed.get("ok").and_then(Value::as_bool) == Some(true);
+            inex_daemon::sensitive::scrub_object(&mut changed);
+            if !changed_ok {
+                return Err(AppError::Daemon);
+            }
+            println!("Umbra password changed; existing private content was not re-encrypted");
+            Ok(ExitCode::SUCCESS)
         }
     }
 }

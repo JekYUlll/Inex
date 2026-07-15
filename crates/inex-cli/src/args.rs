@@ -17,6 +17,7 @@ Usage:
   inex password add <vault> [--slot <current-slot-uuid>]
   inex password remove <vault> <slot-to-remove> --slot <retained-slot-uuid>
   inex password change <vault> [--slot <old-slot-uuid>]
+  inex umbra password change <vault> [--slot <outer-slot-uuid>]
   inex search <vault> [--slot <uuid>] [--case-sensitive] [--limit <count>]
   inex export <vault> <destination> --scope outer|umbra
   inex merge-driver <ancestor> <current> <incoming> <logical-path>
@@ -33,6 +34,11 @@ Passwords are never accepted in argv or environment variables. By default
 Inex prompts on the controlling TTY with echo disabled. For explicit pipe use,
 set INEX_PASSWORD_STDIN=1 and provide one line per prompt. The line order is
 current, then new and confirmation where applicable.
+
+`umbra password change` starts a fresh CLI session, so it prompts for the
+Outer vault password, then the current Umbra password, then a new Umbra
+password and confirmation. It rewraps the same private data key and does not
+re-encrypt private documents.
 
 Search queries follow the same rule: they are read from a hidden TTY prompt,
 or one bounded stdin line with INEX_QUERY_STDIN=1. If both stdin opt-ins are
@@ -118,6 +124,7 @@ pub(crate) enum Command {
         dry_run: bool,
     },
     Password(PasswordCommand),
+    Umbra(UmbraCommand),
     Search {
         vault: PathBuf,
         slot: Option<Uuid>,
@@ -150,6 +157,7 @@ impl Command {
             Self::Password(PasswordCommand::Add { .. }) => "password add",
             Self::Password(PasswordCommand::Remove { .. }) => "password remove",
             Self::Password(PasswordCommand::Change { .. }) => "password change",
+            Self::Umbra(UmbraCommand::PasswordChange { .. }) => "umbra password change",
             Self::Search { .. } => "search <query-from-secure-input>",
             Self::Export { .. } => "export <explicit-plaintext-confirmation>",
             Self::MergeDriver { .. } => "merge-driver <locked-safe>",
@@ -193,6 +201,13 @@ pub(crate) enum PasswordCommand {
     },
 }
 
+pub(crate) enum UmbraCommand {
+    PasswordChange {
+        vault: PathBuf,
+        outer_slot: Option<Uuid>,
+    },
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ArgumentError {
     MissingCommand,
@@ -201,6 +216,8 @@ pub(crate) enum ArgumentError {
     MissingVault,
     MissingPasswordSubcommand,
     UnknownPasswordSubcommand,
+    MissingUmbraSubcommand,
+    UnknownUmbraSubcommand,
     MissingGitSubcommand,
     UnknownGitSubcommand,
     MissingMergeDriverPath,
@@ -228,6 +245,8 @@ impl fmt::Display for ArgumentError {
             Self::MissingVault => "vault path is required",
             Self::MissingPasswordSubcommand => "password subcommand is required",
             Self::UnknownPasswordSubcommand => "unknown password subcommand",
+            Self::MissingUmbraSubcommand => "umbra subcommand is required",
+            Self::UnknownUmbraSubcommand => "unknown umbra subcommand",
             Self::MissingGitSubcommand => "git subcommand is required",
             Self::UnknownGitSubcommand => "unknown git subcommand",
             Self::MissingMergeDriverPath => "merge-driver requires exactly four path arguments",
@@ -272,6 +291,7 @@ impl Cli {
             "import" => parse_import(&mut arguments)?,
             "import-repository" => parse_import_repository(&mut arguments)?,
             "password" => Command::Password(parse_password(&mut arguments)?),
+            "umbra" => Command::Umbra(parse_umbra(&mut arguments)?),
             "search" => parse_search(&mut arguments)?,
             "export" => parse_export(&mut arguments)?,
             "merge-driver" => parse_merge_driver(&mut arguments)?,
@@ -403,6 +423,27 @@ fn parse_password(arguments: &mut Arguments) -> Result<PasswordCommand, Argument
         "--password" | "--passphrase" => Err(ArgumentError::ForbiddenPasswordArgument),
         _ => Err(ArgumentError::UnknownPasswordSubcommand),
     }
+}
+
+fn parse_umbra(arguments: &mut Arguments) -> Result<UmbraCommand, ArgumentError> {
+    let scope = arguments
+        .pop_text()?
+        .ok_or(ArgumentError::MissingUmbraSubcommand)?;
+    if scope != "password" {
+        return Err(ArgumentError::UnknownUmbraSubcommand);
+    }
+    let operation = arguments
+        .pop_text()?
+        .ok_or(ArgumentError::MissingUmbraSubcommand)?;
+    if operation != "change" {
+        return Err(ArgumentError::UnknownUmbraSubcommand);
+    }
+    let vault = arguments.pop_path()?.ok_or(ArgumentError::MissingVault)?;
+    let options = parse_options(arguments, true, false, false)?;
+    Ok(UmbraCommand::PasswordChange {
+        vault,
+        outer_slot: options.slot,
+    })
 }
 
 fn parse_import(arguments: &mut Arguments) -> Result<Command, ArgumentError> {
@@ -693,6 +734,15 @@ mod tests {
             Cli::parse(["password", "remove", "/vault", SLOT_A, "--slot", SLOT_B,]),
             Ok(Cli {
                 command: Command::Password(PasswordCommand::Remove { .. })
+            })
+        ));
+        assert!(matches!(
+            Cli::parse(["umbra", "password", "change", "/vault", "--slot", SLOT_A]),
+            Ok(Cli {
+                command: Command::Umbra(UmbraCommand::PasswordChange {
+                    outer_slot: Some(_),
+                    ..
+                })
             })
         ));
     }

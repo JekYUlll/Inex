@@ -1450,6 +1450,11 @@
 - 回归覆盖 daemon 改密后锁定、旧密码认证失败、新密码解锁并重新读取既有私密投影；VS Code Extension Host 覆盖 production sidecar 的改密→lock→旧密码拒绝→新密码解锁→lock，且 trace 强制包含 `umbra.password.change`。验证：`cargo fmt --check`、73 daemon tests、daemon `-D warnings` Clippy、67/67 VS Code tests、typecheck、真实 Extension Host 回归全部通过。
 - 从独立 clean checkout 的 `03f5011f770803cabbb83bdb9cfe4c8f2c0d69ac` 重新构建、artifact/native-dependency 审计和 package smoke 均通过，并已覆盖安装 [当前 VSIX](/home/horeb/_code/Inex/target/release-artifacts/03f5011-linux-x64/inex-vscode-0.1.0-linux-x64.vsix)。VSIX SHA-256：`94ed147e1cc84002048ef21decd143bf46fffbdb920012f298da642ec30f3031`；包内和已安装 `extension.js` SHA-256 同为 `354095acce6e9547a5fbc401f6f49cf9738ca84e16abfe30c2cf15bf35c6ae18`。
 
+## 2026-07-16 — CLI Umbra password change
+
+- 新增 `inex umbra password change <vault> [--slot <outer-slot-uuid>]`。fresh CLI process 依次读取 Outer、当前 Umbra、新 Umbra、确认密码，通过 `umbra.unlock` 与 `umbra.password.change` RPC 复用同一受认证实现；不接受 argv 或 environment password。
+- 真实 CLI 子进程回归证明 stdout/stderr 不含四个输入密码，旧 Umbra password 在重包裹/锁定后失败，替换密码成功解锁。`cargo fmt --check`、定向真实进程测试和 CLI `-D warnings` Clippy 已通过。
+
 ## 2026-07-16 — Outer-only Umbra export projection
 
 - `umbra_render::render_outer_projection` 现在只根据已认证的公开 Outer slot 策略替换 marker：Drop 输出空内容、Cover 输出明确公开的 cover text、Placeholder 输出固定无标识文本。它严格验证 marker/slot 一一对应和 Cover/Placeholder metadata，永不读取 private payload、kind、tag、slot ID 或 `K_umbra`。

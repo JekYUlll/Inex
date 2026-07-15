@@ -16,6 +16,8 @@ use uuid::Uuid;
 const INIT_PASSWORD: &[u8] = b"init process calibration password";
 const OLD_PASSWORD: &[u8] = b"strong authenticated old password";
 const NEW_PASSWORD: &[u8] = b"no downgrade replacement password";
+const UMBRA_OLD_PASSWORD: &[u8] = b"old independent Umbra password";
+const UMBRA_NEW_PASSWORD: &[u8] = b"new independent Umbra password";
 const MIB: u64 = 1024 * 1024;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -141,6 +143,67 @@ fn init_uses_bounded_v1_calibration_and_creates_an_unlockable_vault() {
         .unwrap_or_else(|error| panic!("created password slot was missing: {error}"));
     assert!((3..=20).contains(&slot.kdf.ops_limit));
     assert_eq!(slot.kdf.mem_limit_bytes, 64 * MIB);
+}
+
+#[test]
+fn umbra_password_change_uses_the_daemon_and_rewraps_the_live_private_key() {
+    let directory = TestDirectory::new("umbra-change");
+    let vault_path = directory.path().join("vault");
+    let mut vault = Vault::create_with_params(
+        &vault_path,
+        OLD_PASSWORD,
+        unix_time_ms(),
+        Argon2idParams {
+            ops_limit: 1,
+            mem_limit_bytes: 8 * 1024,
+        },
+        KdfPolicy {
+            min_creation_ops_limit: 1,
+            min_creation_mem_limit_bytes: 8 * 1024,
+            max_creation_ops_limit: 4,
+            max_creation_mem_limit_bytes: 64 * MIB,
+            max_unlock_ops_limit: 4,
+            max_unlock_mem_limit_bytes: 64 * MIB,
+        },
+    )
+    .unwrap_or_else(|error| panic!("fixture vault creation failed: {error}"));
+    vault
+        .initialize_umbra(UMBRA_OLD_PASSWORD)
+        .unwrap_or_else(|error| panic!("fixture Umbra initialization failed: {error}"));
+    vault.lock_umbra();
+    drop(vault);
+
+    let arguments = [
+        OsString::from("umbra"),
+        OsString::from("password"),
+        OsString::from("change"),
+        vault_path.as_os_str().to_owned(),
+    ];
+    let output = run_inex(
+        &arguments,
+        &[
+            OLD_PASSWORD,
+            UMBRA_OLD_PASSWORD,
+            UMBRA_NEW_PASSWORD,
+            UMBRA_NEW_PASSWORD,
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "umbra password change stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("Umbra password changed; existing private content was not re-encrypted")
+    );
+
+    let mut reopened = Vault::unlock(&vault_path, OLD_PASSWORD, None, KdfPolicy::default())
+        .unwrap_or_else(|error| panic!("fixture outer reopen failed: {error}"));
+    assert!(reopened.unlock_umbra(UMBRA_OLD_PASSWORD).is_err());
+    reopened
+        .unlock_umbra(UMBRA_NEW_PASSWORD)
+        .unwrap_or_else(|error| panic!("replacement Umbra password did not unlock: {error}"));
 }
 
 #[test]
