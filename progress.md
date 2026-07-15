@@ -1502,6 +1502,11 @@
 - 新增 `Inex: Compare HEAD with Parent (Umbra Private)`。它首先走独立 `ensureUmbraReady`，再拒绝非 Umbra/dirty/stale active custom document，调用独立 `revision.compare.umbra` 并只在已有无脚本 compare panel 生命周期中展示。Outer compare command 不变，也不会隐式请求 Umbra 解锁。
 - 验证：VS Code typecheck 与 69/69 Node tests；`cargo fmt --check`、304 core tests、受限 Git reader、真实 daemon revision fixture 都通过。Umbra private canary historical fixture、Extension Host command drive、Linux VSIX rebuild/install 仍待下一发布检查点。
 
+## 2026-07-16 — Current installed VS Code bundle (secure revision compare)
+
+- `67549debeaea4b0f806b6bc61aa5de080bb55c7b` 已通过真实 `pnpm --dir editors/vscode test:extension:local` 基线；compare 专用 Extension Host fixture 尚未存在，不能把这条基线当作 compare command 的黑盒证明。
+- 从独立 `--no-local` clean checkout、canonical origin 与 `/usr/bin/gcc` 构建 Linux x64 release。artifact audit、release `inex`/`inexd` native dependency audit 和 isolated package smoke 全部通过。已覆盖安装 [inex-vscode-0.1.0-linux-x64.vsix](/home/horeb/_code/Inex/target/release-artifacts/67549de-linux-x64/inex-vscode-0.1.0-linux-x64.vsix)，VSIX SHA-256 为 `41b237f926c3aa55cecdea04c940ae3e8cc445e2ce64890c9f693206a0398eee`；包内与已安装 `inexd` 均为 `4e644e358383ea767724e4c8f1b17c6e8d403a3e8d5efa5b3982a5ed3f76293c`，`extension.js` 均为 `a3d512242a8f29139e79a1ac304b1df9f370ba85b566f7b8818a0be98678c883`。同版本窗口仍需 Developer: Reload Window；安装 CLI 的 `DEP0169` 是宿主 Node 警告。
+
 ## 2026-07-16 — Real daemon historical compare fixture
 
 - daemon handler 现有真实 Git fixture：先创建加密 parent Markdown、`git init/add/commit`，再通过 vault CAS 保存新密文并建立 head commit，最后用 production `vault.unlock` RPC 与 `revision.compare.outer` RPC 验证 head/parent 两个 Base64URL projection。这证明 RPC 走的是受限 Git blob reader 而非工作区 plaintext 或伪造 response。
