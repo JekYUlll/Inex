@@ -131,6 +131,26 @@ class InexDocument implements vscode.CustomDocument {
     }
   }
 
+  /** Test-only caller supplies presentation-byte ranges through the normal mapper. */
+  public updateIntegrationSelections(selections: readonly EditorSelection[]): void {
+    this.updateSelections(this.presentationText(), selections);
+  }
+
+  public integrationPresentationByteLength(): number {
+    return Buffer.byteLength(this.presentationText(), "utf8");
+  }
+
+  /** Test-only caller supplies already authenticated canonical ranges. */
+  public restoreIntegrationSelections(selections: readonly EditorSelection[]): void {
+    if (
+      selections.length === 0 || selections.length > MAX_EDITOR_SELECTIONS ||
+      selections.some(({ startByte, endByte }) => startByte < 0 || endByte < startByte || endByte > this.content.byteLength)
+    ) {
+      throw new Error("Inex integration selection is invalid");
+    }
+    this.selections = selections.map(({ startByte, endByte }) => ({ startByte, endByte }));
+  }
+
   public updateSelections(text: string, selections: readonly EditorSelection[]): boolean {
     this.requireUsable();
     const presentation = this.presentationText();
@@ -1423,6 +1443,34 @@ export class InexCustomEditorProvider
         }
       } finally {
         after.content.fill(0);
+      }
+      const presentationBytes = document.integrationPresentationByteLength();
+      if (presentationBytes < 2) {
+        throw new Error("Inex integration Umbra fixture cannot create two selections");
+      }
+      // The second range intentionally crosses the CRLF presentation boundary
+      // mapping used by the real webview selection message path.
+      document.updateIntegrationSelections([
+        { startByte: 0, endByte: 1 },
+        { startByte: presentationBytes - 2, endByte: presentationBytes - 1 },
+      ]);
+      await this.applyPrivateAnnotationToActive(
+        { kind: "comment", tagIds: [], outer: { mode: "drop" } },
+        "reject",
+      );
+      const slots = document.renderMap()?.privateSlots;
+      if (slots === undefined || slots.length !== 2) {
+        throw new Error("Inex integration Umbra multi-selection apply did not create two private slots");
+      }
+      document.restoreIntegrationSelections(slots.map((slot) => slot.range));
+      await this.removePrivateAnnotationFromActive();
+      const multiRemoved = document.snapshot();
+      try {
+        if (!multiRemoved.content.equals(before.content)) {
+          throw new Error("Inex integration Umbra multi-selection remove did not restore the original projection");
+        }
+      } finally {
+        multiRemoved.content.fill(0);
       }
     } finally {
       before.content.fill(0);

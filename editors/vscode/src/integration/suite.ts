@@ -120,29 +120,31 @@ async function runBackupRecoveryCycle(
   await api.verifyUmbraLock(fixture.password);
   const umbraTrace = await waitForSidecarTrace(
     fixture,
-    (entries) => [
-      "umbra.document.convert",
-      "umbra.annotation.apply",
-      "umbra.annotation.edit",
-      "umbra.annotation.remove",
-      "umbra.lock",
-    ].every((method) => entries.some((entry) => entry.method === method)),
+    (entries) => entries.some((entry) => entry.method === "umbra.document.convert")
+      && entries.filter((entry) => entry.method === "umbra.annotation.apply").length >= 2
+      && entries.some((entry) => entry.method === "umbra.annotation.edit")
+      && entries.filter((entry) => entry.method === "umbra.annotation.remove").length >= 2
+      && entries.some((entry) => entry.method === "umbra.lock"),
     "VS Code Umbra annotation lifecycle did not reach the authenticated sidecar",
   );
+  const first = (method: string) => umbraTrace.find((entry) => entry.method === method);
+  const all = (method: string) => umbraTrace.filter((entry) => entry.method === method);
+  const orderedEntries = [
+    first("umbra.document.convert"),
+    all("umbra.annotation.apply")[0],
+    first("umbra.annotation.edit"),
+    all("umbra.annotation.remove")[0],
+    all("umbra.annotation.apply")[1],
+    all("umbra.annotation.remove")[1],
+    first("umbra.lock"),
+  ];
   let previousUmbraSequence = -1;
-  for (const method of [
-    "umbra.document.convert",
-    "umbra.annotation.apply",
-    "umbra.annotation.edit",
-    "umbra.annotation.remove",
-    "umbra.lock",
-  ]) {
-    const entry = umbraTrace.find((candidate) => candidate.method === method);
-    assert.ok(entry, `VS Code Umbra trace omitted ${method}`);
+  for (const entry of orderedEntries) {
+    assert.ok(entry, "VS Code Umbra trace omitted an expected authenticated RPC");
     assert.equal(
       entry.sequence > previousUmbraSequence,
       true,
-      `VS Code Umbra sidecar order is invalid at ${method}`,
+      `VS Code Umbra sidecar order is invalid at ${entry.method}`,
     );
     previousUmbraSequence = entry.sequence;
   }
