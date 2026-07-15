@@ -1487,6 +1487,11 @@
 - 新增 `revision.compare.outer`。它只接收 session 与 canonical logicalPath，固定读取 authenticated `HEAD` 与 `HEAD^1`，且响应只含 fixed role (`head`/`headParent`) 与 bounded Base64URL projection bytes；没有 client-supplied revision/OID/pathspec/physical path。
 - 普通历史 document 返回认证 plaintext；feature-2 历史 document 仅 parse 已认证 outer container 并 render public Drop/Cover/Placeholder，完全不接触 `K_umbra`。daemon 编译、format 和 `-D warnings` Clippy 已通过。尚无 VS Code parser/UI 或 dedicated handler Git fixture，因此这不是可用 compare UI 的声明。
 
+## 2026-07-16 — VS Code controlled Outer compare panel
+
+- `Inex: Compare HEAD with Parent (Outer)` 只在 active clean Inex CustomEditor 上运行。sidecar 必须验证四个 exact response fields、fixed `head`/`headParent` roles 和 canonical bounded Base64URL；响应 substitution 失败时两个 decoded buffers 都清零。
+- 成功结果只进入 `enableScripts: false`、无 local resource roots 的 Inex WebviewPanel，不使用 `vscode.diff`、URI、普通 TextDocument 或临时明文文件。vault lock 和 panel dispose 都 zero-fill owned buffers。VS Code typecheck 与 69/69 Node tests 通过；尚待真实 daemon Git fixture 与 Extension Host release evidence。
+
 ## 2026-07-16 — Outer-only Umbra export projection
 
 - `umbra_render::render_outer_projection` 现在只根据已认证的公开 Outer slot 策略替换 marker：Drop 输出空内容、Cover 输出明确公开的 cover text、Placeholder 输出固定无标识文本。它严格验证 marker/slot 一一对应和 Cover/Placeholder metadata，永不读取 private payload、kind、tag、slot ID 或 `K_umbra`。

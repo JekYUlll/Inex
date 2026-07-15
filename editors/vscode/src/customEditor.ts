@@ -655,6 +655,22 @@ export class InexCustomEditorProvider
       : { logicalPath: document.logicalPath, session: document.session, range };
   }
 
+  /** Return the active clean custom document for read-only revision compare. */
+  public currentRevisionCompareTarget():
+    | { readonly logicalPath: string; readonly session: VaultSession }
+    | undefined {
+    const document = this.activeDocument;
+    if (
+      document === undefined ||
+      document.isDirty ||
+      !this.documents.has(document) ||
+      !this.controller.isSessionCurrent(document.session)
+    ) {
+      return undefined;
+    }
+    return { logicalPath: document.logicalPath, session: document.session };
+  }
+
   public activeSelectionIsCompletePrivateBlock(): boolean {
     const document = this.activeDocument;
     const selections = document?.currentSelections();

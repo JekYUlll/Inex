@@ -66,6 +66,7 @@ export function activate(
   const tree = new InexTreeProvider(controller);
   const editor = new InexCustomEditorProvider(controller, integrationTestMode);
   const crud = new InexCrudActions(controller, tree, editor);
+  const compareViews = new Set<{ readonly panel: vscode.WebviewPanel; readonly buffers: readonly Buffer[] }>();
   // Tags/profile semantics are private catalog data. Keep only a best-effort
   // session-local copy for shortcut behavior; never write it to VS Code settings.
   let lastAnnotationSpec: PrivateAnnotationSpec | undefined;
@@ -83,6 +84,13 @@ export function activate(
     controller.onDidChangeState(syncVaultContext),
     controller.onDidLock(() => {
       lastAnnotationSpec = undefined;
+      for (const view of compareViews) {
+        for (const buffer of view.buffers) buffer.fill(0);
+        view.panel.webview.options = { enableScripts: false, localResourceRoots: [] };
+        view.panel.webview.html = "<!doctype html><meta charset=\"utf-8\"><p>Inex vault is locked.</p>";
+        view.panel.dispose();
+      }
+      compareViews.clear();
     }),
     vscode.window.registerTreeDataProvider("inex.vault", tree),
     vscode.window.registerCustomEditorProvider(VIEW_TYPE, editor, {
@@ -313,6 +321,34 @@ export function activate(
           selected.hit.startByte,
           selected.hit.endByte,
         );
+      });
+    }),
+    vscode.commands.registerCommand("inex.compareOuterRevision", async () => {
+      await runUiAction(async () => {
+        if (!(await ensureVaultUnlocked(controller))) return;
+        const target = editor.currentRevisionCompareTarget();
+        if (target === undefined) {
+          throw new Error("Open a clean Inex Markdown editor before comparing its HEAD revision");
+        }
+        const compared = await target.session.sidecar.compareOuterRevision(target.logicalPath);
+        if (!controller.isSessionCurrent(target.session)) {
+          compared.leftContent.fill(0);
+          compared.rightContent.fill(0);
+          throw new Error("Inex vault session changed during revision compare");
+        }
+        const panel = vscode.window.createWebviewPanel(
+          "inex.revisionCompare",
+          "Inex: HEAD vs Parent",
+          vscode.ViewColumn.Beside,
+          { enableScripts: false, retainContextWhenHidden: false, localResourceRoots: [] },
+        );
+        const view = { panel, buffers: [compared.leftContent, compared.rightContent] };
+        compareViews.add(view);
+        panel.webview.html = revisionCompareHtml(compared.leftContent, compared.rightContent);
+        panel.onDidDispose(() => {
+          for (const buffer of view.buffers) buffer.fill(0);
+          compareViews.delete(view);
+        });
       });
     }),
     vscode.commands.registerCommand("inex.exportPlaintextCopy", async () => {
@@ -1124,6 +1160,15 @@ function isProfileArguments(value: unknown): value is { readonly profileId: stri
   return value !== null && typeof value === "object" &&
     typeof (value as { readonly profileId?: unknown }).profileId === "string" &&
     /^[a-z0-9][a-z0-9._-]{0,63}$/.test((value as { readonly profileId: string }).profileId);
+}
+
+function revisionCompareHtml(head: Buffer, parent: Buffer): string {
+  const escape = (value: string): string => value.replace(/[&<>"']/gu, (character) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  })[character] ?? character);
+  const headText = escape(head.toString("utf8"));
+  const parentText = escape(parent.toString("utf8"));
+  return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'"><style>body{font-family:var(--vscode-editor-font-family);padding:1rem}section{width:49%;display:inline-block;vertical-align:top}pre{white-space:pre-wrap;overflow-wrap:anywhere;border:1px solid var(--vscode-panel-border);padding:.75rem}</style></head><body><section><h2>HEAD</h2><pre>${headText}</pre></section><section><h2>Parent</h2><pre>${parentText}</pre></section></body></html>`;
 }
 
 async function runUiAction(action: () => Promise<void>): Promise<void> {

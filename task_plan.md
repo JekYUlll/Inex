@@ -62,6 +62,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
   - 2026-07-16: 已冻结 [VS Code Secure Revision Compare v1](docs/spec/vscode-revision-compare-v1.md)：普通 SCM 继续只显示密文；历史 compare 必须由 daemon 读取受限 Git revision、认证解密后在 Inex 自有只读 webview 呈现，禁止 plaintext TextDocument/VS Code native diff。下一实现切片为 restricted Git reader、Outer/Umbra projection RPC 和 lock/dispose residue 回归。
   - 2026-07-16: compare 的第一实现切片完成：`inex-git::read_historical_document` 仅接受闭集 `HistoricalRevision::{Head, HeadParent}`，canonical logical path→ciphertext path 后通过固定 Git plumbing 获取 blob，再经 `Vault::authenticate_committed_envelope` 认证；不接受 revision/object-id/pathspec 字符串，也不创建明文文件。真实 Git 双提交回归覆盖 HEAD、first-parent 与缺失路径拒绝；daemon RPC/UI 仍待接线。
   - 2026-07-16: daemon 已接 `revision.compare.outer`：请求只有 authenticated session 与 canonical logicalPath，固定对比 HEAD/first-parent；普通历史 EDRY 返回 plaintext bytes，feature-2 仅从已认证 outer container render Drop/Cover/Placeholder。Umbra compare、严格 VS Code response parser 与 controlled webview 尚待实现。
+  - 2026-07-16: VS Code 已接 `inex.compareOuterRevision`：只接受当前 clean 的 Inex CustomEditor，sidecar 对 response 的 roles/base64url/字段作 exact validation，结果仅进入无脚本 Inex WebviewPanel，vault lock/dispose 时 zero-fill extension-owned buffers 并销毁 panel；不调用 `vscode.diff` 或创建 plaintext TextDocument。真实 daemon Git fixture/Extension Host 与 Umbra compare 仍待完成。
   - 2026-07-16: 当前可安装 Linux x64 VSIX 已更新为 clean canonical-source `8dd7d70`，包含 richer display-only Markdown highlighting；package/audit/native-dependency/isolated-install smoke 通过并已覆盖本机 profile。运行中的窗口仍需 reload。
 - **Status:** complete
 

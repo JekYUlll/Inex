@@ -90,6 +90,11 @@
         "enablement": "inex.vaultUnlocked"
       },
       {
+        "command": "inex.compareOuterRevision",
+        "title": "Inex: Compare HEAD with Parent (Outer)",
+        "enablement": "inex.vaultUnlocked"
+      },
+      {
         "command": "inex.exportPlaintextCopy",
         "title": "Inex: Export Plaintext Copy…",
         "enablement": "inex.vaultUnlocked"

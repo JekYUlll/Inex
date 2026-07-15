@@ -92,6 +92,14 @@ export interface UmbraProjection {
   readonly renderMap: RenderMap;
 }
 
+/** Authenticated, read-only historical Outer projections for one document. */
+export interface OuterRevisionCompare {
+  readonly leftRole: "head";
+  readonly leftContent: Buffer;
+  readonly rightRole: "headParent";
+  readonly rightContent: Buffer;
+}
+
 export type PrivateAnnotationKind = "block" | "comment";
 export type OuterMode = "drop" | "cover" | "placeholder";
 
@@ -1000,6 +1008,16 @@ export class InexSidecar {
     return this.searchWithMethod("umbra.search.query", query, limit);
   }
 
+  public async compareOuterRevision(logicalPath: string): Promise<OuterRevisionCompare> {
+    logicalFileComponents(logicalPath);
+    return parseOuterRevisionCompare(
+      await this.callRaw("revision.compare.outer", {
+        ...this.protectedParams(),
+        logicalPath,
+      }),
+    );
+  }
+
   private async searchWithMethod(
     method: "search.query" | "umbra.search.query",
     query: string,
@@ -1537,6 +1555,34 @@ function expectOuterMode(value: JsonValue | undefined, field: string): OuterMode
     return outer;
   }
   throw new RpcProtocolError(`RPC ${field} is invalid`);
+}
+
+/** @internal Exported for strict historical compare response tests. */
+export function parseOuterRevisionCompare(value: JsonValue): OuterRevisionCompare {
+  const result = expectObject(value);
+  expectExactKeys(
+    result,
+    ["leftContentBase64", "leftRole", "rightContentBase64", "rightRole"],
+    "Outer revision compare",
+  );
+  const leftContent = decodeCanonicalBase64url(
+    expectString(result.leftContentBase64, "Outer compare left content"),
+    MAX_DOCUMENT_BYTES,
+  );
+  const rightContent = decodeCanonicalBase64url(
+    expectString(result.rightContentBase64, "Outer compare right content"),
+    MAX_DOCUMENT_BYTES,
+  );
+  try {
+    if (result.leftRole !== "head" || result.rightRole !== "headParent") {
+      throw new RpcProtocolError("RPC Outer revision compare roles are invalid");
+    }
+    return { leftRole: "head", leftContent, rightRole: "headParent", rightContent };
+  } catch (error: unknown) {
+    leftContent.fill(0);
+    rightContent.fill(0);
+    throw error;
+  }
 }
 
 /** @internal Exported for exact Umbra protocol-shape regression tests. */
