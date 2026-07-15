@@ -47,8 +47,10 @@ prepared `umbra` export before publication.
 1. `vault.export.prepare` validates scope and a caller-selected destination,
    snapshots the authenticated tree, checks that the destination is absent,
    outside the vault and has a safe existing parent on a filesystem capable of
-   atomic sibling publication. It returns a random, session-bound,
-   single-use confirmation capability and only public counts/byte budgets.
+   atomic sibling publication. It reserves an empty restrictive sibling
+   staging root (which contains no plaintext), records the authenticated
+   logical tree snapshot, and returns a random, session-bound, single-use
+   confirmation capability plus only public counts/byte budgets.
 2. The client presents a high-risk warning and receives an explicit user
    confirmation. `vault.export.commit` accepts only that capability; it
    revalidates the session, scope, vault/destination identities and final

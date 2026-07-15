@@ -14,7 +14,9 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use inex_core::crypto::DecryptedAsset;
 use inex_core::format::MAX_ASSET_PLAINTEXT_LEN;
 use inex_core::path::LogicalPath;
+use inex_core::plaintext_export::{PlaintextExportScope, PlaintextExportStaging};
 use inex_core::sodium;
+use inex_core::tree::VaultTree;
 use inex_core::vault::Vault;
 use zeroize::Zeroizing;
 
@@ -29,6 +31,7 @@ pub const MAX_ASSET_CHUNK_BYTES: usize = 1024 * 1024;
 const SESSION_TOKEN_BYTES: usize = 32;
 const DOCUMENT_HANDLE_BYTES: usize = 16;
 const ASSET_HANDLE_BYTES: usize = 16;
+const EXPORT_CAPABILITY_BYTES: usize = 32;
 const MAX_CAPABILITY_GENERATION_ATTEMPTS: usize = 32;
 
 /// Source of monotonic elapsed time used by [`SessionStore`].
@@ -162,6 +165,44 @@ pub struct AssetHandle {
     encoded: Zeroizing<String>,
 }
 
+/// Random single-use confirmation capability for one prepared plaintext
+/// export. It is session-bound, zeroized on drop and never formats its value.
+#[derive(Clone)]
+pub struct ExportCapability {
+    encoded: Zeroizing<String>,
+}
+
+impl ExportCapability {
+    fn generate() -> Result<Self, SessionError> {
+        Ok(Self {
+            encoded: random_base64url::<EXPORT_CAPABILITY_BYTES>()?,
+        })
+    }
+
+    fn matches(&self, presented: &str) -> Result<bool, SessionError> {
+        constant_time_text_eq(&self.encoded, presented)
+    }
+
+    /// Borrow the canonical wire representation exactly while constructing the
+    /// prepare response.
+    #[must_use]
+    pub fn expose_secret(&self) -> &str {
+        self.encoded.as_str()
+    }
+}
+
+impl fmt::Debug for ExportCapability {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ExportCapability([REDACTED])")
+    }
+}
+
+impl fmt::Display for ExportCapability {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("[REDACTED EXPORT CAPABILITY]")
+    }
+}
+
 impl AssetHandle {
     fn generate() -> Result<Self, SessionError> {
         Ok(Self {
@@ -282,6 +323,11 @@ pub enum SessionError {
     InvalidAssetRead,
     /// A caller attempted to retain an asset above the authenticated v1 bound.
     AssetPlaintextTooLarge,
+    /// Only one pending plaintext export confirmation is allowed per session.
+    ExportPending,
+    /// A plaintext export capability was absent, stale or belonged to a
+    /// different session.
+    InvalidExportCapability,
 }
 
 impl fmt::Display for SessionError {
@@ -296,6 +342,8 @@ impl fmt::Display for SessionError {
             Self::InvalidAssetHandle => "asset handle is invalid",
             Self::InvalidAssetRead => "asset read position is invalid",
             Self::AssetPlaintextTooLarge => "asset plaintext exceeds the session limit",
+            Self::ExportPending => "plaintext export confirmation is already pending",
+            Self::InvalidExportCapability => "plaintext export confirmation is invalid",
         })
     }
 }
@@ -314,12 +362,20 @@ struct OpenAsset {
     eof_returned: bool,
 }
 
+struct OpenPlaintextExport {
+    capability: ExportCapability,
+    scope: PlaintextExportScope,
+    tree: VaultTree,
+    staging: PlaintextExportStaging,
+}
+
 struct ActiveSession {
     capability: SessionToken,
     vault: Vault,
     last_activity: Duration,
     documents: Vec<OpenDocument>,
     asset: Option<OpenAsset>,
+    export: Option<OpenPlaintextExport>,
 }
 
 impl Drop for ActiveSession {
@@ -390,6 +446,7 @@ impl<C: MonotonicClock> SessionStore<C> {
             last_activity: self.clock.now(),
             documents: Vec::new(),
             asset: None,
+            export: None,
         };
         self.active = Some(replacement);
         Ok(capability)
@@ -633,6 +690,97 @@ impl<C: MonotonicClock> SessionStore<C> {
         ))
     }
 
+    /// Bind an empty, restrictive plaintext-export staging root to the live
+    /// session and issue its single-use confirmation capability. The staging
+    /// root contains no plaintext until a later commit consumes this record.
+    ///
+    /// # Errors
+    ///
+    /// Returns a session error, or [`SessionError::ExportPending`] when the
+    /// session already has an uncommitted confirmation.
+    pub fn prepare_export(
+        &mut self,
+        presented: &str,
+        scope: PlaintextExportScope,
+        tree: VaultTree,
+        staging: PlaintextExportStaging,
+    ) -> Result<ExportCapability, SessionError> {
+        let session = self.validated_session_mut(presented)?;
+        if session.export.is_some() {
+            return Err(SessionError::ExportPending);
+        }
+        let capability = ExportCapability::generate()?;
+        session.export = Some(OpenPlaintextExport {
+            capability: capability.clone(),
+            scope,
+            tree,
+            staging,
+        });
+        Ok(capability)
+    }
+
+    /// Check that this session has no outstanding plaintext-export
+    /// confirmation before a caller allocates its empty staging root.
+    ///
+    /// # Errors
+    ///
+    /// Returns a session validation error or [`SessionError::ExportPending`].
+    pub fn ensure_export_slot(&mut self, presented: &str) -> Result<(), SessionError> {
+        let session = self.validated_session_mut(presented)?;
+        if session.export.is_some() {
+            Err(SessionError::ExportPending)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Consume one exact pending plaintext-export confirmation. It is removed
+    /// before any plaintext work begins, so failure and success are both
+    /// single-use outcomes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a session error or [`SessionError::InvalidExportCapability`]
+    /// for missing, stale or mismatched capabilities.
+    pub fn take_export(
+        &mut self,
+        presented: &str,
+        capability: &str,
+    ) -> Result<(PlaintextExportScope, VaultTree, PlaintextExportStaging), SessionError> {
+        let session = self.validated_session_mut(presented)?;
+        let export = session
+            .export
+            .as_ref()
+            .ok_or(SessionError::InvalidExportCapability)?;
+        if !export.capability.matches(capability)? {
+            return Err(SessionError::InvalidExportCapability);
+        }
+        let export = session
+            .export
+            .take()
+            .ok_or(SessionError::InvalidExportCapability)?;
+        Ok((export.scope, export.tree, export.staging))
+    }
+
+    /// Discard a pending Umbra-inclusive export before releasing `K_umbra`.
+    /// Outer-only confirmations remain valid because they never depend on
+    /// private slots.
+    ///
+    /// # Errors
+    ///
+    /// Returns a session validation error.
+    pub fn invalidate_umbra_export(&mut self, presented: &str) -> Result<(), SessionError> {
+        let session = self.validated_session_mut(presented)?;
+        if session
+            .export
+            .as_ref()
+            .is_some_and(|export| matches!(export.scope, PlaintextExportScope::Umbra))
+        {
+            drop(session.export.take());
+        }
+        Ok(())
+    }
+
     /// Create a random handle bound to one logical path and base etag.
     ///
     /// No plaintext is retained. This protected operation touches the session.
@@ -849,6 +997,7 @@ mod tests {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use inex_core::crypto::VaultContentProfile;
     use inex_core::path::{AssetPath, LogicalPath};
+    use inex_core::plaintext_export::{PlaintextExportScope, PlaintextExportStaging};
     use inex_core::sodium::Argon2idParams;
     use inex_core::vault::Vault;
     use inex_core::vault_config::KdfPolicy;
@@ -1022,6 +1171,62 @@ mod tests {
             store.validate(token.expose_secret()),
             Err(SessionError::InvalidSession)
         );
+    }
+
+    #[test]
+    fn umbra_export_confirmation_is_invalidated_without_affecting_outer_export() {
+        let root = TestDirectory::new("export-capability");
+        let vault_path = root.path().join("vault");
+        let exports = root.path().join("exports");
+        fs::create_dir(&exports).expect("exports root");
+        let mut vault = Vault::create_with_params(
+            &vault_path,
+            b"test password",
+            1_783_699_200_000,
+            Argon2idParams {
+                ops_limit: 1,
+                mem_limit_bytes: 8 * 1024,
+            },
+            test_policy(),
+        )
+        .expect("fixture vault");
+        let tree = vault.list().expect("tree snapshot");
+        let umbra_staging = PlaintextExportStaging::prepare(&vault_path, &exports.join("umbra"))
+            .expect("Umbra staging");
+        let outer_staging = PlaintextExportStaging::prepare(&vault_path, &exports.join("outer"))
+            .expect("Outer staging");
+        let mut store = SessionStore::with_clock(ManualClock::default());
+        let token = store.unlock(vault).expect("session unlock");
+        let umbra_capability = store
+            .prepare_export(
+                token.expose_secret(),
+                PlaintextExportScope::Umbra,
+                tree.clone(),
+                umbra_staging,
+            )
+            .expect("prepare Umbra export");
+        store
+            .invalidate_umbra_export(token.expose_secret())
+            .expect("invalidate Umbra export");
+        assert!(matches!(
+            store.take_export(token.expose_secret(), umbra_capability.expose_secret()),
+            Err(SessionError::InvalidExportCapability)
+        ));
+        let outer_capability = store
+            .prepare_export(
+                token.expose_secret(),
+                PlaintextExportScope::Outer,
+                tree,
+                outer_staging,
+            )
+            .expect("prepare Outer export");
+        store
+            .invalidate_umbra_export(token.expose_secret())
+            .expect("invalidate only Umbra export");
+        let (scope, _, _) = store
+            .take_export(token.expose_secret(), outer_capability.expose_secret())
+            .expect("Outer export must remain valid");
+        assert_eq!(scope, PlaintextExportScope::Outer);
     }
 
     #[test]

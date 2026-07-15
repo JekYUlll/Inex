@@ -952,10 +952,29 @@ impl Vault {
         staging: &Path,
         manifest: &mut PlaintextExportManifest,
     ) -> Result<PlaintextExportSummary, VaultError> {
+        let tree = self.list()?;
+        self.populate_plaintext_export_staging_from_tree(scope, &tree, staging, manifest)
+    }
+
+    /// Populate plaintext export staging from one previously authenticated
+    /// logical tree snapshot. This lets a daemon bind its confirmation to the
+    /// exact path set inspected at prepare time; additions after preparation
+    /// are not silently included, while removed/unsafe snapshot entries fail
+    /// the atomic export before publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::populate_plaintext_export_staging`].
+    pub fn populate_plaintext_export_staging_from_tree(
+        &mut self,
+        scope: PlaintextExportScope,
+        tree: &VaultTree,
+        staging: &Path,
+        manifest: &mut PlaintextExportManifest,
+    ) -> Result<PlaintextExportSummary, VaultError> {
         if matches!(scope, PlaintextExportScope::Umbra) && self.umbra.is_none() {
             return Err(VaultError::UmbraLocked);
         }
-        let tree = self.list()?;
         let mut summary = PlaintextExportSummary::default();
         for entry in tree.entries() {
             let relative = export_relative_path(entry.logical_path())?;

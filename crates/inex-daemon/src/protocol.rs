@@ -45,6 +45,8 @@ pub enum Method {
     VaultUnlock,
     VaultLock,
     VaultStatus,
+    VaultExportPrepare,
+    VaultExportCommit,
     UmbraStatus,
     UmbraInitialize,
     UmbraUnlock,
@@ -83,7 +85,7 @@ pub enum Method {
 }
 
 impl Method {
-    const ALL: [Self; 42] = [
+    const ALL: [Self; 44] = [
         Self::SystemHello,
         Self::SystemPing,
         Self::SystemShutdown,
@@ -91,6 +93,8 @@ impl Method {
         Self::VaultUnlock,
         Self::VaultLock,
         Self::VaultStatus,
+        Self::VaultExportPrepare,
+        Self::VaultExportCommit,
         Self::UmbraStatus,
         Self::UmbraInitialize,
         Self::UmbraUnlock,
@@ -139,6 +143,8 @@ impl Method {
             Self::VaultUnlock => "vault.unlock",
             Self::VaultLock => "vault.lock",
             Self::VaultStatus => "vault.status",
+            Self::VaultExportPrepare => "vault.export.prepare",
+            Self::VaultExportCommit => "vault.export.commit",
             Self::UmbraStatus => "umbra.status",
             Self::UmbraInitialize => "umbra.initialize",
             Self::UmbraUnlock => "umbra.unlock",

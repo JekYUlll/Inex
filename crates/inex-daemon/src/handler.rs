@@ -16,6 +16,10 @@ use inex_core::crypto::{
 };
 use inex_core::format::{EdryHeader, MAX_ASSET_PLAINTEXT_LEN, MAX_PLAINTEXT_LEN};
 use inex_core::path::{LogicalDir, LogicalPath};
+use inex_core::plaintext_export::{
+    PlaintextExportDestinationError, PlaintextExportManifest, PlaintextExportScope,
+    PlaintextExportStaging,
+};
 use inex_core::search::{
     CaseSensitivity, DEFAULT_SEARCH_RESULTS, DEFAULT_SEARCH_SNIPPET_BYTES, MAX_SEARCH_QUERY_BYTES,
     MAX_SEARCH_RESULTS, MAX_SEARCH_SNIPPET_BYTES, SearchQuery,
@@ -148,6 +152,8 @@ impl<C: MonotonicClock> RpcService<C> {
             Method::VaultUnlock => self.vault_unlock(params),
             Method::VaultLock => self.vault_lock(params),
             Method::VaultStatus => self.vault_status(params),
+            Method::VaultExportPrepare => self.vault_export_prepare(params),
+            Method::VaultExportCommit => self.vault_export_commit(params),
             Method::UmbraStatus => self.umbra_status(params),
             Method::UmbraInitialize => self.umbra_initialize(params),
             Method::UmbraUnlock => self.umbra_unlock(params),
@@ -378,6 +384,107 @@ impl<C: MonotonicClock> RpcService<C> {
         }))
     }
 
+    fn vault_export_prepare(&mut self, params: Params) -> RpcResult {
+        let mut params = ParamObject::new(params);
+        let session = required_session(&mut params)?;
+        let destination =
+            params.required_sensitive_string("destination", 1, MAX_PHYSICAL_PATH_BYTES)?;
+        let scope = parse_export_scope(&mut params)?;
+        params.finish()?;
+        self.sessions
+            .ensure_export_slot(session.as_str())
+            .map_err(map_session_error)?;
+        let (vault_root, tree, files, assets, directories, umbra_unlocked) = {
+            let vault = self
+                .sessions
+                .vault_mut(session.as_str())
+                .map_err(map_session_error)?;
+            let tree = vault
+                .list()
+                .map_err(|error| map_vault_error(error, ErrorContext::Document))?;
+            let files = tree
+                .entries()
+                .iter()
+                .filter(|entry| entry.kind() == TreeEntryKind::File)
+                .count();
+            let assets = tree
+                .entries()
+                .iter()
+                .filter(|entry| entry.kind() == TreeEntryKind::Asset)
+                .count();
+            let directories = tree
+                .entries()
+                .iter()
+                .filter(|entry| entry.kind() == TreeEntryKind::Directory)
+                .count();
+            let umbra_unlocked = vault
+                .umbra_status()
+                .map_err(|error| map_vault_error(error, ErrorContext::Authentication))?
+                .unlocked;
+            (
+                vault.root().to_path_buf(),
+                tree,
+                files,
+                assets,
+                directories,
+                umbra_unlocked,
+            )
+        };
+        if matches!(scope, PlaintextExportScope::Umbra) && !umbra_unlocked {
+            return Err(ErrorObject::new(ErrorCode::AuthFailed));
+        }
+        let staging = PlaintextExportStaging::prepare(&vault_root, Path::new(destination.as_str()))
+            .map_err(|error| map_export_destination_error(&error))?;
+        let capability = self
+            .sessions
+            .prepare_export(session.as_str(), scope, tree, staging)
+            .map_err(map_session_error)?;
+        drop(destination);
+        Ok(json!({
+            "confirmation": capability.expose_secret(),
+            "scope": export_scope_name(scope),
+            "files": files,
+            "assets": assets,
+            "directories": directories,
+        }))
+    }
+
+    fn vault_export_commit(&mut self, params: Params) -> RpcResult {
+        let mut params = ParamObject::new(params);
+        let session = required_session(&mut params)?;
+        let confirmation =
+            params.required_sensitive_string("confirmation", 1, MAX_CAPABILITY_TEXT_BYTES)?;
+        params.finish()?;
+        let (scope, tree, staging) = self
+            .sessions
+            .take_export(session.as_str(), confirmation.as_str())
+            .map_err(map_session_error)?;
+        drop(confirmation);
+        let mut manifest = PlaintextExportManifest::default();
+        let summary = self
+            .sessions
+            .vault_mut(session.as_str())
+            .map_err(map_session_error)?
+            .populate_plaintext_export_staging_from_tree(
+                scope,
+                &tree,
+                staging.staging(),
+                &mut manifest,
+            )
+            .map_err(|error| map_vault_error(error, ErrorContext::Document))?;
+        let outcome = staging
+            .publish(|current| manifest.audit(current))
+            .map_err(|error| map_export_destination_error(&error))?;
+        Ok(json!({
+            "ok": true,
+            "scope": export_scope_name(scope),
+            "files": summary.markdown_documents,
+            "assets": summary.assets,
+            "directories": summary.directories,
+            "durability": durability_name(outcome.parent_sync),
+        }))
+    }
+
     fn umbra_status(&mut self, params: Params) -> RpcResult {
         let mut params = ParamObject::new(params);
         let session = required_session(&mut params)?;
@@ -429,6 +536,9 @@ impl<C: MonotonicClock> RpcService<C> {
             .vault_mut(session.as_str())
             .map_err(map_session_error)?
             .lock_umbra();
+        self.sessions
+            .invalidate_umbra_export(session.as_str())
+            .map_err(map_session_error)?;
         Ok(json!({"ok": true, "unlocked": false}))
     }
 
@@ -1545,9 +1655,11 @@ fn map_session_error(error: SessionError) -> ErrorObject {
             ErrorCode::LimitExceeded
         }
         SessionError::AssetPlaintextTooLarge => ErrorCode::LimitExceeded,
+        SessionError::ExportPending => ErrorCode::Busy,
         SessionError::InvalidDocumentHandle
         | SessionError::InvalidAssetHandle
-        | SessionError::InvalidAssetRead => ErrorCode::InvalidParams,
+        | SessionError::InvalidAssetRead
+        | SessionError::InvalidExportCapability => ErrorCode::InvalidParams,
     };
     ErrorObject::new(code)
 }
@@ -1563,6 +1675,7 @@ fn map_vault_error(error: VaultError, context: ErrorContext) -> ErrorObject {
             ErrorCode::LimitExceeded
         }
         VaultError::Io { .. }
+        | VaultError::PlaintextExportStaging
         | VaultError::NamespaceCommitIndeterminate { .. }
         | VaultError::PasswordCommitVerificationFailed => ErrorCode::IoFailed,
         VaultError::UnsupportedFilesystem => ErrorCode::Unsupported,
@@ -1610,6 +1723,38 @@ fn map_vault_error(error: VaultError, context: ErrorContext) -> ErrorObject {
         },
     };
     ErrorObject::new(code)
+}
+
+fn map_export_destination_error(error: &PlaintextExportDestinationError) -> ErrorObject {
+    let code = match error {
+        PlaintextExportDestinationError::InvalidDestination
+        | PlaintextExportDestinationError::InsideVault
+        | PlaintextExportDestinationError::DestinationChanged => ErrorCode::InvalidParams,
+        PlaintextExportDestinationError::UnsupportedFilesystem => ErrorCode::Unsupported,
+        PlaintextExportDestinationError::DestinationExists => ErrorCode::AlreadyExists,
+        PlaintextExportDestinationError::StagingCreate
+        | PlaintextExportDestinationError::Io
+        | PlaintextExportDestinationError::Publish => ErrorCode::IoFailed,
+    };
+    ErrorObject::new(code)
+}
+
+fn parse_export_scope(params: &mut ParamObject) -> Result<PlaintextExportScope, ErrorObject> {
+    let scope = params.required_sensitive_string("scope", 1, 16)?;
+    let parsed = match scope.as_str() {
+        "outer" => Ok(PlaintextExportScope::Outer),
+        "umbra" => Ok(PlaintextExportScope::Umbra),
+        _ => Err(ErrorObject::new(ErrorCode::InvalidParams)),
+    };
+    drop(scope);
+    parsed
+}
+
+const fn export_scope_name(scope: PlaintextExportScope) -> &'static str {
+    match scope {
+        PlaintextExportScope::Outer => "outer",
+        PlaintextExportScope::Umbra => "umbra",
+    }
 }
 
 fn map_tree_error(error: &TreeError) -> ErrorCode {
@@ -2176,6 +2321,104 @@ mod tests {
         scrub_object(&mut locked);
         session.zeroize();
         handle.zeroize();
+    }
+
+    #[test]
+    fn plaintext_export_rpc_requires_single_use_confirmation_and_publishes_outer_copy() {
+        let root = TestDirectory::new();
+        fs::create_dir(root.path()).expect("test root");
+        let vault_path = root.path().join("vault");
+        let exports = root.path().join("exports");
+        fs::create_dir(&exports).expect("exports root");
+        let password = b"export password";
+        let mut vault = Vault::create_with_params(
+            &vault_path,
+            password,
+            1_783_699_200_000,
+            Argon2idParams {
+                ops_limit: 1,
+                mem_limit_bytes: 8 * 1024,
+            },
+            test_policy(),
+        )
+        .expect("fixture vault");
+        vault
+            .create_document(
+                &LogicalPath::parse_canonical("note.md").expect("logical path"),
+                b"# exported outer copy\n",
+                1_783_699_201_000,
+            )
+            .expect("fixture document");
+        drop(vault);
+
+        let mut service = RpcService::with_clock_and_policy(SystemClock::new(), test_policy());
+        hello(&mut service);
+        let mut unlocked = response(
+            &mut service,
+            1,
+            "vault.unlock",
+            json!({"vaultPath": vault_path, "password": String::from_utf8_lossy(password)}),
+        );
+        let session = Zeroizing::new(
+            unlocked["result"]["session"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+        );
+        scrub_object(&mut unlocked);
+        let destination = exports.join("plaintext-copy");
+        let mut prepared = response(
+            &mut service,
+            2,
+            "vault.export.prepare",
+            json!({
+                "session": session.as_str(),
+                "destination": destination,
+                "scope": "outer",
+            }),
+        );
+        assert_eq!(prepared["result"]["scope"], "outer");
+        assert_eq!(prepared["result"]["files"], 1);
+        let confirmation = Zeroizing::new(
+            prepared["result"]["confirmation"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+        );
+        assert!(!confirmation.is_empty());
+        scrub_object(&mut prepared);
+        let mut concurrent = Vault::unlock(&vault_path, password, None, test_policy())
+            .expect("concurrent fixture unlock");
+        concurrent
+            .create_document(
+                &LogicalPath::parse_canonical("later.md").expect("later logical path"),
+                b"must not enter prepared export\n",
+                1_783_699_202_000,
+            )
+            .expect("concurrent document");
+        drop(concurrent);
+        let mut committed = response(
+            &mut service,
+            3,
+            "vault.export.commit",
+            json!({"session": session.as_str(), "confirmation": confirmation.as_str()}),
+        );
+        assert_eq!(committed["result"]["ok"], true);
+        assert_eq!(committed["result"]["files"], 1);
+        scrub_object(&mut committed);
+        assert_eq!(
+            fs::read(destination.join("note.md")).expect("published Markdown"),
+            b"# exported outer copy\n"
+        );
+        assert!(!destination.join("later.md").exists());
+        let mut replay = response(
+            &mut service,
+            4,
+            "vault.export.commit",
+            json!({"session": session.as_str(), "confirmation": confirmation.as_str()}),
+        );
+        assert_eq!(replay["error"]["code"], ErrorCode::InvalidParams.number());
+        scrub_object(&mut replay);
     }
 
     #[test]
