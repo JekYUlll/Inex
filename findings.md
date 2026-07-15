@@ -679,3 +679,8 @@
 
 - A parent revision may legitimately contain text that later becomes private, so an Outer compare test cannot require a canary to be absent from both sides. The correct assertion is that the head projection, after the text is wrapped as Drop private content, excludes body and tag canaries while preserving unrelated public text.
 - Umbra compare isolation needs two assertions: an Outer-only session must receive `AUTH_FAILED`, and only a separately unlocked Umbra session may receive the historical private projection. Testing only the successful unlock path would not prove the independent password boundary.
+
+## 2026-07-16 Extension Host historical compare fixture
+
+- The standard imported-vault fixture has one parentless commit, so a production compare command cannot be exercised there. A second `--allow-empty` ciphertext-repository commit is sufficient for the command path because it creates an exact HEAD/parent pair while retaining every encrypted blob and avoiding a plaintext mutation in the runner.
+- A command trace alone does not prove the editor boundary. The Extension Host regression consequently retains the custom-tab `assertNoPlaintextTextDocument` check before and after the command, while the existing full isolated-root residue scan remains the persistence evidence.

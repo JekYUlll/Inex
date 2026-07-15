@@ -98,6 +98,19 @@ try {
     redactions,
   );
   await importVault(fixture, options.inexPath, signatures, redactions);
+  await runGit(
+    fixture,
+    [
+      "-C", fixture.vaultPath,
+      "-c", "user.email=inex-vscode-integration@example.invalid",
+      "-c", "user.name=Inex VS Code Integration",
+      "-c", "commit.gpgSign=false",
+      "commit", "--allow-empty", "-q", "-m", "ciphertext revision compare fixture",
+    ],
+    signatures,
+    redactions,
+    "create ciphertext-only compare revision",
+  );
   await removePlaintextSource(fixture.sourcePath);
   await runStage("backup", fixture, expectedSha256, options, signatures, redactions);
 } catch (error) {

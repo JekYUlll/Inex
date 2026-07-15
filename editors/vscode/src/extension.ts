@@ -53,6 +53,7 @@ export interface InexIntegrationTestApi {
   readonly verifyUmbraAnnotationLifecycle: (logicalPath: string, password: string) => Promise<void>;
   readonly verifyUmbraPasswordChange: (oldPassword: string, newPassword: string) => Promise<void>;
   readonly verifyUmbraLock: (password: string) => Promise<void>;
+  readonly verifyOuterRevisionCompare: () => Promise<void>;
   readonly lock: () => Promise<void>;
 }
 
@@ -604,6 +605,9 @@ export function activate(
       if ((await session.sidecar.umbraStatus()).unlocked) {
         throw new Error("Inex integration Umbra lock retained K_umbra in the sidecar");
       }
+    },
+    verifyOuterRevisionCompare: async () => {
+      await vscode.commands.executeCommand("inex.compareOuterRevision");
     },
     lock: () => controller.lock(),
   });

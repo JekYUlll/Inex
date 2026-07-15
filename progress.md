@@ -1512,6 +1512,11 @@
 - 新增真实 feature-2 encrypted Git fixture：parent 是公开 body，head 把 `HISTORICAL_PRIVATE_CANARY` 包入带 `historical-private-tag` 的 Drop private slot。Outer historical compare 的 head 只含 public canary，两个私密 canary 均不出现；这避免将“父提交中此前公开内容”误当作 head Outer 泄露。
 - 同一 fresh Outer session 的 `revision.compare.umbra` 必须返回 AUTH_FAILED；仅在独立 `umbra.unlock` 成功后，full historical projection 才包含 private body/tag canary。定向 daemon test 与 strict Clippy 已通过；compare-specific Extension Host 仍待。
 
+## 2026-07-16 — Extension Host Outer compare regression
+
+- 隔离 integration runner 在已发布的 ciphertext vault 上创建一个 `--allow-empty` second commit：它不复制、读取或修改 Markdown/plaintext/ciphertext blob，只让 fixed HEAD/parent compare 有合法历史对。Extension API 通过 production `inex.compareOuterRevision` command 驱动 compare，而不是直接调用 sidecar helper。
+- Suite 等待 sidecar trace 中的 `revision.compare.outer`，并在 command 前后重复 `assertNoPlaintextTextDocument`；其既有 profile-wide residue scan 继续覆盖该过程。VS Code typecheck、69/69 Node tests 与真实 local Extension Host 通过。Umbra-command-specific Host fixture 仍待，不由此覆盖。
+
 ## 2026-07-16 — Real daemon historical compare fixture
 
 - daemon handler 现有真实 Git fixture：先创建加密 parent Markdown、`git init/add/commit`，再通过 vault CAS 保存新密文并建立 head commit，最后用 production `vault.unlock` RPC 与 `revision.compare.outer` RPC 验证 head/parent 两个 Base64URL projection。这证明 RPC 走的是受限 Git blob reader 而非工作区 plaintext 或伪造 response。

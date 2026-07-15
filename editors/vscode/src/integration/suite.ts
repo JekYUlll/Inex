@@ -47,6 +47,7 @@ interface InexIntegrationTestApi {
   readonly verifyUmbraAnnotationLifecycle: (logicalPath: string, password: string) => Promise<void>;
   readonly verifyUmbraPasswordChange: (oldPassword: string, newPassword: string) => Promise<void>;
   readonly verifyUmbraLock: (password: string) => Promise<void>;
+  readonly verifyOuterRevisionCompare: () => Promise<void>;
   readonly lock: () => Promise<void>;
 }
 
@@ -158,6 +159,13 @@ async function runBackupRecoveryCycle(
   await runCrudCycle(api, fixture);
   await api.openDocument(LOGICAL_PATH);
   const tab = await waitForCustomTab(fixture.vaultPath, LOGICAL_PATH);
+  assertNoPlaintextTextDocument(tab.input.uri, fixture.sourcePath);
+  await api.verifyOuterRevisionCompare();
+  await waitForSidecarTrace(
+    fixture,
+    (entries) => entries.some((entry) => entry.method === "revision.compare.outer"),
+    "VS Code Outer revision compare did not reach the authenticated sidecar",
+  );
   assertNoPlaintextTextDocument(tab.input.uri, fixture.sourcePath);
 
   api.markDirty(LOGICAL_PATH);
@@ -653,6 +661,7 @@ function assertIntegrationApi(value: unknown): asserts value is InexIntegrationT
     "exportUmbraCopy",
     "verifyUmbraAnnotationLifecycle",
     "verifyUmbraLock",
+    "verifyOuterRevisionCompare",
     "lock",
   ]) {
     assert.equal(typeof candidate[method], "function", `Integration-test API lacks ${method}`);
