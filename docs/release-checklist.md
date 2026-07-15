@@ -346,6 +346,10 @@ pnpm test:extension:1.126
       byte-identical across all three product artifacts.
 - [ ] Install each VSIX into a new persistent profile; do not use only
       `extensionTestsLocationURI` test mode.
+- [ ] Follow the disposable
+      [VS Code persistent-profile validation protocol](vscode-persistent-profile-validation.md)
+      for real folder-picker, CRLF no-op, repeated-heading, encrypted-SCM and
+      lock/restart observations; retain only non-secret evidence.
 - [ ] Exercise edit/undo/save/revert, dirty close, normal restart, forced kill,
       backup restore, stale restore, lock/idle/daemon crash, search, headings,
       links, backlinks, and etag conflict.

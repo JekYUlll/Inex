@@ -253,7 +253,8 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
   - [ ] 完成VS Code locked首次交互的最终发布门禁
     - [x] 提供Import/Unlock welcome、锁定CRUD gate、绝对CLI任务、成功后Open New Vault，并由真实Extension Host覆盖底层import→密文workspace→asset/CRUD流程
     - [x] 提供当前单工作区默认source、Explorer文件夹右键初始化、fresh HEAD快照/历史不复制确认、existing exact-v2显式对账入口与不丢快速退出事件的Task状态机（`14b4f18`）
-    - [ ] 在最终VSIX上人工驱动Linux真实folder picker、任务终端双口令与Open New Vault鼠标路径，并纳入persistent-profile残留证据
+  - [ ] 在最终VSIX上人工驱动Linux真实folder picker、任务终端双口令与Open New Vault鼠标路径，并纳入persistent-profile残留证据
+    - [x] 固化一次性 canary/CRLF fixture、真实 folder picker、重复 Heading、SCM secure compare、锁定/重启与无秘密证据要求的 Linux 人工协议（`docs/vscode-persistent-profile-validation.md`）；协议本身不替代人工执行或发布门禁。
   - [ ] 完成冻结GA对象证明与生产接线
     - [x] 实现strict SHA-1 raw index v2/v3/v4 parser，校验entry/extension/trailer、排序、canonical v4 varint与资源边界（`62fa0aa`）
     - [x] 从approved path/OID trie独立typed-SHA-1序列化每棵raw tree，并用单个bounded streaming `cat-file --batch`逐对象比较blob/tree/commit body与exact inventory（`d8805bd`）

@@ -370,6 +370,13 @@ persistent-profile cross-restart residue matrix remains pending. Installing
 the checkpoint into a profile that contains untrusted extensions is outside
 the security model.
 
+For a repeatable Linux manual protocol covering the real folder picker, CRLF
+no-op Git status, repeated heading navigation, encrypted SCM behavior and
+lock/restart observations, use
+[VS Code persistent-profile validation](vscode-persistent-profile-validation.md).
+It intentionally uses disposable content and is diagnostic evidence only; it
+does not close the release residue matrix.
+
 A packaged extension contains the matching platform executable pair at:
 
 ```text

@@ -1786,3 +1786,8 @@
 - 当前源码重新通过 `pnpm --dir editors/vscode check`、75/75 client unit tests 与 `test:extension:build`。
 - 隔离 tmux `pnpm --dir editors/vscode test:extension:local` 以 exit 0 完成，输出 feature-1 import、asset preview、CRUD、backup/recovery 和 plaintext-residue audit passed。该 runner 同时覆盖现有 Outer/Umbra annotation、safe compare、export 和 cross-editor fixture trace；未发现需要修改的 VS Code 产品回归。
 - 这不替代用户持久 VS Code profile 的人工视觉/SCM 验收：仍需确认实际窗口内 Markdown 呈现、重复 Heading 跳转与 CRLF vault 在无操作时 `git status` 保持 clean。
+
+## 2026-07-16 — VS Code persistent-profile gate protocol
+
+- 新增 `docs/vscode-persistent-profile-validation.md`，将无法可靠 mouse-drive 的 Linux 持久 profile 门禁固化为一次性 CRLF/canary fixture 协议：真实 folder picker、任务终端双口令、Open New Vault、无操作密文 Git status、重复 Heading、SCM secure compare、lock/restart 与无秘密记录要求。
+- `installation.md` 与 `release-checklist.md` 已交叉引用该协议，计划中的 locked-first-import 发布门禁也绑定此文档。协议明确不使用真实私密内容、不添加测试后门，且不能将单次人工结果表述为完整 Hot Exit/Local History/崩溃 residue matrix。
