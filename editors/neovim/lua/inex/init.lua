@@ -695,6 +695,46 @@ function M.manage_private_tags()
   show_menu()
 end
 
+function M.manage_private_annotation_profiles()
+  local function show_menu()
+    M.load_umbra_annotation_config(function(config)
+      vim.ui.select({
+        { action = "create", label = "Create annotation profile" },
+        { action = "remove", label = "Remove annotation profile" },
+        { action = "default", label = "Set default annotation profile" },
+      }, { prompt = "Manage Inex annotation profiles", format_item = function(item) return item.label end }, function(item)
+        if not item then config = nil; return end
+        if item.action == "create" then
+          vim.ui.input({ prompt = "Annotation profile label: " }, function(label)
+            if type(label) ~= "string" or #label == 0 or #label > 4096 or label:find("%z") then config = nil; return end
+            vim.ui.input({ prompt = "Stable annotation profile ID: ", default = "profile" }, function(profile_id)
+              if not valid_tag_id(profile_id) then vim.notify("Inex annotation profile ID is invalid", vim.log.levels.ERROR); config = nil; return end
+              umbra_config_mutation("umbra.profile.create", {
+                id = profile_id, label = label, kind = "comment", tagIds = {}, outer = "drop", promptForCover = false,
+              }, "Inex annotation profile created", function() config = nil; show_menu() end)
+            end)
+          end)
+          return
+        end
+        local profiles = config.profiles
+        if item.action == "default" then
+          profiles = vim.list_extend({ { id = "", label = "No default profile" } }, profiles)
+        end
+        if #profiles == 0 then vim.notify("No Inex annotation profiles are configured", vim.log.levels.WARN); config = nil; return end
+        vim.ui.select(profiles, { prompt = "Select annotation profile", format_item = function(profile) return profile.label end }, function(profile)
+          if not profile then config = nil; return end
+          if item.action == "remove" then
+            umbra_config_mutation("umbra.profile.remove", { profileId = profile.id }, "Inex annotation profile removed", function() config = nil; show_menu() end)
+          else
+            umbra_config_mutation("umbra.profile.setDefault", { profileId = profile.id }, "Inex default annotation profile updated", function() config = nil; show_menu() end)
+          end
+        end)
+      end)
+    end)
+  end
+  show_menu()
+end
+
 local function parse_umbra_projection(logical_path, result)
   if not has_exact_keys(result, { contentBase64 = true, etag = true, metadata = true, renderMap = true, count = 4 })
     or type(result.etag) ~= "string" or not result.etag:match(ETAG_RE)

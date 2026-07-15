@@ -68,6 +68,9 @@ Commands currently available:
   operations through live Umbra RPC only. Each successful mutation discards
   the old catalog and reloads it before another menu is shown; no catalog file
   is accessed by the plugin. Annotation-profile management remains pending.
+- `:InexManagePrivateAnnotationProfiles` currently creates the safe default
+  comment/drop profile, removes profiles, and sets or clears the encrypted
+  default profile. Full profile metadata editing remains pending.
 - `:InexStop` terminates the local RPC process and drops pending callbacks.
 
 `InexOpen`, `InexNew`, and `InexMkdir` take Inex logical paths (for example,

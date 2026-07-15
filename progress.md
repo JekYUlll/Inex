@@ -1263,3 +1263,7 @@
 
 - 增加 `:InexManagePrivateTags`：stateful `vim.ui.select`/`vim.ui.input` 可创建、重命名、归档与重排私密标签；每次操作仅向 `umbra.tag.*` 发送 authenticated live-session RPC，严格要求 acknowledgement，成功后丢弃旧 catalog 并重新读取。Lua 不访问 catalog 文件、不缓存标签/ID 至 options、globals 或 shada。
 - UI 对 label/ID/position 均做界限验证，归档标签仍可管理。`annotation profile` 管理 UI 保持待办，避免把 tags 完成误报为完整 tag/profile 管理。
+
+## 2026-07-15 — Neovim annotation-profile management base
+
+- 增加 `:InexManagePrivateAnnotationProfiles`：可创建安全默认 comment/drop profile、删除 profile、设定或清除 encrypted default profile；所有路径只使用 live `umbra.profile.*` RPC acknowledgement 并在 mutation 后丢弃/reload catalog。完整 kind/tag/Outer metadata 编辑仍未实现，计划保持未完成。
