@@ -1429,6 +1429,9 @@ async function runUiAction(action: () => Promise<void>): Promise<void> {
       error instanceof RpcRemoteError || error instanceof Error
         ? error.message
         : "Inex operation failed";
-    await vscode.window.showErrorMessage(message);
+    // A notification is user-facing best effort only. Awaiting its dismissal
+    // leaves command execution (and a headless Extension Host) permanently
+    // suspended whenever a user does not interact with the toast.
+    void vscode.window.showErrorMessage(message);
   }
 }

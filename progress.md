@@ -1714,3 +1714,8 @@
 
 - 扩展真实 daemon Git fixture：提交含 Drop private slot 的 feature-2 head 后，仅通过 live Umbra session 保存公开 `WORKTREE_PUBLIC_CANARY` 作为未暂存工作副本。fresh Outer RPC session 的 `revision.compare.workingTreeOuter` 必须返回两个 public canary，且 private body/tag canary 均不存在。
 - `cargo test -p inex-daemon historical_umbra_compare_requires_second_unlock_and_outer_hides_head_private_canary -- --nocapture` 通过。由此证明 working-tree Outer compare 不因 feature-2 current document 而读取或泄漏 `K_umbra` 数据；仍不替代 VS Code full Extension Host gate。
+
+## 2026-07-16 — Non-blocking VS Code command errors
+
+- 修复 `runUiAction` 的 failure path：保留 VS Code error notification，但不再 await 用户关闭 toast。此前 isolation host 在 compare error 后可无限等待 notification interaction，掩盖实际 RPC/fixture failure 并阻塞 60-second runner deadline。
+- `pnpm --dir editors/vscode check`、75/75 unit tests 与 Extension Host bundle build 通过；下一 Host run 若仍失败应返回可审计错误，而非静默卡住。

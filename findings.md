@@ -774,3 +774,7 @@
 
 - A plain-document worktree fixture cannot establish the Umbra boundary. The correct test first commits a real Drop private slot, then changes only public Outer Markdown in the uncommitted saved envelope; a fresh Outer-only compare must retain the public delta while excluding both private-body and tag canaries.
 - This fixture demonstrates that the current on-disk feature-2 envelope still flows through the same authenticated Outer renderer as historical compare. It does not use a live Umbra projection as a shortcut, so an Outer session remains sufficient and cannot accidentally inherit `K_umbra`.
+
+## 2026-07-16 Command notification lifecycle
+
+- A command-level error notification is not a transaction result and must not be awaited. In headless Extension Host runs there is no user dismissal event, so awaiting `showErrorMessage` turns an otherwise diagnosable command failure into an unbounded hang. Fire-and-forget preserves user feedback while leaving the test runner and command dispatch observable.
