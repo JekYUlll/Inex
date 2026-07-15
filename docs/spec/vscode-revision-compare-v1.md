@@ -76,6 +76,13 @@ oversized output, malformed Git state, changed repository identity, failed
 authentication, and unsupported document features fail closed without a
 partial projection.
 
+`revision.compare.umbra` uses the same fixed `HEAD`/first-parent reader but is
+strictly separate from the Outer endpoint. It passes each historical ciphertext
+envelope to `Vault::render_historical_umbra_projection`, which first
+authenticates the vault/path/epoch context and then requires live `K_umbra` to
+decrypt historical private slots. A locked Umbra session returns `AUTH_FAILED`;
+it cannot fall back to the public projection or reuse an Outer result.
+
 Responses carry two bounded `Zeroizing<String>` projections, fixed revision
 roles, and no Git object identifier. The current wire response uses bounded
 Base64URL fields `leftContentBase64`/`rightContentBase64` with fixed roles

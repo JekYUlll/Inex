@@ -39,7 +39,7 @@ use inex_core::vault::{
     DocumentMetadata, MAX_EDRY_ENVELOPE_BYTES, RenameOutcome, UmbraStatus, Vault, VaultError,
 };
 use inex_core::vault_config::{ConfigError, ConfigWarning, KdfPolicy};
-use inex_git::{HistoricalRevision, read_historical_document};
+use inex_git::{HistoricalRevision, read_historical_document, read_historical_envelope};
 use serde_json::{Value, json};
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -195,6 +195,7 @@ impl<C: MonotonicClock> RpcService<C> {
             Method::SearchQuery => self.search_query(params),
             Method::UmbraSearchQuery => self.umbra_search_query(params),
             Method::RevisionCompareOuter => self.revision_compare_outer(params),
+            Method::RevisionCompareUmbra => self.revision_compare_umbra(params),
             Method::CacheEvict => self.cache_evict(params),
         }
     }
@@ -1226,6 +1227,41 @@ impl<C: MonotonicClock> RpcService<C> {
             "leftContentBase64": encode_base64url(head.as_slice()).as_str(),
             "rightRole": "headParent",
             "rightContentBase64": encode_base64url(parent.as_slice()).as_str(),
+        }))
+    }
+
+    fn revision_compare_umbra(&mut self, params: Params) -> RpcResult {
+        let mut params = ParamObject::new(params);
+        let session = required_session(&mut params)?;
+        let logical_path = params.required_logical_path("logicalPath")?;
+        params.finish()?;
+        if self
+            .sessions
+            .asset_count(session.as_str())
+            .map_err(map_session_error)?
+            != 0
+        {
+            return Err(ErrorObject::new(ErrorCode::Busy));
+        }
+        let vault = self
+            .sessions
+            .vault(session.as_str())
+            .map_err(map_session_error)?;
+        let head = read_historical_envelope(vault, HistoricalRevision::Head, &logical_path)
+            .map_err(|error| map_git_error(error, ErrorContext::Document))?;
+        let parent = read_historical_envelope(vault, HistoricalRevision::HeadParent, &logical_path)
+            .map_err(|error| map_git_error(error, ErrorContext::Document))?;
+        let head = vault
+            .render_historical_umbra_projection(&logical_path, &head)
+            .map_err(|error| map_vault_error(error, ErrorContext::Document))?;
+        let parent = vault
+            .render_historical_umbra_projection(&logical_path, &parent)
+            .map_err(|error| map_vault_error(error, ErrorContext::Document))?;
+        Ok(json!({
+            "leftRole": "head",
+            "leftContentBase64": encode_base64url(head.markdown.as_bytes()).as_str(),
+            "rightRole": "headParent",
+            "rightContentBase64": encode_base64url(parent.markdown.as_bytes()).as_str(),
         }))
     }
 

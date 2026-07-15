@@ -496,6 +496,26 @@ pub fn read_historical_document(
     revision: HistoricalRevision,
     logical_path: &LogicalPath,
 ) -> Result<DecryptedDocument, GitError> {
+    let ciphertext = read_historical_envelope(vault, revision, logical_path)?;
+    vault
+        .authenticate_committed_envelope(logical_path, &ciphertext)
+        .map_err(GitError::from)
+}
+
+/// Read one bounded, canonical ciphertext envelope from a fixed Git revision.
+///
+/// The returned bytes remain ciphertext; callers must use a vault API that
+/// authenticates the envelope before deriving any projection.
+///
+/// # Errors
+///
+/// Returns [`GitError`] when repository discovery, the fixed revision, tree
+/// entry, or bounded blob read fails.
+pub fn read_historical_envelope(
+    vault: &Vault,
+    revision: HistoricalRevision,
+    logical_path: &LogicalPath,
+) -> Result<Vec<u8>, GitError> {
     let git = Git::open(vault.root())?;
     let commit = git.resolve_historical_revision(revision)?;
     let physical = logical_path.to_ciphertext_relative_path();
@@ -505,10 +525,7 @@ pub fn read_historical_document(
     let entry = git
         .tree_entry(&commit, physical)?
         .ok_or(GitError::HistoricalRevisionUnavailable)?;
-    let ciphertext = git.read_object(&entry.oid)?;
-    vault
-        .authenticate_committed_envelope(logical_path, &ciphertext)
-        .map_err(GitError::from)
+    git.read_object(&entry.oid)
 }
 
 /// Install the locked-safe merge driver into one repository only.

@@ -64,6 +64,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
   - 2026-07-16: daemon 已接 `revision.compare.outer`：请求只有 authenticated session 与 canonical logicalPath，固定对比 HEAD/first-parent；普通历史 EDRY 返回 plaintext bytes，feature-2 仅从已认证 outer container render Drop/Cover/Placeholder。Umbra compare、严格 VS Code response parser 与 controlled webview 尚待实现。
   - 2026-07-16: VS Code 已接 `inex.compareOuterRevision`：只接受当前 clean 的 Inex CustomEditor，sidecar 对 response 的 roles/base64url/字段作 exact validation，结果仅进入无脚本 Inex WebviewPanel，vault lock/dispose 时 zero-fill extension-owned buffers 并销毁 panel；不调用 `vscode.diff` 或创建 plaintext TextDocument。真实 daemon Git fixture/Extension Host 与 Umbra compare 仍待完成。
   - 2026-07-16: daemon compare 现已由真实 encrypted Git 双提交 fixture 覆盖：production `vault.unlock` 后 RPC 返回正确 HEAD/parent projection；不依赖工作区明文或 mock response。feature-2 Outer canary、Extension Host 命令驱动与 Umbra compare 仍待完成。
+  - 2026-07-16: historical Umbra core bridge 与 `revision.compare.umbra` 已实现：fixed historical ciphertext envelope 必须先绑定 vault/path/epoch，再由 live `K_umbra` 解密 slots 和 render full projection；locked Umbra fail closed。VS Code 明确 scope UI 与 private canary regression 仍待完成。
   - 2026-07-16: 当前可安装 Linux x64 VSIX 已更新为 clean canonical-source `8dd7d70`，包含 richer display-only Markdown highlighting；package/audit/native-dependency/isolated-install smoke 通过并已覆盖本机 profile。运行中的窗口仍需 reload。
 - **Status:** complete
 

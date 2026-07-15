@@ -669,3 +669,8 @@
 
 - A parser-only test cannot establish that the compare RPC reads Git history instead of the current worktree. The daemon fixture must produce two independently encrypted commits, unlock a fresh session through the production RPC, and assert the returned roles and decoded bytes against each committed historical body.
 - The test fixture's canaries remain in in-memory Rust assertions and encrypted Git blobs only. They are scrubbed from JSON response objects before test return; no product log or editor persistence claim follows from this daemon-only evidence.
+
+## 2026-07-16 Historical Umbra compare boundary
+
+- Historical Umbra rendering cannot call the ordinary on-disk `render_umbra_projection`: that would compare the worktree instead of the selected Git blob. The vault therefore needs a separate envelope-taking API which authenticates the historical envelope first and decrypts its slots only with an existing live Umbra session.
+- Outer and Umbra compare must remain separate RPC methods. Returning a full historical Umbra projection from the Outer method would make a client-side scope mistake a private-data disclosure; a locked Umbra request must fail rather than degrade to a public result.

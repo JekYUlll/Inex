@@ -1492,6 +1492,11 @@
 - `Inex: Compare HEAD with Parent (Outer)` 只在 active clean Inex CustomEditor 上运行。sidecar 必须验证四个 exact response fields、fixed `head`/`headParent` roles 和 canonical bounded Base64URL；响应 substitution 失败时两个 decoded buffers 都清零。
 - 成功结果只进入 `enableScripts: false`、无 local resource roots 的 Inex WebviewPanel，不使用 `vscode.diff`、URI、普通 TextDocument 或临时明文文件。vault lock 和 panel dispose 都 zero-fill owned buffers。VS Code typecheck 与 69/69 Node tests 通过；尚待真实 daemon Git fixture 与 Extension Host release evidence。
 
+## 2026-07-16 — Historical Umbra projection bridge
+
+- `Vault::render_historical_umbra_projection` 认证 supplied historical EDRY envelope 的 vault/path/epoch 后，要求 live `K_umbra`，再解密其 historical private slots 并生成 canonical full Umbra projection。它没有读取工作区文件、没有创建 plaintext file，也不会让 Outer API 获得 `K_umbra`。
+- daemon `revision.compare.umbra` 复用相同的 fixed HEAD/first-parent ciphertext reader，但独立调用上述 bridge；`revision.compare.outer` 完全不变。core/git/daemon 编译和三个 crate 的 strict Clippy 均通过；尚待 private canary fixture、VS Code explicit scope command 与 Extension Host evidence。
+
 ## 2026-07-16 — Real daemon historical compare fixture
 
 - daemon handler 现有真实 Git fixture：先创建加密 parent Markdown、`git init/add/commit`，再通过 vault CAS 保存新密文并建立 head commit，最后用 production `vault.unlock` RPC 与 `revision.compare.outer` RPC 验证 head/parent 两个 Base64URL projection。这证明 RPC 走的是受限 Git blob reader 而非工作区 plaintext 或伪造 response。

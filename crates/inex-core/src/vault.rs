@@ -1335,6 +1335,41 @@ impl Vault {
         Ok(render_umbra_projection(&document, &payloads)?)
     }
 
+    /// Authenticate and render one historical Umbra envelope with live
+    /// `K_umbra`, without reading or creating a worktree plaintext file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError::UmbraLocked`] without an Umbra session, or an
+    /// error when the supplied envelope is not an authenticated feature-2
+    /// document for `logical_path` or one of its private slots is invalid.
+    pub fn render_historical_umbra_projection(
+        &self,
+        logical_path: &LogicalPath,
+        envelope: &[u8],
+    ) -> Result<RenderedUmbraProjection, VaultError> {
+        let document = self.authenticate_committed_envelope(logical_path, envelope)?;
+        if document.header.required_features.as_slice()
+            != [crate::features::UMBRA_PRIVATE_ANNOTATIONS_V1]
+        {
+            return Err(CryptoError::DocumentContextMismatch.into());
+        }
+        let outer = UmbraDocumentV1::from_json(document.plaintext.as_slice())?;
+        let session = self.umbra.as_ref().ok_or(VaultError::UmbraLocked)?;
+        let mut payloads = std::collections::BTreeMap::new();
+        for slot_id in outer.slots.keys() {
+            let payload = outer.decrypt_private_slot(
+                self.config.vault_id,
+                logical_path.as_str(),
+                session.slot.key_id(),
+                &session.key,
+                slot_id,
+            )?;
+            payloads.insert(slot_id.clone(), payload);
+        }
+        Ok(render_umbra_projection(&outer, &payloads)?)
+    }
+
     /// Atomically wrap one or more plain Umbra projection selections in fresh
     /// encrypted private slots.
     ///
