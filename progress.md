@@ -1795,3 +1795,9 @@
 ## 2026-07-16 — VS Code evidence wording refresh
 
 - 发布文档审计发现 `README.md` 与 `docs/release-checklist.md` 仍将 VS Code unit baseline 写为早期的 45。当前 `pnpm --dir editors/vscode test` 已实际通过 75/75，故仅更新这两个 current-evidence 数值；历史 `progress.md` 的时间序列不回写。
+
+## 2026-07-16 — Sublime client regression refresh
+
+- `PYTHONPATH=editors/sublime python3 -m unittest discover -s editors/sublime/tests -p 'test*.py' -q` 以 exit 0 完成 96 tests、1 skipped。输出的三个 argparse error 来自 `test_build4200_runner.py` 对 mutually-exclusive/missing paired arguments 的预期 `SystemExit` 负例，不是 runner failure。
+- 当前证据文档原先的 84/84（61 product + 23 runner/evidence）已同步为实际 96/1 skip；历史进度不改写。Sublime 仍保持 experimental，且此 suite 不替代真实用户 persistent-profile/Hot Exit/签名门禁。
+- 同步 `editor-security.md` 时发现替换遗留的 `skip; tests.` 语法残片，已在提交前改为完整的 exact-package evidence 边界句；未影响产品或测试运行。

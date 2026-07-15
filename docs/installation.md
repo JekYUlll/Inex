@@ -468,7 +468,7 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=editors/sublime \
   python3 -m unittest discover -s editors/sublime/tests -v
 ```
 
-The suite passes 84/84: 61 product tests plus 23 runner/evidence tests. It does
+The current suite completes 96 tests with one platform-conditional skip. It does
 not by itself replace exact-package black-box evidence. On Linux, separately
 preserved canonical reports bind three exact packaged Build 4200 scenarios:
 normal schema v2, plugin-host-crash schema v2, and full-application

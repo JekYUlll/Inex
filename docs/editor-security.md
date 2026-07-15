@@ -192,8 +192,8 @@ binding crash matrix.
 
 ### Experimental release gate
 
-The current Python suite passes 84/84: 61 product tests plus 23 runner/evidence
-tests. On Linux, separately preserved canonical reports bind three exact
+The current Python suite completes 96 tests with one platform-conditional skip.
+Tests alone do not replace exact-package evidence. On Linux, separately preserved canonical reports bind three exact
 packaged Build 4200 scenarios: normal schema v2, plugin-host-crash schema v2,
 and full-application SIGKILL/restart schema v4. Each starts from a fresh
 isolated profile and the same audited package bytes; restart v4 alone reuses

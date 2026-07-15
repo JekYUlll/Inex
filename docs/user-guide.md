@@ -266,8 +266,8 @@ be restarted to end that editor-process plaintext lifetime. The fixed marker
 is therefore not observed same-process crash recovery or instantaneous
 fail-safe containment.
 
-Current checkpoint evidence is deliberately split: 84/84 Python tests pass
-(61 product tests plus 23 runner/evidence tests), and separately preserved
+Current checkpoint evidence is deliberately split: 96 Python tests complete
+with one platform-conditional skip, and separately preserved
 canonical reports bind three exact packaged Build 4200 Linux scenarios: normal
 schema v2, plugin-host-crash schema v2, and full-application SIGKILL/restart
 schema v4. Each starts from a fresh isolated profile and the same audited
