@@ -1590,3 +1590,8 @@
 
 - 在 catalog write/read 后，VS Code integration API 以该 tag 在 `plain.md` 的首行创建 Drop private comment，sidecar 返回必须恰有一个 private slot。Host 随后锁定 Umbra；独立 Sublime client 使用 replacement password 打开同一 feature-2 document，仅验证 parsed RenderMap 的 `privateSlots` 长度为一，并在 finally 中 wipe decrypted projection。测试不检查、打印或持久 annotation body。
 - 验证：Sublime 96/96、Python 3.8 AST syntax gate、VS Code typecheck 与真实 local Extension Host 通过。Build 4200 argument-negative unit tests 的 usage stderr 是其预期断言，不是本次测试失败。
+
+## 2026-07-16 — Cross-editor feature-2 Outer rejection
+
+- 同一 fresh Sublime client 在仅 `vault.unlock`（Outer）后先调用 ordinary `document.open(plain.md)`；private-slot helper 只接受 `RpcRemoteError`，任何 normal-document 成功都 fail。随后才执行 `umbra.unlock` 和 `umbra.document.open`，继续验证 one-slot RenderMap 并 wipe projection。
+- 这绑定了 VS Code 写入 feature-2 文档与跨客户端 Outer/Umbra 双边界：普通 buffer 不会得到 Outer container 或 private projection，Umbra API 仍可在独立 key unlock 后读取。VS Code typecheck、Python 3.8 AST gate 与 local Extension Host regression 通过。

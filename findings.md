@@ -708,3 +708,8 @@
 
 - Catalog compatibility alone cannot prove that two editors agree on a feature-2 document projection. The strengthened matrix has VS Code create a tagged private slot through the same typed sidecar API, then requires a fresh Sublime daemon to independently unlock Umbra and parse the resulting RenderMap. A one-slot check proves the shared document container/projection contract without making test code inspect private Markdown.
 - The Sublime helper owns the returned projection bytearray and wipes it in `finally`. Its only observable result is a fixed success token, so neither the private slot body nor catalog content becomes subprocess output, test failure text, or a persisted fixture.
+
+## 2026-07-16 Cross-editor feature-2 Outer boundary
+
+- Feature-2 Outer data is not a normal editor projection in this v1 contract. `Vault::read` rejects a required-feature document, while the separate `read_umbra_outer_document` API is reserved for explicit limited projections such as export. The cross-client test therefore expects ordinary Sublime `document.open` to fail before `K_umbra` is unlocked, rather than treating a public JSON container as Markdown.
+- A successful subsequent `umbra.document.open` after independent unlock proves this is scope separation rather than an unreadable/corrupt document. This is the correct observable test for “no feature-2 private projection reaches an Outer editor buffer.”

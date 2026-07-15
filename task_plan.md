@@ -213,6 +213,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
     - [x] VS Code 隔离 Extension Host 已走真实 CustomEditor convert → 单 range apply → edit → complete-range remove → 两个不相邻 range apply → complete-range batch remove → Umbra lock，且 sidecar trace 强制两次 apply/remove 的完整顺序；每次移除后逐字节恢复原 projection（本轮）。跨编辑器与 persistent-profile 隔离仍待独立矩阵。
     - [x] 同一隔离密文 vault 现真实覆盖 VS Code→Sublime encrypted catalog read：VS Code sidecar 创建 `umbra.tag.create` 并由 trace 排序绑定；随后 host lock，Sublime RPC client 以独立 daemon、仅 stdin password 解锁 Umbra 并读取该 tag。tag metadata 不作为 helper argv/env/temporary file，Sublime 固定成功输出且测试 runner 不读取 catalog 内容。
     - [x] 同一跨客户端闭环现进一步覆盖 feature-2 document：VS Code 使用刚创建 tag 包裹 `plain.md` 首个 Markdown line 并检查 one-slot result；Sublime 在独立 Umbra unlock 后打开同一文档、只验证 RenderMap 含一个 private slot、立即 wipe projection。该流程不输出私密正文，独立 helper 无 document/tag metadata argv。
+    - [x] feature-2 Outer rejection 也已由同一 fresh Sublime session 覆盖：只解锁 Outer 时普通 `document.open(plain.md)` 必须 RPC 拒绝；仅随后显式 Umbra unlock 的 `umbra.document.open` 才可返回投影/RenderMap。不得把 Outer JSON 或私密 projection 交给普通编辑器 buffer。
     - [x] VS Code `Inex: Show Security Status` 现从 authenticated sidecar 区分 Outer locked、Umbra 未初始化、Umbra locked、Umbra unlocked 与 status-unavailable；状态查询失败不暗示私密数据可用，并有纯格式化回归测试（本轮）。
 
 - [x] 实现 `.gitattributes`、locked-safe `inex merge-driver` 与已解锁 CLI 三方合并

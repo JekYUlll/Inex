@@ -17,7 +17,7 @@ PACKAGE_DIRECTORY = Path(__file__).resolve().parents[1]
 if str(PACKAGE_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(PACKAGE_DIRECTORY))
 
-from inex_rpc import InexRpcClient, wipe
+from inex_rpc import InexRpcClient, RpcRemoteError, wipe
 
 
 EXPECTED_TAG_ID = "cross-editor-catalog"
@@ -41,6 +41,12 @@ def main(arguments: List[str]) -> int:
     try:
         client.start("cross-editor-integration")
         client.unlock(vault_path, password.decode("utf-8"))
+        try:
+            client.open_document(EXPECTED_DOCUMENT_PATH)
+        except RpcRemoteError:
+            pass
+        else:
+            return 1
         client.unlock_umbra(password.decode("utf-8"))
         config = client.load_umbra_annotation_config()
         tags = config["tags"]
