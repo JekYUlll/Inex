@@ -1497,6 +1497,11 @@
 - `Vault::render_historical_umbra_projection` 认证 supplied historical EDRY envelope 的 vault/path/epoch 后，要求 live `K_umbra`，再解密其 historical private slots 并生成 canonical full Umbra projection。它没有读取工作区文件、没有创建 plaintext file，也不会让 Outer API 获得 `K_umbra`。
 - daemon `revision.compare.umbra` 复用相同的 fixed HEAD/first-parent ciphertext reader，但独立调用上述 bridge；`revision.compare.outer` 完全不变。core/git/daemon 编译和三个 crate 的 strict Clippy 均通过；尚待 private canary fixture、VS Code explicit scope command 与 Extension Host evidence。
 
+## 2026-07-16 — VS Code explicit Umbra revision compare
+
+- 新增 `Inex: Compare HEAD with Parent (Umbra Private)`。它首先走独立 `ensureUmbraReady`，再拒绝非 Umbra/dirty/stale active custom document，调用独立 `revision.compare.umbra` 并只在已有无脚本 compare panel 生命周期中展示。Outer compare command 不变，也不会隐式请求 Umbra 解锁。
+- 验证：VS Code typecheck 与 69/69 Node tests；`cargo fmt --check`、304 core tests、受限 Git reader、真实 daemon revision fixture 都通过。Umbra private canary historical fixture、Extension Host command drive、Linux VSIX rebuild/install 仍待下一发布检查点。
+
 ## 2026-07-16 — Real daemon historical compare fixture
 
 - daemon handler 现有真实 Git fixture：先创建加密 parent Markdown、`git init/add/commit`，再通过 vault CAS 保存新密文并建立 head commit，最后用 production `vault.unlock` RPC 与 `revision.compare.outer` RPC 验证 head/parent 两个 Base64URL projection。这证明 RPC 走的是受限 Git blob reader 而非工作区 plaintext 或伪造 response。

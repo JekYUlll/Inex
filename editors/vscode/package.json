@@ -95,6 +95,11 @@
         "enablement": "inex.vaultUnlocked"
       },
       {
+        "command": "inex.compareUmbraRevision",
+        "title": "Inex: Compare HEAD with Parent (Umbra Private)",
+        "enablement": "inex.vaultUnlocked"
+      },
+      {
         "command": "inex.exportPlaintextCopy",
         "title": "Inex: Export Plaintext Copy…",
         "enablement": "inex.vaultUnlocked"

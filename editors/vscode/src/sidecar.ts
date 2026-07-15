@@ -1009,9 +1009,20 @@ export class InexSidecar {
   }
 
   public async compareOuterRevision(logicalPath: string): Promise<OuterRevisionCompare> {
+    return this.compareRevision("revision.compare.outer", logicalPath);
+  }
+
+  public async compareUmbraRevision(logicalPath: string): Promise<OuterRevisionCompare> {
+    return this.compareRevision("revision.compare.umbra", logicalPath);
+  }
+
+  private async compareRevision(
+    method: "revision.compare.outer" | "revision.compare.umbra",
+    logicalPath: string,
+  ): Promise<OuterRevisionCompare> {
     logicalFileComponents(logicalPath);
     return parseOuterRevisionCompare(
-      await this.callRaw("revision.compare.outer", {
+      await this.callRaw(method, {
         ...this.protectedParams(),
         logicalPath,
       }),

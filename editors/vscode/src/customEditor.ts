@@ -657,7 +657,7 @@ export class InexCustomEditorProvider
 
   /** Return the active clean custom document for read-only revision compare. */
   public currentRevisionCompareTarget():
-    | { readonly logicalPath: string; readonly session: VaultSession }
+    | { readonly logicalPath: string; readonly session: VaultSession; readonly umbra: boolean }
     | undefined {
     const document = this.activeDocument;
     if (
@@ -668,7 +668,11 @@ export class InexCustomEditorProvider
     ) {
       return undefined;
     }
-    return { logicalPath: document.logicalPath, session: document.session };
+    return {
+      logicalPath: document.logicalPath,
+      session: document.session,
+      umbra: document.isUmbraProjection,
+    };
   }
 
   public activeSelectionIsCompletePrivateBlock(): boolean {

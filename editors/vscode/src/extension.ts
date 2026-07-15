@@ -351,6 +351,35 @@ export function activate(
         });
       });
     }),
+    vscode.commands.registerCommand("inex.compareUmbraRevision", async () => {
+      await runUiAction(async () => {
+        const ready = await ensureUmbraReady(controller);
+        if (ready === undefined) return;
+        const target = editor.currentRevisionCompareTarget();
+        if (target === undefined || !target.umbra || !controller.isSessionCurrent(target.session)) {
+          throw new Error("Open a clean Umbra private projection before comparing its HEAD revision");
+        }
+        const compared = await ready.sidecar.compareUmbraRevision(target.logicalPath);
+        if (!controller.isSessionCurrent(ready.session)) {
+          compared.leftContent.fill(0);
+          compared.rightContent.fill(0);
+          throw new Error("Inex Umbra session changed during revision compare");
+        }
+        const panel = vscode.window.createWebviewPanel(
+          "inex.umbraRevisionCompare",
+          "Inex: Umbra HEAD vs Parent",
+          vscode.ViewColumn.Beside,
+          { enableScripts: false, retainContextWhenHidden: false, localResourceRoots: [] },
+        );
+        const view = { panel, buffers: [compared.leftContent, compared.rightContent] };
+        compareViews.add(view);
+        panel.webview.html = revisionCompareHtml(compared.leftContent, compared.rightContent);
+        panel.onDidDispose(() => {
+          for (const buffer of view.buffers) buffer.fill(0);
+          compareViews.delete(view);
+        });
+      });
+    }),
     vscode.commands.registerCommand("inex.exportPlaintextCopy", async () => {
       await runUiAction(async () => {
         if (!(await ensureVaultUnlocked(controller))) return;
