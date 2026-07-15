@@ -297,6 +297,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "inex-core",
+ "inex-git",
  "serde_json",
  "uuid",
  "zeroize",
