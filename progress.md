@@ -1663,6 +1663,7 @@
 |---|---:|---|
 | `apply_patch` first matched stale prose context while updating the Umbra PRD. | 1 | Re-read the exact current paragraph and applied a narrow contextual patch. |
 | The disposable VS Code CLI/Extension Host process loses its parent terminal under this tool supervisor before a final exit result can be observed; its audit root is retained. | 1 | Tried normal, PTY, detached, and tmux launch paths; all were supervisor-terminated. Kept the automated assertion in source but do not treat this environment run as passing evidence. Persistent-profile/manual verification remains open. |
+| Full Neovim lifecycle invocation initially omitted required absolute `INEX_SIDECAR`/test-vault/password environment. | 1 | Re-ran the transport smoke with the absolute local sidecar; retained the lifecycle test's explicit fixture requirement rather than weakening it. |
 
 ## 2026-07-16 — Installed Quick Redact bundle
 
