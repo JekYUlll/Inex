@@ -18,6 +18,7 @@ pub mod crypto;
 pub mod features;
 pub mod format;
 pub mod path;
+pub mod plaintext_export;
 pub mod publication;
 pub mod search;
 #[allow(unsafe_code)]

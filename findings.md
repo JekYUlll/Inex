@@ -598,3 +598,8 @@
 
 - Feature-2 disk plaintext is the canonical Outer JSON container, not directly exportable Markdown. `render_outer_projection` must replace authenticated marker occurrences from the public `OuterSlotStrategy`; emitting container JSON would expose ciphertext grammar to users, while using full `render_umbra_projection` would incorrectly require/decrypt `K_umbra`.
 - The first new assertion encoded a literal backslash plus `n` instead of a newline and failed one focused test. The test was corrected before any broader gate; all three projection tests and pedantic core Clippy now pass.
+
+## 2026-07-16 Plaintext export staging transaction
+
+- Export staging cannot use an RAII delete-on-drop helper: after authenticated plaintext has been written, automatic cleanup risks deleting user-authorized output or hiding an incident. `PlaintextExportStaging` therefore deliberately retains the directory on every pre-publication failure while the generic no-replace move prevents replacing an existing final destination.
+- The generic mover alone does not audit export content. The caller-provided audit runs after the final identity/absence checks; the next export engine slice must write only create-new restrictive files, fsync and digest them, then make that manifest audit the publish callback.

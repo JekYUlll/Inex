@@ -1296,3 +1296,8 @@
 
 - `umbra_render::render_outer_projection` 现在只根据已认证的公开 Outer slot 策略替换 marker：Drop 输出空内容、Cover 输出明确公开的 cover text、Placeholder 输出固定无标识文本。它严格验证 marker/slot 一一对应和 Cover/Placeholder metadata，永不读取 private payload、kind、tag、slot ID 或 `K_umbra`。
 - `Vault::render_umbra_outer_projection` 以 `Zeroizing<String>` 暴露该受限结果，作为后续 plaintext export staging 的唯一 feature-2 Outer 路径。`cargo fmt --check`、3 项 `umbra_render` 测试和 `cargo clippy -p inex-core --all-targets -- -D warnings` 已通过。
+
+## 2026-07-16 — Plaintext export destination transaction base
+
+- 新增 `plaintext_export::PlaintextExportStaging`：导出只能指向 vault 外、已存在 parent 下的 absent child；它捕获 parent/staging directory identity、创建 `0700` 同级随机 staging root、发布前重验身份和最终 absent 状态，再调用 generic verified no-replace directory move。该结构没有 `Drop` cleanup，任何失败都保留可能已含用户授权明文的 staging，交给显式 incident handling。
+- 回归覆盖成功 staging→audit→publish，以及 vault 内/existing destination 拒绝。`cargo test -p inex-core plaintext_export` 与 pedantic core Clippy 通过。首次 Clippy 仅发现三个 public Result 文档段和一个 by-value error mapper；补齐 `# Errors`/借用 mapper 后重跑成功。
