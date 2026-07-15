@@ -1395,6 +1395,11 @@
 - 呈现 overlay 使用 `innerHTML` 但所有 source text 必须经过 escape。新增 VM regression 实际渲染 heading/list/emphasis/inline-code/link/quote/rule 与 literal `<script>alert(1)</script>`，断言各 Markdown class 出现，同时后者只能成为 `&lt;script&gt;…` 文本，绝不成为 DOM script。
 - 首次 TypeScript gate 正确指出 VM `innerHTML` 是 `unknown`；测试改用显式运行时 string guard，未改变产品路径。验证：`pnpm --dir editors/vscode check`、65/65 Node tests、真实 `pnpm --dir editors/vscode test:extension:local` 通过。
 
+## 2026-07-16 — VS Code Markdown-language-service boundary documented
+
+- 用户指南现在说明 Inex CustomEditor 的 richer display-only Markdown token 呈现及其边界：`*.md.enc` 真实资源不被注册为可写 plaintext `TextDocument`，因此不会承诺普通 Markdown LSP、第三方 TextDocument extension 或普通 preview。
+- 该限制是有意的安全设计，而不是遗漏 file-association：将解密文本虚拟注册为 Markdown document 以启动语言服务可让 VS Code/扩展索引、缓存、backup 或保留明文。后续若实现 Inex 内部语言服务，必须以独立的 in-memory/residue-lifecycle 证明交付。
+
 ## 2026-07-16 — Current VS Code Linux x64 installable package
 
 - 从独立 `--no-local` clean checkout、canonical origin `https://github.com/JekYUlll/Inex` 的 `d5f7a394aa97e2e3881216fc0f8b9cb5234fce64`，使用 `/usr/bin/gcc` 构建 CLI/daemon 与 VS Code bundle。ELF interpreter 为系统 `/lib64/ld-linux-x86-64.so.2`，未出现开发机 xlings RPATH/RUNPATH。

@@ -78,7 +78,10 @@ complete.
    Palette.
 4. Select a file to open the `Inex Markdown` custom editor. The real tab
    resource remains the `*.md.enc` file; decrypted text is not registered as a
-   writable VS Code `TextDocument`.
+   writable VS Code `TextDocument`. Its controlled display layer highlights
+   headings, links/images, inline/fenced code, emphasis, lists, quotes, rules,
+   and comments while the underlying editor remains the authenticated Inex
+   textarea.
 5. Edit and use the normal Save command. Save takes a fresh snapshot from the
    webview, performs an etag-conditional encrypted write, and reports a conflict
    instead of overwriting externally changed ciphertext.
@@ -138,9 +141,13 @@ executable smoke; even that does not close those gates.
 ### Current VS Code limitations
 
 - The custom editor is a controlled textarea, not the normal VS Code Markdown
-  text editor. Native language-service features, extensions that inspect
-  TextDocuments, standard custom-editor undo integration, and ordinary Markdown
-  preview are not promised.
+  text editor. Native Markdown language-service features, extensions that
+  inspect `TextDocument`s, standard custom-editor undo integration, and
+  ordinary Markdown preview are not promised. Registering a decrypted virtual
+  Markdown document merely to activate those features could allow VS Code or
+  another extension to index, cache, back up, or otherwise retain plaintext;
+  Inex therefore keeps syntax presentation inside its display-only webview
+  layer.
 - Save As is blocked; use the authenticated tree rename. Folder rename/delete
   and cross-directory move are not exposed by the current UI.
 - Inex does not globally change Hot Exit or Local History settings.
