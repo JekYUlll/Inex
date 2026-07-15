@@ -88,8 +88,10 @@ workspace storage.
 ## Client UX
 
 CLI exposes `inex export <vault> <destination> --scope outer|umbra`. It uses
-the normal password/session flow and requires an explicit noninteractive
-opt-in environment variable only for automated tests.
+the normal password/session flow and requires the user to type `EXPORT
+PLAINTEXT` at a hidden terminal prompt after prepare. `INEX_EXPORT_TEST_CONFIRM=1`
+is reserved for automated tests; it is not documented as an interactive
+automation mechanism.
 
 VS Code contributes `Inex: Export Plaintext Copy…`, disabled while locked. It
 uses a folder chooser, then scope selection. Umbra-inclusive scope is offered

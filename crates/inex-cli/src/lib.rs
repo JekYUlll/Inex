@@ -27,9 +27,10 @@ use inex_core::search::{CaseSensitivity, DEFAULT_SEARCH_SNIPPET_BYTES, SearchQue
 use inex_core::sodium;
 use inex_core::vault::{PasswordSlotCommit, Vault, VaultError};
 use inex_core::vault_config::{ConfigWarning, KdfPolicy};
+use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
-use crate::args::{Cli, Command, GitCommand, PasswordCommand};
+use crate::args::{Cli, Command, ExportScope, GitCommand, PasswordCommand};
 use crate::password::{PasswordInput, read_confirmed_password, read_password};
 use crate::query::{QueryInput, read_query};
 
@@ -106,6 +107,16 @@ fn execute(command: Command) -> Result<ExitCode, AppError> {
                 query_input,
             )
         }
+        Command::Export {
+            vault,
+            destination,
+            scope,
+        } => command_export(
+            &vault,
+            &destination,
+            scope,
+            PasswordInput::from_environment()?,
+        ),
         Command::MergeDriver { inputs } => Ok(command_merge_driver(inputs)),
         Command::Git(command) => command_git(command),
         Command::Serve => command_serve(),
@@ -861,6 +872,155 @@ fn command_search(
     Ok(ExitCode::SUCCESS)
 }
 
+fn command_export(
+    vault_path: &Path,
+    destination: &Path,
+    scope: ExportScope,
+    password_input: PasswordInput,
+) -> Result<ExitCode, AppError> {
+    let mut daemon = inex_daemon::handler::RpcService::new();
+    let mut request_id = 1_i64;
+    let _ = daemon_call(
+        &mut daemon,
+        request_id,
+        "system.hello",
+        json!({"client":"inex-cli", "clientVersion":env!("CARGO_PKG_VERSION"), "protocolMajor":1}),
+    )?;
+    request_id += 1;
+    let password = read_password(password_input, "Vault password: ")?;
+    let password_text = String::from_utf8_lossy(password.as_slice()).into_owned();
+    let mut unlocked = daemon_call(
+        &mut daemon,
+        request_id,
+        "vault.unlock",
+        json!({"vaultPath": vault_path, "password": password_text}),
+    )?;
+    drop(password);
+    let session = daemon_sensitive_string(&mut unlocked, "session")?;
+    inex_daemon::sensitive::scrub_object(&mut unlocked);
+    request_id += 1;
+
+    let scope_name = match scope {
+        ExportScope::Outer => "outer",
+        ExportScope::Umbra => "umbra",
+    };
+    if matches!(scope, ExportScope::Umbra) {
+        let umbra_password = read_password(password_input, "Umbra password: ")?;
+        let umbra_password_text = String::from_utf8_lossy(umbra_password.as_slice()).into_owned();
+        let mut status = daemon_call(
+            &mut daemon,
+            request_id,
+            "umbra.unlock",
+            json!({"session":session.as_str(), "password":umbra_password_text}),
+        )?;
+        inex_daemon::sensitive::scrub_object(&mut status);
+        drop(umbra_password);
+        request_id += 1;
+    }
+    let mut prepared = daemon_call(
+        &mut daemon,
+        request_id,
+        "vault.export.prepare",
+        json!({"session":session.as_str(), "destination":destination, "scope":scope_name}),
+    )?;
+    let confirmation = daemon_sensitive_string(&mut prepared, "confirmation")?;
+    let files = prepared
+        .get("files")
+        .and_then(Value::as_u64)
+        .ok_or(AppError::Daemon)?;
+    let assets = prepared
+        .get("assets")
+        .and_then(Value::as_u64)
+        .ok_or(AppError::Daemon)?;
+    let directories = prepared
+        .get("directories")
+        .and_then(Value::as_u64)
+        .ok_or(AppError::Daemon)?;
+    inex_daemon::sensitive::scrub_object(&mut prepared);
+    if !confirm_plaintext_export(scope_name, files, assets, directories)? {
+        let _ = daemon_call(
+            &mut daemon,
+            request_id + 1,
+            "vault.lock",
+            json!({"session":session.as_str()}),
+        );
+        return Err(AppError::ExportCancelled);
+    }
+    request_id += 1;
+    let mut committed = daemon_call(
+        &mut daemon,
+        request_id,
+        "vault.export.commit",
+        json!({"session":session.as_str(), "confirmation":confirmation.as_str()}),
+    )?;
+    let durability = committed
+        .get("durability")
+        .and_then(Value::as_str)
+        .ok_or(AppError::Daemon)?
+        .to_owned();
+    inex_daemon::sensitive::scrub_object(&mut committed);
+    let _ = daemon_call(
+        &mut daemon,
+        request_id + 1,
+        "vault.lock",
+        json!({"session":session.as_str()}),
+    );
+    println!("plaintext export completed");
+    println!("scope: {scope_name}");
+    println!("markdown-files: {files}");
+    println!("asset-files: {assets}");
+    println!("directories: {directories}");
+    println!("durability: {durability}");
+    Ok(ExitCode::SUCCESS)
+}
+
+fn daemon_call(
+    daemon: &mut inex_daemon::handler::RpcService,
+    id: i64,
+    method: &str,
+    params: Value,
+) -> Result<Map<String, Value>, AppError> {
+    let mut object = Map::new();
+    object.insert("jsonrpc".to_owned(), Value::String("2.0".to_owned()));
+    object.insert("id".to_owned(), Value::from(id));
+    object.insert("method".to_owned(), Value::String(method.to_owned()));
+    object.insert("params".to_owned(), params);
+    let mut response = daemon.handle_object(object).into_json_object();
+    let result = response
+        .remove("result")
+        .and_then(|value| value.as_object().cloned());
+    inex_daemon::sensitive::scrub_object(&mut response);
+    result.ok_or(AppError::Daemon)
+}
+
+fn daemon_sensitive_string(
+    result: &mut Map<String, Value>,
+    field: &str,
+) -> Result<zeroize::Zeroizing<String>, AppError> {
+    let value = result.remove(field).ok_or(AppError::Daemon)?;
+    let Value::String(value) = value else {
+        return Err(AppError::Daemon);
+    };
+    Ok(zeroize::Zeroizing::new(value))
+}
+
+fn confirm_plaintext_export(
+    scope: &str,
+    files: u64,
+    assets: u64,
+    directories: u64,
+) -> Result<bool, AppError> {
+    if std::env::var_os("INEX_EXPORT_TEST_CONFIRM").as_deref() == Some("1".as_ref()) {
+        return Ok(true);
+    }
+    eprintln!("WARNING: this creates a plaintext copy outside the vault.");
+    eprintln!("Inex cannot protect its Git, backup, search-index, history, or deletion residue.");
+    eprintln!("scope={scope}; markdown={files}; assets={assets}; directories={directories}");
+    let typed = rpassword::prompt_password("Type EXPORT PLAINTEXT to continue: ")
+        .map_err(|error| AppError::io(IoOperation::ReadConfirmation, &error))?;
+    Ok(typed == "EXPORT PLAINTEXT")
+}
+
 fn command_serve() -> Result<ExitCode, AppError> {
     let executable = daemon_executable()?;
     let mut command = ProcessCommand::new(executable);
@@ -994,6 +1154,7 @@ enum IoOperation {
     LocateDaemon,
     LaunchDaemon,
     WriteOutput,
+    ReadConfirmation,
 }
 
 impl fmt::Display for IoOperation {
@@ -1002,6 +1163,7 @@ impl fmt::Display for IoOperation {
             Self::LocateDaemon => "locating inexd",
             Self::LaunchDaemon => "launching inexd",
             Self::WriteOutput => "writing command output",
+            Self::ReadConfirmation => "reading plaintext-export confirmation",
         })
     }
 }
@@ -1023,6 +1185,8 @@ enum AppError {
     },
     InvalidDaemonPath,
     DaemonNotFound,
+    Daemon,
+    ExportCancelled,
     Clock,
     Io {
         operation: IoOperation,
@@ -1053,6 +1217,8 @@ impl AppError {
             | Self::PasswordRetirementDeferred { .. }
             | Self::InvalidDaemonPath
             | Self::DaemonNotFound
+            | Self::Daemon
+            | Self::ExportCancelled
             | Self::Clock
             | Self::Io { .. } => ExitCode::FAILURE,
         }
@@ -1078,6 +1244,8 @@ impl fmt::Display for AppError {
             ),
             Self::InvalidDaemonPath => formatter.write_str("INEXD_PATH is empty"),
             Self::DaemonNotFound => formatter.write_str("sibling inexd executable does not exist"),
+            Self::Daemon => formatter.write_str("daemon plaintext-export request failed"),
+            Self::ExportCancelled => formatter.write_str("plaintext export cancelled"),
             Self::Clock => formatter.write_str("system clock cannot produce a Unix timestamp"),
             Self::Io { operation, kind } => {
                 write!(formatter, "I/O failed while {operation}: {kind:?}")

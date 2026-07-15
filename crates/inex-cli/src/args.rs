@@ -18,6 +18,7 @@ Usage:
   inex password remove <vault> <slot-to-remove> --slot <retained-slot-uuid>
   inex password change <vault> [--slot <old-slot-uuid>]
   inex search <vault> [--slot <uuid>] [--case-sensitive] [--limit <count>]
+  inex export <vault> <destination> --scope outer|umbra
   inex merge-driver <ancestor> <current> <incoming> <logical-path>
   inex git install-driver <vault>
   inex git merge <vault> [--slot <uuid>]
@@ -123,6 +124,11 @@ pub(crate) enum Command {
         case_sensitive: bool,
         limit: usize,
     },
+    Export {
+        vault: PathBuf,
+        destination: PathBuf,
+        scope: ExportScope,
+    },
     MergeDriver {
         inputs: Option<[PathBuf; 4]>,
     },
@@ -145,6 +151,7 @@ impl Command {
             Self::Password(PasswordCommand::Remove { .. }) => "password remove",
             Self::Password(PasswordCommand::Change { .. }) => "password change",
             Self::Search { .. } => "search <query-from-secure-input>",
+            Self::Export { .. } => "export <explicit-plaintext-confirmation>",
             Self::MergeDriver { .. } => "merge-driver <locked-safe>",
             Self::Git(GitCommand::InstallDriver { .. }) => "git install-driver",
             Self::Git(GitCommand::Merge { .. }) => "git merge",
@@ -156,6 +163,12 @@ impl Command {
             Self::Version => "version",
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExportScope {
+    Outer,
+    Umbra,
 }
 
 pub(crate) enum GitCommand {
@@ -201,6 +214,9 @@ pub(crate) enum ArgumentError {
     NonUnicodeCommand,
     ForbiddenPasswordArgument,
     UnsupportedInPlaceImport,
+    MissingExportDestination,
+    MissingExportScope,
+    InvalidExportScope,
 }
 
 impl fmt::Display for ArgumentError {
@@ -229,6 +245,9 @@ impl fmt::Display for ArgumentError {
             Self::UnsupportedInPlaceImport => {
                 "destructive in-place import is unsupported; use copy import"
             }
+            Self::MissingExportDestination => "plaintext export destination is required",
+            Self::MissingExportScope => "plaintext export requires --scope outer|umbra",
+            Self::InvalidExportScope => "plaintext export scope must be outer or umbra",
         })
     }
 }
@@ -254,6 +273,7 @@ impl Cli {
             "import-repository" => parse_import_repository(&mut arguments)?,
             "password" => Command::Password(parse_password(&mut arguments)?),
             "search" => parse_search(&mut arguments)?,
+            "export" => parse_export(&mut arguments)?,
             "merge-driver" => parse_merge_driver(&mut arguments)?,
             "git" => Command::Git(parse_git(&mut arguments)?),
             "serve" => Command::Serve,
@@ -269,6 +289,33 @@ impl Cli {
         reject_remaining(arguments)?;
         Ok(Self { command })
     }
+}
+
+fn parse_export(arguments: &mut Arguments) -> Result<Command, ArgumentError> {
+    let vault = arguments.pop_path()?.ok_or(ArgumentError::MissingVault)?;
+    let destination = arguments
+        .pop_path()?
+        .ok_or(ArgumentError::MissingExportDestination)?;
+    let option = arguments
+        .pop_text()?
+        .ok_or(ArgumentError::MissingExportScope)?;
+    if option != "--scope" {
+        return Err(ArgumentError::MissingExportScope);
+    }
+    let scope = match arguments
+        .pop_text()?
+        .ok_or(ArgumentError::MissingExportScope)?
+        .as_str()
+    {
+        "outer" => ExportScope::Outer,
+        "umbra" => ExportScope::Umbra,
+        _ => return Err(ArgumentError::InvalidExportScope),
+    };
+    Ok(Command::Export {
+        vault,
+        destination,
+        scope,
+    })
 }
 
 fn parse_merge_driver(arguments: &mut Arguments) -> Result<Command, ArgumentError> {
@@ -553,6 +600,15 @@ mod tests {
             })
         ));
         assert!(matches!(
+            Cli::parse(["export", "/vault", "/plaintext-copy", "--scope", "outer"]),
+            Ok(Cli {
+                command: Command::Export {
+                    scope: ExportScope::Outer,
+                    ..
+                }
+            })
+        ));
+        assert!(matches!(
             Cli::parse(["runtime-info"]),
             Ok(Cli {
                 command: Command::RuntimeInfo
@@ -587,6 +643,18 @@ mod tests {
             Ok(Cli {
                 command: Command::MergeDriver { inputs: None }
             })
+        ));
+    }
+
+    #[test]
+    fn export_requires_one_known_scope() {
+        assert!(matches!(
+            Cli::parse(["export", "/vault", "/copy"]),
+            Err(ArgumentError::MissingExportScope)
+        ));
+        assert!(matches!(
+            Cli::parse(["export", "/vault", "/copy", "--scope", "private"]),
+            Err(ArgumentError::InvalidExportScope)
         ));
     }
 

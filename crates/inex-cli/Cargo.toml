@@ -17,6 +17,7 @@ inex-daemon = { path = "../inex-daemon" }
 inex-git = { path = "../inex-git" }
 rpassword = "=7.5.4"
 sha2.workspace = true
+serde_json.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
 

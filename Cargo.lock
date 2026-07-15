@@ -269,6 +269,7 @@ dependencies = [
  "inex-daemon",
  "inex-git",
  "rpassword",
+ "serde_json",
  "sha2",
  "uuid",
  "zeroize",
