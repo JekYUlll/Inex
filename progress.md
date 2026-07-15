@@ -1434,6 +1434,11 @@
 - 这是 local construction / isolated-install evidence，不是签名发布、持久 profile 行为或多平台 GA 证明。
 - 已使用 `/usr/bin/code --install-extension …/d5f7a39-linux-x64/inex-vscode-0.1.0-linux-x64.vsix --force` 覆盖当前 Linux VS Code profile；`code --list-extensions --show-versions` 确认 `horeb.inex-vscode@0.1.0`。版本号未变，运行中的窗口必须 reload 才会切换到新 bundle。
 
+## 2026-07-16 — VS Code security-status Umbra state
+
+- `Inex: Show Security Status` 现在明确显示 Outer locked、Umbra 未初始化、已初始化但 locked、已解锁，或 Umbra status 无法验证的保守状态；不会仅因 Outer 已解锁而暗示私密内容可用。
+- 验证：67/67 VS Code Node tests、`pnpm --dir editors/vscode check`，以及真实 `pnpm --dir editors/vscode test:extension:local` 均通过。首次误用不存在的 `test:integration` script，未产生测试证据；随后以 package 声明的 `test:extension:local` 完整重跑。
+
 ## 2026-07-16 — Outer-only Umbra export projection
 
 - `umbra_render::render_outer_projection` 现在只根据已认证的公开 Outer slot 策略替换 marker：Drop 输出空内容、Cover 输出明确公开的 cover text、Placeholder 输出固定无标识文本。它严格验证 marker/slot 一一对应和 Cover/Placeholder metadata，永不读取 private payload、kind、tag、slot ID 或 `K_umbra`。

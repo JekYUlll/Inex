@@ -17,6 +17,7 @@ import {
   type PrivateAnnotationPreferences,
 } from "./privateAnnotationPreferences.ts";
 import { validatePlaintextExportDirectoryName } from "./plaintextExport.ts";
+import { formatSecurityStatus } from "./securityStatus.ts";
 import type { PrivateAnnotationSpec, UmbraAnnotationProfile } from "./sidecar.ts";
 import { showSensitiveInputBox, showSensitiveQuickPick } from "./sensitiveUi.ts";
 import { InexTreeProvider } from "./tree.ts";
@@ -370,9 +371,15 @@ export function activate(
       });
     }),
     vscode.commands.registerCommand("inex.showSecurityStatus", async () => {
-      const sidecar = controller.isUnlocked ? "unlocked in memory" : "locked";
+      const session = controller.isUnlocked ? controller.acquireSession() : undefined;
+      const umbra = session === undefined
+        ? undefined
+        : await session.sidecar.umbraStatus().catch(() => undefined);
+      if (session !== undefined && !controller.isSessionCurrent(session)) {
+        return;
+      }
       await vscode.window.showInformationMessage(
-        `Inex is ${sidecar}. Backups are encrypted EDRY drafts and no plaintext TextDocument provider is registered. JavaScript/Webview zeroization is best effort; isolated-profile residue audit remains a release gate.`,
+        `${formatSecurityStatus(controller.isUnlocked, umbra)} Backups are encrypted EDRY drafts and no plaintext TextDocument provider is registered. JavaScript/Webview zeroization is best effort; isolated-profile residue audit remains a release gate.`,
       );
     }),
   );

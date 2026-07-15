@@ -193,6 +193,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
   - [x] 默认 annotation profile 现可经 core→daemon→VS Code 加密事务设置或清除；`useDefaultProfile` 不再依赖无法配置的初始空 default，删除默认 profile 仍在同一 config write 中自动清除引用（`3b9f5c5`）
   - [ ] 跑通多选、wrap/unwrap/edit、跨编辑器目录、canary/残留及Outer隔离矩阵
     - [x] VS Code 隔离 Extension Host 已走真实 CustomEditor convert → 单 range apply → edit → complete-range remove → 两个不相邻 range apply → complete-range batch remove → Umbra lock，且 sidecar trace 强制两次 apply/remove 的完整顺序；每次移除后逐字节恢复原 projection（本轮）。跨编辑器与 persistent-profile 隔离仍待独立矩阵。
+    - [x] VS Code `Inex: Show Security Status` 现从 authenticated sidecar 区分 Outer locked、Umbra 未初始化、Umbra locked、Umbra unlocked 与 status-unavailable；状态查询失败不暗示私密数据可用，并有纯格式化回归测试（本轮）。
 
 - [x] 实现 `.gitattributes`、locked-safe `inex merge-driver` 与已解锁 CLI 三方合并
 - [x] 实现加密冲突状态、普通编辑器保存清旗与 journal 恢复流程
