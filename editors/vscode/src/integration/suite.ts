@@ -40,6 +40,7 @@ interface InexIntegrationTestApi {
   }[]>;
   readonly failNextMutationClose: () => void;
   readonly exportOuterCopy: (destination: string) => Promise<void>;
+  readonly verifyUmbraAnnotationLifecycle: (logicalPath: string, password: string) => Promise<void>;
   readonly verifyUmbraLock: (password: string) => Promise<void>;
   readonly lock: () => Promise<void>;
 }
@@ -111,6 +112,37 @@ async function runBackupRecoveryCycle(
   await runPlaintextExportCycle(api, fixture);
   await runFeatureOneAssetLifecycle(api, fixture);
   await api.unlock(fixture.vaultPath, fixture.password, fixture.sidecarPath);
+  await api.openDocument(SECONDARY_LOGICAL_PATH);
+  await api.verifyUmbraAnnotationLifecycle(SECONDARY_LOGICAL_PATH, fixture.password);
+  await api.verifyUmbraLock(fixture.password);
+  const umbraTrace = await waitForSidecarTrace(
+    fixture,
+    (entries) => [
+      "umbra.document.convert",
+      "umbra.annotation.apply",
+      "umbra.annotation.edit",
+      "umbra.annotation.remove",
+      "umbra.lock",
+    ].every((method) => entries.some((entry) => entry.method === method)),
+    "VS Code Umbra annotation lifecycle did not reach the authenticated sidecar",
+  );
+  let previousUmbraSequence = -1;
+  for (const method of [
+    "umbra.document.convert",
+    "umbra.annotation.apply",
+    "umbra.annotation.edit",
+    "umbra.annotation.remove",
+    "umbra.lock",
+  ]) {
+    const entry = umbraTrace.find((candidate) => candidate.method === method);
+    assert.ok(entry, `VS Code Umbra trace omitted ${method}`);
+    assert.equal(
+      entry.sequence > previousUmbraSequence,
+      true,
+      `VS Code Umbra sidecar order is invalid at ${method}`,
+    );
+    previousUmbraSequence = entry.sequence;
+  }
   await runCrudCycle(api, fixture);
   await api.openDocument(LOGICAL_PATH);
   const tab = await waitForCustomTab(fixture.vaultPath, LOGICAL_PATH);
@@ -152,7 +184,6 @@ async function runBackupRecoveryCycle(
       fixture.expectedSha256,
       "The provider backupId recovery path did not restore the unsaved EDRY draft",
     );
-    await api.verifyUmbraLock(fixture.password);
     await api.lock();
     assertNoPlaintextTextDocument(tab.input.uri, fixture.sourcePath);
     console.log(
@@ -564,6 +595,7 @@ function assertIntegrationApi(value: unknown): asserts value is InexIntegrationT
     "listTree",
     "failNextMutationClose",
     "exportOuterCopy",
+    "verifyUmbraAnnotationLifecycle",
     "verifyUmbraLock",
     "lock",
   ]) {

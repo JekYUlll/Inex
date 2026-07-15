@@ -48,6 +48,7 @@ export interface InexIntegrationTestApi {
   readonly listTree: () => Promise<readonly import("./sidecar.ts").TreeEntry[]>;
   readonly failNextMutationClose: () => void;
   readonly exportOuterCopy: (destination: string) => Promise<void>;
+  readonly verifyUmbraAnnotationLifecycle: (logicalPath: string, password: string) => Promise<void>;
   readonly verifyUmbraLock: (password: string) => Promise<void>;
   readonly lock: () => Promise<void>;
 }
@@ -418,6 +419,18 @@ export function activate(
       if (!controller.isSessionCurrent(session)) {
         throw new Error("Inex vault session changed after integration plaintext export");
       }
+    },
+    verifyUmbraAnnotationLifecycle: async (logicalPath: string, password: string) => {
+      const session = controller.acquireSession();
+      let status = await session.sidecar.umbraStatus();
+      if (!status.initialized) {
+        status = await session.sidecar.initializeUmbra(password);
+      }
+      if (!status.unlocked) {
+        await session.sidecar.unlockUmbra(password);
+      }
+      await session.sidecar.enableUmbra();
+      await editor.verifyIntegrationUmbraAnnotationLifecycle(logicalPath);
     },
     verifyUmbraLock: async (password: string) => {
       const session = controller.acquireSession();

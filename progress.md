@@ -1361,6 +1361,12 @@
 - 真实隔离 Extension Host fixture 现覆盖 Umbra initialize（或已初始化时 unlock）→ enable → lock，并在同一 authenticated sidecar session 上断言最终 `umbra.status.unlocked=false`。验证：`pnpm --dir editors/vscode check`、63/63 Node tests、`pnpm --dir editors/vscode test:extension:local` 全部通过。
 - 此项验证的是 sidecar `K_umbra` lock 状态和客户端 fail-closed 清理路径；尚未替代含真实 private projection 的跨窗口/persistent-profile 人工隔离验收。
 
+## 2026-07-16 — VS Code authenticated private-annotation lifecycle
+
+- 隔离 Extension Host fixture 现在通过 production CustomEditor 的转换与 mutation 方法，对独立 `plain.md` 实际执行 feature-2 convert、单 range comment/drop apply、cursor-in-slot block/placeholder edit、完整 slot range remove，以及 Umbra lock。测试选择零 tag，避免以普通测试配置伪造或泄漏私密 catalog。
+- 每个阶段仅采用 daemon 返回的 fresh projection/RenderMap；remove 后逐字节比较原始 Umbra projection。sidecar trace 额外强制 `umbra.document.convert` → `umbra.annotation.apply` → `umbra.annotation.edit` → `umbra.annotation.remove` → `umbra.lock` 的 RPC 顺序，并在 lock 后由 `umbra.status.unlocked=false` 确认 `K_umbra` 不再保留。
+- 验证：`pnpm --dir editors/vscode check`、63/63 Node tests、`pnpm --dir editors/vscode test:extension:local` 全部通过。该自动回归不替代多范围、跨编辑器与持久用户 profile 的最终隔离验收。
+
 ## 2026-07-16 — Outer-only Umbra export projection
 
 - `umbra_render::render_outer_projection` 现在只根据已认证的公开 Outer slot 策略替换 marker：Drop 输出空内容、Cover 输出明确公开的 cover text、Placeholder 输出固定无标识文本。它严格验证 marker/slot 一一对应和 Cover/Placeholder metadata，永不读取 private payload、kind、tag、slot ID 或 `K_umbra`。

@@ -1367,6 +1367,68 @@ export class InexCustomEditorProvider
     }
   }
 
+  /**
+   * Exercise the production CustomEditor Umbra mutation path without exposing
+   * a production command that can synthesize selections. This deliberately
+   * uses no tags, so the fixture does not need a private catalog.
+   */
+  public async verifyIntegrationUmbraAnnotationLifecycle(logicalPath: string): Promise<void> {
+    this.requireIntegrationTestMode();
+    const document = [...this.documents].find(
+      (candidate) => candidate.logicalPath === logicalPath,
+    );
+    if (document === undefined) {
+      throw new Error("Inex integration Umbra document is not open");
+    }
+    const before = document.snapshot();
+    try {
+      if (before.content.byteLength < 1) {
+        throw new Error("Inex integration Umbra fixture has no Markdown to annotate");
+      }
+      this.activeDocument = document;
+      await this.convertActiveDocumentToUmbra();
+      const wrapEnd = Math.min(before.content.byteLength, 1);
+      document.restoreSelection({ startByte: 0, endByte: wrapEnd });
+      await this.applyPrivateAnnotationToActive(
+        { kind: "comment", tagIds: [], outer: { mode: "drop" } },
+        "reject",
+      );
+      const slot = document.renderMap()?.privateSlots.at(-1);
+      if (slot === undefined) {
+        throw new Error("Inex integration Umbra apply did not create a private slot");
+      }
+      document.restoreSelection({ startByte: slot.range.startByte + 1, endByte: slot.range.startByte + 1 });
+      const appliedSpec = this.activePrivateAnnotationSpec();
+      if (appliedSpec.kind !== "comment" || appliedSpec.tagIds.length !== 0 || appliedSpec.outer.mode !== "drop") {
+        throw new Error("Inex integration Umbra apply did not retain the requested private annotation metadata");
+      }
+      await this.editPrivateAnnotationAtActive(
+        { kind: "block", tagIds: [], outer: { mode: "placeholder" } },
+      );
+      const editedSlot = document.renderMap()?.privateSlots.at(-1);
+      if (editedSlot === undefined) {
+        throw new Error("Inex integration Umbra edit lost the private slot");
+      }
+      document.restoreSelection({ startByte: editedSlot.range.startByte + 1, endByte: editedSlot.range.startByte + 1 });
+      const editedSpec = this.activePrivateAnnotationSpec();
+      if (editedSpec.kind !== "block" || editedSpec.tagIds.length !== 0 || editedSpec.outer.mode !== "placeholder") {
+        throw new Error("Inex integration Umbra edit did not retain the requested private annotation metadata");
+      }
+      document.restoreSelection(editedSlot.range);
+      await this.removePrivateAnnotationFromActive();
+      const after = document.snapshot();
+      try {
+        if (!after.content.equals(before.content)) {
+          throw new Error("Inex integration Umbra remove did not restore the original projection");
+        }
+      } finally {
+        after.content.fill(0);
+      }
+    } finally {
+      before.content.fill(0);
+    }
+  }
+
   public failNextMutationCloseForIntegrationTest(): void {
     this.requireIntegrationTestMode();
     this.failNextMutationCloseForTest = true;
