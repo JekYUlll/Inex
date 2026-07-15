@@ -1296,6 +1296,12 @@
 - 下一实现切片是 core transaction 与 daemon RPC；普通 VS Code SCM/textconv、`workspace.fs.copy` 或 plaintext `TextDocument` 均被明确排除，以免为了导出功能破坏日常编辑的无明文落盘边界。
 - 实现预审确认 vault-specific directory publisher 正确地绑定 `.vault-local` 与 import marker，不能用于明文 export staging；但其底层 `atomic_move_verified_directory_no_replace_checked` 已是所需的通用 no-replace/identity/fsync primitive。导出实现将直接使用它，避免重复或伪造 vault 恢复协议。
 
+## 2026-07-16 — VS Code plaintext-export RPC contract regression
+
+- 将 VS Code sidecar 的 `vault.export.prepare`/`vault.export.commit` 响应解析提炼为严格、可单测的 frozen-v1 parser：精确字段集合、scope 回显、非负安全整数、43 字符单次 capability 与 durability 均被验证。修复了原实现中字段白名单未按 canonical 排序而会拒绝合法响应的阻断问题。
+- `commit` 现在接收完整 prepare 结果，并校验 scope、Markdown/asset/directory 计数完全一致后才向 UI 报告成功，防止扩展把不匹配的响应当作同一次导出完成。
+- 验证：`pnpm --dir editors/vscode check`、61/61 Node tests（新增 export parser 正反例）和真实 `pnpm --dir editors/vscode test:extension:local` 均通过。该 Extension Host 回归仍不代替最终 VSIX 内真实 folder picker / modal confirmation 的人工交互验收。
+
 ## 2026-07-16 — Outer-only Umbra export projection
 
 - `umbra_render::render_outer_projection` 现在只根据已认证的公开 Outer slot 策略替换 marker：Drop 输出空内容、Cover 输出明确公开的 cover text、Placeholder 输出固定无标识文本。它严格验证 marker/slot 一一对应和 Cover/Placeholder metadata，永不读取 private payload、kind、tag、slot ID 或 `K_umbra`。

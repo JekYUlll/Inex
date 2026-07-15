@@ -382,34 +382,23 @@ export class InexSidecar {
     destination: string,
     scope: "outer" | "umbra",
   ): Promise<PlaintextExportPrepare> {
-    const result = expectObject(await this.callRaw("vault.export.prepare", {
+    return parsePlaintextExportPrepare(await this.callRaw("vault.export.prepare", {
       ...this.protectedParams(), destination, scope,
-    }));
-    expectExactKeys(result, ["confirmation", "scope", "files", "assets", "directories"], "plaintext export prepare");
-    const confirmation = expectCapability(result.confirmation, "plaintext export confirmation", 43);
-    if ((result.scope !== "outer" && result.scope !== "umbra") || result.scope !== scope) {
-      throw new RpcProtocolError("RPC plaintext export scope is invalid");
-    }
-    return {
-      confirmation, scope: result.scope,
-      files: expectSafeInteger(result.files, "plaintext export files"),
-      assets: expectSafeInteger(result.assets, "plaintext export assets"),
-      directories: expectSafeInteger(result.directories, "plaintext export directories"),
-    };
+    }), scope);
   }
 
-  public async commitPlaintextExport(confirmation: string): Promise<void> {
-    const result = expectObject(await this.callRaw("vault.export.commit", {
-      ...this.protectedParams(), confirmation,
+  public async commitPlaintextExport(prepared: PlaintextExportPrepare): Promise<void> {
+    const committed = parsePlaintextExportCommit(await this.callRaw("vault.export.commit", {
+      ...this.protectedParams(), confirmation: prepared.confirmation,
     }));
-    expectExactKeys(result, ["ok", "scope", "files", "assets", "directories", "durability"], "plaintext export commit");
-    if (result.ok !== true || (result.scope !== "outer" && result.scope !== "umbra")
-      || !["synced", "notSynced"].includes(String(result.durability))) {
-      throw new RpcProtocolError("RPC plaintext export commit is invalid");
+    if (
+      committed.scope !== prepared.scope
+      || committed.files !== prepared.files
+      || committed.assets !== prepared.assets
+      || committed.directories !== prepared.directories
+    ) {
+      throw new RpcProtocolError("RPC plaintext export commit does not match its prepare result");
     }
-    expectSafeInteger(result.files, "plaintext export files");
-    expectSafeInteger(result.assets, "plaintext export assets");
-    expectSafeInteger(result.directories, "plaintext export directories");
   }
 
   public async umbraStatus(): Promise<UmbraStatus> {
@@ -1824,6 +1813,57 @@ export function parseDeleteResult(value: JsonValue): DeleteResult {
   };
 }
 
+export interface PlaintextExportCommit {
+  readonly scope: "outer" | "umbra";
+  readonly files: number;
+  readonly assets: number;
+  readonly directories: number;
+}
+
+/** @internal Exported so protocol-shape tests can exercise the frozen v1 contract. */
+export function parsePlaintextExportPrepare(
+  value: JsonValue,
+  expectedScope: "outer" | "umbra",
+): PlaintextExportPrepare {
+  const result = expectObject(value);
+  expectExactKeys(
+    result,
+    ["assets", "confirmation", "directories", "files", "scope"],
+    "plaintext export prepare",
+  );
+  const scope = expectPlaintextExportScope(result.scope, "prepare");
+  if (scope !== expectedScope) {
+    throw new RpcProtocolError("RPC plaintext export scope is invalid");
+  }
+  return {
+    confirmation: expectCapability(result.confirmation, "plaintext export confirmation", 43),
+    scope,
+    files: expectNonNegativeSafeInteger(result.files, "plaintext export files"),
+    assets: expectNonNegativeSafeInteger(result.assets, "plaintext export assets"),
+    directories: expectNonNegativeSafeInteger(result.directories, "plaintext export directories"),
+  };
+}
+
+/** @internal Exported so protocol-shape tests can exercise the frozen v1 contract. */
+export function parsePlaintextExportCommit(value: JsonValue): PlaintextExportCommit {
+  const result = expectObject(value);
+  expectExactKeys(
+    result,
+    ["assets", "directories", "durability", "files", "ok", "scope"],
+    "plaintext export commit",
+  );
+  if (result.ok !== true) {
+    throw new RpcProtocolError("RPC plaintext export commit is invalid");
+  }
+  expectDurability(result.durability, "plaintext export durability");
+  return {
+    scope: expectPlaintextExportScope(result.scope, "commit"),
+    files: expectNonNegativeSafeInteger(result.files, "plaintext export files"),
+    assets: expectNonNegativeSafeInteger(result.assets, "plaintext export assets"),
+    directories: expectNonNegativeSafeInteger(result.directories, "plaintext export directories"),
+  };
+}
+
 function parseMetadata(
   value: JsonValue | undefined,
   expectedLogicalPath: string,
@@ -2024,6 +2064,24 @@ function expectString(value: JsonValue | undefined, _field: string): string {
 function expectSafeInteger(value: JsonValue | undefined, _field: string): number {
   if (typeof value !== "number" || !Number.isSafeInteger(value)) {
     throw new RpcProtocolError("RPC result integer is invalid");
+  }
+  return value;
+}
+
+function expectNonNegativeSafeInteger(value: JsonValue | undefined, field: string): number {
+  const integer = expectSafeInteger(value, field);
+  if (integer < 0) {
+    throw new RpcProtocolError(`RPC ${field} is invalid`);
+  }
+  return integer;
+}
+
+function expectPlaintextExportScope(
+  value: JsonValue | undefined,
+  phase: "prepare" | "commit",
+): "outer" | "umbra" {
+  if (value !== "outer" && value !== "umbra") {
+    throw new RpcProtocolError(`RPC plaintext export ${phase} scope is invalid`);
   }
   return value;
 }

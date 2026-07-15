@@ -270,7 +270,7 @@ export function activate(
         );
         if (confirmed !== action) return;
         if (!controller.isSessionCurrent(session)) throw new Error("Inex vault session changed during export confirmation");
-        await session.sidecar.commitPlaintextExport(prepared.confirmation);
+        await session.sidecar.commitPlaintextExport(prepared);
         await vscode.window.showInformationMessage("Inex plaintext export completed.");
       });
     }),
