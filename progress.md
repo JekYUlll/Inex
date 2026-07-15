@@ -1247,3 +1247,8 @@
 
 - 新增无 daemon 的 headless state-machine regression：模拟 live encrypted catalog 后依次选择两个 active tags、block、placeholder、Apply；断言 tag IDs canonical sort、archived tag 不显示、selection 不变，并覆盖取消不触发 mutation。该测试只替换 UI/RPC 边界，验证真实 picker 的选择状态与最终 one-shot spec，不将 catalog 写入 Neovim state。
 - README 现记录 `:InexChoosePrivateAnnotation startByte endByte`，并删除“尚无 annotation/tag/profile UI”的过期表述；明确仍未实现 tag/profile 管理 UI 和宿主残留 gate。
+
+## 2026-07-15 — VS Code current-source integration revalidation
+
+- 当前源码运行 `pnpm --dir editors/vscode check` 与 `pnpm --dir editors/vscode test`：TypeScript 通过、57/57 单测通过。随后运行真实本机 Extension Host `pnpm --dir editors/vscode test:extension:local`，重新构建 extension、integration suite、CLI/daemon，并在隔离 Xvfb/VS Code profile 下通过 feature-1 repository import、asset preview、CRUD、backup/recovery 与 residue audit。
+- 该证据不替代最终 VSIX 的人工 folder picker、隐藏终端双口令、Open New Vault 鼠标路径和 persistent-profile release gate；计划中的该项继续保持未完成，避免将 headless Extension Host 冒充真实交互验收。
