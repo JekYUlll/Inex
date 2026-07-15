@@ -1267,3 +1267,9 @@
 ## 2026-07-15 — Neovim annotation-profile management base
 
 - 增加 `:InexManagePrivateAnnotationProfiles`：可创建安全默认 comment/drop profile、删除 profile、设定或清除 encrypted default profile；所有路径只使用 live `umbra.profile.*` RPC acknowledgement 并在 mutation 后丢弃/reload catalog。完整 kind/tag/Outer metadata 编辑仍未实现，计划保持未完成。
+
+## 2026-07-15 — Current Linux VS Code package built and installed
+
+- 从独立、clean、canonical-origin checkout 的源码提交 `067f15295b36f7cd366f5ddad1be54fba845e9fd` 用 system GCC 重建 `inex`/`inexd`；VS Code TypeScript check、57/57 unit tests、release package audit 与 isolated VS Code install/runtime smoke 均通过。
+- 新产物为 `target/release-artifacts/067f152-linux-x64/inex-vscode-0.1.0-linux-x64.vsix`，SHA-256 为 `b916d8d0c73314ecd7c924f39fd327ec5fd415768a08290fabcc17f50220d5bb`。从该 VSIX 解出的 bundled CLI 对真实 `_blog` 的独立 Git clone 完成 import；locked verify 报告 7 directories / 307 documents / 17 assets，解锁 search 返回 0 matches，`git fsck --full --strict` 与 plaintext `.md`/`.png`/`.jpg` filename scan 均通过。
+- 已使用 `/usr/bin/code --install-extension … --force` 覆盖安装，`code --list-extensions --show-versions` 确认 `horeb.inex-vscode@0.1.0`。版本号仍是 pre-alpha `0.1.0`，本记录只说明本机 Linux artifact 的构建、包审计、真实仓库回归和安装，不覆盖持久 profile、签名或跨平台 GA 门禁。
