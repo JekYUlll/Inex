@@ -1383,6 +1383,7 @@
 - 从独立 `--no-local` clean checkout、canonical origin `https://github.com/JekYUlll/Inex` 的 `d5f7a394aa97e2e3881216fc0f8b9cb5234fce64`，使用 `/usr/bin/gcc` 构建 CLI/daemon 与 VS Code bundle。ELF interpreter 为系统 `/lib64/ld-linux-x86-64.so.2`，未出现开发机 xlings RPATH/RUNPATH。
 - `scripts/package_release.py`、`audit_release_artifacts.py`、`audit_native_dependencies.py` 和 `smoke_release_artifacts.py --vscode-cli /usr/bin/code` 全部通过。可安装 VSIX：`target/release-artifacts/d5f7a39-linux-x64/inex-vscode-0.1.0-linux-x64.vsix`，SHA-256 `03a829a0d02b7d92dec02117a8d885fdbec9b1446e0c8b409541deb77e2f64ec`。
 - 这是 local construction / isolated-install evidence，不是签名发布、持久 profile 行为或多平台 GA 证明。
+- 已使用 `/usr/bin/code --install-extension …/d5f7a39-linux-x64/inex-vscode-0.1.0-linux-x64.vsix --force` 覆盖当前 Linux VS Code profile；`code --list-extensions --show-versions` 确认 `horeb.inex-vscode@0.1.0`。版本号未变，运行中的窗口必须 reload 才会切换到新 bundle。
 
 ## 2026-07-16 — Outer-only Umbra export projection
 
