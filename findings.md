@@ -753,3 +753,8 @@
 
 - A real-source `--dry-run` is useful for proving the production source classifier sees the user's actual object format, tracked count, Markdown/asset limits, and clean HEAD policy. It is not enough to claim a finished encrypted publication unless the final source revalidation and exit result are observable.
 - The authoritative automated substitute for the full transactional contract remains the CLI integration test: it builds a real source repository, runs production import, verifies a fresh parentless ciphertext Git commit, and exercises the early rejection paths before destination creation. Persistent manual import remains required for the UI/password picker experience.
+
+## 2026-07-16 Neovim profile RPC boundary
+
+- `umbra.profile.create` does not accept profile fields at the top level: the daemon requires one exact nested `profile` object. `umbra.profile.edit` additionally requires top-level `profileId`. Keeping those shapes exact prevents a UI-only implementation from silently failing or broadening the protocol parser.
+- Reusable profiles carry only kind, tag IDs, Outer mode and the derived `promptForCover` boolean. Public cover text is per annotation instance and must remain outside profile editing, so the editor does not accidentally persist display text in semantic catalog metadata.

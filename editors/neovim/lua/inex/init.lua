@@ -696,10 +696,52 @@ function M.manage_private_tags()
 end
 
 function M.manage_private_annotation_profiles()
+  -- Profile metadata is encrypted catalog data. This repeated picker retains it
+  -- only until one strict daemon mutation is issued; it never asks for an
+  -- instance cover text (that belongs to annotation application, not a profile).
+  local function choose_profile_draft(config, initial, callback)
+    local state = {
+      kind = initial and initial.kind or "comment",
+      outer = initial and initial.outer or "drop",
+      tags = {},
+    }
+    if initial then for _, tag_id in ipairs(initial.tagIds) do state.tags[tag_id] = true end end
+    local function done()
+      local tag_ids = {}
+      for tag_id, selected in pairs(state.tags) do if selected then table.insert(tag_ids, tag_id) end end
+      table.sort(tag_ids)
+      callback({ kind = state.kind, tagIds = tag_ids, outer = state.outer, promptForCover = state.outer == "cover" })
+      state = nil
+    end
+    local show_picker
+    show_picker = function()
+      local items = {
+        { group = "kind", value = "comment", label = (state.kind == "comment" and "[x] " or "[ ] ") .. "Kind: private comment" },
+        { group = "kind", value = "block", label = (state.kind == "block" and "[x] " or "[ ] ") .. "Kind: private block" },
+      }
+      for _, tag in ipairs(config.tags) do
+        if not tag.archived then table.insert(items, { group = "tag", value = tag.id, label = (state.tags[tag.id] and "[x] " or "[ ] ") .. "Tag: " .. tag.label }) end
+      end
+      for _, outer in ipairs({ "drop", "placeholder", "cover" }) do
+        table.insert(items, { group = "outer", value = outer, label = (state.outer == outer and "[x] " or "[ ] ") .. "Outer: " .. outer })
+      end
+      table.insert(items, { group = "done", label = "Save profile" })
+      vim.ui.select(items, { prompt = "Configure Inex annotation profile", format_item = function(item) return item.label end }, function(item)
+        if not item then state, config = nil, nil; return end
+        if item.group == "done" then done(); return end
+        if item.group == "kind" then state.kind = item.value
+        elseif item.group == "outer" then state.outer = item.value
+        else state.tags[item.value] = not state.tags[item.value] end
+        show_picker()
+      end)
+    end
+    show_picker()
+  end
   local function show_menu()
     M.load_umbra_annotation_config(function(config)
       vim.ui.select({
         { action = "create", label = "Create annotation profile" },
+        { action = "edit", label = "Edit annotation profile" },
         { action = "remove", label = "Remove annotation profile" },
         { action = "default", label = "Set default annotation profile" },
       }, { prompt = "Manage Inex annotation profiles", format_item = function(item) return item.label end }, function(item)
@@ -709,9 +751,11 @@ function M.manage_private_annotation_profiles()
             if type(label) ~= "string" or #label == 0 or #label > 4096 or label:find("%z") then config = nil; return end
             vim.ui.input({ prompt = "Stable annotation profile ID: ", default = "profile" }, function(profile_id)
               if not valid_tag_id(profile_id) then vim.notify("Inex annotation profile ID is invalid", vim.log.levels.ERROR); config = nil; return end
-              umbra_config_mutation("umbra.profile.create", {
-                id = profile_id, label = label, kind = "comment", tagIds = {}, outer = "drop", promptForCover = false,
-              }, "Inex annotation profile created", function() config = nil; show_menu() end)
+              choose_profile_draft(config, nil, function(draft)
+                if not draft then config = nil; return end
+                draft.id, draft.label = profile_id, label
+                umbra_config_mutation("umbra.profile.create", { profile = draft }, "Inex annotation profile created", function() config = nil; show_menu() end)
+              end)
             end)
           end)
           return
@@ -723,7 +767,16 @@ function M.manage_private_annotation_profiles()
         if #profiles == 0 then vim.notify("No Inex annotation profiles are configured", vim.log.levels.WARN); config = nil; return end
         vim.ui.select(profiles, { prompt = "Select annotation profile", format_item = function(profile) return profile.label end }, function(profile)
           if not profile then config = nil; return end
-          if item.action == "remove" then
+          if item.action == "edit" then
+            vim.ui.input({ prompt = "Annotation profile label: ", default = profile.label }, function(label)
+              if type(label) ~= "string" or #label == 0 or #label > 4096 or label:find("%z") then config = nil; return end
+              choose_profile_draft(config, profile, function(draft)
+                if not draft then config = nil; return end
+                draft.id, draft.label = profile.id, label
+                umbra_config_mutation("umbra.profile.edit", { profileId = profile.id, profile = draft }, "Inex annotation profile updated", function() config = nil; show_menu() end)
+              end)
+            end)
+          elseif item.action == "remove" then
             umbra_config_mutation("umbra.profile.remove", { profileId = profile.id }, "Inex annotation profile removed", function() config = nil; show_menu() end)
           else
             umbra_config_mutation("umbra.profile.setDefault", { profileId = profile.id }, "Inex default annotation profile updated", function() config = nil; show_menu() end)

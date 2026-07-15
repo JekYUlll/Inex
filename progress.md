@@ -1678,3 +1678,8 @@
 
 - 对用户复制出的 `/home/horeb/_code/_blog`，CLI dry-run 在真实 clean SHA-1 Git 仓库中完整读取 324 tracked entries（307 Markdown、17 assets、46,643,446 asset bytes、最大 asset 25,074,521 bytes）；随后再次确认源 `git status --porcelain -uno` 为零、候选 destination 仍不存在。第一次使用不存在的 `/home/horeb/_code/inex-test` 父目录被安全路径策略拒绝，未产生输出目录。
 - 当前终端 supervisor 在实际 source 的最终 revalidation/exit 观测前中断其子进程，故不将这个 dry-run 记为完整成功。作为可重复完整事务证据，`cargo test -p inex-cli --test repository_import_cli -- --nocapture` 通过 5/5：包含 current tracked snapshot → one parentless ciphertext commit、dirty/untracked/empty-dir/LFS/symlink 拒绝、password failure terminal report，以及 existing target preflight 路由。
+
+## 2026-07-16 — Neovim annotation-profile metadata editor
+
+- `:InexManagePrivateAnnotationProfiles` 现在可创建或编辑完整 profile metadata：comment/block、未归档 encrypted tag 多选与 drop/placeholder/cover Outer strategy。create RPC 已修正为严格的 `{ profile = ... }` 嵌套协议；edit 保留 stable ID 并发送 `{ profileId, profile }`。
+- profile UI 不采集实例 public cover text；仅在 `outer == cover` 时写入 `promptForCover = true`。`nvim --headless --clean ... annotation_picker.lua` 通过，且 diff whitespace 检查通过。

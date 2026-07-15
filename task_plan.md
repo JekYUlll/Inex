@@ -122,6 +122,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
     - [x] Neovim encrypted tag create/rename/archive/reorder UI（每次 mutation 后重新读取 live catalog）
     - [ ] Neovim annotation-profile management UI
       - [x] Neovim profile create/remove/set-default UI（full metadata edit 待实现）
+      - [x] Neovim profile create/edit metadata picker：kind、非归档 tag 多选与 Outer strategy 都仅经 live encrypted catalog；Cover profile 仅存 `promptForCover`，不收集实例公开 cover text（2026-07-16）
 - [ ] 使用 headless Neovim 回归验证，并对 swap、shada、undo、LSP 等宿主明文残留执行显式门控（当前 transport/Outer/Umbra lifecycle 已通过；完整 host-residue gate 仍未完成）
 - **Status:** in_progress（正式 goal；2026-07-15 已再次确认最后优先级：CLI/daemon 与 VS Code 为最高优先，Sublime 维持既定 experimental 范围后，才开始 Neovim；不得创建第二套协议/密码学实现）
 
