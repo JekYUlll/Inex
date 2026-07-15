@@ -55,6 +55,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
 - [x] 添加 lint、类型检查、单元测试与 Extension Host 集成测试基础
 - [ ] 修复 CustomEditor 的 CRLF 展示/同步边界：导航、selection 与 snapshot 不得将浏览器 textarea 的 LF 规范化误认作用户编辑；补充真实加密 Git worktree 无操作不变回归
 - [ ] 在不降级 CustomEditor plaintext-residue 边界的前提下，实现 webview 内 Markdown 语法呈现并修复 Headings 的可重复跳转；普通 VS Code SCM 保持密文 binary diff，另行设计需解锁的安全 revision-compare UX
+  - 2026-07-16: `7f89ff8` 的 package smoke 与真实 `_blog` clone import regression 已通过，Linux VSIX 已覆盖安装；两项保留为未完成，直到用户的持久 VS Code profile 确认 CRLF vault 无操作不产生新 Git 变更、Heading 可重复跳转并验证实际视觉呈现。
 - **Status:** complete
 
 ### Phase 5: Sublime 轻量客户端

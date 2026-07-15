@@ -1279,3 +1279,9 @@
 - `InexDocument` 现在将 authenticated canonical plaintext 与浏览器 textarea 的 LF-only presentation 明确分离：CRLF 文档在 selection、navigation、snapshot 与 save 时通过受限 UTF-8 byte/UTF-16 offset mapping 往返，navigation/selection 不再把浏览器的 CRLF→LF 规范化误判为编辑。Heading/link 路径仍会先采纳真实未同步编辑，但仅在 canonical bytes 实际变化时才标记 dirty。
 - webview 增加独立的 display-only Markdown presentation layer，渲染 headings、fenced code、comments 和 block quotes；它不发送消息、不持有权限且不参与保存/RenderMap/路径决策。主受控编辑脚本先完成 `ready` handshake，因此 display-only 层故障不能阻断 unlock/open/save/lock lifecycle。
 - 验证：`pnpm --dir editors/vscode check`、59/59 Node tests（含 CRLF/UTF-8 offset regressions）及真实 `pnpm --dir editors/vscode test:extension:local` 均通过；后者重新覆盖 feature-1 import、asset preview、CRUD、encrypted backup/recovery 与 residue audit。尚需将这批源码打包、在用户的持久 profile 上人工确认视觉高亮、连续 Heading 跳转及现有 CRLF vault 的无操作 Git clean。
+
+## 2026-07-16 — VS Code repair package and real-repository regression
+
+- 从独立 clean checkout 的源码提交 `7f89ff8e71ebfa9570007c6bf4ad9578bc07c6b6` 构建 Linux x64 VSIX：`target/release-artifacts/7f89ff8-linux-x64/inex-vscode-0.1.0-linux-x64.vsix`，SHA-256 为 `980403249878cf47ad9ff63aa325e84279b44582071793d954145f413d934c39`。package smoke 在 disposable VS Code profile 中通过。
+- 从该 VSIX 解出的 bundled CLI 对 `_blog` 的独立 Git clone 完成真实导入：源审计为 324 entries、307 Markdown、17 assets；candidate audit、Git object audit、publication 通过。随后 locked structural verify、无命中 canary search、`git fsck --full --strict`、clean worktree 与 plaintext filename scan 全部通过。
+- 已用 `/usr/bin/code --install-extension … --force` 覆盖安装，`code --list-extensions --show-versions` 确认 `horeb.inex-vscode@0.1.0`。版本号未变，必须以 reload window 载入新 bundle；持久用户 profile 的视觉高亮、连续 Heading 跳转和 CRLF vault 无操作 Git clean 仍是最后人工验收项，不能由 disposable smoke 替代。
