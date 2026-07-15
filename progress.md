@@ -1553,3 +1553,10 @@
 | Error | Attempt | Resolution |
 |---|---:|---|
 | A diagnostic `rg` command used unescaped Markdown backticks, causing zsh to try to execute `inex.compareUmbraRevision` | 1 | No repository change or test was affected; subsequent searches avoid unescaped backticks. |
+| Release packer rejected the default xlings-linked ELF interpreter | 1 | Rebuilt CLI/daemon with `/usr/bin/gcc` and the system linker; native dependency audit then passed. |
+| Release packer rejected the active source worktree, then the clean clone lacked pinned `vsce` and editor dependencies | 1 | Used a clean standalone clone with canonical origin, explicit pinned `vsce`, and frozen-lockfile Node installation before packaging. |
+
+## 2026-07-16 — Installed readable revision-compare bundle
+
+- 从 clean standalone source `e1a50ea` 使用 system GCC 构建 Linux x64 CLI/daemon，package artifact audit、native dependency audit 与 isolated VS Code install/bundled executable smoke 全部成功。VSIX 已复制到 `target/release-artifacts/e1a50ea-linux-x64/` 并覆盖安装当前 profile。
+- 安装绑定：VSIX SHA-256 `a3de9e1e3a54f539e00d75a4ed6a0f81a0c8ef31cc829b98e37ad839a3876dd6`；包内/已安装 `extension.js` 都为 `bd799bd8071d27c1d122ec07f0d4cbd285fe78ab9ce9ae0b5b806015bdddddab`；包内/已安装 `inexd` 都为 `cb946f0e90153fe2da4e5e49038ebc1c6a9e3f95c79f47d59a226ed006fb89e8`。VS Code CLI 的 `DEP0169` 为宿主 Node warning，安装成功且不属于 Inex trace。
