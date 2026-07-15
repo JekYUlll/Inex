@@ -1285,3 +1285,8 @@
 - 从独立 clean checkout 的源码提交 `7f89ff8e71ebfa9570007c6bf4ad9578bc07c6b6` 构建 Linux x64 VSIX：`target/release-artifacts/7f89ff8-linux-x64/inex-vscode-0.1.0-linux-x64.vsix`，SHA-256 为 `980403249878cf47ad9ff63aa325e84279b44582071793d954145f413d934c39`。package smoke 在 disposable VS Code profile 中通过。
 - 从该 VSIX 解出的 bundled CLI 对 `_blog` 的独立 Git clone 完成真实导入：源审计为 324 entries、307 Markdown、17 assets；candidate audit、Git object audit、publication 通过。随后 locked structural verify、无命中 canary search、`git fsck --full --strict`、clean worktree 与 plaintext filename scan 全部通过。
 - 已用 `/usr/bin/code --install-extension … --force` 覆盖安装，`code --list-extensions --show-versions` 确认 `horeb.inex-vscode@0.1.0`。版本号未变，必须以 reload window 载入新 bundle；持久用户 profile 的视觉高亮、连续 Heading 跳转和 CRLF vault 无操作 Git clean 仍是最后人工验收项，不能由 disposable smoke 替代。
+
+## 2026-07-16 — Plaintext Export v1 contract
+
+- 将此前请求的管理员/加强模式导出明确冻结为高风险、用户显式授权的 Plaintext Export Mode，而非任何密码绕过。新增 `docs/spec/plaintext-export-v1.md`：daemon-only write、Outer/独立 Umbra scope、session-bound single-use prepare/commit capability、同级 staging 审计与 no-replace 原子发布、staging 保留、destination receipt 和 CLI/VS Code UX 边界均已定义。
+- 下一实现切片是 core transaction 与 daemon RPC；普通 VS Code SCM/textconv、`workspace.fs.copy` 或 plaintext `TextDocument` 均被明确排除，以免为了导出功能破坏日常编辑的无明文落盘边界。

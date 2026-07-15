@@ -586,3 +586,8 @@
 
 - The CustomEditor now preserves canonical CRLF bytes by presenting LF-only text to textarea and mapping all presentation byte/UTF-16 offsets back to canonical plaintext. Selection messages no longer mutate content; navigation snapshots any genuine unsent edit through the same mapping, so heading/link interaction remains current without turning CRLF normalization into ciphertext rewrites.
 - Markdown presentation is intentionally a second, display-only webview script rather than a prerequisite editor runtime. An initial monolithic inline highlighter could make a webview syntax error prevent the `ready` handshake and thereby break backup/recovery integration. The main controlled editor starts first; the presentation layer has no host-message authority, no persistence path and cannot block lifecycle behavior. A future CodeMirror migration must retain this availability and authority separation.
+
+## 2026-07-16 Plaintext Export v1 boundary
+
+- Plaintext export cannot share the normal CustomEditor or Git/SCM code path: a successful export deliberately creates user-visible plaintext on disk, whereas the editor pipeline must remain ciphertext-only on disk. The safe common boundary is therefore a daemon-owned, session-bound two-step transaction with a capability that is invalidated by Outer/Umbra lock rather than an editor-local confirmation boolean.
+- Outer-only export must never decrypt feature-2 slots or catalog; Umbra-inclusive export requires a separately live Umbra session and emits canonical annotated Markdown without exporting a standalone private-tag/profile configuration. This gives an intentional portable Markdown result while avoiding accidental profile/catalog plaintext persistence.
