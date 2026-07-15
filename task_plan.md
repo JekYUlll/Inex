@@ -71,6 +71,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
   - 2026-07-16: isolated Extension Host 现也驱动 production `inex.compareUmbraRevision`：annotation lifecycle 产生 feature-2 ciphertext 后只提交 `plain.md.enc`，等待 `revision.compare.umbra` trace；不在 runner 接触 private projection。daemon private-canary fixture继续是内容隔离的证据。
   - 2026-07-16: Inex compare panel 已从两段无标识只读文本升级为 deterministic linear line comparison：共同前/后缀保持未标记，中间 HEAD/Parent range 分列绿色/红色显示；HTML 无脚本、无 local resource、无 native diff/TextDocument，输入转义与单侧新增均有单元回归。真实 Extension Host 全回归继续通过。
   - 2026-07-16: `e1a50ea` Linux x64 clean standalone-source package 已以 system GCC 重建，artifact/native dependency/isolated install smoke 均通过并已覆盖安装；该发布包包含可读受控 compare panel。持久 profile 手工视觉/SCM/residue 门禁仍未因此关闭。
+  - 2026-07-16: revision-compare v1 规范已加入 VSIX `docs/spec/` release allowlist，避免可安装包缺少该命令的安全边界说明；发布工具 86/86 与 VS Code typecheck 已通过，正重建最终文档完整包。
   - 2026-07-16: 当前可安装 Linux x64 VSIX 已更新为 clean canonical-source `8dd7d70`，包含 richer display-only Markdown highlighting；package/audit/native-dependency/isolated-install smoke 通过并已覆盖本机 profile。运行中的窗口仍需 reload。
 - **Status:** complete
 

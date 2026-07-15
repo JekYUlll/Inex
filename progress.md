@@ -1560,3 +1560,8 @@
 
 - 从 clean standalone source `e1a50ea` 使用 system GCC 构建 Linux x64 CLI/daemon，package artifact audit、native dependency audit 与 isolated VS Code install/bundled executable smoke 全部成功。VSIX 已复制到 `target/release-artifacts/e1a50ea-linux-x64/` 并覆盖安装当前 profile。
 - 安装绑定：VSIX SHA-256 `a3de9e1e3a54f539e00d75a4ed6a0f81a0c8ef31cc829b98e37ad839a3876dd6`；包内/已安装 `extension.js` 都为 `bd799bd8071d27c1d122ec07f0d4cbd285fe78ab9ce9ae0b5b806015bdddddab`；包内/已安装 `inexd` 都为 `cb946f0e90153fe2da4e5e49038ebc1c6a9e3f95c79f47d59a226ed006fb89e8`。VS Code CLI 的 `DEP0169` 为宿主 Node warning，安装成功且不属于 Inex trace。
+
+## 2026-07-16 — Compare documentation included in release input
+
+- `scripts/package_release.py` 的 strict `DOCUMENTATION_FILES` 已加入 `spec/vscode-revision-compare-v1.md`，使 VSIX 的 `docs/spec/` 包含已交付 Outer/Umbra compare 的 scope、锁定与明文边界。规范同时删除未实现的 working-copy compare 表述，准确限定 v1 为 fixed HEAD/first-parent。
+- 验证：release tooling 86/86 unittest 与 VS Code `tsc --noEmit` 通过。下一 packaging checkpoint 会从干净 source 重建并审计新文档清单。

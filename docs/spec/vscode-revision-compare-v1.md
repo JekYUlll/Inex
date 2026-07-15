@@ -100,16 +100,15 @@ linked/external gitdir, active merge/rebase/cherry-pick state, split index,
 submodule, or non-regular encrypted target. It never writes the worktree,
 index, refs, configuration, attributes, or a temporary plaintext file.
 
-`Working copy` means the currently authenticated on-disk envelope, not an
-unsaved webview model. Unsaved changes remain the custom editor's ordinary
-dirty-state concern; v1 compare refuses a dirty active document rather than
-copying its plaintext into another lifecycle.
+The current v1 commands do not compare a working copy. Unsaved changes remain
+the custom editor's ordinary dirty-state concern; v1 refuses a dirty active
+document rather than copying its plaintext into another lifecycle.
 
 ## Required evidence
 
 - Unit tests reject arbitrary revision text and physical paths before Git.
 - Integration tests create a real encrypted Git vault with two commits and
-  prove current/HEAD and HEAD/parent projections are correct.
+  prove fixed HEAD/parent projections are correct.
 - A private canary and private tag canary appear in Umbra compare only after an
   independent Umbra unlock, never in Outer compare, responses while locked,
   Git output, or logs.
