@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { promisify } from "node:util";
 
 import * as vscode from "vscode";
 
@@ -14,6 +16,7 @@ const ASSET_LOGICAL_PATH = "images/pixel.png";
 const EXPECTED_ASSET_CHUNK_BYTES = 1024 * 1024;
 const MAX_TRACE_BYTES = 1024 * 1024;
 const WAIT_TIMEOUT_MS = 20_000;
+const execFileAsync = promisify(execFile);
 
 interface InexIntegrationTestApi {
   readonly unlock: (
@@ -306,6 +309,10 @@ async function runFeatureOneAssetLifecycle(
   );
   await waitForNoCustomTab(fixture.vaultPath, LOGICAL_PATH);
   await waitForNoCustomTab(fixture.vaultPath, SECONDARY_LOGICAL_PATH);
+  await assertCleanCiphertextGitWorktree(
+    fixture.vaultPath,
+    "opening and hiding the CRLF CustomEditor fixture",
+  );
 
   await api.lock();
   const lockedEntries = await waitForSidecarTrace(
@@ -347,6 +354,19 @@ async function runFeatureOneAssetLifecycle(
     "The preview lifecycle issued an asset RPC after vault.lock",
   );
   assertNoPlaintextTextDocument(assetTab.input.uri, fixture.sourcePath);
+}
+
+async function assertCleanCiphertextGitWorktree(
+  vaultPath: string,
+  context: string,
+): Promise<void> {
+  const { stdout, stderr } = await execFileAsync(
+    "git",
+    ["-C", vaultPath, "status", "--porcelain=v1", "-z"],
+    { encoding: "utf8", maxBuffer: 1024 * 1024 },
+  );
+  assert.equal(stderr, "", `git status emitted stderr while ${context}`);
+  assert.equal(stdout, "", `CustomEditor changed ciphertext without an edit while ${context}`);
 }
 
 async function runCrudCycle(

@@ -69,7 +69,10 @@ await fs.chmod(auditRoot, 0o700);
 const fixture = fixturePaths(auditRoot);
 const canary = `inex-residue:${randomBytes(96).toString("base64url")}`;
 const originalPlaintext = `# Inex residue audit\n\n${canary}\n\n![Encrypted pixel](${ASSET_LOGICAL_PATH})\n`;
-const secondaryPlaintext = `# Secondary encrypted note\n\n${canary}:secondary\n`;
+// Keep one real repository fixture in CRLF form. The Extension Host then
+// proves that textarea's LF presentation does not rewrite ciphertext merely
+// by opening, navigating, hiding, or closing the document.
+const secondaryPlaintext = `# Secondary encrypted note\r\n\r\n${canary}:secondary\r\n`;
 const dirtyPlaintext = `${originalPlaintext}${DIRTY_SUFFIX}`;
 const expectedSha256 = createHash("sha256").update(dirtyPlaintext, "utf8").digest("hex");
 const originalSha256 = createHash("sha256").update(originalPlaintext, "utf8").digest("hex");

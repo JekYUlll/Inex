@@ -1367,6 +1367,12 @@
 - 每个阶段仅采用 daemon 返回的 fresh projection/RenderMap；remove 后逐字节比较原始 Umbra projection。sidecar trace 额外强制 `umbra.document.convert` → `umbra.annotation.apply` → `umbra.annotation.edit` → `umbra.annotation.remove` → `umbra.lock` 的 RPC 顺序，并在 lock 后由 `umbra.status.unlocked=false` 确认 `K_umbra` 不再保留。
 - 验证：`pnpm --dir editors/vscode check`、63/63 Node tests、`pnpm --dir editors/vscode test:extension:local` 全部通过。该自动回归不替代多范围、跨编辑器与持久用户 profile 的最终隔离验收。
 
+## 2026-07-16 — VS Code CRLF ciphertext Git no-op regression
+
+- Extension Host 的真实 repository-import fixture 将 `plain.md` 固定为 CRLF 字节。它在同一密文 vault 内打开、隐藏、重新显示并关闭 CRLF 与带相对图片的 CustomEditor，然后在任何 CRUD/Umbra 变更之前执行 `git -C <vault> status --porcelain=v1 -z`；输出必须为空。
+- 这将用户报告的“未修改却将 `.enc` 标为 M”转为可复现门禁，并确认现有 presentation→canonical offset 映射不会把 textarea 的 LF 规范化写回密文。验证：`pnpm --dir editors/vscode check` 与真实 `pnpm --dir editors/vscode test:extension:local` 通过。
+- 该 disposable-profile 证据不替代用户持久 profile 的 SCM/Local History 行为验收；后者仍在发布门禁中保持未完成。
+
 ## 2026-07-16 — Outer-only Umbra export projection
 
 - `umbra_render::render_outer_projection` 现在只根据已认证的公开 Outer slot 策略替换 marker：Drop 输出空内容、Cover 输出明确公开的 cover text、Placeholder 输出固定无标识文本。它严格验证 marker/slot 一一对应和 Cover/Placeholder metadata，永不读取 private payload、kind、tag、slot ID 或 `K_umbra`。

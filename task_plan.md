@@ -54,6 +54,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
 - [x] 使用真实 Extension Host 黑盒验证 encrypted backup/recovery 并扫描 isolated profile；持久 profile/Local History/crash 矩阵留作 Phase 7 发布门禁
 - [x] 添加 lint、类型检查、单元测试与 Extension Host 集成测试基础
 - [ ] 修复 CustomEditor 的 CRLF 展示/同步边界：导航、selection 与 snapshot 不得将浏览器 textarea 的 LF 规范化误认作用户编辑；补充真实加密 Git worktree 无操作不变回归
+  - [x] 隔离 Extension Host fixture 已以真实 CRLF Markdown 导入密文 Git vault，执行 open/hide/reveal/close 后强制 `git status --porcelain=v1 -z` 为空；普通 textarea LF presentation 不再能形成无编辑 `.enc` 修改（本轮）。用户持久 profile 的人工复验仍待完成。
 - [ ] 在不降级 CustomEditor plaintext-residue 边界的前提下，实现 webview 内 Markdown 语法呈现并修复 Headings 的可重复跳转；普通 VS Code SCM 保持密文 binary diff，另行设计需解锁的安全 revision-compare UX
   - 2026-07-16: `7f89ff8` 的 package smoke 与真实 `_blog` clone import regression 已通过，Linux VSIX 已覆盖安装；随后发现 webview reveal helper 内嵌正则被模板字符串转义为换行，导致脚本在加载前语法失效。现已改为无转义换行计数，并由 runtime 覆盖连续 Unicode heading reveal、selection 回传和滚动；两项仍保留为未完成，直到用户的持久 VS Code profile 确认 CRLF vault 无操作不产生新 Git 变更与实际视觉呈现。
 - **Status:** complete
