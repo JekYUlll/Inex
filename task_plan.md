@@ -103,6 +103,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
     - [x] 实现仅 Outer 的 feature-2 Markdown projection：公开 drop/cover/placeholder 策略替换 marker，严格拒绝不一致 marker/slot/cover，且 API 不读取 `K_umbra` 或私密 payload（本轮）
     - [x] 实现通用 plaintext export destination/staging 生命周期：目标 absent/outside-vault 校验、同级受限权限 staging、identity/absence 重验和 generic no-replace publish；失败保留 staging（本轮）
     - [x] 实现 staging create-new 文件写入与 manifest audit：相对路径限制、受限权限、file/directory fsync、SHA-256 精确重读验证，并将 manifest 绑定 publish callback（本轮）
+    - [x] 实现 Vault authenticated-tree → staging engine：保留空目录、普通 Markdown 与附件；Outer scope 仅输出公开 Umbra 投影，Umbra scope 在写入前要求 live `K_umbra` 并输出完整投影；manifest 递归拒绝任何未登记文件/目录/链接（本轮）
     - [x] 核验通用 sibling-directory no-replace publisher：直接复用 `atomic_move_verified_directory_no_replace_checked`，它已提供身份重验/no-replace/fsync 且不依赖 `.vault-local`；export 不得调用 vault-specific import wrapper
     - [ ] CLI/VS Code 首先接入，Sublime/Neovim 仅复用 RPC 与同一确认语义
 

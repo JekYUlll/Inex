@@ -6,6 +6,7 @@
 //! the staging root only with fully authenticated plaintext, audit it, then
 //! publish it through the generic verified no-replace directory move.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
 use std::io::{self, Write};
@@ -81,6 +82,28 @@ pub struct PlaintextExportEntry {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PlaintextExportManifest {
     entries: Vec<PlaintextExportEntry>,
+    directories: BTreeSet<PathBuf>,
+}
+
+/// The authorized visibility level for one explicit plaintext export.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlaintextExportScope {
+    /// Export public Markdown and the public projection of Umbra documents.
+    Outer,
+    /// Export fully decrypted Umbra Markdown. Requires a live Umbra session.
+    Umbra,
+}
+
+/// Non-sensitive counts describing one populated plaintext export staging
+/// tree. It deliberately contains no logical paths, document text or tags.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PlaintextExportSummary {
+    /// Markdown documents emitted into staging.
+    pub markdown_documents: usize,
+    /// Opaque assets emitted into staging.
+    pub assets: usize,
+    /// Logical directories created or verified in staging.
+    pub directories: usize,
 }
 
 impl PlaintextExportManifest {
@@ -90,14 +113,35 @@ impl PlaintextExportManifest {
         &self.entries
     }
 
-    /// Verify every recorded entry against its staged bytes and synchronize
-    /// every containing directory before publication.
+    /// Verify the exact staged tree against recorded bytes and synchronize it
+    /// before publication.
     ///
     /// # Errors
     ///
-    /// Returns an error when a path is replaced, missing, oversized or differs
-    /// from its exact recorded digest.
+    /// Returns an error when a path is replaced, missing, oversized, differs
+    /// from its exact recorded digest, or an unexpected file, directory or
+    /// link appears beneath staging.
     pub fn audit(&self, staging: &Path) -> io::Result<()> {
+        let root_metadata = fs::symlink_metadata(staging)?;
+        if root_metadata.file_type().is_symlink() || !root_metadata.file_type().is_dir() {
+            return Err(io::Error::other("plaintext export staging root unsafe"));
+        }
+        let expected_files: BTreeSet<&Path> = self
+            .entries
+            .iter()
+            .map(|entry| entry.relative_path.as_path())
+            .collect();
+        let mut expected_directories = self.directories.clone();
+        expected_directories.insert(PathBuf::new());
+        for entry in &self.entries {
+            register_parent_directories(&mut expected_directories, &entry.relative_path);
+        }
+        audit_exact_tree(
+            staging,
+            Path::new(""),
+            &expected_files,
+            &expected_directories,
+        )?;
         for entry in &self.entries {
             let path = staging.join(&entry.relative_path);
             let metadata = fs::symlink_metadata(&path)?;
@@ -111,12 +155,8 @@ impl PlaintextExportManifest {
             if actual != entry.sha256 {
                 return Err(io::Error::other("plaintext export staged digest changed"));
             }
-            let parent = path
-                .parent()
-                .ok_or_else(|| io::Error::other("plaintext export staged path invalid"))?;
-            sync_directory(parent)?;
         }
-        sync_directory(staging)
+        sync_directories_bottom_up(staging, &expected_directories)
     }
 }
 
@@ -163,6 +203,112 @@ pub fn write_plaintext_export_file(
         byte_len: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
         sha256: Sha256::digest(bytes).into(),
     });
+    register_parent_directories(&mut manifest.directories, relative_path);
+    Ok(())
+}
+
+/// Create or verify one empty logical directory below a prepared staging root.
+/// It accepts only portable relative components and records the directory for
+/// exact-tree auditing.
+///
+/// # Errors
+///
+/// Returns an error when the relative directory is unsafe or an existing
+/// filesystem object is not a real directory.
+pub fn create_plaintext_export_directory(
+    staging: &Path,
+    relative_path: &Path,
+    manifest: &mut PlaintextExportManifest,
+) -> io::Result<()> {
+    if relative_path.as_os_str().is_empty()
+        || relative_path
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "plaintext export relative directory invalid",
+        ));
+    }
+    let mut current = staging.to_path_buf();
+    for component in relative_path.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "plaintext export relative directory invalid",
+            ));
+        };
+        current.push(name);
+        match fs::create_dir(&current) {
+            Ok(()) => restrict_directory_permissions_best_effort(&current),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+        let metadata = fs::symlink_metadata(&current)?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+            return Err(io::Error::other("plaintext export directory unsafe"));
+        }
+    }
+    manifest.directories.insert(relative_path.to_path_buf());
+    Ok(())
+}
+
+fn register_parent_directories(directories: &mut BTreeSet<PathBuf>, relative_path: &Path) {
+    let mut current = PathBuf::new();
+    if let Some(parent) = relative_path.parent() {
+        for component in parent.components() {
+            let std::path::Component::Normal(name) = component else {
+                return;
+            };
+            current.push(name);
+            directories.insert(current.clone());
+        }
+    }
+}
+
+fn audit_exact_tree(
+    root: &Path,
+    relative: &Path,
+    expected_files: &BTreeSet<&Path>,
+    expected_directories: &BTreeSet<PathBuf>,
+) -> io::Result<()> {
+    let directory = root.join(relative);
+    let metadata = fs::symlink_metadata(&directory)?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        return Err(io::Error::other("plaintext export staged directory unsafe"));
+    }
+    for entry in fs::read_dir(&directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let child_relative = relative.join(&name);
+        let metadata = entry.metadata()?;
+        if metadata.file_type().is_symlink() {
+            return Err(io::Error::other("plaintext export staged link present"));
+        }
+        if metadata.file_type().is_dir() {
+            if !expected_directories.contains(&child_relative) {
+                return Err(io::Error::other(
+                    "plaintext export staged directory unexpected",
+                ));
+            }
+            audit_exact_tree(root, &child_relative, expected_files, expected_directories)?;
+        } else if metadata.file_type().is_file() {
+            if !expected_files.contains(child_relative.as_path()) {
+                return Err(io::Error::other("plaintext export staged file unexpected"));
+            }
+        } else {
+            return Err(io::Error::other("plaintext export staged entry unsafe"));
+        }
+    }
+    Ok(())
+}
+
+fn sync_directories_bottom_up(root: &Path, directories: &BTreeSet<PathBuf>) -> io::Result<()> {
+    let mut ordered: Vec<_> = directories.iter().collect();
+    ordered.sort_by_key(|relative| std::cmp::Reverse(relative.components().count()));
+    for relative in ordered {
+        sync_directory(&root.join(relative))?;
+    }
     Ok(())
 }
 
@@ -444,6 +590,24 @@ mod tests {
             PlaintextExportStaging::prepare(&vault, &existing),
             Err(PlaintextExportDestinationError::DestinationExists)
         ));
+    }
+
+    #[test]
+    fn audit_rejects_unrecorded_staging_entries() {
+        let root = TemporaryRoot::new();
+        let staging = root.0.join("staging");
+        fs::create_dir(&staging).unwrap_or_else(|error| panic!("staging: {error}"));
+        let mut manifest = PlaintextExportManifest::default();
+        write_plaintext_export_file(
+            &staging,
+            std::path::Path::new("nested/entry.md"),
+            b"intentional plaintext\n",
+            &mut manifest,
+        )
+        .unwrap_or_else(|error| panic!("write fixture: {error}"));
+        fs::write(staging.join("unexpected.txt"), b"not in manifest")
+            .unwrap_or_else(|error| panic!("inject unexpected entry: {error}"));
+        assert!(manifest.audit(&staging).is_err());
     }
 
     #[cfg(unix)]

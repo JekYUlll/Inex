@@ -1289,6 +1289,7 @@
 ## 2026-07-16 — Plaintext Export v1 contract
 
 - 将此前请求的管理员/加强模式导出明确冻结为高风险、用户显式授权的 Plaintext Export Mode，而非任何密码绕过。新增 `docs/spec/plaintext-export-v1.md`：daemon-only write、Outer/独立 Umbra scope、session-bound single-use prepare/commit capability、同级 staging 审计与 no-replace 原子发布、staging 保留、destination receipt 和 CLI/VS Code UX 边界均已定义。
+- 实现 plaintext export 的 authenticated-tree → staging 核心引擎：`PlaintextExportManifest` 现在递归审计精确树，拒绝未登记的文件、目录和链接；Vault 写入逻辑保留空目录，导出普通 Markdown/附件，Outer scope 只生成公开 Umbra 投影，Umbra scope 在任何写入前要求 live `K_umbra` 并写出完整 projection。核心全量门禁：`cargo clippy -p inex-core --all-targets -- -D warnings`、`cargo test -p inex-core`（303 单测 + 2 doctest）均通过。
 - 下一实现切片是 core transaction 与 daemon RPC；普通 VS Code SCM/textconv、`workspace.fs.copy` 或 plaintext `TextDocument` 均被明确排除，以免为了导出功能破坏日常编辑的无明文落盘边界。
 - 实现预审确认 vault-specific directory publisher 正确地绑定 `.vault-local` 与 import marker，不能用于明文 export staging；但其底层 `atomic_move_verified_directory_no_replace_checked` 已是所需的通用 no-replace/identity/fsync primitive。导出实现将直接使用它，避免重复或伪造 vault 恢复协议。
 

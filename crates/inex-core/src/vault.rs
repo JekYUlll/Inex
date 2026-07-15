@@ -26,6 +26,10 @@ use crate::crypto::{
 };
 use crate::format::{self, ContentFlags, EdryHeader};
 use crate::path::{AssetPath, LogicalDir, LogicalPath, PathError, portable_case_fold};
+use crate::plaintext_export::{
+    PlaintextExportManifest, PlaintextExportScope, PlaintextExportSummary,
+    create_plaintext_export_directory, write_plaintext_export_file,
+};
 use crate::search::{
     Document as SearchDocument, MemorySearchIndex, SearchError, SearchHit, SearchQuery,
 };
@@ -60,6 +64,17 @@ pub const MAX_EDRY_ENVELOPE_BYTES: usize =
 
 /// Largest complete opaque-asset EDRY envelope accepted from disk.
 pub const MAX_ASSET_EDRY_ENVELOPE_BYTES: usize = format::MAX_ASSET_ENVELOPE_BYTES;
+
+fn export_relative_path(logical_path: &str) -> Result<PathBuf, VaultError> {
+    let mut relative = PathBuf::new();
+    for component in logical_path.split('/') {
+        if component.is_empty() || component == "." || component == ".." {
+            return Err(VaultError::PlaintextExportStaging);
+        }
+        relative.push(component);
+    }
+    Ok(relative)
+}
 
 /// A repository I/O operation exposed without filesystem paths or OS text.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -120,6 +135,11 @@ pub enum VaultError {
         /// Stable standard-library error classification.
         kind: io::ErrorKind,
     },
+    /// Writing user-authorized plaintext to the already prepared export
+    /// staging root failed. Physical paths and OS text are deliberately
+    /// omitted because the caller may display this error.
+    #[error("plaintext export staging write failed")]
+    PlaintextExportStaging,
     /// The vault root or a traversed entry was a link/reparse point or had an
     /// unexpected filesystem type.
     #[error("vault storage contains an unsafe filesystem entry")]
@@ -904,6 +924,101 @@ impl Vault {
     pub fn list(&mut self) -> Result<VaultTree, VaultError> {
         let _guard = self.acquire_mutation_guard()?;
         self.scan_tree()
+    }
+
+    /// Populate a caller-prepared plaintext export staging root from the
+    /// complete authenticated vault tree.
+    ///
+    /// This is deliberately not a generic filesystem export API. Callers
+    /// must first create [`PlaintextExportStaging`](crate::plaintext_export::PlaintextExportStaging),
+    /// obtain explicit user confirmation, then pass its private staging root
+    /// here. The returned manifest must be audited by that staging transaction
+    /// before publication. No logical paths or plaintext are included in the
+    /// result or its errors.
+    ///
+    /// `Outer` writes ordinary Markdown unchanged and renders Umbra documents
+    /// through their public Outer projection. `Umbra` requires a currently
+    /// live `K_umbra` session before any file is written, then renders each
+    /// Umbra document with its private slots restored.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError::UmbraLocked`] before staging is populated for an
+    /// Umbra export without a live session, or an authenticated vault/export
+    /// staging error. It never creates plaintext inside the vault itself.
+    pub fn populate_plaintext_export_staging(
+        &mut self,
+        scope: PlaintextExportScope,
+        staging: &Path,
+        manifest: &mut PlaintextExportManifest,
+    ) -> Result<PlaintextExportSummary, VaultError> {
+        if matches!(scope, PlaintextExportScope::Umbra) && self.umbra.is_none() {
+            return Err(VaultError::UmbraLocked);
+        }
+        let tree = self.list()?;
+        let mut summary = PlaintextExportSummary::default();
+        for entry in tree.entries() {
+            let relative = export_relative_path(entry.logical_path())?;
+            match entry.kind() {
+                TreeEntryKind::Directory => {
+                    create_plaintext_export_directory(staging, &relative, manifest)
+                        .map_err(|_| VaultError::PlaintextExportStaging)?;
+                    summary.directories += 1;
+                }
+                TreeEntryKind::File => {
+                    let logical = LogicalPath::parse_canonical(entry.logical_path())?;
+                    match self.read(&logical) {
+                        Ok(document) => write_plaintext_export_file(
+                            staging,
+                            &relative,
+                            document.plaintext.as_slice(),
+                            manifest,
+                        )
+                        .map_err(|_| VaultError::PlaintextExportStaging)?,
+                        Err(VaultError::Crypto(CryptoError::DocumentContextMismatch)) => {
+                            match scope {
+                                PlaintextExportScope::Outer => {
+                                    let projection =
+                                        self.render_umbra_outer_projection(&logical)?;
+                                    write_plaintext_export_file(
+                                        staging,
+                                        &relative,
+                                        projection.as_bytes(),
+                                        manifest,
+                                    )
+                                    .map_err(|_| VaultError::PlaintextExportStaging)?;
+                                }
+                                PlaintextExportScope::Umbra => {
+                                    let projection = self.render_umbra_projection(&logical)?;
+                                    write_plaintext_export_file(
+                                        staging,
+                                        &relative,
+                                        projection.markdown.as_bytes(),
+                                        manifest,
+                                    )
+                                    .map_err(|_| VaultError::PlaintextExportStaging)?;
+                                }
+                            }
+                        }
+                        Err(error) => return Err(error),
+                    }
+                    summary.markdown_documents += 1;
+                }
+                TreeEntryKind::Asset => {
+                    let logical = AssetPath::parse_canonical(entry.logical_path())?;
+                    let asset = self.read_asset(&logical)?;
+                    write_plaintext_export_file(
+                        staging,
+                        &relative,
+                        asset.plaintext.as_slice(),
+                        manifest,
+                    )
+                    .map_err(|_| VaultError::PlaintextExportStaging)?;
+                    summary.assets += 1;
+                }
+            }
+        }
+        Ok(summary)
     }
 
     /// Read and authenticate one committed encrypted Markdown document.
@@ -3497,6 +3612,146 @@ mod tests {
             .read_umbra_outer_document(&path)
             .expect("reopen feature two container");
         assert_eq!(reopened, updated);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // exercises the complete Outer/Umbra export state transition
+    fn plaintext_export_populates_outer_and_umbra_projections_without_vault_writes() {
+        let root = TestDirectory::new();
+        fs::create_dir(root.path()).expect("test root");
+        let vault_root = root.path().join("vault");
+        let exports = root.path().join("exports");
+        fs::create_dir(&exports).expect("exports root");
+        let mut vault = Vault::create_with_params(
+            &vault_root,
+            b"outer password",
+            1_783_699_200_000,
+            test_params(),
+            test_policy(),
+        )
+        .expect("create vault");
+        vault
+            .create_document(&logical("public.md"), b"# public\n", 1_783_699_201_000)
+            .expect("create public document");
+        vault
+            .create_directory(&LogicalDir::parse_canonical("empty").expect("empty directory"))
+            .expect("create empty directory");
+        vault
+            .initialize_umbra(b"umbra password")
+            .expect("initialize Umbra");
+        vault
+            .enable_umbra_private_annotations(test_policy())
+            .expect("enable Umbra");
+        let created_umbra = vault
+            .create_umbra_outer_document(
+                &logical("outer.md"),
+                &UmbraDocumentV1::new("# outer public\nPRIVATE_EXPORT_CANARY\n".to_owned()),
+                1_783_699_202_000,
+            )
+            .expect("create Umbra outer document");
+        let before = vault
+            .render_umbra_projection(&logical("outer.md"))
+            .expect("render Umbra document");
+        let private_start = before
+            .markdown
+            .find("PRIVATE_EXPORT_CANARY")
+            .expect("private selection");
+        vault
+            .apply_private_annotation(
+                &logical("outer.md"),
+                &created_umbra.etag,
+                &before.markdown,
+                &before.render_map,
+                &[
+                    TextRange::new(private_start, private_start + "PRIVATE_EXPORT_CANARY".len())
+                        .expect("private range"),
+                ],
+                &PrivateAnnotationSpec {
+                    kind: crate::umbra_config::PrivateAnnotationKind::Comment,
+                    tag_ids: vec!["canary-tag".to_owned()],
+                    outer: OuterSlotStrategy {
+                        mode: crate::umbra_config::OuterMode::Drop,
+                        cover_text: None,
+                    },
+                },
+                false,
+                1_783_699_203_000,
+            )
+            .expect("annotate private export canary");
+        vault.lock_umbra();
+
+        let outer_staging = crate::plaintext_export::PlaintextExportStaging::prepare(
+            vault.root(),
+            &exports.join("outer-copy"),
+        )
+        .expect("prepare Outer export");
+        let mut outer_manifest = PlaintextExportManifest::default();
+        let outer_summary = vault
+            .populate_plaintext_export_staging(
+                PlaintextExportScope::Outer,
+                outer_staging.staging(),
+                &mut outer_manifest,
+            )
+            .expect("populate Outer export");
+        assert_eq!(outer_summary.markdown_documents, 2);
+        assert_eq!(outer_summary.directories, 1);
+        outer_manifest
+            .audit(outer_staging.staging())
+            .expect("audit Outer export");
+        let outer_markdown = String::from_utf8(
+            fs::read(outer_staging.staging().join("outer.md")).expect("read Outer document"),
+        )
+        .expect("UTF-8 Outer export");
+        assert!(outer_markdown.starts_with("# outer public\n"));
+        assert!(!outer_markdown.contains("PRIVATE_EXPORT_CANARY"));
+
+        let locked_staging = crate::plaintext_export::PlaintextExportStaging::prepare(
+            vault.root(),
+            &exports.join("umbra-locked-copy"),
+        )
+        .expect("prepare locked Umbra export");
+        let mut locked_manifest = PlaintextExportManifest::default();
+        assert!(matches!(
+            vault.populate_plaintext_export_staging(
+                PlaintextExportScope::Umbra,
+                locked_staging.staging(),
+                &mut locked_manifest,
+            ),
+            Err(VaultError::UmbraLocked)
+        ));
+        assert!(locked_manifest.entries().is_empty());
+        assert!(
+            fs::read_dir(locked_staging.staging())
+                .expect("locked staging read")
+                .next()
+                .is_none()
+        );
+
+        vault.unlock_umbra(b"umbra password").expect("unlock Umbra");
+        let umbra_staging = crate::plaintext_export::PlaintextExportStaging::prepare(
+            vault.root(),
+            &exports.join("umbra-copy"),
+        )
+        .expect("prepare Umbra export");
+        let mut umbra_manifest = PlaintextExportManifest::default();
+        let summary = vault
+            .populate_plaintext_export_staging(
+                PlaintextExportScope::Umbra,
+                umbra_staging.staging(),
+                &mut umbra_manifest,
+            )
+            .expect("populate Umbra export");
+        assert_eq!(summary.markdown_documents, 2);
+        umbra_manifest
+            .audit(umbra_staging.staging())
+            .expect("audit Umbra export");
+        assert!(
+            String::from_utf8(
+                fs::read(umbra_staging.staging().join("outer.md")).expect("read Umbra document")
+            )
+            .expect("UTF-8 Umbra export")
+            .contains("PRIVATE_EXPORT_CANARY")
+        );
     }
 
     #[test]
