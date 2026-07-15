@@ -1319,6 +1319,11 @@
 - daemon 的 vault-outside/absent-destination 校验仍是权威安全边界；本次修复仅补足 editor UX 所声明的“在选择的 parent 下创建新目录”语义。
 - 验证：`pnpm --dir editors/vscode check`、62/62 Node tests、真实 `pnpm --dir editors/vscode test:extension:local` 通过。
 
+## 2026-07-16 — Updated VS Code plaintext-export package
+
+- 从独立、clean、canonical-origin checkout 的 `db35a8b4de9493ab18b182615fe51dcee4dd7fc4` 以 system GCC 重新构建 Linux x64 release set；`package_release.py`、严格 artifact audit 和隔离 VS Code install smoke 均通过。
+- 最新可安装 VSIX：`target/release-artifacts/db35a8b-linux-x64/inex-vscode-0.1.0-linux-x64.vsix`，SHA-256 为 `f92a0fc18b5a9cbabf56c41129f48f7dfd1fc15e3450f0ff63c3b99ce4674ded`。该包包含 destination containment 修复，替代此前的 `ff0bd23` 包；未自动安装到用户 profile。
+
 ## 2026-07-16 — Outer-only Umbra export projection
 
 - `umbra_render::render_outer_projection` 现在只根据已认证的公开 Outer slot 策略替换 marker：Drop 输出空内容、Cover 输出明确公开的 cover text、Placeholder 输出固定无标识文本。它严格验证 marker/slot 一一对应和 Cover/Placeholder metadata，永不读取 private payload、kind、tag、slot ID 或 `K_umbra`。
