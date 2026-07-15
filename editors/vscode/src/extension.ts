@@ -472,7 +472,7 @@ export function activate(
         const preferences = privateAnnotationPreferences();
         if (editor.activeSelectionIsCompletePrivateBlock()) {
           if (await confirmPrivateAnnotationRemoval(preferences)) {
-            await editor.removePrivateAnnotationFromActive();
+            await editor.removePrivateAnnotationFromActive(preferences.mergeAdjacentSelections);
           }
           return;
         }
@@ -499,7 +499,9 @@ export function activate(
     vscode.commands.registerCommand("inex.removePrivateAnnotation", async () => {
       await runUiAction(async () => {
         if (!(await confirmPrivateAnnotationRemoval(privateAnnotationPreferences()))) return;
-        await editor.removePrivateAnnotationFromActive();
+        await editor.removePrivateAnnotationFromActive(
+          privateAnnotationPreferences().mergeAdjacentSelections,
+        );
       });
     }),
     vscode.commands.registerCommand("inex.editPrivateAnnotation", async () => {
@@ -936,7 +938,11 @@ async function applyChosenPrivateAnnotation(
     throw new Error("Inex vault session changed during private annotation selection");
   }
   if (initialSpec === undefined) {
-    await editor.applyPrivateAnnotationToActive(spec, preferences.noSelectionTarget);
+    await editor.applyPrivateAnnotationToActive(
+      spec,
+      preferences.noSelectionTarget,
+      preferences.mergeAdjacentSelections,
+    );
   } else {
     await editor.editPrivateAnnotationAtActive(spec);
   }
@@ -1301,6 +1307,7 @@ function privateAnnotationPreferences(): PrivateAnnotationPreferences {
     confirmBeforeUnwrap: configuration.get<unknown>("confirmBeforeUnwrap"),
     toggleBehavior: configuration.get<unknown>("toggleBehavior"),
     rememberLastSelection: configuration.get<unknown>("rememberLastSelection"),
+    mergeAdjacentSelections: configuration.get<unknown>("mergeAdjacentSelections"),
   });
 }
 

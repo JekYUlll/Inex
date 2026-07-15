@@ -733,3 +733,8 @@
 
 - A Source Control context menu can improve the ciphertext-diff workflow without taking ownership of native SCM: accept only the Extension Host's `vscode.Uri` (or its `resourceUri` wrapper), rebind it through the current controller's root/canonical-path validator, and invoke the pre-existing daemon-owned fixed historical comparison.
 - Resource selection must not be mistaken for a request to compare the mutable worktree. Keeping the closed HEAD/parent pair preserves the no-plaintext-Git and no-unsaved-snapshot boundary while giving users a direct secure history view beside their changed ciphertext file.
+
+## 2026-07-16 Adjacent annotation selection boundary
+
+- The core/daemon already own the only authoritative range normalization and accept `mergeAdjacent` as an authenticated operation parameter. The VS Code setting must therefore be a boolean interaction preference only: forward it to apply/remove (and never place selected ranges, tags, or profile data in settings) rather than reimplementing mutation normalization in the webview.
+- Defaulting it to `false` retains the frozen semantics that adjacent selections remain distinct. Opting in only changes whether touching ranges coalesce after daemon RenderMap validation, so overlapping, partial-private, stale-map, and atomic rollback checks remain in the common core path.

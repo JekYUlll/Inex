@@ -116,13 +116,15 @@ keybindings file:
 }
 ```
 
-The MVP supports one textarea selection. `inex.privateAnnotation.noSelectionTarget`
-is a window-local setting with `paragraph` (default), `line`, and `reject`;
-the first two resolve an empty selection without retaining content in settings.
-`inex.privateAnnotation.confirmBeforeUnwrap` defaults to `true` and governs
-both toggle unwrap and explicit removal. Multi-cursor adapters, heading-section
-expansion, cursor-inside metadata edit, shortcut `toggleBehavior`, and tag/profile
-management commands remain pending. `Inex: View Outer Projection` can open from
+The MVP supports the primary textarea selection plus up to 63 explicitly added
+ranges; all are sent as one authenticated atomic transaction. `inex.privateAnnotation.noSelectionTarget`
+is a window-local setting with `paragraph` (default), `line`, `headingSection`,
+and `reject`; the non-reject modes resolve an empty selection without retaining
+content in settings. `inex.privateAnnotation.confirmBeforeUnwrap` defaults to
+`true` and governs both toggle unwrap and explicit removal. `toggleBehavior`,
+cursor-inside metadata editing, and the adjacent-range policy are applied before
+the daemon mutation; `mergeAdjacentSelections` defaults to `false` and is passed
+as the authenticated `mergeAdjacent` operation parameter. `Inex: View Outer Projection` can open from
 an encrypted Markdown item's Inex Tree context menu (using only the unlocked
 Outer session), or from a clean active Umbra projection. It shows a
 script-free, read-only public rendering using only the Outer session; it
@@ -134,8 +136,9 @@ paths are implemented.
 `Inex: Manage Private Tags` uses the same Umbra unlock session as annotation
 commands. It supports create, rename, archive, and `Inex: Reorder Private Tags`
 can move a selected tag to the first/previous/next/last position. Each mutation
-reloads the encrypted catalog from the daemon. Profile management remains
-pending rather than being represented by editor-local files.
+reloads the encrypted catalog from the daemon. `Inex: Manage Private Annotation
+Profiles` creates, edits, removes, and sets/clears the encrypted default profile;
+it never represents profile data in editor-local files.
 
 `Inex: Edit Private Annotation` requires the cursor or a non-complete selection
 inside exactly one private block. It preselects the block's current kind, tags,

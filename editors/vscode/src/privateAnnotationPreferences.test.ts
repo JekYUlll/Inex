@@ -12,6 +12,7 @@ test("private annotation preferences accept only editor-local supported values",
     confirmBeforeUnwrap: true,
     toggleBehavior: "alwaysAsk",
     rememberLastSelection: true,
+    mergeAdjacentSelections: false,
   });
   assert.deepEqual(
     parsePrivateAnnotationPreferences({
@@ -19,12 +20,14 @@ test("private annotation preferences accept only editor-local supported values",
       confirmBeforeUnwrap: false,
       toggleBehavior: "useDefaultProfile",
       rememberLastSelection: false,
+      mergeAdjacentSelections: true,
     }),
     {
       noSelectionTarget: "headingSection",
       confirmBeforeUnwrap: false,
       toggleBehavior: "useDefaultProfile",
       rememberLastSelection: false,
+      mergeAdjacentSelections: true,
     },
   );
   assert.deepEqual(
@@ -39,6 +42,7 @@ test("private annotation preferences accept only editor-local supported values",
       confirmBeforeUnwrap: true,
       toggleBehavior: "alwaysAsk",
       rememberLastSelection: true,
+      mergeAdjacentSelections: false,
     },
   );
 });

@@ -362,6 +362,12 @@
           "default": true,
           "scope": "window",
           "description": "Retain the last private annotation choice only in the unlocked editor session."
+        },
+        "inex.privateAnnotation.mergeAdjacentSelections": {
+          "type": "boolean",
+          "default": false,
+          "scope": "window",
+          "description": "Merge directly adjacent private-annotation selections before the authenticated mutation."
         }
       }
     }

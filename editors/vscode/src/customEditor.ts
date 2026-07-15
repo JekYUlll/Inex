@@ -1101,6 +1101,7 @@ export class InexCustomEditorProvider
   public async applyPrivateAnnotationToActive(
     spec: PrivateAnnotationSpec,
     noSelectionTarget: NoSelectionTarget,
+    mergeAdjacent = false,
   ): Promise<void> {
     const document = this.activeDocument;
     if (
@@ -1138,6 +1139,7 @@ export class InexCustomEditorProvider
         { content: snapshot.content, etag: document.etag, metadata: document.metadata, renderMap },
         resolvedSelections as readonly TextRange[],
         spec,
+        mergeAdjacent,
       );
       this.requireCurrentDocumentSession(document);
       document.replaceFromUmbraProjection(applied, applied.metadata);
@@ -1147,7 +1149,7 @@ export class InexCustomEditorProvider
     }
   }
 
-  public async removePrivateAnnotationFromActive(): Promise<void> {
+  public async removePrivateAnnotationFromActive(mergeAdjacent = false): Promise<void> {
     const document = this.activeDocument;
     if (
       document === undefined ||
@@ -1169,6 +1171,7 @@ export class InexCustomEditorProvider
         document.logicalPath,
         { content: snapshot.content, etag: document.etag, metadata: document.metadata, renderMap },
         selections,
+        mergeAdjacent,
       );
       this.requireCurrentDocumentSession(document);
       document.replaceFromUmbraProjection(applied, applied.metadata);

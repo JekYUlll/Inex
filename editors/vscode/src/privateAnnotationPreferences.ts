@@ -6,6 +6,8 @@ export interface PrivateAnnotationPreferences {
   readonly confirmBeforeUnwrap: boolean;
   readonly toggleBehavior: ToggleBehavior;
   readonly rememberLastSelection: boolean;
+  /** Merge directly adjacent editor ranges before the authenticated mutation. */
+  readonly mergeAdjacentSelections: boolean;
 }
 
 export type ToggleAnnotationAction = "ask" | "last" | "defaultProfile";
@@ -15,6 +17,7 @@ const DEFAULT_PREFERENCES: PrivateAnnotationPreferences = Object.freeze({
   confirmBeforeUnwrap: true,
   toggleBehavior: "alwaysAsk",
   rememberLastSelection: true,
+  mergeAdjacentSelections: false,
 });
 
 /** Parses only editor-local interaction flags; private labels and tags never belong here. */
@@ -40,6 +43,10 @@ export function parsePrivateAnnotationPreferences(
       typeof values.rememberLastSelection === "boolean"
         ? values.rememberLastSelection
         : DEFAULT_PREFERENCES.rememberLastSelection,
+    mergeAdjacentSelections:
+      typeof values.mergeAdjacentSelections === "boolean"
+        ? values.mergeAdjacentSelections
+        : DEFAULT_PREFERENCES.mergeAdjacentSelections,
   };
 }
 

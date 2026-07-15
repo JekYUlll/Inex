@@ -1634,3 +1634,8 @@
 
 - clean standalone source `b68d745` 的 Linux x64 package 和 release-set audit 已完成，产物已覆盖安装：[inex-vscode-0.1.0-linux-x64.vsix](/home/horeb/_code/Inex/target/release-artifacts/b68d745-linux-x64/inex-vscode-0.1.0-linux-x64.vsix)。SHA-256：`f992a68c9edf0ae7265d3e8e31968dde0b71d76dcf994cca2c3f5bb18e01c86f`。
 - `code --install-extension --force` 成功；唯一诊断为宿主 Node 的 `DEP0169` warning。需 reload 运行中的 VS Code 窗口后，在 Source Control 中右键一个变更的 `*.md.enc` 测试入口。
+
+## 2026-07-16 — VS Code adjacent private-selection policy
+
+- 新增 window-local `inex.privateAnnotation.mergeAdjacentSelections`，默认 `false`。它不保存任何标签、profile 或内容；只决定 toggle/explicit remove/chosen/profile-apply 所走的 authenticated annotation RPC 是否带 `mergeAdjacent: true`。
+- 因而默认的相邻多范围仍产生独立 private slots；用户显式启用后才由 daemon 在 RenderMap 验证后合并相邻范围。`pnpm --dir editors/vscode check`、73/73 unit 与 `test:extension:local` 均成功；后者完成 build、integration build 和 Rust CLI/daemon preparation 并以零退出返回。
