@@ -59,8 +59,11 @@ Commands currently available:
   equivalent explicit default-spec test surface. `:InexChoosePrivateAnnotationProfile
   startByte endByte` displays profiles only from the live encrypted Umbra
   catalog; `:InexApplyPrivateAnnotationProfile startByte endByte profileId`
-  permits normal user mappings. Profile data is transient and is not cached in
-  Neovim settings or module state.
+  permits normal user mappings. `:InexChoosePrivateAnnotation startByte endByte`
+  provides the stateful kind/tag/Outer picker: kind and Outer are exclusive,
+  active tags can be toggled independently, and only `Apply` sends the final
+  canonical spec to the daemon. Profile and picker data is transient and is
+  not cached in Neovim settings or module state.
 - `:InexStop` terminates the local RPC process and drops pending callbacks.
 
 `InexOpen`, `InexNew`, and `InexMkdir` take Inex logical paths (for example,
@@ -71,8 +74,10 @@ completion.
 
 The current MVP renders feature-2/Umbra documents only through an authenticated
 daemon projection and validates the accompanying RenderMap before display. It
-does not yet edit/save Umbra projections or expose annotation/tag/profile UI;
-those remain behind the CLI/VS Code milestones. Neovim's
+does not edit/save arbitrary Umbra Markdown; private annotation mutations and
+the transient picker surfaces above remain authenticated daemon operations.
+Tag/profile management UI and the explicit Neovim host-residue gate remain
+behind the CLI/VS Code milestones. Neovim's
 cmdline, undo, shada, LSP, plugins, terminal, and OS memory remain separate
 residue boundaries; do not enable other plugins on an Inex buffer until the
 explicit Neovim host-residue gate is implemented. Do not point the plugin at a
