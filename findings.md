@@ -684,3 +684,7 @@
 
 - The standard imported-vault fixture has one parentless commit, so a production compare command cannot be exercised there. A second `--allow-empty` ciphertext-repository commit is sufficient for the command path because it creates an exact HEAD/parent pair while retaining every encrypted blob and avoiding a plaintext mutation in the runner.
 - A command trace alone does not prove the editor boundary. The Extension Host regression consequently retains the custom-tab `assertNoPlaintextTextDocument` check before and after the command, while the existing full isolated-root residue scan remains the persistence evidence.
+
+## 2026-07-16 Extension Host Umbra compare wiring
+
+- The host fixture may commit only the already encrypted feature-2 `plain.md.enc` output of the annotation lifecycle; committing or constructing a private plaintext body in the JavaScript runner would weaken the exact boundary being tested. The command trace then proves the UI reaches the independent Umbra RPC without exposing response content to the test harness.

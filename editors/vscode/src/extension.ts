@@ -54,6 +54,7 @@ export interface InexIntegrationTestApi {
   readonly verifyUmbraPasswordChange: (oldPassword: string, newPassword: string) => Promise<void>;
   readonly verifyUmbraLock: (password: string) => Promise<void>;
   readonly verifyOuterRevisionCompare: () => Promise<void>;
+  readonly verifyUmbraRevisionCompare: () => Promise<void>;
   readonly lock: () => Promise<void>;
 }
 
@@ -608,6 +609,9 @@ export function activate(
     },
     verifyOuterRevisionCompare: async () => {
       await vscode.commands.executeCommand("inex.compareOuterRevision");
+    },
+    verifyUmbraRevisionCompare: async () => {
+      await vscode.commands.executeCommand("inex.compareUmbraRevision");
     },
     lock: () => controller.lock(),
   });

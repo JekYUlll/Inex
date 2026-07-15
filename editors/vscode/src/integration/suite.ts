@@ -48,6 +48,7 @@ interface InexIntegrationTestApi {
   readonly verifyUmbraPasswordChange: (oldPassword: string, newPassword: string) => Promise<void>;
   readonly verifyUmbraLock: (password: string) => Promise<void>;
   readonly verifyOuterRevisionCompare: () => Promise<void>;
+  readonly verifyUmbraRevisionCompare: () => Promise<void>;
   readonly lock: () => Promise<void>;
 }
 
@@ -120,6 +121,20 @@ async function runBackupRecoveryCycle(
   await api.unlock(fixture.vaultPath, fixture.password, fixture.sidecarPath);
   await api.openDocument(SECONDARY_LOGICAL_PATH);
   await api.verifyUmbraAnnotationLifecycle(SECONDARY_LOGICAL_PATH, fixture.password);
+  await execFileAsync("git", ["-C", fixture.vaultPath, "add", "plain.md.enc"]);
+  await execFileAsync("git", [
+    "-C", fixture.vaultPath,
+    "-c", "user.email=inex-vscode-integration@example.invalid",
+    "-c", "user.name=Inex VS Code Integration",
+    "-c", "commit.gpgSign=false",
+    "commit", "-q", "-m", "encrypted Umbra revision compare fixture",
+  ]);
+  await api.verifyUmbraRevisionCompare();
+  await waitForSidecarTrace(
+    fixture,
+    (entries) => entries.some((entry) => entry.method === "revision.compare.umbra"),
+    "VS Code Umbra revision compare did not reach the authenticated sidecar",
+  );
   await runUmbraPlaintextExportCycle(api, fixture);
   const replacementUmbraPassword = "Inex integration replacement Umbra password";
   await api.verifyUmbraPasswordChange(fixture.password, replacementUmbraPassword);
@@ -662,6 +677,7 @@ function assertIntegrationApi(value: unknown): asserts value is InexIntegrationT
     "verifyUmbraAnnotationLifecycle",
     "verifyUmbraLock",
     "verifyOuterRevisionCompare",
+    "verifyUmbraRevisionCompare",
     "lock",
   ]) {
     assert.equal(typeof candidate[method], "function", `Integration-test API lacks ${method}`);

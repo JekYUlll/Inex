@@ -1517,6 +1517,11 @@
 - 隔离 integration runner 在已发布的 ciphertext vault 上创建一个 `--allow-empty` second commit：它不复制、读取或修改 Markdown/plaintext/ciphertext blob，只让 fixed HEAD/parent compare 有合法历史对。Extension API 通过 production `inex.compareOuterRevision` command 驱动 compare，而不是直接调用 sidecar helper。
 - Suite 等待 sidecar trace 中的 `revision.compare.outer`，并在 command 前后重复 `assertNoPlaintextTextDocument`；其既有 profile-wide residue scan 继续覆盖该过程。VS Code typecheck、69/69 Node tests 与真实 local Extension Host 通过。Umbra-command-specific Host fixture 仍待，不由此覆盖。
 
+## 2026-07-16 — Extension Host Umbra compare regression
+
+- 在同一 isolated ciphertext vault 的既有 annotation lifecycle 后，suite 仅用 Git 提交 `plain.md.enc` 的 feature-2 ciphertext，再通过 integration API 执行 production `inex.compareUmbraRevision`。它等待 strict sidecar trace 中的 `revision.compare.umbra`，不直接读取私密 projection 或向 runner 注入私密 Markdown。
+- VS Code typecheck 与真实 local Extension Host 命令退出成功。该 Host path 证明 production command→sidecar wiring 和 isolated-residue lifecycle；真实 private body/tag 的 Outer/Umbra 分离仍由 daemon historical canary fixture 证明，不能混淆两类证据。
+
 ## 2026-07-16 — Real daemon historical compare fixture
 
 - daemon handler 现有真实 Git fixture：先创建加密 parent Markdown、`git init/add/commit`，再通过 vault CAS 保存新密文并建立 head commit，最后用 production `vault.unlock` RPC 与 `revision.compare.outer` RPC 验证 head/parent 两个 Base64URL projection。这证明 RPC 走的是受限 Git blob reader 而非工作区 plaintext 或伪造 response。
