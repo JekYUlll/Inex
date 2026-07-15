@@ -1600,3 +1600,7 @@
 
 - 新增 daemon `umbra.document.openOuter`，它只接受 authenticated session/logical path，调用专用 `render_umbra_outer_projection` 与 feature-2 authenticated metadata reader；响应 exact shape 为 public `contentBase64`、etag、metadata，不能携带 RenderMap、slot ID、tag/kind/timestamp 或任何 `K_umbra` 数据。普通 `document.open` 对 feature-2 的 fail-closed 语义不变。
 - VS Code 新增 `Inex: View Outer Projection`，仅 active clean Umbra CustomEditor 可调用。投影只进入 `enableScripts:false`/no-resource 的 read-only panel，并加入同一 lock/dispose owned-buffer wipe set；不创建 plaintext TextDocument，不使用 native diff，且不可编辑保存。验证：daemon 75/75、VS Code typecheck、73/73 unit 与 local Extension Host trace `umbra.document.openOuter` 均通过。
+
+## 2026-07-16 — Installed Outer Projection bundle
+
+- clean standalone source `cccb244` 使用 system GCC release binaries 完成 Linux x64 package/audit，VSIX 已覆盖安装：[inex-vscode-0.1.0-linux-x64.vsix](/home/horeb/_code/Inex/target/release-artifacts/cccb244-linux-x64/inex-vscode-0.1.0-linux-x64.vsix)。SHA-256：`2fdfa54e381e15d71b8fd5656744c6f9fd0d114df366cc0dba8ae06e098942cf`。VS Code CLI 的 `DEP0169` 为宿主 Node warning，安装成功。
