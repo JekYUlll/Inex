@@ -1950,6 +1950,7 @@ fn map_config_error(error: &ConfigError, context: ErrorContext) -> ErrorCode {
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2056,6 +2057,100 @@ mod tests {
         );
         assert_eq!(result["result"]["protocolMajor"], 1);
         scrub_object(&mut result);
+    }
+
+    fn git(root: &Path, arguments: &[&str]) {
+        let status = Command::new("git")
+            .current_dir(root)
+            .args(arguments)
+            .status()
+            .unwrap_or_else(|error| panic!("Git fixture spawn failed: {error}"));
+        assert!(
+            status.success(),
+            "Git fixture command failed: {arguments:?}"
+        );
+    }
+
+    #[test]
+    fn revision_compare_outer_authenticates_two_real_git_revisions() {
+        let directory = TestDirectory::new();
+        let password = b"revision compare handler password";
+        let path = LogicalPath::parse_canonical("entry.md").expect("path is canonical");
+        let mut vault = Vault::create_with_params(
+            directory.path(),
+            password,
+            1_783_699_200_000,
+            Argon2idParams {
+                ops_limit: 1,
+                mem_limit_bytes: 8 * 1024,
+            },
+            test_policy(),
+        )
+        .expect("fixture vault creates");
+        let created = vault
+            .create_document(&path, b"REVISION_PARENT_CANARY\n", 1_783_699_201_000)
+            .expect("parent document creates");
+        drop(vault);
+        git(directory.path(), &["init", "-q"]);
+        git(
+            directory.path(),
+            &["config", "user.email", "inex@example.invalid"],
+        );
+        git(directory.path(), &["config", "user.name", "Inex"]);
+        git(directory.path(), &["add", "--all"]);
+        git(directory.path(), &["commit", "-q", "-m", "parent"]);
+        let mut vault = Vault::unlock(directory.path(), password, None, test_policy())
+            .expect("fixture vault unlocks");
+        vault
+            .save_document(
+                &path,
+                b"REVISION_HEAD_CANARY\n",
+                &created.etag,
+                1_783_699_202_000,
+            )
+            .expect("head document saves");
+        drop(vault);
+        git(directory.path(), &["add", "entry.md.enc"]);
+        git(directory.path(), &["commit", "-q", "-m", "head"]);
+
+        let mut service = RpcService::with_clock_and_policy(SystemClock::new(), test_policy());
+        hello(&mut service);
+        let mut unlocked = response(
+            &mut service,
+            2,
+            "vault.unlock",
+            json!({"vaultPath": directory.path().to_string_lossy(), "password": String::from_utf8_lossy(password)}),
+        );
+        let session = unlocked["result"]["session"]
+            .as_str()
+            .expect("unlock session")
+            .to_owned();
+        scrub_object(&mut unlocked);
+        let mut compared = response(
+            &mut service,
+            3,
+            "revision.compare.outer",
+            json!({"session": session, "logicalPath": "entry.md"}),
+        );
+        assert_eq!(compared["result"]["leftRole"], "head");
+        assert_eq!(compared["result"]["rightRole"], "headParent");
+        let head = URL_SAFE_NO_PAD
+            .decode(
+                compared["result"]["leftContentBase64"]
+                    .as_str()
+                    .expect("head bytes"),
+            )
+            .expect("head decode");
+        let parent = URL_SAFE_NO_PAD
+            .decode(
+                compared["result"]["rightContentBase64"]
+                    .as_str()
+                    .expect("parent bytes"),
+            )
+            .expect("parent decode");
+        assert_eq!(head, b"REVISION_HEAD_CANARY\n");
+        assert_eq!(parent, b"REVISION_PARENT_CANARY\n");
+        scrub_object(&mut compared);
     }
 
     #[test]

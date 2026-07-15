@@ -1492,6 +1492,11 @@
 - `Inex: Compare HEAD with Parent (Outer)` 只在 active clean Inex CustomEditor 上运行。sidecar 必须验证四个 exact response fields、fixed `head`/`headParent` roles 和 canonical bounded Base64URL；响应 substitution 失败时两个 decoded buffers 都清零。
 - 成功结果只进入 `enableScripts: false`、无 local resource roots 的 Inex WebviewPanel，不使用 `vscode.diff`、URI、普通 TextDocument 或临时明文文件。vault lock 和 panel dispose 都 zero-fill owned buffers。VS Code typecheck 与 69/69 Node tests 通过；尚待真实 daemon Git fixture 与 Extension Host release evidence。
 
+## 2026-07-16 — Real daemon historical compare fixture
+
+- daemon handler 现有真实 Git fixture：先创建加密 parent Markdown、`git init/add/commit`，再通过 vault CAS 保存新密文并建立 head commit，最后用 production `vault.unlock` RPC 与 `revision.compare.outer` RPC 验证 head/parent 两个 Base64URL projection。这证明 RPC 走的是受限 Git blob reader 而非工作区 plaintext 或伪造 response。
+- 定向 daemon 测试与 daemon `-D warnings` Clippy 通过。feature-2 Outer canary、Extension Host command drive、Umbra compare 仍是独立未完成证据，不能由该 ordinary-document fixture 代替。
+
 ## 2026-07-16 — Outer-only Umbra export projection
 
 - `umbra_render::render_outer_projection` 现在只根据已认证的公开 Outer slot 策略替换 marker：Drop 输出空内容、Cover 输出明确公开的 cover text、Placeholder 输出固定无标识文本。它严格验证 marker/slot 一一对应和 Cover/Placeholder metadata，永不读取 private payload、kind、tag、slot ID 或 `K_umbra`。

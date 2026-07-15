@@ -664,3 +664,8 @@
 
 - A revision-compare API must not expose a `String` revision parameter. Even with shell-free spawning, arbitrary revision expressions expand the Git attack surface and make response provenance difficult to audit. The first bridge therefore exposes only a closed enum for `HEAD` and its first parent.
 - Reading a Git blob is not sufficient: a valid Git object can still be another vault, another epoch, or a ciphertext path substitution. The bridge maps the canonical logical path itself and sends every returned blob through `authenticate_committed_envelope`, which binds those cryptographic contexts without materializing a plaintext file.
+
+## 2026-07-16 Historical compare test evidence
+
+- A parser-only test cannot establish that the compare RPC reads Git history instead of the current worktree. The daemon fixture must produce two independently encrypted commits, unlock a fresh session through the production RPC, and assert the returned roles and decoded bytes against each committed historical body.
+- The test fixture's canaries remain in in-memory Rust assertions and encrypted Git blobs only. They are scrubbed from JSON response objects before test return; no product log or editor persistence claim follows from this daemon-only evidence.
