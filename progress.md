@@ -1411,6 +1411,12 @@
 - 用户指南现给出 `Inex: Export Plaintext Copy…` 的实际流程：vault 外 parent/new child、Outer-only 与 Umbra-inclusive 范围的内容差异、独立 Umbra unlock、modal risk confirmation 及 tag catalog/profile 不随文档导出。
 - 文档明确该能力是授权明文导出而非 preview/recovery，解释 staging→audit→no-replace publish，并提示 pre-confirmation cancellation 不写 plaintext、而包含已授权明文的失败 staging 需按 incident handling 处理。
 
+## 2026-07-16 — Current bundled VSIX real Markdown Git repository gate
+
+- 使用审计通过的 `8dd7d70` VSIX 内置 Linux CLI，对 `/home/horeb/_code/_blog` 的独立 clean `--no-local` clone 运行 `import-repository`。源审计为 324 tree/index/worktree entries、7 directories、307 Markdown（3,549,648 bytes）、17 assets（46,643,446 bytes，最大 25,074,521 bytes）；导入报告 candidate vault audit、candidate Git object audit、source revalidation、单次 atomic publication 与 parentless encrypted root commit 全部通过。
+- 对发布 vault 继续执行 locked `inex verify`、`git fsck --full --strict`、`git status --porcelain=v1 --untracked-files=all`，并以完整有效 UTF-8 source Markdown line 作 fixed-string canary scan；全部通过且临时 source/vault/pkg root 已删除。首次 canary 用 48-byte 前缀截断 UTF-8，`rg` 拒绝该无效 pattern，因此未计为证据；改用完整 line 后重跑完整 gate。
+- 运行中发现 shell tool 的输出窗口可能在长导入仍执行时提前返回；曾出现三个临时 import process groups，均在发现后立即终止并删除对应临时 roots。最终证据只来自一个单独、轮询至 exit 0 的 clean run。
+
 ## 2026-07-16 — Current VS Code Linux x64 installable package
 
 - 从独立 `--no-local` clean checkout、canonical origin `https://github.com/JekYUlll/Inex` 的 `d5f7a394aa97e2e3881216fc0f8b9cb5234fce64`，使用 `/usr/bin/gcc` 构建 CLI/daemon 与 VS Code bundle。ELF interpreter 为系统 `/lib64/ld-linux-x86-64.so.2`，未出现开发机 xlings RPATH/RUNPATH。

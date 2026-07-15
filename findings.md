@@ -599,6 +599,11 @@
 - Static API isolation is supplemented by VM rendering: Markdown containing a literal `<script>` must become escaped display text while heading/list/emphasis/code/link/quote/rule spans still appear. This protects the intentional `innerHTML` display sink from becoming an injection path.
 - This improves highlighting but is intentionally not a Markdown language-server integration. LSP completion/diagnostics would require an explicit separate in-memory editor architecture and its own residue/lifecycle security proof.
 
+## 2026-07-16 Real repository bundled-CLI import gate
+
+- A real repository import must run as one observable process: the 324-entry, 46 MiB `_blog` clone spends over two minutes in KDF/encryption/object audit after printing its public source plan. Tool output windows can return before that child exits; launching another import would create concurrent plaintext clones. Use one detached tracked process, poll its PID/output, and explicitly clean its one temporary root after verification.
+- A byte-count prefix is not necessarily valid UTF-8 and is unsuitable as an `rg` fixed-string canary. Use a complete nonempty source Markdown line, validate it with `iconv`, then require an encrypted-vault scan to return no hit. The earlier truncated-pattern scan was rejected by `rg` and was not counted as evidence.
+
 ## 2026-07-16 Plaintext Export v1 boundary
 
 - Plaintext export cannot share the normal CustomEditor or Git/SCM code path: a successful export deliberately creates user-visible plaintext on disk, whereas the editor pipeline must remain ciphertext-only on disk. The safe common boundary is therefore a daemon-owned, session-bound two-step transaction with a capability that is invalidated by Outer/Umbra lock rather than an editor-local confirmation boolean.

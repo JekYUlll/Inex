@@ -353,6 +353,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
 - [x] 从 standalone clean `7fb83ec` 以Node 26.3.1、Rust 1.97.0、`/usr/bin/gcc` 13.3.0重建含repository-import与双binary VSIX的Linux x64 engineering demo；strict三包audit、shared CLI/sidecar、native dependency、SHA256SUMS与VS Code 1.128.0隔离安装/打包CLI+daemon smoke通过。该单次构建不替代Node 22 A/B reproducibility、真实打包VSIX UI/persistent-profile lifecycle、签名或发布批准
 - [x] 对当前修复 checkpoint 的候选 CLI，使用独立的真实规模 Markdown Git 仓库副本完成 `import-repository` 全流程（含隐藏已跟踪文件、307 Markdown、17 附件与 25 MiB 图片），并验证发布、锁定结构、fresh unlock 与无明文残留；每个后续 VSIX 仍必须重跑该门禁，fixture、dry-run 或只验证 bundled binary 不得替代
   - [x] 以 standalone `ff41eb3` Linux x64 VSIX 的实际 bundled CLI 重跑同一 324-entry 仓库门禁；strict package/audit 与 isolated install smoke 一并通过
+  - [x] 以 standalone `8dd7d70` Linux x64 VSIX 的实际 bundled CLI 再次导入同一 clean 324-entry `_blog` clone：307 Markdown、17 资产、46 MiB 附件，candidate vault/Git audit、atomic publication、locked verify、`git fsck --full --strict`、clean worktree 与完整 UTF-8 source canary 无命中均通过；所有临时 source/vault 已清理（本轮）
 - **Status:** in_progress
 
 ## Key Questions
