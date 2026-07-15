@@ -1422,6 +1422,11 @@
 - VS Code extension version 保持 `0.1.0`，因此 `code --list-extensions` 不能区分旧/new bundle。直接比较 `/home/horeb/.vscode/extensions/horeb.inex-vscode-0.1.0/dist/extension.js` 与 `8dd7d70` VSIX 的 `extension/dist/extension.js`，两者 SHA-256 均为 `9cb3985a40d00f82667f13834ae06b891dcad2d6d1d68d2590c3b6d8e0325338`。
 - 因此本机 profile 确实持有审计通过的 Markdown-presentation bundle；运行中 Extension Host 仍需 Developer: Reload Window 才会替换内存中的旧代码。
 
+## 2026-07-16 — VS Code persistent-profile manual acceptance checklist
+
+- 用户指南新增安装后（同 `0.1.0` version 必须 Reload Window）的最小人工验收：Markdown display layer、重复 Heading reveal、CRLF note 无编辑后的 NUL porcelain Git clean、Umbra lock 对 private/Outer tab 的不同影响，以及 Outer/Umbra plaintext export 的范围与确认。
+- 清单要求保留 ciphertext-only diagnostics、VSIX SHA-256 与 extension-host log，明确禁止把 private Markdown、密码、tag label 或 export plaintext 贴进报告。这将仍需人工的 profile 验收变为可复现、安全可报告的门禁。
+
 ## 2026-07-16 — Current VS Code Linux x64 installable package
 
 - 从独立 `--no-local` clean checkout、canonical origin `https://github.com/JekYUlll/Inex` 的 `d5f7a394aa97e2e3881216fc0f8b9cb5234fce64`，使用 `/usr/bin/gcc` 构建 CLI/daemon 与 VS Code bundle。ELF interpreter 为系统 `/lib64/ld-linux-x86-64.so.2`，未出现开发机 xlings RPATH/RUNPATH。

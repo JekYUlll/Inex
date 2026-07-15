@@ -167,6 +167,38 @@ remain release gates. For an exact packaged VSIX, separately require an
 external record matching its manifest and checksums for install/bundled
 executable smoke; even that does not close those gates.
 
+### Manual VS Code verification checklist
+
+After installing a new VSIX with an unchanged `0.1.0` version number, run
+**Developer: Reload Window** before testing. Use a disposable vault copy for
+the following checks:
+
+1. Unlock the vault, open a Markdown note containing headings, a relative link,
+   a list, emphasis, inline/fenced code, a quote, and a same-vault image. The
+   Inex display layer should present these Markdown constructs while the tab
+   remains an `Inex Markdown` custom editor.
+2. Click **Headings**, choose a later heading, return to **Headings**, and
+   choose a different heading. Both reveals must move the selection and scroll
+   to the selected range; this verifies repeated navigation rather than just
+   the first reveal.
+3. For a CRLF note, open, switch away from it, switch back, and close it
+   without changing text. In a terminal, run `git status --porcelain=v1 -z` in
+   the vault: it must produce no output. Do not use Explorer's ordinary text
+   editor for this check.
+4. With an Umbra document open, run **Inex: Lock Umbra**. The private
+   projection must be replaced by the locked page while ordinary Outer tabs
+   remain available. Then use **Inex: Lock Vault** and confirm all Inex
+   plaintext views close or become locked.
+5. If testing export, select a new directory outside the vault. Confirm that
+   **Outer only** omits private content and **Include Umbra private content**
+   requires the independent password and shows its high-risk confirmation.
+   Delete only the deliberately exported disposable directory after the test.
+
+If any step fails, retain the ciphertext vault, the exact VSIX path/SHA-256,
+the output of `git status --porcelain=v1 -z`, and the VS Code extension-host
+log. Do not paste private Markdown, passwords, tag labels, or exported
+plaintext into a bug report.
+
 ### Current VS Code limitations
 
 - The custom editor is a controlled textarea, not the normal VS Code Markdown
