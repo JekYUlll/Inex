@@ -1774,3 +1774,8 @@
 
 - 独立 tmux `cargo test --workspace` 在当前 source 以 exit 0 完成。最长的 `inex-git` suite 为 369 passed、12 expected ignored、0 failed，耗时 226.33s；CLI/core/daemon/Git integration 与 Rust doc-tests 均通过。
 - 运行期间仍观察到一个早于本轮的 orphaned ignored `force_kill_writer_child` process；它不属于本轮 tmux process tree，也未阻止本轮 `cargo test --workspace` 正常 exit 0，因此不将其作为本轮失败或清理它。独立 full native force-kill matrix 仍按计划另行执行，不由 workspace ignored cases冒充。
+
+## 2026-07-16 — Rust Clippy quality gate repair
+
+- `cargo clippy --workspace --all-targets -- -D warnings` 首次发现两个无运行时语义的问题：working-tree compare 的 `K_umbra` doc-markdown 格式，以及 real-Git historical compare test 超过 100 行。
+- 将密钥名改为 code span，并对该单一线性 fixture 添加说明性 `#[allow(clippy::too_many_lines)]`；fixture 保持可审计的 HEAD/first-parent setup。重新运行完整 Clippy 与 `revision_compare_outer_authenticates_two_real_git_revisions` 均通过。

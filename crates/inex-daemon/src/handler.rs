@@ -1293,7 +1293,7 @@ impl<C: MonotonicClock> RpcService<C> {
     /// Compare a saved authenticated worktree envelope to the fixed HEAD blob.
     /// This intentionally has a separate wire method from historical compare:
     /// clients cannot add a mutable worktree side to arbitrary revision input,
-    /// and Outer scope never loads K_umbra.
+    /// and Outer scope never loads `K_umbra`.
     fn revision_compare_working_tree_outer(&mut self, params: Params) -> RpcResult {
         let mut params = ParamObject::new(params);
         let session = required_session(&mut params)?;
@@ -2170,6 +2170,9 @@ mod tests {
     }
 
     #[test]
+    // This deliberately remains one linear, real-Git fixture so its HEAD and
+    // first-parent authentication setup is auditable at the assertion site.
+    #[allow(clippy::too_many_lines)]
     fn revision_compare_outer_authenticates_two_real_git_revisions() {
         let directory = TestDirectory::new();
         let password = b"revision compare handler password";
