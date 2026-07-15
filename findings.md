@@ -630,3 +630,8 @@
 
 - Reporting only the Outer session state makes an unlocked vault look equivalent to an active Umbra session. `Inex: Show Security Status` must query `umbra.status` only through the current authenticated session and display the initialized/unlocked distinction; query failure remains "private data unavailable" rather than defaulting to unlocked.
 - The first intended Extension Host command was named `test:integration`, but the package deliberately exposes `test:extension:local`; the missing-script failure was non-evidence. The declared local Extension Host gate then passed.
+
+## 2026-07-16 VSIX package audit invocation
+
+- `audit_native_dependencies.py` accepts the standalone release `inex` and `inexd` paths, not the packaged Rust ZIP. Passing the ZIP stopped the first post-package chain before smoke/install; artifact structure audit had already passed but no installation claim was made. Re-running the audit with both release binaries, then package smoke, then explicit VSIX install completed successfully.
+- VS Code CLI emitted host-owned Node `DEP0169` `url.parse()` deprecation text during install, while installation exited successfully and package-vs-installed `extension.js` digests matched. Treat this as host CLI noise unless a trace attributes it to Inex.

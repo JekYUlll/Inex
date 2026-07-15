@@ -1439,6 +1439,11 @@
 - `Inex: Show Security Status` 现在明确显示 Outer locked、Umbra 未初始化、已初始化但 locked、已解锁，或 Umbra status 无法验证的保守状态；不会仅因 Outer 已解锁而暗示私密内容可用。
 - 验证：67/67 VS Code Node tests、`pnpm --dir editors/vscode check`，以及真实 `pnpm --dir editors/vscode test:extension:local` 均通过。首次误用不存在的 `test:integration` script，未产生测试证据；随后以 package 声明的 `test:extension:local` 完整重跑。
 
+## 2026-07-16 — Current installed VS Code bundle (Umbra state status)
+
+- 从独立 `--no-local` clean checkout、canonical origin `https://github.com/JekYUlll/Inex` 的 `f5dae0719e6ce94729f240703a1cd3a9ee490be4` 用 `/usr/bin/gcc` 构建 Linux x64 release。release artifact audit、对 release `inex`/`inexd` 的 native dependency audit，以及 package smoke 均通过。
+- 已将 [inex-vscode-0.1.0-linux-x64.vsix](/home/horeb/_code/Inex/target/release-artifacts/f5dae07-linux-x64/inex-vscode-0.1.0-linux-x64.vsix) 用 `/usr/bin/code --install-extension --force` 覆盖安装。VSIX SHA-256 为 `0999b7491470343199eb3c3f0ff7f43c187dfddfea25c1afd4d56472e6f569eb`；其中 `extension.js` SHA-256 与已安装副本同为 `4f3744399cee7857bb8f9a7b719e0a96104206fdb5a51e6186e7f6fc2d70099d`。`horeb.inex-vscode@0.1.0` 已被 VS Code 列出；同版号窗口仍须 Developer: Reload Window。
+
 ## 2026-07-16 — Outer-only Umbra export projection
 
 - `umbra_render::render_outer_projection` 现在只根据已认证的公开 Outer slot 策略替换 marker：Drop 输出空内容、Cover 输出明确公开的 cover text、Placeholder 输出固定无标识文本。它严格验证 marker/slot 一一对应和 Cover/Placeholder metadata，永不读取 private payload、kind、tag、slot ID 或 `K_umbra`。
