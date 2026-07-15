@@ -1752,3 +1752,9 @@
 - `revertCustomDocument` 已正确更新 Inex document 的 saved revision；直接调用 provider bridge 时，VS Code tab dirty flag 不会经过 Workbench 状态机同步，因此 fixture 现断言 provider document 的真实 dirty state，而非错误地要求未经过 Workbench 的 tab 变更。
 - recovery helper 保存后会 dispose 临时 custom document；saved-worktree compare 的 Host 回归相应改为传入 canonical ciphertext URI，验证同一 command 的 Source Control resource 路径。此前 active-editor compare 已在同一 runner 的历史 Outer compare 中得到覆盖。
 - `pnpm --dir editors/vscode check`、`test:extension:build` 通过；仍需完整 tmux Host/residue rerun，尚未发布 VSIX。
+
+## 2026-07-16 — Verified VS Code compare/recovery bundle installed
+
+- 独立 tmux Host runner 对 `75a7932` 以 exit 0 完成，并输出 `Inex VS Code feature-1 import, asset preview, CRUD, backup/recovery, and residue audit passed`。该证据覆盖 active-editor/SCM revision compare、asset-handle 释放、backup/recovery、lock/shutdown 与 plaintext residue scan。
+- clean detached canonical source `75a79329bb813369c04d658240888effaf23cdb9` 从客户端源码重建，复用先前 system-GCC 审计过且未在该提交中改动的 Linux CLI/daemon。native dependency audit、package release、release-set audit、`smoke_release_artifacts.py` 全部通过。
+- VSIX：[inex-vscode-0.1.0-linux-x64.vsix](/home/horeb/_code/Inex/target/release-artifacts/75a7932-linux-x64/inex-vscode-0.1.0-linux-x64.vsix)，SHA-256：`3d2d2e460242b8ff06a176bc4b8d83f653e82f9d09b633aafdddce272d9dbd3f`。已以 `code --install-extension --force` 覆盖安装，`horeb.inex-vscode@0.1.0` 枚举确认；唯一输出是 VS Code host Node `DEP0169` warning。
