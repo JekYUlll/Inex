@@ -84,8 +84,8 @@ The current MVP renders feature-2/Umbra documents only through an authenticated
 daemon projection and validates the accompanying RenderMap before display. It
 does not edit/save arbitrary Umbra Markdown; private annotation mutations and
 the transient picker surfaces above remain authenticated daemon operations.
-Tag/profile management UI and the explicit Neovim host-residue gate remain
-behind the CLI/VS Code milestones. Neovim's
+The explicit Neovim host-residue gate remains behind the CLI/VS Code
+milestones. Neovim's
 cmdline, undo, shada, LSP, plugins, terminal, and OS memory remain separate
 residue boundaries; do not enable other plugins on an Inex buffer until the
 explicit Neovim host-residue gate is implemented. Do not point the plugin at a

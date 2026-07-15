@@ -1801,3 +1801,8 @@
 - `PYTHONPATH=editors/sublime python3 -m unittest discover -s editors/sublime/tests -p 'test*.py' -q` 以 exit 0 完成 96 tests、1 skipped。输出的三个 argparse error 来自 `test_build4200_runner.py` 对 mutually-exclusive/missing paired arguments 的预期 `SystemExit` 负例，不是 runner failure。
 - 当前证据文档原先的 84/84（61 product + 23 runner/evidence）已同步为实际 96/1 skip；历史进度不改写。Sublime 仍保持 experimental，且此 suite 不替代真实用户 persistent-profile/Hot Exit/签名门禁。
 - 同步 `editor-security.md` 时发现替换遗留的 `skip; tests.` 语法残片，已在提交前改为完整的 exact-package evidence 边界句；未影响产品或测试运行。
+
+## 2026-07-16 — Neovim MVP plan reconciliation
+
+- 计划与 README 审计发现 tag/profile management UI 的全部实现子项已完成（包括 profile metadata edit），但两个父 checkbox 与 README 仍误写 pending。现已仅将其与现有实现对齐；explicit Neovim host-residue gate 继续保持未完成。
+- `annotation_picker.lua`、`headless_smoke.lua` 与 temporary-vault `run_outer_lifecycle.sh` 均以当前 `target/debug/inexd` exit 0 通过。后者实际覆盖 Outer/Umbra unlock/lock、create/save/search/mkdir、reopen、feature-2 enable 和 private annotation mutation；不把此结果扩大为 shada/undo/LSP/third-party host residue 结论。
