@@ -26,6 +26,7 @@ interface InexIntegrationTestApi {
   ) => Promise<void>;
   readonly openDocument: (logicalPath: string) => Promise<void>;
   readonly waitUntilReady: (logicalPath: string) => Promise<void>;
+  readonly revertDocument: (logicalPath: string) => Promise<void>;
   readonly markDirty: (logicalPath: string) => void;
   readonly waitForBackup: () => Promise<string>;
   readonly contentSha256: (logicalPath: string) => string;
@@ -287,7 +288,10 @@ async function runBackupRecoveryCycle(
     // Clean the workbench-owned document before locking so test shutdown cannot
     // request another backup from a deliberately locked document. The copied
     // EDRY envelope remains the recovery input for the exact backupId path.
-    await vscode.commands.executeCommand("workbench.action.files.revert");
+    // Compare panels may own focus. Invoke the same custom-document revert
+    // implementation directly so this recovery invariant does not depend on
+    // VS Code's active-tab routing policy.
+    await api.revertDocument(LOGICAL_PATH);
     await waitFor(() => !tab.isDirty, "Inex custom-editor tab did not become clean after revert");
     await api.lock();
     await api.unlock(fixture.vaultPath, fixture.password, fixture.sidecarPath);
@@ -747,6 +751,7 @@ function assertIntegrationApi(value: unknown): asserts value is InexIntegrationT
     "unlock",
     "openDocument",
     "waitUntilReady",
+    "revertDocument",
     "markDirty",
     "waitForBackup",
     "contentSha256",

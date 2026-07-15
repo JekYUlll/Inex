@@ -36,6 +36,7 @@ export interface InexIntegrationTestApi {
   ) => Promise<void>;
   readonly openDocument: (logicalPath: string) => Promise<void>;
   readonly waitUntilReady: (logicalPath: string) => Promise<void>;
+  readonly revertDocument: (logicalPath: string) => Promise<void>;
   readonly markDirty: (logicalPath: string) => void;
   readonly waitForBackup: () => Promise<string>;
   readonly contentSha256: (logicalPath: string) => string;
@@ -631,6 +632,8 @@ export function activate(
     },
     waitUntilReady: (logicalPath: string) =>
       editor.waitForIntegrationDocument(logicalPath),
+    revertDocument: (logicalPath: string) =>
+      editor.revertIntegrationDocument(logicalPath),
     markDirty: (logicalPath: string) => {
       editor.markIntegrationDocumentDirty(logicalPath);
     },

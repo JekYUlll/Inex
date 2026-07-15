@@ -1371,6 +1371,23 @@ export class InexCustomEditorProvider
     await this.waitForOpenedDocument(logicalPath, this.controller.acquireSession());
   }
 
+  /** Exercise VS Code's custom-document revert implementation without tab focus. */
+  public async revertIntegrationDocument(logicalPath: string): Promise<void> {
+    this.requireIntegrationTestMode();
+    const document = [...this.documents].find(
+      (candidate) => candidate.logicalPath === logicalPath,
+    );
+    if (document === undefined) {
+      throw new Error("Inex integration document is not open");
+    }
+    const cancellation = new vscode.CancellationTokenSource();
+    try {
+      await this.revertCustomDocument(document, cancellation.token);
+    } finally {
+      cancellation.dispose();
+    }
+  }
+
   public markIntegrationDocumentDirty(logicalPath: string): void {
     this.requireIntegrationTestMode();
     const document = [...this.documents].find(

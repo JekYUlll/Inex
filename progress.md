@@ -1741,3 +1741,8 @@
 - 修复首次打开 Inex custom editor 的 lifecycle gap：resolver 在注册 view-state listener 后立即采样 `webviewPanel.active`，因此无需先切换标签，active-editor compare/annotation 等命令即可取得当前 document。
 - 新增 AssetPreviewCoordinator 的可等待取消栅栏；三种 historical/working-tree compare 都先取消 preview 并等待 in-flight `asset.close`，保持 daemon 对同时存在 asset handle 的 `Busy` 拒绝不变。真实带图片 Markdown 现在无需用户手动关闭预览即可比较。
 - 最新 isolated Host trace 已覆盖两个 `revision.compare.outer`、asset open/close、draft backup、`document.close → vault.lock → system.shutdown`。测试 runner 仍保留 `/tmp/inex-vscode-audit-iTc86n` 而未输出最终 residue verdict；该状态不得计为完整 Host/residue gate 通过，尚未发布新 VSIX。
+
+## 2026-07-16 — VS Code Host runner diagnosis
+
+- 独立 tmux runner 排除了终端 supervisor 提前终止，给出两项可复现 Host fixture 修复：revision compare panel 会占据 focus，因此依赖 `workbench.action.files.revert` 的 recovery fixture 会对错误 tab 操作；已新增仅 integration-mode 的 bridge，调用相同 `revertCustomDocument` 实现而不依赖 VS Code active-tab 路由。
+- 该 bridge 不绕过生产逻辑：仍使用已打开的 `InexDocument`、正常 cancellation token 和 `revertCustomDocument`。`pnpm --dir editors/vscode check` 与 `test:extension:build` 通过；完整 runner 的下一阶段尚待重跑，继续不发布 VSIX。
