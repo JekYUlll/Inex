@@ -8,12 +8,21 @@
  * large Markdown notes do not turn opening a compare view into quadratic work.
  */
 export function revisionCompareHtml(head: Buffer, parent: Buffer): string {
-  const headLines = splitLines(head.toString("utf8"));
-  const parentLines = splitLines(parent.toString("utf8"));
+  return compareHtml(head, parent, "HEAD", "Parent", "HEAD is green; Parent is red. Only changed line ranges are highlighted.");
+}
+
+/** Render an authenticated saved worktree against fixed HEAD without native SCM diff. */
+export function workingTreeCompareHtml(workingTree: Buffer, head: Buffer): string {
+  return compareHtml(workingTree, head, "Saved working copy", "HEAD", "The saved encrypted worktree is green; HEAD is red. Unsaved editor text is not included.");
+}
+
+function compareHtml(left: Buffer, right: Buffer, leftLabel: string, rightLabel: string, description: string): string {
+  const headLines = splitLines(left.toString("utf8"));
+  const parentLines = splitLines(right.toString("utf8"));
   const rows: CompareRow[] = [];
   appendAlignedRows(headLines, parentLines, rows);
 
-  return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'"><style>body{font-family:var(--vscode-editor-font-family);padding:1rem;color:var(--vscode-editor-foreground)}p{color:var(--vscode-descriptionForeground)}.grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:1rem}.column{min-width:0;border:1px solid var(--vscode-panel-border)}h2{margin:.7rem .75rem;font-size:1rem}.row{display:grid;grid-template-columns:3.75rem minmax(0,1fr);min-height:1.35rem}.number{padding:0 .5rem;text-align:right;user-select:none;color:var(--vscode-editorLineNumber-foreground);border-right:1px solid var(--vscode-panel-border)}.line{margin:0;padding:0 .6rem;white-space:pre-wrap;overflow-wrap:anywhere;font-family:var(--vscode-editor-font-family)}.head-change{background:color-mix(in srgb,var(--vscode-gitDecoration-addedResourceForeground) 20%,transparent)}.parent-change{background:color-mix(in srgb,var(--vscode-gitDecoration-deletedResourceForeground) 20%,transparent)}.empty{background:var(--vscode-editor-background)}@supports not (background:color-mix(in srgb,red,transparent)){.head-change{background:rgba(0,128,0,.16)}.parent-change{background:rgba(160,0,0,.16)}}</style></head><body><h1>Inex revision comparison</h1><p>HEAD is green; Parent is red. Only changed line ranges are highlighted.</p><div class="grid"><section class="column"><h2>HEAD</h2>${rows.map((row) => row.head).join("")}</section><section class="column"><h2>Parent</h2>${rows.map((row) => row.parent).join("")}</section></div></body></html>`;
+  return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'"><style>body{font-family:var(--vscode-editor-font-family);padding:1rem;color:var(--vscode-editor-foreground)}p{color:var(--vscode-descriptionForeground)}.grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:1rem}.column{min-width:0;border:1px solid var(--vscode-panel-border)}h2{margin:.7rem .75rem;font-size:1rem}.row{display:grid;grid-template-columns:3.75rem minmax(0,1fr);min-height:1.35rem}.number{padding:0 .5rem;text-align:right;user-select:none;color:var(--vscode-editorLineNumber-foreground);border-right:1px solid var(--vscode-panel-border)}.line{margin:0;padding:0 .6rem;white-space:pre-wrap;overflow-wrap:anywhere;font-family:var(--vscode-editor-font-family)}.head-change{background:color-mix(in srgb,var(--vscode-gitDecoration-addedResourceForeground) 20%,transparent)}.parent-change{background:color-mix(in srgb,var(--vscode-gitDecoration-deletedResourceForeground) 20%,transparent)}.empty{background:var(--vscode-editor-background)}@supports not (background:color-mix(in srgb,red,transparent)){.head-change{background:rgba(0,128,0,.16)}.parent-change{background:rgba(160,0,0,.16)}}</style></head><body><h1>Inex revision comparison</h1><p>${escapeHtml(description)}</p><div class="grid"><section class="column"><h2>${escapeHtml(leftLabel)}</h2>${rows.map((row) => row.head).join("")}</section><section class="column"><h2>${escapeHtml(rightLabel)}</h2>${rows.map((row) => row.parent).join("")}</section></div></body></html>`;
 }
 
 /** Render an explicit public-only projection in the same no-script boundary. */

@@ -1664,6 +1664,8 @@
 | `apply_patch` first matched stale prose context while updating the Umbra PRD. | 1 | Re-read the exact current paragraph and applied a narrow contextual patch. |
 | The disposable VS Code CLI/Extension Host process loses its parent terminal under this tool supervisor before a final exit result can be observed; its audit root is retained. | 1 | Tried normal, PTY, detached, and tmux launch paths; all were supervisor-terminated. Kept the automated assertion in source but do not treat this environment run as passing evidence. Persistent-profile/manual verification remains open. |
 | Full Neovim lifecycle invocation initially omitted required absolute `INEX_SIDECAR`/test-vault/password environment. | 1 | Re-ran the transport smoke with the absolute local sidecar; retained the lifecycle test's explicit fixture requirement rather than weakening it. |
+| This environment's disposable VS Code Extension Host runner stopped advancing after its pre-existing `revision.compare.umbra` trace and did not reach the new saved-worktree command after more than one minute. | 1 | Terminated only the test process started for this run and retained `/tmp/inex-vscode-audit-I7UmP4` for diagnosis. Do not claim the host gate passed; TypeScript/unit/core evidence remains valid and the test source now contains the required command trace assertion. |
+| The unfiltered 381-test `inex-git` suite remained in a native child after its normal tests had printed, beyond the bounded verification window. | 1 | Terminated only the spawned cargo/test PIDs. The focused saved-worktree reader test had already passed; do not treat this interrupted full-suite attempt as a green result. |
 
 ## 2026-07-16 — Installed Quick Redact bundle
 
@@ -1695,3 +1697,9 @@
 
 - 新增并发布 allowlist `vscode-working-tree-compare-v1.md`：下一 compare 切片只比较已保存、认证的 worktree document 与 canonical HEAD blob；daemon 独占 worktree/Git 读取，extension 不得发送未保存 textarea 内容。
 - 普通 SCM 保持 ciphertext-only；结果只能进入 Inex script-free read-only webview。Outer scope 不加载 `K_umbra`，Umbra working-tree compare 必须是未来独立 second-unlock command。
+
+## 2026-07-16 — Saved worktree vs HEAD Outer comparison
+
+- 新增独立 `revision.compare.workingTreeOuter`，避免扩宽历史 compare 的 revision 输入。daemon 只取得 authenticated session 与 canonical logical path；`inex-git::read_worktree_document` 拒绝 linked/external gitdir、无 HEAD、active merge/rebase/cherry-pick control state，并通过 Vault 的 bounded regular-file path 认证已保存 EDRY envelope。它不读取 CustomEditor textarea、不会运行 textconv/filter，也不写入 worktree/index/ref/config/temp 文件。
+- response 固定为 `workingTree`/`head` 两角色。两侧都经 Outer projection：feature-2 只渲染 Drop/Cover/Placeholder，不加载 `K_umbra`。VS Code 的新 command 可从 clean active editor 或 Source Control `*.md.enc` resource 启动，严格 parser 拒绝角色/字段替换，结果只进入 existing no-script local-resource-free Inex panel；lock/dispose 仍 zero-fill owned buffers。
+- 验证已通过：`cargo fmt`、`cargo test -p inex-git saved_worktree_reader_returns_only_persisted_ciphertext_and_rejects_active_merge -- --nocapture`、real daemon working/HEAD fixture、`pnpm --dir editors/vscode check`、75/75 VS Code unit tests 与 Extension Host bundle build。完整 disposable host run 与 release package 仍待，不以 build-only 代替。

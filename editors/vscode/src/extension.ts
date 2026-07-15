@@ -17,7 +17,7 @@ import {
   type PrivateAnnotationPreferences,
 } from "./privateAnnotationPreferences.ts";
 import { validatePlaintextExportDirectoryName } from "./plaintextExport.ts";
-import { outerProjectionHtml, revisionCompareHtml } from "./revisionCompare.ts";
+import { outerProjectionHtml, revisionCompareHtml, workingTreeCompareHtml } from "./revisionCompare.ts";
 import { formatSecurityStatus } from "./securityStatus.ts";
 import type { PrivateAnnotationSpec, UmbraAnnotationProfile } from "./sidecar.ts";
 import { showSensitiveInputBox, showSensitiveQuickPick } from "./sensitiveUi.ts";
@@ -56,6 +56,7 @@ export interface InexIntegrationTestApi {
   readonly verifyUmbraLock: (password: string) => Promise<void>;
   readonly verifyOuterRevisionCompare: () => Promise<void>;
   readonly verifyOuterRevisionCompareFromScm: (logicalPath: string) => Promise<void>;
+  readonly verifyWorkingTreeOuterCompare: () => Promise<void>;
   readonly verifyUmbraRevisionCompare: () => Promise<void>;
   readonly verifyOuterProjection: () => Promise<void>;
   readonly verifyOuterProjectionFromTree: (logicalPath: string) => Promise<void>;
@@ -404,6 +405,41 @@ export function activate(
         });
       });
     }),
+    vscode.commands.registerCommand("inex.compareWorkingTreeOuter", async (resource?: unknown) => {
+      await runUiAction(async () => {
+        if (!(await ensureVaultUnlocked(controller))) return;
+        const resourceUri = resourceUriFromArgument(resource);
+        const scmTarget = resourceUri === undefined
+          ? undefined
+          : (() => {
+            const session = controller.acquireSession();
+            return { logicalPath: controller.logicalPathForSession(resourceUri, session), session };
+          })();
+        const target = scmTarget ?? editor.currentRevisionCompareTarget();
+        if (target === undefined) {
+          throw new Error("Choose an encrypted Markdown resource in Source Control or open a clean saved Inex Markdown editor before comparing its working copy with HEAD");
+        }
+        const compared = await target.session.sidecar.compareWorkingTreeOuter(target.logicalPath);
+        if (!controller.isSessionCurrent(target.session)) {
+          compared.leftContent.fill(0);
+          compared.rightContent.fill(0);
+          throw new Error("Inex vault session changed during working-tree comparison");
+        }
+        const panel = vscode.window.createWebviewPanel(
+          "inex.workingTreeCompare",
+          "Inex: Saved Working Copy vs HEAD",
+          vscode.ViewColumn.Beside,
+          { enableScripts: false, retainContextWhenHidden: false, localResourceRoots: [] },
+        );
+        const view = { panel, buffers: [compared.leftContent, compared.rightContent] };
+        compareViews.add(view);
+        panel.webview.html = workingTreeCompareHtml(compared.leftContent, compared.rightContent);
+        panel.onDidDispose(() => {
+          for (const buffer of view.buffers) buffer.fill(0);
+          compareViews.delete(view);
+        });
+      });
+    }),
     vscode.commands.registerCommand("inex.openOuterProjection", async (node?: unknown) => {
       await runUiAction(async () => {
         if (!(await ensureVaultUnlocked(controller))) return;
@@ -677,6 +713,9 @@ export function activate(
         "inex.compareOuterRevision",
         controller.ciphertextUriForSession(logicalPath, session),
       );
+    },
+    verifyWorkingTreeOuterCompare: async () => {
+      await vscode.commands.executeCommand("inex.compareWorkingTreeOuter");
     },
     verifyUmbraRevisionCompare: async () => {
       await vscode.commands.executeCommand("inex.compareUmbraRevision");

@@ -39,7 +39,9 @@ use inex_core::vault::{
     DocumentMetadata, MAX_EDRY_ENVELOPE_BYTES, RenameOutcome, UmbraStatus, Vault, VaultError,
 };
 use inex_core::vault_config::{ConfigError, ConfigWarning, KdfPolicy};
-use inex_git::{HistoricalRevision, read_historical_document, read_historical_envelope};
+use inex_git::{
+    HistoricalRevision, read_historical_document, read_historical_envelope, read_worktree_document,
+};
 use serde_json::{Value, json};
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -197,6 +199,9 @@ impl<C: MonotonicClock> RpcService<C> {
             Method::UmbraSearchQuery => self.umbra_search_query(params),
             Method::RevisionCompareOuter => self.revision_compare_outer(params),
             Method::RevisionCompareUmbra => self.revision_compare_umbra(params),
+            Method::RevisionCompareWorkingTreeOuter => {
+                self.revision_compare_working_tree_outer(params)
+            }
             Method::CacheEvict => self.cache_evict(params),
         }
     }
@@ -1285,6 +1290,43 @@ impl<C: MonotonicClock> RpcService<C> {
         }))
     }
 
+    /// Compare a saved authenticated worktree envelope to the fixed HEAD blob.
+    /// This intentionally has a separate wire method from historical compare:
+    /// clients cannot add a mutable worktree side to arbitrary revision input,
+    /// and Outer scope never loads K_umbra.
+    fn revision_compare_working_tree_outer(&mut self, params: Params) -> RpcResult {
+        let mut params = ParamObject::new(params);
+        let session = required_session(&mut params)?;
+        let logical_path = params.required_logical_path("logicalPath")?;
+        params.finish()?;
+        if self
+            .sessions
+            .asset_count(session.as_str())
+            .map_err(map_session_error)?
+            != 0
+        {
+            return Err(ErrorObject::new(ErrorCode::Busy));
+        }
+        let vault = self
+            .sessions
+            .vault(session.as_str())
+            .map_err(map_session_error)?;
+        let working = read_worktree_document(vault, &logical_path)
+            .map_err(|error| map_git_error(error, ErrorContext::Document))?;
+        let head = read_historical_document(vault, HistoricalRevision::Head, &logical_path)
+            .map_err(|error| map_git_error(error, ErrorContext::Document))?;
+        let working = outer_compare_projection(working)
+            .map_err(|error| map_vault_error(error, ErrorContext::Document))?;
+        let head = outer_compare_projection(head)
+            .map_err(|error| map_vault_error(error, ErrorContext::Document))?;
+        Ok(json!({
+            "leftRole": "workingTree",
+            "leftContentBase64": encode_base64url(working.as_slice()).as_str(),
+            "rightRole": "head",
+            "rightContentBase64": encode_base64url(head.as_slice()).as_str(),
+        }))
+    }
+
     fn umbra_search_query(&mut self, params: Params) -> RpcResult {
         self.search_query_inner(params, true)
     }
@@ -2168,6 +2210,22 @@ mod tests {
         drop(vault);
         git(directory.path(), &["add", "entry.md.enc"]);
         git(directory.path(), &["commit", "-q", "-m", "head"]);
+        let mut vault = Vault::unlock(directory.path(), password, None, test_policy())
+            .expect("fixture vault unlocks for saved worktree change");
+        let saved = vault
+            .read(&path)
+            .expect("HEAD document reads before saved mutation");
+        let saved_etag = saved.etag.clone();
+        drop(saved);
+        vault
+            .save_document(
+                &path,
+                b"WORKTREE_SAVED_CANARY\n",
+                &saved_etag,
+                1_783_699_203_000,
+            )
+            .expect("saved worktree mutation succeeds");
+        drop(vault);
 
         let mut service = RpcService::with_clock_and_policy(SystemClock::new(), test_policy());
         hello(&mut service);
@@ -2207,6 +2265,31 @@ mod tests {
         assert_eq!(head, b"REVISION_HEAD_CANARY\n");
         assert_eq!(parent, b"REVISION_PARENT_CANARY\n");
         scrub_object(&mut compared);
+        let mut working = response(
+            &mut service,
+            4,
+            "revision.compare.workingTreeOuter",
+            json!({"session": session, "logicalPath": "entry.md"}),
+        );
+        assert_eq!(working["result"]["leftRole"], "workingTree");
+        assert_eq!(working["result"]["rightRole"], "head");
+        let saved = URL_SAFE_NO_PAD
+            .decode(
+                working["result"]["leftContentBase64"]
+                    .as_str()
+                    .expect("saved worktree bytes"),
+            )
+            .expect("saved worktree decode");
+        let head = URL_SAFE_NO_PAD
+            .decode(
+                working["result"]["rightContentBase64"]
+                    .as_str()
+                    .expect("HEAD bytes"),
+            )
+            .expect("HEAD decode");
+        assert_eq!(saved, b"WORKTREE_SAVED_CANARY\n");
+        assert_eq!(head, b"REVISION_HEAD_CANARY\n");
+        scrub_object(&mut working);
     }
 
     #[test]

@@ -107,6 +107,14 @@ export interface OuterRevisionCompare {
   readonly rightContent: Buffer;
 }
 
+/** Authenticated saved-worktree and fixed-HEAD Outer projections for one document. */
+export interface WorkingTreeOuterCompare {
+  readonly leftRole: "workingTree";
+  readonly leftContent: Buffer;
+  readonly rightRole: "head";
+  readonly rightContent: Buffer;
+}
+
 export type PrivateAnnotationKind = "block" | "comment";
 export type OuterMode = "drop" | "cover" | "placeholder";
 
@@ -1035,6 +1043,17 @@ export class InexSidecar {
     return this.compareRevision("revision.compare.umbra", logicalPath);
   }
 
+  /** Compare only the daemon-authenticated saved worktree envelope with HEAD. */
+  public async compareWorkingTreeOuter(logicalPath: string): Promise<WorkingTreeOuterCompare> {
+    logicalFileComponents(logicalPath);
+    return parseWorkingTreeOuterCompare(
+      await this.callRaw("revision.compare.workingTreeOuter", {
+        ...this.protectedParams(),
+        logicalPath,
+      }),
+    );
+  }
+
   private async compareRevision(
     method: "revision.compare.outer" | "revision.compare.umbra",
     logicalPath: string,
@@ -1608,6 +1627,34 @@ export function parseOuterRevisionCompare(value: JsonValue): OuterRevisionCompar
       throw new RpcProtocolError("RPC Outer revision compare roles are invalid");
     }
     return { leftRole: "head", leftContent, rightRole: "headParent", rightContent };
+  } catch (error: unknown) {
+    leftContent.fill(0);
+    rightContent.fill(0);
+    throw error;
+  }
+}
+
+/** @internal Exported for strict saved-worktree compare response tests. */
+export function parseWorkingTreeOuterCompare(value: JsonValue): WorkingTreeOuterCompare {
+  const result = expectObject(value);
+  expectExactKeys(
+    result,
+    ["leftContentBase64", "leftRole", "rightContentBase64", "rightRole"],
+    "Working-tree Outer compare",
+  );
+  const leftContent = decodeCanonicalBase64url(
+    expectString(result.leftContentBase64, "Working-tree compare left content"),
+    MAX_DOCUMENT_BYTES,
+  );
+  const rightContent = decodeCanonicalBase64url(
+    expectString(result.rightContentBase64, "Working-tree compare right content"),
+    MAX_DOCUMENT_BYTES,
+  );
+  try {
+    if (result.leftRole !== "workingTree" || result.rightRole !== "head") {
+      throw new RpcProtocolError("RPC working-tree Outer compare roles are invalid");
+    }
+    return { leftRole: "workingTree", leftContent, rightRole: "head", rightContent };
   } catch (error: unknown) {
     leftContent.fill(0);
     rightContent.fill(0);

@@ -102,6 +102,11 @@
         "enablement": "inex.vaultUnlocked"
       },
       {
+        "command": "inex.compareWorkingTreeOuter",
+        "title": "Inex: Compare Saved Working Copy with HEAD (Outer)",
+        "enablement": "inex.vaultUnlocked"
+      },
+      {
         "command": "inex.openOuterProjection",
         "title": "Inex: View Outer Projection",
         "enablement": "inex.vaultUnlocked"
@@ -293,9 +298,14 @@
       ],
       "scm/resourceState/context": [
         {
-          "command": "inex.compareOuterRevision",
+          "command": "inex.compareWorkingTreeOuter",
           "when": "inex.vaultUnlocked && resourceFilename =~ /.*\\.md\\.enc$/",
           "group": "inex@1"
+        },
+        {
+          "command": "inex.compareOuterRevision",
+          "when": "inex.vaultUnlocked && resourceFilename =~ /.*\\.md\\.enc$/",
+          "group": "inex@2"
         }
       ]
     },

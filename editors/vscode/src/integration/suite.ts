@@ -49,6 +49,7 @@ interface InexIntegrationTestApi {
   readonly verifyUmbraLock: (password: string) => Promise<void>;
   readonly verifyOuterRevisionCompare: () => Promise<void>;
   readonly verifyOuterRevisionCompareFromScm: (logicalPath: string) => Promise<void>;
+  readonly verifyWorkingTreeOuterCompare: () => Promise<void>;
   readonly verifyUmbraRevisionCompare: () => Promise<void>;
   readonly verifyOuterProjection: () => Promise<void>;
   readonly verifyOuterProjectionFromTree: (logicalPath: string) => Promise<void>;
@@ -260,6 +261,13 @@ async function runBackupRecoveryCycle(
       fixture.expectedSha256,
       "The provider backupId recovery path did not restore the unsaved EDRY draft",
     );
+    await api.verifyWorkingTreeOuterCompare();
+    await waitForSidecarTrace(
+      fixture,
+      (entries) => entries.some((entry) => entry.method === "revision.compare.workingTreeOuter"),
+      "VS Code saved-worktree comparison did not reach the authenticated sidecar",
+    );
+    assertNoPlaintextTextDocument(tab.input.uri, fixture.sourcePath);
     await api.lock();
     assertNoPlaintextTextDocument(tab.input.uri, fixture.sourcePath);
     console.log(
@@ -720,6 +728,7 @@ function assertIntegrationApi(value: unknown): asserts value is InexIntegrationT
     "verifyUmbraLock",
     "verifyOuterRevisionCompare",
     "verifyOuterRevisionCompareFromScm",
+    "verifyWorkingTreeOuterCompare",
     "verifyUmbraRevisionCompare",
     "verifyOuterProjection",
     "verifyOuterProjectionFromTree",

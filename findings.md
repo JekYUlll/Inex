@@ -763,3 +763,9 @@
 
 - A secure SCM comparison may decrypt an already persisted, authenticated worktree envelope, but must never treat the CustomEditor textarea as a Git revision. This preserves save semantics and prevents a second plaintext ownership path.
 - Working-tree/HEAD is distinct from the existing fixed historical HEAD/parent compare; keeping it a separate daemon method avoids widening historical revision input or silently adding private Umbra scope.
+
+## 2026-07-16 Saved-worktree implementation boundary
+
+- The worktree reader must authenticate the envelope after the same secure bounded regular-file/path-chain checks used by Vault reads. A Git status output or a raw `fs::read` of `*.enc` is insufficient: neither proves vault/path/epoch binding, and the latter would bypass link/TOCTOU protections.
+- A normal dirty worktree is the intended left side, but active Git operation control state is not. Primary local `.git` validation plus explicit MERGE_HEAD/CHERRY_PICK_HEAD/REVERT_HEAD/rebase/sequencer refusal cleanly separates “saved document changed” from an incomplete repository transaction without invoking Git filters or user hooks.
+- The VS Code parser uses a separate exact `workingTree`/`head` response model rather than widening the historical `head`/`headParent` model. This makes an accidental revision/worktree substitution fail before any plaintext reaches the controlled webview.

@@ -86,11 +86,12 @@ pub enum Method {
     UmbraSearchQuery,
     RevisionCompareOuter,
     RevisionCompareUmbra,
+    RevisionCompareWorkingTreeOuter,
     CacheEvict,
 }
 
 impl Method {
-    const ALL: [Self; 49] = [
+    const ALL: [Self; 50] = [
         Self::SystemHello,
         Self::SystemPing,
         Self::SystemShutdown,
@@ -139,6 +140,7 @@ impl Method {
         Self::UmbraSearchQuery,
         Self::RevisionCompareOuter,
         Self::RevisionCompareUmbra,
+        Self::RevisionCompareWorkingTreeOuter,
         Self::CacheEvict,
     ];
 
@@ -194,6 +196,7 @@ impl Method {
             Self::UmbraSearchQuery => "umbra.search.query",
             Self::RevisionCompareOuter => "revision.compare.outer",
             Self::RevisionCompareUmbra => "revision.compare.umbra",
+            Self::RevisionCompareWorkingTreeOuter => "revision.compare.workingTreeOuter",
             Self::CacheEvict => "cache.evict",
         }
     }

@@ -87,6 +87,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
   - 2026-07-16: `Ctrl+Alt+O` 现绑定 `inex.redactToOuter`：仅 clean active Umbra projection 可触发，先 `umbra.lock` 并 wipe private editor，再以同一 authenticated Outer session 打开 script-free public panel；不产生 plaintext TextDocument。TypeScript 与 73 unit 通过；本环境的 disposable Extension Host CLI 被 terminal supervisor 终止、留下 audit root，故不把该次 host run 计为成功，真实 persistent-profile 仍是门禁。
   - 2026-07-16: `e6f5c85` clean standalone-source Linux x64 release set 已完成 package/release-set audit 并覆盖安装本机 VS Code；VSIX SHA-256 为 `891b50e90c740bb13e7ddb4a11c7d63266dd0a23eecc764880efa2ba5f7645b1`。该结构性审计不替代 quick-redact 的 host runtime/persistent-profile 门禁。
   - 2026-07-16: 冻结 `docs/spec/vscode-working-tree-compare-v1.md`，定义 Source Control 已保存工作树 vs HEAD 的下一安全切片；普通 SCM 仍只显示密文，禁止未保存 textarea/native diff/plaintext file，待 core/daemon/VS Code 实现。
+  - 2026-07-16: `revision.compare.workingTreeOuter` 现已独立实现：daemon 只接收 authenticated session/canonical logicalPath，`inex-git` 验证 primary local Git worktree、HEAD 与无 merge/rebase/cherry-pick 控制状态后读取已保存的 authenticated envelope，再与 fixed HEAD blob 作 Outer-only projection。VS Code `Inex: Compare Saved Working Copy with HEAD (Outer)` 可从 clean CustomEditor 或 SCM ciphertext resource 启动，严格 role parser 和无脚本 buffer-wiping panel 均已接线；host/release runtime 证据仍在本轮验证中。
 - **Status:** complete
 
 ### Phase 5: Sublime 轻量客户端

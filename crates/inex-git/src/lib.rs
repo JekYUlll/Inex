@@ -502,6 +502,33 @@ pub fn read_historical_document(
         .map_err(GitError::from)
 }
 
+/// Read and authenticate the current saved ciphertext worktree document for a
+/// fixed canonical logical path.
+///
+/// The caller never supplies a revision, object ID or physical path. Git
+/// discovery verifies that this is a local primary worktree, rejects active
+/// merge/rebase/cherry-pick control state, and requires `HEAD` to resolve
+/// before the vault performs its bounded regular-file read and authenticated
+/// decryption. The returned document is therefore the persisted worktree
+/// state, not an editor buffer or a Git textconv result.
+///
+/// # Errors
+///
+/// Returns [`GitError`] when the Git control layout is unsafe or incomplete,
+/// `HEAD` is unavailable, the saved ciphertext changed/failed authentication,
+/// or the requested path cannot be read as one committed vault envelope.
+pub fn read_worktree_document(
+    vault: &Vault,
+    logical_path: &LogicalPath,
+) -> Result<DecryptedDocument, GitError> {
+    let git = Git::open(vault.root())?;
+    git.ensure_worktree_compare_safe()?;
+    let _head = git.resolve_historical_revision(HistoricalRevision::Head)?;
+    vault
+        .read_committed_worktree_document(logical_path)
+        .map_err(GitError::from)
+}
+
 /// Read one bounded, canonical ciphertext envelope from a fixed Git revision.
 ///
 /// The returned bytes remain ciphertext; callers must use a vault API that
@@ -2732,6 +2759,26 @@ impl Git {
         validate_git_version(&output)
     }
 
+    /// Refuse control states in which a saved worktree cannot be interpreted
+    /// as one stable ordinary HEAD comparison. `Git::open` has already
+    /// rejected linked/external gitdirs and split indexes; these checks close
+    /// the remaining active-operation states without invoking a user Git hook,
+    /// filter or text conversion.
+    fn ensure_worktree_compare_safe(&self) -> Result<(), GitError> {
+        let git_dir = self.root.join(".git");
+        for name in ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD"] {
+            if git_control_entry_exists(&git_dir.join(name))? {
+                return Err(GitError::WorktreeChanged);
+            }
+        }
+        for name in ["rebase-apply", "rebase-merge", "sequencer"] {
+            if git_control_entry_exists(&git_dir.join(name))? {
+                return Err(GitError::WorktreeChanged);
+            }
+        }
+        Ok(())
+    }
+
     fn validate_oid(&self, oid: &str) -> Result<(), GitError> {
         validate_oid(oid)?;
         if oid.len() != self.object_format.oid_hex_len() {
@@ -3476,6 +3523,25 @@ impl Git {
 fn validate_git_directory(root: &Path) -> Result<(), GitError> {
     let git_directory = root.join(".git");
     validate_local_directory(&git_directory).map_err(|_| GitError::NotRepositoryRoot)
+}
+
+/// Test whether a named primary-gitdir control entry is absent. Any link-like
+/// or otherwise unexpected entry is rejected rather than followed, because a
+/// compare operation is read-only and has no recovery semantics for mutable
+/// Git control state.
+fn git_control_entry_exists(path: &Path) -> Result<bool, GitError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if is_link_or_reparse_point(&metadata)
+                || (!metadata.file_type().is_file() && !metadata.file_type().is_dir())
+            {
+                return Err(GitError::UnsafeRepositoryMetadata);
+            }
+            Ok(true)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(io_error(GitIoOperation::InspectMetadata, &error)),
+    }
 }
 
 fn validate_local_directory(directory: &Path) -> Result<(), GitError> {
@@ -10218,6 +10284,35 @@ mod tests {
             read_historical_document(&vault, HistoricalRevision::Head, &missing),
             Err(GitError::HistoricalRevisionUnavailable)
         ));
+    }
+
+    #[test]
+    fn saved_worktree_reader_returns_only_persisted_ciphertext_and_rejects_active_merge() {
+        let (directory, mut vault) = create_conflicted_repository();
+        let path = LogicalPath::parse_canonical("entry.md").expect("path is canonical");
+        assert!(matches!(
+            read_worktree_document(&vault, &path),
+            Err(GitError::WorktreeChanged)
+        ));
+
+        // The failed Git merge has a primary-worktree MERGE_HEAD. Removing
+        // only that fixture control file lets this test demonstrate the saved
+        // encrypted worktree path without staging its ciphertext.
+        fs::remove_file(directory.path().join(".git").join("MERGE_HEAD"))
+            .expect("fixture MERGE_HEAD removes");
+        let current = vault
+            .read(&path)
+            .expect("conflicted worktree document reads");
+        let etag = current.etag.clone();
+        drop(current);
+        vault
+            .save_document(&path, b"saved worktree only\n", &etag, 1_783_699_204_000)
+            .expect("saved worktree mutation succeeds");
+        let saved = read_worktree_document(&vault, &path).expect("saved worktree reads");
+        assert_eq!(saved.plaintext.as_slice(), b"saved worktree only\n");
+        let head = read_historical_document(&vault, HistoricalRevision::Head, &path)
+            .expect("fixed HEAD still reads");
+        assert_eq!(head.plaintext.as_slice(), b"ours\n");
     }
 
     fn create_conflicted_repository_with_format(

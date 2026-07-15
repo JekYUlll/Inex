@@ -1867,6 +1867,31 @@ impl Vault {
         )?)
     }
 
+    /// Read and authenticate the current committed envelope in this vault's
+    /// worktree without applying the normal-editor feature gate.
+    ///
+    /// This is deliberately narrower than a general plaintext file API: it
+    /// performs the same bounded, regular-file and path-chain checks as a
+    /// normal vault read, returns no filesystem path, and is intended for
+    /// trusted ciphertext-only integrations which immediately apply their own
+    /// projection boundary (for example, an Outer-only saved-worktree compare).
+    /// Normal editor clients must continue to use [`Self::read`] or the
+    /// dedicated Umbra projection APIs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError`] when the target is absent or unsafe, exceeds the
+    /// EDRY bound, or fails committed-envelope authentication for this exact
+    /// vault, epoch and logical path.
+    pub fn read_committed_worktree_document(
+        &self,
+        logical_path: &LogicalPath,
+    ) -> Result<DecryptedDocument, VaultError> {
+        let target = self.document_target(logical_path)?;
+        let envelope = read_regular_bounded(&target, MAX_EDRY_ENVELOPE_BYTES)?;
+        self.authenticate_committed_envelope(logical_path, &envelope)
+    }
+
     /// Encrypt an in-memory three-way merge result as a committed EDRY file.
     ///
     /// `identity_header` must have come from an authenticated committed stage
