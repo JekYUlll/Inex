@@ -276,6 +276,10 @@ test("webview applies consecutive reveals, synchronizes selection, and scrolls l
     { startByte: firstStart, endByte: firstEnd },
     { startByte: secondStart, endByte: secondEnd },
   ]);
+  post({ type: "reveal", startByte: firstStart + 1, endByte: firstEnd });
+  post({ type: "reveal", startByte: secondEnd, endByte: secondEnd + 2 });
+  assert.deepEqual(selection, [8, 13]);
+  assert.equal(focusCount, 2, "invalid byte ranges must not move focus or selection");
 });
 
 function minimalPng(width: number, height: number): Uint8Array {

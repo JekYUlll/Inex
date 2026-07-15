@@ -1345,6 +1345,11 @@
 - 从独立、clean、canonical-origin checkout 的 `6f9847f3fab7adee4ae92cdb55e8d1a8d154c930` 以 system GCC 构建 Linux x64 release set；package/audit 与隔离 VS Code install smoke 全部通过。
 - 最新可安装 VSIX：`target/release-artifacts/6f9847f-linux-x64/inex-vscode-0.1.0-linux-x64.vsix`，SHA-256 为 `56025a5ce2d465f27395039333ee6e9f140d025c2ec64deb3fa8299e89a20f35`。它替代 `e593440` 包并包含 `Inex: Lock Umbra`；未自动安装到用户 profile。
 
+## 2026-07-16 — Webview reveal UTF-8 boundary hardening
+
+- webview reveal 的 UTF-8 byte→UTF-16 映射现只接受精确 code-point 边界；负数、非整数、越界或落在多字节字符中间的 start/end 将 fail closed，不改变 textarea selection、focus 或 scroll。
+- 连续 Heading reveal runtime 回归新增 malformed range 场景；`pnpm --dir editors/vscode test`（63/63）与真实 `test:extension:local` 均通过。
+
 ## 2026-07-16 — Outer-only Umbra export projection
 
 - `umbra_render::render_outer_projection` 现在只根据已认证的公开 Outer slot 策略替换 marker：Drop 输出空内容、Cover 输出明确公开的 cover text、Placeholder 输出固定无标识文本。它严格验证 marker/slot 一一对应和 Cover/Placeholder metadata，永不读取 private payload、kind、tag、slot ID 或 `K_umbra`。

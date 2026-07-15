@@ -1751,14 +1751,14 @@ let editEpoch=0;
 let extraSelections=[];
 const transfers=new Map();
 const objectUrls=new Set();
-function byteIndex(text,target){let bytes=0,index=0;for(const scalar of text){if(bytes>=target)break;bytes+=encoder.encode(scalar).length;index+=scalar.length;}return index;}
+function byteIndex(text,target){if(!Number.isSafeInteger(target)||target<0)return undefined;let bytes=0,index=0;for(const scalar of text){if(bytes===target)return index;const next=bytes+encoder.encode(scalar).length;if(next>target)return undefined;bytes=next;index+=scalar.length;}return bytes===target?index:undefined;}
 function byteOffset(text,target){return encoder.encode(text.slice(0,target)).length;}
 function currentRange(){return {startByte:byteOffset(editor.value,editor.selectionStart),endByte:byteOffset(editor.value,editor.selectionEnd)};}
 function sendSelection(){const current=currentRange(),seen=new Set(),selections=[];for(const range of [...extraSelections,current]){const key=range.startByte+':'+range.endByte;if(!seen.has(key)){seen.add(key);selections.push(range);}}vscode.postMessage({type:'selection',content:editor.value,selections,editEpoch});}
 function cancelEditTimer(){if(editTimer!==undefined){clearTimeout(editTimer);editTimer=undefined;}}
 function sendEdit(){cancelEditTimer();if(!applying)vscode.postMessage({type:'edit',content:editor.value,editEpoch});}
 function sendNavigation(type,offset){cancelEditTimer();vscode.postMessage({type,offset,content:editor.value,editEpoch});}
-function revealRange(startByte,endByte){const start=byteIndex(editor.value,startByte),end=byteIndex(editor.value,endByte);editor.focus();editor.setSelectionRange(start,end);const precedingLines=editor.value.slice(0,start).split(String.fromCharCode(10)).length-1;if(Number.isFinite(editor.clientHeight)&&editor.clientHeight>0)editor.scrollTop=Math.max(0,precedingLines*20-editor.clientHeight/3);sendSelection();}
+function revealRange(startByte,endByte){const start=byteIndex(editor.value,startByte),end=byteIndex(editor.value,endByte);if(start===undefined||end===undefined)return;editor.focus();editor.setSelectionRange(start,end);const precedingLines=editor.value.slice(0,start).split(String.fromCharCode(10)).length-1;if(Number.isFinite(editor.clientHeight)&&editor.clientHeight>0)editor.scrollTop=Math.max(0,precedingLines*20-editor.clientHeight/3);sendSelection();}
 function wipe(bytes){if(bytes&&typeof bytes.fill==='function')bytes.fill(0);}
 function wipeTransfer(transfer){for(const chunk of transfer.chunks)wipe(chunk);transfer.chunks.length=0;transfer.total=0;}
 function clearPreviewStorage(){for(const transfer of transfers.values())wipeTransfer(transfer);transfers.clear();for(const url of objectUrls)URL.revokeObjectURL(url);objectUrls.clear();previews.replaceChildren();previews.hidden=true;}
