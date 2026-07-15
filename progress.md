@@ -1306,3 +1306,4 @@
 
 - `write_plaintext_export_file` 现在只接收 portable relative path，以 create-new、Unix `0600`、`sync_all` 写入 staging；`PlaintextExportManifest` 记录长度/SHA-256，publication audit 重新读取所有文件、拒绝 link/wrong-kind/长度或 digest 改变，并同步文件父目录和 staging root。成功 publish 回归改为真实 manifest audit。
 - 定向测试和 pedantic Clippy 均通过。第一次 Clippy 指出新 writer 缺少 `# Errors` 文档；补齐后重跑通过。
+- staged writer 不再使用会跟随中间链接的 `create_dir_all`：现在逐级 create/`symlink_metadata` 验证每一父目录均为普通目录后才 create-new 文件。定向测试与 pedantic Clippy 重跑通过。

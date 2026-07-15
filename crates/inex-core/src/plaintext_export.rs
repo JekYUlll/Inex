@@ -144,18 +144,13 @@ pub fn write_plaintext_export_file(
             "plaintext export relative path invalid",
         ));
     }
-    let target = staging.join(relative_path);
-    let parent = target.parent().ok_or_else(|| {
+    let parent = ensure_safe_relative_parent(staging, relative_path)?;
+    let target = parent.join(relative_path.file_name().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "plaintext export target parent missing",
+            "plaintext export target name missing",
         )
-    })?;
-    fs::create_dir_all(parent)?;
-    let metadata = fs::symlink_metadata(parent)?;
-    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
-        return Err(io::Error::other("plaintext export parent unsafe"));
-    }
+    })?);
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
     configure_restrictive_file_creation(&mut options);
@@ -169,6 +164,30 @@ pub fn write_plaintext_export_file(
         sha256: Sha256::digest(bytes).into(),
     });
     Ok(())
+}
+
+fn ensure_safe_relative_parent(staging: &Path, relative_path: &Path) -> io::Result<PathBuf> {
+    let mut current = staging.to_path_buf();
+    let parent = relative_path.parent().unwrap_or_else(|| Path::new(""));
+    for component in parent.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "plaintext export parent invalid",
+            ));
+        };
+        current.push(name);
+        match fs::create_dir(&current) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+        let metadata = fs::symlink_metadata(&current)?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+            return Err(io::Error::other("plaintext export parent unsafe"));
+        }
+    }
+    Ok(current)
 }
 
 impl fmt::Debug for PlaintextExportStaging {
