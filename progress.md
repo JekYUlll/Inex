@@ -1791,3 +1791,7 @@
 
 - 新增 `docs/vscode-persistent-profile-validation.md`，将无法可靠 mouse-drive 的 Linux 持久 profile 门禁固化为一次性 CRLF/canary fixture 协议：真实 folder picker、任务终端双口令、Open New Vault、无操作密文 Git status、重复 Heading、SCM secure compare、lock/restart 与无秘密记录要求。
 - `installation.md` 与 `release-checklist.md` 已交叉引用该协议，计划中的 locked-first-import 发布门禁也绑定此文档。协议明确不使用真实私密内容、不添加测试后门，且不能将单次人工结果表述为完整 Hot Exit/Local History/崩溃 residue matrix。
+
+## 2026-07-16 — VS Code evidence wording refresh
+
+- 发布文档审计发现 `README.md` 与 `docs/release-checklist.md` 仍将 VS Code unit baseline 写为早期的 45。当前 `pnpm --dir editors/vscode test` 已实际通过 75/75，故仅更新这两个 current-evidence 数值；历史 `progress.md` 的时间序列不回写。
