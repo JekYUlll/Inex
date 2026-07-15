@@ -108,6 +108,7 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
     - [x] 核验通用 sibling-directory no-replace publisher：直接复用 `atomic_move_verified_directory_no_replace_checked`，它已提供身份重验/no-replace/fsync 且不依赖 `.vault-local`；export 不得调用 vault-specific import wrapper
     - [ ] CLI/VS Code 首先接入，Sublime/Neovim 仅复用 RPC 与同一确认语义
       - [x] CLI `inex export <vault> <destination> --scope outer|umbra` 已复用 daemon RPC service、Outer/Umbra 独立 password 生命周期和 prepare 后的显式 typed confirmation；test-only `INEX_EXPORT_TEST_CONFIRM=1` 仅用于真实进程回归（本轮）
+      - [x] VS Code `Inex: Export Plaintext Copy…` 已通过 sidecar prepare/commit、folder picker、Umbra gate 与 modal warning 接线；不创建 plaintext TextDocument 或 SCM/Git copy（本轮）
 
   - [x] 设计并实现 Umbra 私密标注系统（`docs/prd-umbra-mode.md`）；冻结独立 `K_umbra`、加密 catalog/profile、feature-2 container、atomic RenderMap mutation 与 Outer 隔离，MVP defer 项保持在规范中
   - [x] 冻结产品交互、私密标签/profile加密边界、Outer隔离、selection原子性及MVP/延期范围

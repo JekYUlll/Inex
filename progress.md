@@ -1292,6 +1292,7 @@
 - 实现 plaintext export 的 authenticated-tree → staging 核心引擎：`PlaintextExportManifest` 现在递归审计精确树，拒绝未登记的文件、目录和链接；Vault 写入逻辑保留空目录，导出普通 Markdown/附件，Outer scope 只生成公开 Umbra 投影，Umbra scope 在任何写入前要求 live `K_umbra` 并写出完整 projection。核心全量门禁：`cargo clippy -p inex-core --all-targets -- -D warnings`、`cargo test -p inex-core`（303 单测 + 2 doctest）均通过。
 - `inexd` 现提供 `vault.export.prepare` 和 `vault.export.commit`。prepare 验证 scope/destination、保留无明文的受限 staging，并保存认证 tree snapshot 与随机 session-bound single-use confirmation；commit 先消费 capability，再按该 snapshot 写入、审计并 no-replace 发布。RPC 回归证明 capability replay 拒绝，prepare 后出现的新文件不进入导出；core 303 tests + daemon 72 tests 通过。
 - CLI 新增 `inex export <vault> <destination> --scope outer|umbra`，复用 daemon JSON-RPC handler 而不直接调用 core plaintext writer；先解锁 Outer、Umbra scope 再独立解锁 Umbra，prepare 后显示高风险提示并要求隐藏终端输入 `EXPORT PLAINTEXT`。`INEX_EXPORT_TEST_CONFIRM=1` 仅被真实子进程测试使用。Outer CLI integration regression 证明已发布目录含精确 Markdown。
+- VS Code 新增 `Inex: Export Plaintext Copy…`：仅 unlocked session 可执行，用户先选 parent/new folder/scope，Umbra scope 复用独立 unlock，再以 modal warning 消耗 daemon confirmation。实现不触发 SCM/Git 或 VS Code plaintext TextDocument，`pnpm --dir editors/vscode check` 通过。
 - 下一实现切片是 core transaction 与 daemon RPC；普通 VS Code SCM/textconv、`workspace.fs.copy` 或 plaintext `TextDocument` 均被明确排除，以免为了导出功能破坏日常编辑的无明文落盘边界。
 - 实现预审确认 vault-specific directory publisher 正确地绑定 `.vault-local` 与 import marker，不能用于明文 export staging；但其底层 `atomic_move_verified_directory_no_replace_checked` 已是所需的通用 no-replace/identity/fsync primitive。导出实现将直接使用它，避免重复或伪造 vault 恢复协议。
 
