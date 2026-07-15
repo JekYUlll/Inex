@@ -1806,3 +1806,8 @@
 
 - 计划与 README 审计发现 tag/profile management UI 的全部实现子项已完成（包括 profile metadata edit），但两个父 checkbox 与 README 仍误写 pending。现已仅将其与现有实现对齐；explicit Neovim host-residue gate 继续保持未完成。
 - `annotation_picker.lua`、`headless_smoke.lua` 与 temporary-vault `run_outer_lifecycle.sh` 均以当前 `target/debug/inexd` exit 0 通过。后者实际覆盖 Outer/Umbra unlock/lock、create/save/search/mkdir、reopen、feature-2 enable 和 private annotation mutation；不把此结果扩大为 shada/undo/LSP/third-party host residue 结论。
+
+## 2026-07-16 — Hosted CI recheck
+
+- 本地 `master` 相对 `origin/master` 为 `0 behind / 426 ahead`；尚未推送，避免未经授权将大批本地 checkpoint 写入远端。
+- 只读检查未能取得新的 hosted run：`gh auth status` 在 keyring 访问 GitHub account 时 timeout，`gh run list` 对 GitHub Actions API 报 TLS handshake timeout。此网络/认证结果不能推断 CI 状态，也不重试或修改远端。
