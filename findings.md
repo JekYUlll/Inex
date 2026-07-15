@@ -703,3 +703,8 @@
 
 - Schema unit tests of two clients do not prove catalog portability. The meaningful boundary is a real ciphertext vault written through VS Code's typed sidecar and subsequently opened by a separately spawned Sublime RPC client. The cross-client test now binds the VS Code `umbra.tag.create` trace, a post-password-change Umbra lock, a fresh Sublime daemon unlock, and an encrypted config read.
 - Test orchestration itself must not normalize a private tag label into process metadata. The helper has a fixed test-only assertion and receives only executable/vault paths as argv; the dynamic Umbra password is piped on stdin, never placed in an environment variable or temporary file.
+
+## 2026-07-16 Cross-editor private-slot evidence
+
+- Catalog compatibility alone cannot prove that two editors agree on a feature-2 document projection. The strengthened matrix has VS Code create a tagged private slot through the same typed sidecar API, then requires a fresh Sublime daemon to independently unlock Umbra and parse the resulting RenderMap. A one-slot check proves the shared document container/projection contract without making test code inspect private Markdown.
+- The Sublime helper owns the returned projection bytearray and wipes it in `finally`. Its only observable result is a fixed success token, so neither the private slot body nor catalog content becomes subprocess output, test failure text, or a persisted fixture.

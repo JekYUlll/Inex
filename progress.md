@@ -1585,3 +1585,8 @@
 
 - Extension Host integration 新增真实跨客户端闭环：VS Code 在已解锁 Umbra session 通过 typed sidecar 创建测试 private tag，随后修改/验证 Umbra password 并锁定；独立 `InexRpcClient`（Sublime client）启动第二个 daemon，对同一 vault 输入 replacement password、独立 unlock Umbra、读取 encrypted catalog 并验证 tag 存在，最后 lock/shutdown。sidecar trace 必须包含并排序 `umbra.tag.create`，避免 test-only API 绕过客户端 RPC。
 - helper 只从 stdin 接收 password；测试 tag 的固定 ID/label 留在 helper source，绝不作为 argv、environment 或 temporary file 传递。其输出固定为 success token，runner 既不打印也不持久 catalog。验证：Sublime 96/96 unittest、Python 3.8 AST syntax gate、VS Code typecheck 与 local Extension Host gate 均通过。当前主机无 `python3.8` executable，因此解释器级运行不能声明；兼容性由现有 3.8 AST gate 覆盖。
+
+## 2026-07-16 — VS Code → Sublime private-slot interoperability
+
+- 在 catalog write/read 后，VS Code integration API 以该 tag 在 `plain.md` 的首行创建 Drop private comment，sidecar 返回必须恰有一个 private slot。Host 随后锁定 Umbra；独立 Sublime client 使用 replacement password 打开同一 feature-2 document，仅验证 parsed RenderMap 的 `privateSlots` 长度为一，并在 finally 中 wipe decrypted projection。测试不检查、打印或持久 annotation body。
+- 验证：Sublime 96/96、Python 3.8 AST syntax gate、VS Code typecheck 与真实 local Extension Host 通过。Build 4200 argument-negative unit tests 的 usage stderr 是其预期断言，不是本次测试失败。

@@ -22,6 +22,7 @@ from inex_rpc import InexRpcClient, wipe
 
 EXPECTED_TAG_ID = "cross-editor-catalog"
 EXPECTED_TAG_LABEL = "Cross editor catalog"
+EXPECTED_DOCUMENT_PATH = "plain.md"
 
 
 def main(arguments: List[str]) -> int:
@@ -49,6 +50,15 @@ def main(arguments: List[str]) -> int:
             for tag in tags
         ):
             return 1
+        content, _etag, render_map = client.open_umbra_document(
+            EXPECTED_DOCUMENT_PATH
+        )
+        try:
+            slots = render_map.get("privateSlots")
+            if not isinstance(slots, list) or len(slots) != 1:
+                return 1
+        finally:
+            wipe(content)
         print("sublime-cross-editor-catalog-ok")
         return 0
     finally:

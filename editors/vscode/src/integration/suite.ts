@@ -50,6 +50,7 @@ interface InexIntegrationTestApi {
   readonly verifyOuterRevisionCompare: () => Promise<void>;
   readonly verifyUmbraRevisionCompare: () => Promise<void>;
   readonly createCrossEditorUmbraTag: () => Promise<void>;
+  readonly createCrossEditorUmbraAnnotation: (logicalPath: string) => Promise<void>;
   readonly lock: () => Promise<void>;
 }
 
@@ -139,6 +140,7 @@ async function runBackupRecoveryCycle(
   );
   await runUmbraPlaintextExportCycle(api, fixture);
   await api.createCrossEditorUmbraTag();
+  await api.createCrossEditorUmbraAnnotation(SECONDARY_LOGICAL_PATH);
   const replacementUmbraPassword = "Inex integration replacement Umbra password";
   await api.verifyUmbraPasswordChange(fixture.password, replacementUmbraPassword);
   await api.verifyUmbraLock(replacementUmbraPassword);
@@ -149,7 +151,7 @@ async function runBackupRecoveryCycle(
   const umbraTrace = await waitForSidecarTrace(
     fixture,
     (entries) => entries.some((entry) => entry.method === "umbra.document.convert")
-      && entries.filter((entry) => entry.method === "umbra.annotation.apply").length >= 2
+      && entries.filter((entry) => entry.method === "umbra.annotation.apply").length >= 3
       && entries.some((entry) => entry.method === "umbra.annotation.edit")
       && entries.filter((entry) => entry.method === "umbra.annotation.remove").length >= 2
       && entries.some((entry) => entry.method === "umbra.tag.create")
@@ -167,6 +169,7 @@ async function runBackupRecoveryCycle(
     all("umbra.annotation.apply")[1],
     all("umbra.annotation.remove")[1],
     first("umbra.tag.create"),
+    all("umbra.annotation.apply")[2],
     first("umbra.password.change"),
     first("umbra.lock"),
   ];
@@ -689,6 +692,7 @@ function assertIntegrationApi(value: unknown): asserts value is InexIntegrationT
     "verifyOuterRevisionCompare",
     "verifyUmbraRevisionCompare",
     "createCrossEditorUmbraTag",
+    "createCrossEditorUmbraAnnotation",
     "lock",
   ]) {
     assert.equal(typeof candidate[method], "function", `Integration-test API lacks ${method}`);

@@ -57,6 +57,7 @@ export interface InexIntegrationTestApi {
   readonly verifyOuterRevisionCompare: () => Promise<void>;
   readonly verifyUmbraRevisionCompare: () => Promise<void>;
   readonly createCrossEditorUmbraTag: () => Promise<void>;
+  readonly createCrossEditorUmbraAnnotation: (logicalPath: string) => Promise<void>;
   readonly lock: () => Promise<void>;
 }
 
@@ -634,6 +635,31 @@ export function activate(
         throw new Error("Inex integration cross-editor tag was not persisted");
       }
       return;
+    },
+    createCrossEditorUmbraAnnotation: async (logicalPath: string) => {
+      const session = controller.acquireSession();
+      if (!(await session.sidecar.umbraStatus()).unlocked) {
+        throw new Error("Inex integration cross-editor annotation requires an unlocked Umbra session");
+      }
+      const projection = await session.sidecar.openUmbraDocument(logicalPath);
+      const content = Buffer.from(projection.content);
+      try {
+        const lineEnd = content.indexOf(0x0a);
+        if (lineEnd < 1) throw new Error("Inex integration cross-editor annotation needs a first Markdown line");
+        const updated = await session.sidecar.applyUmbraAnnotation(
+          logicalPath,
+          projection,
+          [{ startByte: 0, endByte: lineEnd + 1 }],
+          { kind: "comment", tagIds: ["cross-editor-catalog"], outer: { mode: "drop" } },
+        );
+        updated.content.fill(0);
+        if (updated.renderMap.privateSlots.length !== 1) {
+          throw new Error("Inex integration cross-editor annotation did not create one private slot");
+        }
+      } finally {
+        content.fill(0);
+        projection.content.fill(0);
+      }
     },
     lock: () => controller.lock(),
   });
