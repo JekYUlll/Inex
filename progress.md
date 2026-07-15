@@ -1290,3 +1290,4 @@
 
 - 将此前请求的管理员/加强模式导出明确冻结为高风险、用户显式授权的 Plaintext Export Mode，而非任何密码绕过。新增 `docs/spec/plaintext-export-v1.md`：daemon-only write、Outer/独立 Umbra scope、session-bound single-use prepare/commit capability、同级 staging 审计与 no-replace 原子发布、staging 保留、destination receipt 和 CLI/VS Code UX 边界均已定义。
 - 下一实现切片是 core transaction 与 daemon RPC；普通 VS Code SCM/textconv、`workspace.fs.copy` 或 plaintext `TextDocument` 均被明确排除，以免为了导出功能破坏日常编辑的无明文落盘边界。
+- 实现预审发现现有 directory publisher 正确地绑定 `.vault-local` 与 import marker，不能用于明文 export staging；计划已增加独立 generic no-replace publisher 前置项，避免把 vault 恢复协议错误扩展到 plaintext destination。
