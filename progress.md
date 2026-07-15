@@ -1252,3 +1252,9 @@
 
 - 当前源码运行 `pnpm --dir editors/vscode check` 与 `pnpm --dir editors/vscode test`：TypeScript 通过、57/57 单测通过。随后运行真实本机 Extension Host `pnpm --dir editors/vscode test:extension:local`，重新构建 extension、integration suite、CLI/daemon，并在隔离 Xvfb/VS Code profile 下通过 feature-1 repository import、asset preview、CRUD、backup/recovery 与 residue audit。
 - 该证据不替代最终 VSIX 的人工 folder picker、隐藏终端双口令、Open New Vault 鼠标路径和 persistent-profile release gate；计划中的该项继续保持未完成，避免将 headless Extension Host 冒充真实交互验收。
+
+## 2026-07-15 — Unix Git process-group containment
+
+- repository-import 的普通 Git plumbing 与 `cat-file --batch` 均以独立 Unix process group 启动；timeout、oversized output、protocol mismatch 和 Drop 路径通过 safe rustix `kill_process_group` 先终止该组，再回收 direct child/reader。stdout acquisition 失败也会先执行同一清理，避免已启动 child 脱离所有权。
+- 新增 Linux 对抗回归：shell 启动一个继承 stdout 的 background descendant，记录其 PID 后触发 `kill_and_wait`；测试确认 direct child 非成功结束且 descendant 在两秒内为 `ESRCH`。`inex-git` 全 379 单测、all-targets Clippy `-D warnings` 与 diff check 通过。
+- 该闭合仅覆盖不主动逃离 dedicated group 的 Unix 后代；Windows Job、native process-tree evidence 和 hostile same-UID escape/TOCTOU 保持 GA 未完成门禁。

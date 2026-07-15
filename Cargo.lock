@@ -307,6 +307,7 @@ version = "0.1.0"
 dependencies = [
  "diffy",
  "inex-core",
+ "rustix",
  "serde",
  "serde_json",
  "sha1",

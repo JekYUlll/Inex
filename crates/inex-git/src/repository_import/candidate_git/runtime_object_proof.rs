@@ -8,11 +8,11 @@
 //! shutdown have succeeded.
 //!
 //! This is intentionally a trusted-local Linux preview. `TargetObjectBatch`
-//! supervises the direct child with a deadline, but its scoped reader joins can
-//! remain blocked if a hostile descendant inherits a pipe after the direct
-//! child is killed. Consequently this proof does not establish hostile process
-//! tree containment, a total wall-clock bound, mutation-lock authority, or
-//! publication authority.
+//! supervises one dedicated Git process group with a deadline and terminates
+//! that group before joining its bounded readers. A hostile descendant that
+//! escapes the group remains outside this Linux preview's authority; the proof
+//! consequently does not establish hostile process-tree containment, a total
+//! wall-clock bound, mutation-lock authority, or publication authority.
 
 use std::fmt;
 
@@ -423,9 +423,10 @@ mod tests {
     }
 
     #[test]
-    fn runtime_proof_contract_documents_unclosed_descendant_pipe_risk() {
+    fn runtime_proof_contract_documents_process_group_boundary() {
         let source = include_str!("runtime_object_proof.rs");
-        assert!(source.contains("hostile descendant inherits a pipe"));
+        assert!(source.contains("dedicated Git process group"));
+        assert!(source.contains("escapes the group"));
         assert!(source.contains("does not establish hostile process tree containment"));
         assert!(source.contains("TARGET_OBJECT_STREAM_CHUNK_BYTES == 16 * 1024"));
     }

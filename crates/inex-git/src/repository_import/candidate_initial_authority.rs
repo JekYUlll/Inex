@@ -18,8 +18,9 @@
 //! The lock serializes cooperative Inex writers only. A hostile same-UID
 //! process can ignore it and can still attempt swap-and-restore races; the
 //! unkeyed content seal is not a MAC. Runtime Git supervision also retains the
-//! documented trusted-local boundary where a hostile descendant can inherit a
-//! pipe and keep a reader join blocked after the direct child is terminated.
+//! documented trusted-local boundary where a hostile descendant can escape the
+//! dedicated Git process group or race filesystem identities; process-group
+//! shutdown otherwise closes inherited pipes before bounded reader joins.
 
 use std::fmt;
 #[cfg(target_os = "linux")]

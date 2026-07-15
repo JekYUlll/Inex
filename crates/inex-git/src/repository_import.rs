@@ -2622,14 +2622,17 @@ fn normalize_target_paths(paths: &[PathBuf]) -> Result<Vec<PathBuf>, RepositoryI
     if normalized.len() > MAX_TARGET_ENTRIES {
         return Err(RepositoryImportError::ResourceLimit);
     }
-    let mut paths = normalized.into_iter().collect::<Vec<_>>();
-    paths.sort_by(|left, right| {
-        slash_path(left)
-            .expect("validated target path")
-            .as_bytes()
-            .cmp(slash_path(right).expect("validated target path").as_bytes())
-    });
-    Ok(paths)
+    let mut ordered = normalized
+        .into_iter()
+        .map(|path| {
+            let key = slash_path(&path)
+                .ok_or(RepositoryImportError::UnsafeTarget)?
+                .into_bytes();
+            Ok((key, path))
+        })
+        .collect::<Result<Vec<_>, RepositoryImportError>>()?;
+    ordered.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(ordered.into_iter().map(|(_, path)| path).collect())
 }
 
 fn validate_target_relative_path(path: &Path) -> Result<(), RepositoryImportError> {
@@ -3889,6 +3892,7 @@ impl GitRunner {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        configure_git_process_containment(&mut command);
         copy_platform_process_environment(&mut command);
         let mut child = match command.spawn() {
             Ok(child) => child,
@@ -4063,6 +4067,7 @@ impl GitRunner {
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        configure_git_process_containment(&mut command);
         if isolate_repository_discovery {
             command.env("GIT_DIR", null_device());
         }
@@ -4089,10 +4094,14 @@ impl GitRunner {
                 return Err(io_error(RepositoryIoOperation::SpawnGit, &error));
             }
         };
-        let stdout = child.stdout.take().ok_or(RepositoryImportError::Io {
-            operation: RepositoryIoOperation::CommunicateGit,
-            kind: io::ErrorKind::BrokenPipe,
-        })?;
+        let Some(stdout) = child.stdout.take() else {
+            let _ = kill_and_wait(&mut child);
+            self.verify_runtime_bindings()?;
+            return Err(RepositoryImportError::Io {
+                operation: RepositoryIoOperation::CommunicateGit,
+                kind: io::ErrorKind::BrokenPipe,
+            });
+        };
         let mut child_stdin = child.stdin.take();
         let output_too_large = AtomicBool::new(false);
         let communication = std::thread::scope(|scope| {
@@ -4118,7 +4127,7 @@ impl GitRunner {
             let deadline = Instant::now() + GIT_TIMEOUT;
             let (status, timed_out) = loop {
                 if output_too_large.load(Ordering::Acquire) {
-                    let _ = child.kill();
+                    let _ = terminate_git_process_tree(&mut child);
                     let status = child
                         .wait()
                         .map_err(|error| io_error(RepositoryIoOperation::CommunicateGit, &error))?;
@@ -4131,7 +4140,7 @@ impl GitRunner {
                     break (status, false);
                 }
                 if Instant::now() >= deadline {
-                    let _ = child.kill();
+                    let _ = terminate_git_process_tree(&mut child);
                     let status = child
                         .wait()
                         .map_err(|error| io_error(RepositoryIoOperation::CommunicateGit, &error))?;
@@ -4490,6 +4499,43 @@ impl Drop for TargetObjectBatch<'_> {
     }
 }
 
+/// Spawn every Git plumbing command in its own Unix process group. This is a
+/// containment boundary for descendants which inherit one of our pipes: on a
+/// timeout or malformed response we can close the whole group before joining
+/// the bounded readers. Windows keeps its separate Job Object release gate.
+#[cfg(unix)]
+fn configure_git_process_containment(command: &mut Command) {
+    use std::os::unix::process::CommandExt as _;
+
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_git_process_containment(_command: &mut Command) {}
+
+#[cfg(unix)]
+fn terminate_git_process_tree(child: &mut Child) -> io::Result<()> {
+    use rustix::io::Errno;
+    use rustix::process::{Pid, Signal, kill_process_group};
+
+    // `process_group(0)` makes the direct child's positive PID the group
+    // leader. rustix issues `kill(-pid, SIGKILL)` without an unsafe boundary.
+    match kill_process_group(Pid::from_child(child), Signal::KILL) {
+        Ok(()) | Err(Errno::SRCH) => {}
+        Err(error) => return Err(io::Error::from(error)),
+    }
+    match child.kill() {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate_git_process_tree(child: &mut Child) -> io::Result<()> {
+    child.kill()
+}
+
 fn kill_and_wait(child: &mut Child) -> Result<ExitStatus, RepositoryImportError> {
     let deadline = Instant::now() + GIT_TERMINATION_TIMEOUT;
     loop {
@@ -4499,7 +4545,7 @@ fn kill_and_wait(child: &mut Child) -> Result<ExitStatus, RepositoryImportError>
         {
             return Ok(status);
         }
-        let _ = child.kill();
+        let _ = terminate_git_process_tree(child);
         if let Some(status) = child
             .try_wait()
             .map_err(|error| io_error(RepositoryIoOperation::CommunicateGit, &error))?
@@ -4803,6 +4849,59 @@ mod tests {
             .status()
             .expect("test Git starts");
         assert!(status.success(), "test Git command failed: {arguments:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_process_group_shutdown_reaps_a_descendant_that_inherits_stdout() {
+        use rustix::io::Errno;
+        use rustix::process::{Pid, test_kill_process};
+
+        let directory = TestDirectory::new("git-process-group");
+        let child_pid_path = directory.path().join("descendant.pid");
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("sleep 30 & child=$!; printf '%s' \"$child\" > \"$1\"; wait \"$child\"")
+            .arg("inex-process-group-test")
+            .arg(&child_pid_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null());
+        configure_git_process_containment(&mut command);
+        let mut child = command.spawn().expect("contained fixture starts");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !child_pid_path.is_file() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let descendant_pid = fs::read_to_string(&child_pid_path)
+            .expect("fixture records inherited-pipe descendant PID")
+            .trim()
+            .parse::<i32>()
+            .expect("fixture PID is numeric");
+        let descendant = Pid::from_raw(descendant_pid).expect("fixture PID is positive");
+        assert!(
+            test_kill_process(descendant).is_ok(),
+            "descendant starts alive"
+        );
+
+        let status = kill_and_wait(&mut child).expect("contained process group terminates");
+        assert!(
+            !status.success(),
+            "direct child is terminated with its group"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match test_kill_process(descendant) {
+                Err(Errno::SRCH) => break,
+                Ok(()) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(()) => panic!("inherited-pipe descendant survived process-group shutdown"),
+                Err(error) => panic!("cannot inspect descendant after shutdown: {error:?}"),
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]

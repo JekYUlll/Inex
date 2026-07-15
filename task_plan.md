@@ -189,6 +189,9 @@ Phase 6 extension — 现有 Markdown Git 仓库/加密附件迁移与 Umbra 私
     - [x] 从approved path/OID trie独立typed-SHA-1序列化每棵raw tree，并用单个bounded streaming `cat-file --batch`逐对象比较blob/tree/commit body与exact inventory（`d8805bd`）
     - [x] 将同一次secure-handle raw index读取接入repository import，证明raw index、`ls-files -s`与HEAD tree三方完全一致，并拒绝raw `FSMN` bitmap状态（`b4ab8cf`）
     - [ ] 以Unix进程组/Windows Job或等价机制闭合恶意Git后代持pipe、hostile same-UID TOCTOU及完整process-tree资源边界
+      - [x] Unix Git process-group：所有 repository-import plumbing spawn 均独立成组；异常/超时先终止全组再 join reader，Linux inherited-stdout descendant 对抗回归通过
+      - [ ] Windows Job 与 native active-process/handle-release 证据
+      - [ ] hostile same-UID process-group escape、executable/identity TOCTOU 的完整边界
   - [ ] 完成跨进程publication ambiguity恢复
     - [x] 冻结并独立复审generic marker v2、candidate seal v1、existing-only no-create reconcile、initial held-lock与reserved marker mutation barrier契约（`3fd797e`）
     - [x] 冻结reconcile终态、dry-run观察态、输出确认与reserved namespace分类，三轮独立复审GO（`3a7c622`）
