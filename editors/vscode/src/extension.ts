@@ -117,6 +117,28 @@ export function activate(
         );
       });
     }),
+    vscode.commands.registerCommand("inex.lockUmbra", async () => {
+      await runUiAction(async () => {
+        if (!controller.isUnlocked) {
+          await vscode.window.showInformationMessage("Unlock the Inex vault before locking Umbra.");
+          return;
+        }
+        const session = controller.acquireSession();
+        try {
+          const status = await session.sidecar.umbraStatus();
+          if (!status.unlocked) {
+            await vscode.window.showInformationMessage("Umbra is already locked.");
+            return;
+          }
+          await session.sidecar.lockUmbra();
+        } finally {
+          // A transport failure leaves remote lock state unknown. Never retain
+          // an Umbra projection locally in that case.
+          editor.wipeUmbraForLock();
+        }
+        await vscode.window.showInformationMessage("Umbra locked; private projections and related preview state were cleared.");
+      });
+    }),
     vscode.commands.registerCommand("inex.importRepository", async (source?: unknown) => {
       await runUiAction(async () => {
         if (controller.isUnlocked) {

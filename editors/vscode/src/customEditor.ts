@@ -946,6 +946,16 @@ export class InexCustomEditorProvider
     }
   }
 
+  /** Clear only private projections after K_umbra leaves the sidecar. */
+  public wipeUmbraForLock(): void {
+    this.previews.cancelAll();
+    for (const document of this.documents) {
+      if (document.isUmbraProjection) {
+        document.wipeForLock();
+      }
+    }
+  }
+
   public async confirmLock(): Promise<boolean> {
     const currentDocuments = [...this.documents].filter((document) =>
       this.controller.isSessionCurrent(document.session),

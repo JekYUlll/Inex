@@ -31,6 +31,7 @@
     "onCommand:inex.showSecurityStatus",
     "onCommand:inex.exportPlaintextCopy",
     "onCommand:inex.unlockVault",
+    "onCommand:inex.lockUmbra",
     "onCommand:inex.importRepository",
     "onCommand:inex.newEncryptedMarkdown",
     "onCommand:inex.newFolder",
@@ -65,6 +66,11 @@
       {
         "command": "inex.lockVault",
         "title": "Inex: Lock Vault",
+        "enablement": "inex.vaultUnlocked"
+      },
+      {
+        "command": "inex.lockUmbra",
+        "title": "Inex: Lock Umbra",
         "enablement": "inex.vaultUnlocked"
       },
       {
