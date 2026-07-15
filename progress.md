@@ -1769,3 +1769,8 @@
 - 在全新 `/home/horeb/_code/inex-test/_blog-inex-real-import` 对同一 `_blog` source 完整运行 `import-repository`。独立 tmux 事务以 exit 0 完成：307 encrypted Markdown、17 encrypted assets，candidate vault audit 与 Git object audit 均通过，plaintext file objects 为 0。
 - publication 结果为 single atomic new Git root：`git-root-parent-count: 0`、无 tracked source plaintext files、`source-revalidated: yes`、`source-preserved: yes`、`recovery-required: none`。发布后 source 与 destination 都 clean，locked `inex verify` 报告 7 directories、307 documents、17 assets，且 root 顶层普通 `.md`/image 文件计数为 0。
 - 此项使用独立测试口令与用户源仓库的复制目录；它证明 CLI full import/atomic publication，仍不替代最终 VS Code persistent-profile folder-picker/manual UI 证据。
+
+## 2026-07-16 — Current Rust workspace validation
+
+- 独立 tmux `cargo test --workspace` 在当前 source 以 exit 0 完成。最长的 `inex-git` suite 为 369 passed、12 expected ignored、0 failed，耗时 226.33s；CLI/core/daemon/Git integration 与 Rust doc-tests 均通过。
+- 运行期间仍观察到一个早于本轮的 orphaned ignored `force_kill_writer_child` process；它不属于本轮 tmux process tree，也未阻止本轮 `cargo test --workspace` 正常 exit 0，因此不将其作为本轮失败或清理它。独立 full native force-kill matrix 仍按计划另行执行，不由 workspace ignored cases冒充。
