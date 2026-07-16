@@ -8121,17 +8121,11 @@ mod platform {
             // Windows does not consistently support FlushFileBuffers on a
             // directory handle. File contents have already been flushed and
             // MoveFileExW supplies the namespace write-through barrier, so
-            // capability-only directory failures must not reject a valid
+            // an unavailable directory checkpoint must not reject a valid
             // ciphertext commit on an otherwise supported local volume.
-            if matches!(
-                error.kind(),
-                io::ErrorKind::PermissionDenied
-                    | io::ErrorKind::InvalidInput
-                    | io::ErrorKind::Unsupported
-            ) {
-                return Ok(());
-            }
-            return Err(error);
+            // Keep the error consumed so no platform-specific path details
+            // escape through a later diagnostic.
+            drop(error);
         }
         if closed == 0 {
             return Err(io::Error::last_os_error());
