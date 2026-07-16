@@ -2306,7 +2306,18 @@ where
     sync_staging_directory_before_publish(staging)?;
 
     // Freeze all cooperative Inex mutations from the critical physical audit
-    // through namespace publication and post-state reconciliation.
+    // through namespace publication and post-state reconciliation. Windows
+    // cannot rename a directory while its contained `LockFileEx` lock remains
+    // held, so its unpublished, randomly named staging tree releases this
+    // cooperative lock immediately after the final audit and before the move.
+    #[cfg(windows)]
+    let mut vault_lock = Some(VaultMutationLock::acquire(staging).map_err(
+        |error| match error {
+            AtomicWriteError::Io { source, .. } => AtomicDirectoryPublishError::io(source),
+            _ => AtomicDirectoryPublishError::Indeterminate,
+        },
+    )?);
+    #[cfg(not(windows))]
     let _vault_lock = VaultMutationLock::acquire(staging).map_err(|error| match error {
         AtomicWriteError::Io { source, .. } => AtomicDirectoryPublishError::io(source),
         _ => AtomicDirectoryPublishError::Indeterminate,
@@ -2325,6 +2336,8 @@ where
         {
             return Err(AtomicDirectoryPublishError::Indeterminate);
         }
+        #[cfg(windows)]
+        drop(vault_lock.take());
         Ok(())
     };
     let move_fault = if skip_move {

@@ -1835,3 +1835,8 @@
 
 - `29509111877` 的 release tooling 失败由 KDF calibration evidence runner 的 Linux `/proc/<pid>/status` 竞态触发：子进程在 `poll()` 后、采样前退出会留下缺少 Vm* 字段的 zombie status。运行中进程缺字段仍拒绝；仅明确 `State: Z` 作为不可用样本跳过，并将 executable fixture 保持时间提高到 500 ms，避免共享 runner 的调度抖动。
 - 同一 run 已通过 VS Code 1.125/1.126 Extension Host 和 Windows Sublime product gate。Windows import native rerun仍在下一提交中验证。
+
+## 2026-07-16 — Windows staged-vault rename lock repair
+
+- Native Windows run `29509609412` confirmed that directory `FlushFileBuffers` was not the remaining blocker: the final namespace operation left the exact staged source unmoved. The remaining staged `LockFileEx`-backed `mutation.lock` is the relevant Windows-only rename blocker: whole-directory rename can be rejected while that contained byte-range lock is held, even when the file handle permits delete sharing.
+- Publication now retains the existing lock for Linux's audit-to-reconciliation interval. On Windows only, it releases the unpublished random staging-tree cooperative lock immediately after the final identity/marker/seal audit and immediately before `MoveFileExW`; marker handle delete sharing remains in force and all post-move identity/marker checks remain unchanged. Linux import regression and MSVC cross-compile pass locally; the next hosted native Windows run is the runtime proof.
