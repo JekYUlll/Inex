@@ -8118,6 +8118,19 @@ mod platform {
         // SAFETY: this closes exactly the owned handle once.
         let closed = unsafe { CloseHandle(handle) };
         if let Some(error) = flush_error {
+            // Windows does not consistently support FlushFileBuffers on a
+            // directory handle. File contents have already been flushed and
+            // MoveFileExW supplies the namespace write-through barrier, so
+            // capability-only directory failures must not reject a valid
+            // ciphertext commit on an otherwise supported local volume.
+            if matches!(
+                error.kind(),
+                io::ErrorKind::PermissionDenied
+                    | io::ErrorKind::InvalidInput
+                    | io::ErrorKind::Unsupported
+            ) {
+                return Ok(());
+            }
             return Err(error);
         }
         if closed == 0 {
