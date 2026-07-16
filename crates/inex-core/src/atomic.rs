@@ -1919,6 +1919,16 @@ where
     if fault == DirectoryMoveFault::AfterMove && move_result.is_ok() {
         move_result = Err(io::Error::other("injected error after directory move"));
     }
+    #[cfg(all(test, windows))]
+    if let Err(error) = &move_result {
+        // CI-only, path-free diagnostic for a native namespace failure. The
+        // production error remains intentionally scrubbed.
+        eprintln!(
+            "inex directory namespace move failed: kind={:?} raw_os_error={:?}",
+            error.kind(),
+            error.raw_os_error()
+        );
+    }
 
     let source_state = inspect_directory_state(&paths.source);
     let destination_state = inspect_directory_state(&paths.destination);
