@@ -734,7 +734,7 @@ class KdfCalibrationEvidenceTests(unittest.TestCase):
                         raise SystemExit(3)
                     sys.stdout.buffer.write({output_literal})
                     sys.stdout.buffer.flush()
-                    time.sleep(0.08)
+                    time.sleep(0.5)
                     """
                 ),
                 encoding="utf-8",

@@ -789,6 +789,11 @@ def _linux_process_memory_sample(process_id: int) -> dict[str, int] | None:
         os.close(descriptor)
     if len(data) > 128 * 1024:
         raise ReleaseError("Linux KDF process status exceeds its byte ceiling")
+    # A child can exit after poll() but before /proc is read. Linux retains a
+    # zombie status entry without the Vm* counters; it is not a usable sample,
+    # but also is not evidence that a running process omitted required data.
+    if re.search(rb"^State:\s+Z", data, re.MULTILINE) is not None:
+        return None
     fields = {
         "vmHwmBytes": b"VmHWM",
         "vmPeakBytes": b"VmPeak",

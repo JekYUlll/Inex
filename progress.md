@@ -1830,3 +1830,8 @@
 
 - Native Windows rerun 已证明两个 VS Code Extension Host gates 通过，但 import publication 仍在 staging publication 前失败。发布前的 `FlushFileBuffers(directory)` 在 Windows 是 capability probe，不能作为 namespace publication 必须条件；marker bytes 已 `sync_all`，而 `MoveFileExW(MOVEFILE_WRITE_THROUGH)` 才是 Windows commit barrier。
 - 现将 publication 前 local/staging directory sync 在 Windows 降为 best-effort，成功路径仍以 `ParentSyncStatus` 报告后续 internal/parent sync；Linux 保持严格错误传播。MSVC compile 与 Linux import publication regression 通过，等待下一 native Windows rerun。
+
+## 2026-07-16 — Hosted release-tooling poll race repair
+
+- `29509111877` 的 release tooling 失败由 KDF calibration evidence runner 的 Linux `/proc/<pid>/status` 竞态触发：子进程在 `poll()` 后、采样前退出会留下缺少 Vm* 字段的 zombie status。运行中进程缺字段仍拒绝；仅明确 `State: Z` 作为不可用样本跳过，并将 executable fixture 保持时间提高到 500 ms，避免共享 runner 的调度抖动。
+- 同一 run 已通过 VS Code 1.125/1.126 Extension Host 和 Windows Sublime product gate。Windows import native rerun仍在下一提交中验证。
