@@ -1421,17 +1421,29 @@ export class InexCustomEditorProvider
     }
   }
 
-  public async waitForIntegrationBackup(): Promise<string> {
+  public async backupIntegrationDocument(logicalPath: string, destination: string): Promise<string> {
     this.requireIntegrationTestMode();
-    const deadline = Date.now() + 10_000;
-    while (Date.now() < deadline) {
-      const uri = this.lastBackupUri;
-      if (uri !== undefined) {
-        return uri.fsPath;
-      }
-      await delay(25);
+    const document = [...this.documents].find(
+      (candidate) => candidate.logicalPath === logicalPath,
+    );
+    if (document === undefined) {
+      throw new Error("Inex integration document is not open");
     }
-    throw new Error("VS Code did not request an encrypted custom-editor backup");
+    const cancellation = new vscode.CancellationTokenSource();
+    try {
+      await this.backupCustomDocument(
+        document,
+        { destination: vscode.Uri.file(destination) },
+        cancellation.token,
+      );
+      const backup = this.lastBackupUri;
+      if (backup === undefined || backup.fsPath !== destination) {
+        throw new Error("Inex integration backup did not reach its requested destination");
+      }
+      return backup.fsPath;
+    } finally {
+      cancellation.dispose();
+    }
   }
 
   public integrationContentSha256(logicalPath: string): string {

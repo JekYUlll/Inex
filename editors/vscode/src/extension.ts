@@ -39,7 +39,7 @@ export interface InexIntegrationTestApi {
   readonly revertDocument: (logicalPath: string) => Promise<void>;
   readonly documentIsDirty: (logicalPath: string) => boolean;
   readonly markDirty: (logicalPath: string) => void;
-  readonly waitForBackup: () => Promise<string>;
+  readonly backupDocument: (logicalPath: string, destination: string) => Promise<string>;
   readonly contentSha256: (logicalPath: string) => string;
   readonly recoverBackupAndSave: (
     logicalPath: string,
@@ -639,7 +639,8 @@ export function activate(
     markDirty: (logicalPath: string) => {
       editor.markIntegrationDocumentDirty(logicalPath);
     },
-    waitForBackup: () => editor.waitForIntegrationBackup(),
+    backupDocument: (logicalPath: string, destination: string) =>
+      editor.backupIntegrationDocument(logicalPath, destination),
     contentSha256: (logicalPath: string) => editor.integrationContentSha256(logicalPath),
     recoverBackupAndSave: (logicalPath: string, backupPath: string) =>
       editor.recoverIntegrationBackupAndSave(logicalPath, backupPath),

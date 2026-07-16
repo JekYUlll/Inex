@@ -2292,9 +2292,10 @@ where
 
     let marker = local.join(IMPORT_PUBLISH_MARKER);
     let marker_bytes = *Uuid::new_v4().as_bytes();
-    let mut marker_file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
+    let mut marker_options = OpenOptions::new();
+    marker_options.write(true).create_new(true);
+    permit_namespace_rename(&mut marker_options);
+    let mut marker_file = marker_options
         .open(&marker)
         .map_err(AtomicDirectoryPublishError::io)?;
     marker_file
@@ -6857,11 +6858,13 @@ fn open_lock_file(path: &Path) -> io::Result<(File, bool)> {
     let mut create = OpenOptions::new();
     create.read(true).write(true).create_new(true);
     configure_restrictive_creation(&mut create);
+    permit_namespace_rename(&mut create);
     match create.open(path) {
         Ok(file) => Ok((file, true)),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
             let mut existing = OpenOptions::new();
             existing.read(true).write(true);
+            permit_namespace_rename(&mut existing);
             existing.open(path).map(|file| (file, false))
         }
         Err(error) => Err(error),
@@ -7023,6 +7026,23 @@ fn configure_restrictive_creation(options: &mut OpenOptions) {
 
 #[cfg(not(unix))]
 fn configure_restrictive_creation(_options: &mut OpenOptions) {}
+
+/// Keep internal marker and lock handles compatible with a Windows directory
+/// namespace move. Their data remains protected by the exclusive file lock;
+/// allowing deletion only permits the staged vault root to be renamed as one
+/// atomic namespace operation.
+#[cfg(windows)]
+fn permit_namespace_rename(options: &mut OpenOptions) {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+    options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+}
+
+#[cfg(not(windows))]
+fn permit_namespace_rename(_options: &mut OpenOptions) {}
 
 #[cfg(unix)]
 fn restrict_file_permissions_best_effort(file: &File) {

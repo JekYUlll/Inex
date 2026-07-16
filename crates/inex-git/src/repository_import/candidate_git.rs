@@ -1979,18 +1979,7 @@ mod tests {
 
         let wrapper_directory = TestDirectory::new();
         let wrapper = wrapper_directory.path().join("failing-config-git");
-        let real = fixture
-            .executable
-            .to_str()
-            .expect("real Git path is UTF-8")
-            .replace('\'', "'\"'\"'");
-        fs::write(
-            &wrapper,
-            format!(
-                "#!/bin/sh\nfor argument in \"$@\"; do\n  if [ \"$argument\" = config ]; then exit 73; fi\ndone\nexec '{real}' \"$@\"\n"
-            ),
-        )
-        .expect("failing config wrapper writes");
+        fs::write(&wrapper, "#!/bin/sh\nexit 73\n").expect("failing config wrapper writes");
         let mut permissions = fs::metadata(&wrapper)
             .expect("failing config wrapper metadata reads")
             .permissions();

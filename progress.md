@@ -1819,3 +1819,9 @@
 - Linux Git candidate test 的 shell wrapper 只检查 `$1 == config`，但受控 Git runner 会在该参数前插入安全选项；现检查完整 argv，两个受影响的 `inex-git` test 均通过。
 - VS Code 1.125/1.126 的 Extension Host 报告修改前 Tab snapshot 一直 clean。fixture 保留 provider dirty assertion，改为每次轮询当前 tab collection；TypeScript check 与本机真实 1.125 extension-host runner 均通过。
 - Hosted Windows atomic-publication failure 仍待 native runner 复核。已构建 Windows GNU test executable 并尝试 Wine，但 Wine 在更早的 publication-marker setup 处与 native Windows 行为不兼容，不能把该结果当作 Windows 修复证据。
+
+## 2026-07-16 — Native CI follow-up repair
+
+- 直连 GitHub Actions API 取得 run `29502564440` 的失败日志：Git 2.54 的 target-root wrapper test 仍把 wrapper argv 形状误当为契约；该 test 现改为无条件失败的 executable，只验证首个 configuration operation 的固定错误映射，目标回归通过。
+- Windows publication 的 staged marker/lock 文件现在明确以 read/write/delete share mode 打开；这让保持排他文件锁的同时允许 `MoveFileExW(MOVEFILE_WRITE_THROUGH)` 整根移动 staged vault。Linux 行为不变，Windows MSVC `cargo check` 通过；仍需本次 native GitHub runner 给出运行时证据。
+- VS Code 1.125/1.126 Host failure 是 Workbench 没有为 integration bridge 的 provider-only edit 调度 custom-document backup，直至 60-second runner deadline。fixture 现继续断言 provider dirty state，但直接调用同一 `backupCustomDocument` 实现，严格验证 EDRY draft 和 backupId recovery，不把 Workbench tab/backup scheduling 时机当产品安全契约。

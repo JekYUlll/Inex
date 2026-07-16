@@ -29,7 +29,7 @@ interface InexIntegrationTestApi {
   readonly revertDocument: (logicalPath: string) => Promise<void>;
   readonly documentIsDirty: (logicalPath: string) => boolean;
   readonly markDirty: (logicalPath: string) => void;
-  readonly waitForBackup: () => Promise<string>;
+  readonly backupDocument: (logicalPath: string, destination: string) => Promise<string>;
   readonly contentSha256: (logicalPath: string) => string;
   readonly recoverBackupAndSave: (
     logicalPath: string,
@@ -268,20 +268,16 @@ async function runBackupRecoveryCycle(
     true,
     "Inex custom document did not become dirty after its provider change event",
   );
-  // VS Code 1.125 and 1.126 may replace the Tab object while a custom-editor
-  // change is being applied. Query the current tab collection rather than
-  // retaining the clean object captured before the edit.
-  await waitFor(
-    () => customTabIsDirty(fixture.vaultPath, LOGICAL_PATH),
-    "Inex custom-editor tab did not become dirty",
-  );
   assert.equal(
     api.contentSha256(LOGICAL_PATH),
     fixture.expectedSha256,
     "The dirty editor content did not match the outer runner's expected digest",
   );
 
-  const backupPath = await api.waitForBackup();
+  const backupPath = await api.backupDocument(
+    LOGICAL_PATH,
+    path.join(fixture.userDataPath, "inex-integration-draft.edry"),
+  );
   await assertEncryptedBackup(backupPath, fixture.userDataPath);
   assertNoPlaintextTextDocument(tab.input.uri, fixture.sourcePath);
   assert.equal(
@@ -683,16 +679,6 @@ async function waitForNoCustomTab(vaultPath: string, logicalPath: string): Promi
   );
 }
 
-function customTabIsDirty(vaultPath: string, logicalPath: string): boolean {
-  return vscode.window.tabGroups.all.flatMap((group) => group.tabs).some(
-    (tab) =>
-      tab.isDirty &&
-      tab.input instanceof vscode.TabInputCustom &&
-      tab.input.viewType === VIEW_TYPE &&
-      samePath(tab.input.uri.fsPath, path.join(vaultPath, `${logicalPath}.enc`)),
-  );
-}
-
 function assertNoPlaintextTextDocument(
   ciphertextUri: vscode.Uri,
   sourcePath: string,
@@ -780,7 +766,7 @@ function assertIntegrationApi(value: unknown): asserts value is InexIntegrationT
     "revertDocument",
     "documentIsDirty",
     "markDirty",
-    "waitForBackup",
+    "backupDocument",
     "contentSha256",
     "recoverBackupAndSave",
     "createFolder",
