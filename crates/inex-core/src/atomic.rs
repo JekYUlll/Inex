@@ -8097,7 +8097,13 @@ mod platform {
         let handle = unsafe {
             CreateFileW(
                 encoded.as_ptr(),
-                GENERIC_READ | GENERIC_WRITE,
+                // Windows requires write access for a directory flush on
+                // some filesystems, but that capability is optional here:
+                // the actual namespace barrier is MOVEFILE_WRITE_THROUGH.
+                // Asking only for read access prevents a valid `.git`
+                // directory from being rejected merely because another
+                // process did not grant directory-write sharing.
+                GENERIC_READ,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 std::ptr::null_mut(),
                 OPEN_EXISTING,
