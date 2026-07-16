@@ -1919,17 +1919,6 @@ where
     if fault == DirectoryMoveFault::AfterMove && move_result.is_ok() {
         move_result = Err(io::Error::other("injected error after directory move"));
     }
-    #[cfg(all(windows, debug_assertions))]
-    if let Err(error) = &move_result {
-        // CI-only, path-free diagnostic for a native namespace failure. The
-        // production error remains intentionally scrubbed.
-        eprintln!(
-            "inex directory namespace move failed: kind={:?} raw_os_error={:?}",
-            error.kind(),
-            error.raw_os_error()
-        );
-    }
-
     let source_state = inspect_directory_state(&paths.source);
     let destination_state = inspect_directory_state(&paths.destination);
     let parent_unchanged = paths.parent_matches();
@@ -2247,10 +2236,6 @@ where
         .map_err(AtomicDirectoryPublishError::io)?;
     let shared_mount =
         paths_share_mount(&resolved_parent, staging).map_err(AtomicDirectoryPublishError::io)?;
-    #[cfg(all(windows, debug_assertions))]
-    eprintln!(
-        "inex directory publication preflight: local={supported_local} shared_mount={shared_mount}"
-    );
     if !supported_local || !shared_mount {
         return Err(AtomicDirectoryPublishError::InvalidPaths);
     }
@@ -2319,30 +2304,13 @@ where
         .map_err(AtomicDirectoryPublishError::io)?;
     sync_staging_directory_before_publish(&local)?;
     sync_staging_directory_before_publish(staging)?;
-    #[cfg(all(windows, debug_assertions))]
-    eprintln!("inex directory publication reached staging synchronization");
-
     // Freeze all cooperative Inex mutations from the critical physical audit
     // through namespace publication and post-state reconciliation. Windows
-    // cannot rename a directory while its contained `LockFileEx` lock remains
-    // held, so its unpublished, randomly named staging tree releases this
-    // cooperative lock immediately after the final audit and before the move.
+    // cannot move a directory that contains this lock. Its staging directory
+    // is random, unpublished, and only reachable by the current transaction,
+    // so Windows relies on the final seal/identity/marker audit instead.
     #[cfg(windows)]
-    let mut vault_lock = {
-        let result = VaultMutationLock::acquire(staging);
-        #[cfg(debug_assertions)]
-        if let Err(AtomicWriteError::Io { source, .. }) = &result {
-            eprintln!(
-                "inex staged mutation lock failed: kind={:?} raw_os_error={:?}",
-                source.kind(),
-                source.raw_os_error()
-            );
-        }
-        Some(result.map_err(|error| match error {
-            AtomicWriteError::Io { source, .. } => AtomicDirectoryPublishError::io(source),
-            _ => AtomicDirectoryPublishError::Indeterminate,
-        })?)
-    };
+    let mut vault_lock: Option<VaultMutationLock> = None;
     #[cfg(not(windows))]
     let _vault_lock = VaultMutationLock::acquire(staging).map_err(|error| match error {
         AtomicWriteError::Io { source, .. } => AtomicDirectoryPublishError::io(source),
@@ -2364,8 +2332,6 @@ where
         }
         #[cfg(windows)]
         drop(vault_lock.take());
-        #[cfg(all(windows, debug_assertions))]
-        eprintln!("inex directory publication released staged mutation lock");
         Ok(())
     };
     let move_fault = if skip_move {
