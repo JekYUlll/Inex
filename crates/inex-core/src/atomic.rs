@@ -2304,6 +2304,12 @@ where
         .map_err(AtomicDirectoryPublishError::io)?;
     sync_staging_directory_before_publish(&local)?;
     sync_staging_directory_before_publish(staging)?;
+    #[cfg(windows)]
+    drop(marker_file);
+    #[cfg(windows)]
+    let marker_file = None;
+    #[cfg(not(windows))]
+    let marker_file = Some(marker_file);
     // Freeze all cooperative Inex mutations from the critical physical audit
     // through namespace publication and post-state reconciliation. Windows
     // cannot move a directory that contains this lock. Its staging directory
@@ -2325,7 +2331,7 @@ where
             || current != resolved_staging
             || filesystem_directory_identity(current).ok().as_ref() != Some(&staging_identity)
             || filesystem_directory_identity(&local).ok().as_ref() != Some(&local_identity)
-            || !marker_matches_open_file(&marker, &marker_file, marker_bytes.len())
+            || !marker_matches_publication_marker(&marker, marker_file.as_ref(), &marker_bytes)
             || !publish_handles_match()
         {
             return Err(AtomicDirectoryPublishError::Indeterminate);
@@ -2354,7 +2360,7 @@ where
                 .is_ok_and(|identity| identity == staging_identity)
             && filesystem_directory_identity(&local)
                 .is_ok_and(|identity| identity == local_identity)
-            && marker_matches_open_file(&marker, &marker_file, marker_bytes.len())
+            && marker_matches_publication_marker(&marker, marker_file.as_ref(), &marker_bytes)
             && publish_handles_match()
     };
     match directory_move_result {
@@ -2395,7 +2401,11 @@ where
                 .is_ok_and(|identity| identity == staging_identity)
             && filesystem_directory_identity(&destination.join(VAULT_LOCAL_DIRECTORY))
                 .is_ok_and(|identity| identity == local_identity)
-            && marker_matches_open_file(&published_marker, &marker_file, marker_bytes.len())
+            && marker_matches_publication_marker(
+                &published_marker,
+                marker_file.as_ref(),
+                &marker_bytes,
+            )
             && publish_handles_match()
     };
     if !exact_published_with_marker() {
@@ -2480,6 +2490,7 @@ fn sync_staging_directory_before_publish(path: &Path) -> Result<(), AtomicDirect
     }
 }
 
+#[cfg(not(windows))]
 fn marker_matches_open_file(path: &Path, marker_file: &File, expected_len: usize) -> bool {
     let Ok(metadata) = fs::symlink_metadata(path) else {
         return false;
@@ -2492,6 +2503,31 @@ fn marker_matches_open_file(path: &Path, marker_file: &File, expected_len: usize
     }
     platform::open_file_matches_path_and_is_single_link_same_tree(path, marker_file)
         .unwrap_or(false)
+}
+
+fn marker_matches_publication_marker(
+    path: &Path,
+    marker_file: Option<&File>,
+    expected_bytes: &[u8],
+) -> bool {
+    #[cfg(windows)]
+    {
+        let _ = marker_file;
+        let Ok(metadata) = fs::symlink_metadata(path) else {
+            return false;
+        };
+        if is_link_or_reparse_point(&metadata)
+            || !metadata.file_type().is_file()
+            || metadata.len() != u64::try_from(expected_bytes.len()).unwrap_or(u64::MAX)
+        {
+            return false;
+        }
+        return fs::read(path).is_ok_and(|actual| actual == expected_bytes);
+    }
+    #[cfg(not(windows))]
+    {
+        marker_file.is_some_and(|file| marker_matches_open_file(path, file, expected_bytes.len()))
+    }
 }
 
 fn atomic_write_ciphertext_with_faults<F: FaultInjector>(
@@ -7956,6 +7992,7 @@ mod platform {
         )
     }
 
+    #[allow(dead_code)]
     pub(super) fn open_file_matches_path_and_is_single_link_same_tree(
         path: &Path,
         file: &File,
