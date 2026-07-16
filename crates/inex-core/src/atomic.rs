@@ -2302,8 +2302,8 @@ where
         .write_all(&marker_bytes)
         .and_then(|()| marker_file.sync_all())
         .map_err(AtomicDirectoryPublishError::io)?;
-    platform::sync_directory(&local).map_err(AtomicDirectoryPublishError::io)?;
-    platform::sync_directory(staging).map_err(AtomicDirectoryPublishError::io)?;
+    sync_staging_directory_before_publish(&local)?;
+    sync_staging_directory_before_publish(staging)?;
 
     // Freeze all cooperative Inex mutations from the critical physical audit
     // through namespace publication and post-state reconciliation.
@@ -2455,6 +2455,22 @@ fn inspect_directory_state(path: &Path) -> io::Result<DirectoryState> {
         return Ok(DirectoryState::Other);
     }
     filesystem_directory_identity(path).map(DirectoryState::Directory)
+}
+
+fn sync_staging_directory_before_publish(path: &Path) -> Result<(), AtomicDirectoryPublishError> {
+    #[cfg(windows)]
+    {
+        // FlushFileBuffers on a directory is not a Windows namespace-commit
+        // guarantee and is unsupported on some valid local filesystems. The
+        // marker itself was already synchronized; MoveFileExW with
+        // MOVEFILE_WRITE_THROUGH is the required publication barrier.
+        let _ = platform::sync_directory(path);
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        platform::sync_directory(path).map_err(AtomicDirectoryPublishError::io)
+    }
 }
 
 fn marker_matches_open_file(path: &Path, marker_file: &File, expected_len: usize) -> bool {

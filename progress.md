@@ -1825,3 +1825,8 @@
 - 直连 GitHub Actions API 取得 run `29502564440` 的失败日志：Git 2.54 的 target-root wrapper test 仍把 wrapper argv 形状误当为契约；该 test 现改为无条件失败的 executable，只验证首个 configuration operation 的固定错误映射，目标回归通过。
 - Windows publication 的 staged marker/lock 文件现在明确以 read/write/delete share mode 打开；这让保持排他文件锁的同时允许 `MoveFileExW(MOVEFILE_WRITE_THROUGH)` 整根移动 staged vault。Linux 行为不变，Windows MSVC `cargo check` 通过；仍需本次 native GitHub runner 给出运行时证据。
 - VS Code 1.125/1.126 Host failure 是 Workbench 没有为 integration bridge 的 provider-only edit 调度 custom-document backup，直至 60-second runner deadline。fixture 现继续断言 provider dirty state，但直接调用同一 `backupCustomDocument` 实现，严格验证 EDRY draft 和 backupId recovery，不把 Workbench tab/backup scheduling 时机当产品安全契约。
+
+## 2026-07-16 — Windows directory publication capability correction
+
+- Native Windows rerun 已证明两个 VS Code Extension Host gates 通过，但 import publication 仍在 staging publication 前失败。发布前的 `FlushFileBuffers(directory)` 在 Windows 是 capability probe，不能作为 namespace publication 必须条件；marker bytes 已 `sync_all`，而 `MoveFileExW(MOVEFILE_WRITE_THROUGH)` 才是 Windows commit barrier。
+- 现将 publication 前 local/staging directory sync 在 Windows 降为 best-effort，成功路径仍以 `ParentSyncStatus` 报告后续 internal/parent sync；Linux 保持严格错误传播。MSVC compile 与 Linux import publication regression 通过，等待下一 native Windows rerun。
