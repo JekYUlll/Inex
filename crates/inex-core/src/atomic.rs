@@ -2314,6 +2314,8 @@ where
         .map_err(AtomicDirectoryPublishError::io)?;
     sync_staging_directory_before_publish(&local)?;
     sync_staging_directory_before_publish(staging)?;
+    #[cfg(all(test, windows))]
+    eprintln!("inex directory publication reached staging synchronization");
 
     // Freeze all cooperative Inex mutations from the critical physical audit
     // through namespace publication and post-state reconciliation. Windows
@@ -2321,12 +2323,21 @@ where
     // held, so its unpublished, randomly named staging tree releases this
     // cooperative lock immediately after the final audit and before the move.
     #[cfg(windows)]
-    let mut vault_lock = Some(VaultMutationLock::acquire(staging).map_err(
-        |error| match error {
+    let mut vault_lock = {
+        let result = VaultMutationLock::acquire(staging);
+        #[cfg(test)]
+        if let Err(AtomicWriteError::Io { source, .. }) = &result {
+            eprintln!(
+                "inex staged mutation lock failed: kind={:?} raw_os_error={:?}",
+                source.kind(),
+                source.raw_os_error()
+            );
+        }
+        Some(result.map_err(|error| match error {
             AtomicWriteError::Io { source, .. } => AtomicDirectoryPublishError::io(source),
             _ => AtomicDirectoryPublishError::Indeterminate,
-        },
-    )?);
+        })?)
+    };
     #[cfg(not(windows))]
     let _vault_lock = VaultMutationLock::acquire(staging).map_err(|error| match error {
         AtomicWriteError::Io { source, .. } => AtomicDirectoryPublishError::io(source),
@@ -2348,6 +2359,8 @@ where
         }
         #[cfg(windows)]
         drop(vault_lock.take());
+        #[cfg(all(test, windows))]
+        eprintln!("inex directory publication released staged mutation lock");
         Ok(())
     };
     let move_fault = if skip_move {
