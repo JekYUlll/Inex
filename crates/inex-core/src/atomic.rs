@@ -8044,17 +8044,24 @@ mod platform {
 
     pub(super) fn path_is_supported_local_filesystem(path: &Path) -> io::Result<bool> {
         let canonical = std::fs::canonicalize(path)?;
-        // `GetVolumePathNameW` resolves an existing canonical path to its
-        // volume root. Unlike the file-operation APIs below, it rejects the
-        // verbatim `\\?\` form on the hosted Windows runner. Keep verbatim
-        // paths for file I/O, but supply this volume-discovery API the normal
-        // canonical absolute path it documents.
+        // `std::fs::canonicalize` returns a verbatim `\\?\` path on Windows.
+        // `GetVolumePathNameW` resolves an existing path to its volume root,
+        // but rejects that verbatim form on the hosted runner. Keep verbatim
+        // paths for file I/O, and convert only this volume-discovery input
+        // back to its documented ordinary drive or UNC representation.
         let mut encoded = canonical.as_os_str().encode_wide().collect::<Vec<_>>();
         if encoded.contains(&0) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Windows path contains NUL",
             ));
+        }
+        if encoded.starts_with(&VERBATIM_UNC_PATH_PREFIX) {
+            let mut unc = vec![u16::from(b'\\'), u16::from(b'\\')];
+            unc.extend_from_slice(&encoded[VERBATIM_UNC_PATH_PREFIX.len()..]);
+            encoded = unc;
+        } else if encoded.starts_with(&VERBATIM_PATH_PREFIX) {
+            encoded.drain(..VERBATIM_PATH_PREFIX.len());
         }
         encoded.push(0);
         let mut volume = vec![0_u16; 32_768];
