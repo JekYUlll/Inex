@@ -1919,7 +1919,7 @@ where
     if fault == DirectoryMoveFault::AfterMove && move_result.is_ok() {
         move_result = Err(io::Error::other("injected error after directory move"));
     }
-    #[cfg(all(test, windows))]
+    #[cfg(all(windows, debug_assertions))]
     if let Err(error) = &move_result {
         // CI-only, path-free diagnostic for a native namespace failure. The
         // production error remains intentionally scrubbed.
@@ -2243,10 +2243,15 @@ where
     }
     let resolved_staging = resolved_parent.join(staging_name);
     let resolved_destination = resolved_parent.join(destination_name);
-    if !path_is_supported_local_filesystem(&resolved_parent)
-        .map_err(AtomicDirectoryPublishError::io)?
-        || !paths_share_mount(&resolved_parent, staging).map_err(AtomicDirectoryPublishError::io)?
-    {
+    let supported_local = path_is_supported_local_filesystem(&resolved_parent)
+        .map_err(AtomicDirectoryPublishError::io)?;
+    let shared_mount =
+        paths_share_mount(&resolved_parent, staging).map_err(AtomicDirectoryPublishError::io)?;
+    #[cfg(all(windows, debug_assertions))]
+    eprintln!(
+        "inex directory publication preflight: local={supported_local} shared_mount={shared_mount}"
+    );
+    if !supported_local || !shared_mount {
         return Err(AtomicDirectoryPublishError::InvalidPaths);
     }
     match fs::symlink_metadata(destination) {
@@ -2314,7 +2319,7 @@ where
         .map_err(AtomicDirectoryPublishError::io)?;
     sync_staging_directory_before_publish(&local)?;
     sync_staging_directory_before_publish(staging)?;
-    #[cfg(all(test, windows))]
+    #[cfg(all(windows, debug_assertions))]
     eprintln!("inex directory publication reached staging synchronization");
 
     // Freeze all cooperative Inex mutations from the critical physical audit
@@ -2325,7 +2330,7 @@ where
     #[cfg(windows)]
     let mut vault_lock = {
         let result = VaultMutationLock::acquire(staging);
-        #[cfg(test)]
+        #[cfg(debug_assertions)]
         if let Err(AtomicWriteError::Io { source, .. }) = &result {
             eprintln!(
                 "inex staged mutation lock failed: kind={:?} raw_os_error={:?}",
@@ -2359,7 +2364,7 @@ where
         }
         #[cfg(windows)]
         drop(vault_lock.take());
-        #[cfg(all(test, windows))]
+        #[cfg(all(windows, debug_assertions))]
         eprintln!("inex directory publication released staged mutation lock");
         Ok(())
     };
