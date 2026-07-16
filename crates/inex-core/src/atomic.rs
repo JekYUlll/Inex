@@ -8044,7 +8044,19 @@ mod platform {
 
     pub(super) fn path_is_supported_local_filesystem(path: &Path) -> io::Result<bool> {
         let canonical = std::fs::canonicalize(path)?;
-        let encoded = extended_path(&canonical)?;
+        // `GetVolumePathNameW` resolves an existing canonical path to its
+        // volume root. Unlike the file-operation APIs below, it rejects the
+        // verbatim `\\?\` form on the hosted Windows runner. Keep verbatim
+        // paths for file I/O, but supply this volume-discovery API the normal
+        // canonical absolute path it documents.
+        let mut encoded = canonical.as_os_str().encode_wide().collect::<Vec<_>>();
+        if encoded.contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Windows path contains NUL",
+            ));
+        }
+        encoded.push(0);
         let mut volume = vec![0_u16; 32_768];
         let buffer_length = u32::try_from(volume.len())
             .map_err(|_| io::Error::other("volume path buffer overflow"))?;
