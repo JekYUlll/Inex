@@ -1986,7 +1986,9 @@ mod tests {
             .replace('\'', "'\"'\"'");
         fs::write(
             &wrapper,
-            format!("#!/bin/sh\nif [ \"$1\" = config ]; then exit 73; fi\nexec '{real}' \"$@\"\n"),
+            format!(
+                "#!/bin/sh\nfor argument in \"$@\"; do\n  if [ \"$argument\" = config ]; then exit 73; fi\ndone\nexec '{real}' \"$@\"\n"
+            ),
         )
         .expect("failing config wrapper writes");
         let mut permissions = fs::metadata(&wrapper)

@@ -263,7 +263,18 @@ async function runBackupRecoveryCycle(
   assertNoPlaintextTextDocument(tab.input.uri, fixture.sourcePath);
 
   api.markDirty(LOGICAL_PATH);
-  await waitFor(() => tab.isDirty, "Inex custom-editor tab did not become dirty");
+  assert.equal(
+    api.documentIsDirty(LOGICAL_PATH),
+    true,
+    "Inex custom document did not become dirty after its provider change event",
+  );
+  // VS Code 1.125 and 1.126 may replace the Tab object while a custom-editor
+  // change is being applied. Query the current tab collection rather than
+  // retaining the clean object captured before the edit.
+  await waitFor(
+    () => customTabIsDirty(fixture.vaultPath, LOGICAL_PATH),
+    "Inex custom-editor tab did not become dirty",
+  );
   assert.equal(
     api.contentSha256(LOGICAL_PATH),
     fixture.expectedSha256,
@@ -669,6 +680,16 @@ async function waitForNoCustomTab(vaultPath: string, logicalPath: string): Promi
           samePath(tab.input.uri.fsPath, path.join(vaultPath, `${logicalPath}.enc`)),
       ),
     `VS Code retained a stale custom-editor tab for ${logicalPath}`,
+  );
+}
+
+function customTabIsDirty(vaultPath: string, logicalPath: string): boolean {
+  return vscode.window.tabGroups.all.flatMap((group) => group.tabs).some(
+    (tab) =>
+      tab.isDirty &&
+      tab.input instanceof vscode.TabInputCustom &&
+      tab.input.viewType === VIEW_TYPE &&
+      samePath(tab.input.uri.fsPath, path.join(vaultPath, `${logicalPath}.enc`)),
   );
 }
 

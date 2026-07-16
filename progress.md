@@ -1811,3 +1811,11 @@
 
 - 本地 `master` 相对 `origin/master` 为 `0 behind / 426 ahead`；尚未推送，避免未经授权将大批本地 checkpoint 写入远端。
 - 只读检查未能取得新的 hosted run：`gh auth status` 在 keyring 访问 GitHub account 时 timeout，`gh run list` 对 GitHub Actions API 报 TLS handshake timeout。此网络/认证结果不能推断 CI 状态，也不重试或修改远端。
+
+## 2026-07-16 — Hosted CI failure triage and portable test repair
+
+- 通过受控本地代理重新取得 Actions run `29464851371` 的完整日志。release tooling 因新增的 persistent-profile protocol 未列入打包/审计 documentation allowlist 而失败；现已将该文档加入两份 canonical 清单，`scripts.tests.test_release_artifacts` 30/30 通过。
+- Windows Sublime RPC test 错将运行平台固定为 Linux，并以 POSIX execute bit 验证 Windows sidecar；测试现按宿主选择 `inexd.exe`，仅在 POSIX 断言 executable mode。Linux strict `test_rpc` 29/29 通过。
+- Linux Git candidate test 的 shell wrapper 只检查 `$1 == config`，但受控 Git runner 会在该参数前插入安全选项；现检查完整 argv，两个受影响的 `inex-git` test 均通过。
+- VS Code 1.125/1.126 的 Extension Host 报告修改前 Tab snapshot 一直 clean。fixture 保留 provider dirty assertion，改为每次轮询当前 tab collection；TypeScript check 与本机真实 1.125 extension-host runner 均通过。
+- Hosted Windows atomic-publication failure 仍待 native runner 复核。已构建 Windows GNU test executable 并尝试 Wine，但 Wine 在更早的 publication-marker setup 处与 native Windows 行为不兼容，不能把该结果当作 Windows 修复证据。

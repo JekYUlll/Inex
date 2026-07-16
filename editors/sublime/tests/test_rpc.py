@@ -627,20 +627,24 @@ class SidecarResolutionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             package = os.path.join(root, "package")
             os.makedirs(os.path.join(package, "bin"))
-            executable = os.path.join(package, "bin", "inexd")
+            platform = "windows" if os.name == "nt" else "linux"
+            executable_name = "inexd.exe" if platform == "windows" else "inexd"
+            executable = os.path.join(package, "bin", executable_name)
             with open(executable, "wb") as stream:
                 stream.write(b"fake")
-            os.chmod(executable, 0o700)
-            self.assertEqual(resolve_sidecar("", package, "linux"), executable)
+            if platform != "windows":
+                os.chmod(executable, 0o700)
+            self.assertEqual(resolve_sidecar("", package, platform), executable)
             with self.assertRaises(RpcLifecycleError):
-                resolve_sidecar("inexd", package, "linux")
-            link = os.path.join(root, "linked-inexd")
+                resolve_sidecar(executable_name, package, platform)
+            link = os.path.join(root, "linked-" + executable_name)
             os.symlink(executable, link)
             with self.assertRaises(RpcLifecycleError):
-                resolve_sidecar(link, package, "linux")
-            os.chmod(executable, stat.S_IRUSR)
-            with self.assertRaises(RpcLifecycleError):
-                resolve_sidecar(executable, package, "linux")
+                resolve_sidecar(link, package, platform)
+            if platform != "windows":
+                os.chmod(executable, stat.S_IRUSR)
+                with self.assertRaises(RpcLifecycleError):
+                    resolve_sidecar(executable, package, platform)
 
 
 class ClientBoundTests(unittest.TestCase):

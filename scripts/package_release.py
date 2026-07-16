@@ -58,6 +58,7 @@ DOCUMENTATION_FILES = (
     "release-notes-0.1.0-pre-alpha.md",
     "troubleshooting.md",
     "user-guide.md",
+    "vscode-persistent-profile-validation.md",
     "spec/edry-v1.md",
     "spec/git-merge-v1.md",
     "spec/import-repository-v1.md",

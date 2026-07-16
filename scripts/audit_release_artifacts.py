@@ -73,6 +73,7 @@ REQUIRED_DOCUMENTATION = (
     "docs/release-notes-0.1.0-pre-alpha.md",
     "docs/troubleshooting.md",
     "docs/user-guide.md",
+    "docs/vscode-persistent-profile-validation.md",
     "docs/spec/edry-v1.md",
     "docs/spec/git-merge-v1.md",
     "docs/spec/import-v1.md",
