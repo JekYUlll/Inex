@@ -7664,7 +7664,6 @@ mod platform {
     const DRIVE_FIXED: u32 = 3;
     const DRIVE_RAMDISK: u32 = 6;
     const GENERIC_READ: u32 = 0x8000_0000;
-    const GENERIC_WRITE: u32 = 0x4000_0000;
     const FILE_SHARE_READ: u32 = 0x0000_0001;
     const FILE_SHARE_WRITE: u32 = 0x0000_0002;
     const FILE_SHARE_DELETE: u32 = 0x0000_0004;
