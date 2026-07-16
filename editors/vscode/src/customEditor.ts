@@ -111,6 +111,10 @@ class InexDocument implements vscode.CustomDocument {
     return this.revision !== this.savedRevision;
   }
 
+  public get isUsable(): boolean {
+    return !this.locked && !this.disposed && !this.mutating;
+  }
+
   public get requiresStaleBackupConfirmation(): boolean {
     return this.staleBackup;
   }
@@ -1371,15 +1375,29 @@ export class InexCustomEditorProvider
     await this.waitForOpenedDocument(logicalPath, this.controller.acquireSession());
   }
 
+  /** Select the newest live instance after an integration-mode reopen. */
+  private integrationDocument(logicalPath: string): InexDocument {
+    const session = this.controller.acquireSession();
+    const document = [...this.documents]
+      .reverse()
+      .find(
+        (candidate) =>
+          candidate.logicalPath === logicalPath &&
+          candidate.session.root === session.root &&
+          candidate.session.sidecar === session.sidecar &&
+          candidate.session.generation === session.generation &&
+          candidate.isUsable,
+      );
+    if (document === undefined) {
+      throw new Error("Inex integration document is not open in the current unlocked session");
+    }
+    return document;
+  }
+
   /** Exercise VS Code's custom-document revert implementation without tab focus. */
   public async revertIntegrationDocument(logicalPath: string): Promise<void> {
     this.requireIntegrationTestMode();
-    const document = [...this.documents].find(
-      (candidate) => candidate.logicalPath === logicalPath,
-    );
-    if (document === undefined) {
-      throw new Error("Inex integration document is not open");
-    }
+    const document = this.integrationDocument(logicalPath);
     const cancellation = new vscode.CancellationTokenSource();
     try {
       await this.revertCustomDocument(document, cancellation.token);
@@ -1390,23 +1408,13 @@ export class InexCustomEditorProvider
 
   public integrationDocumentIsDirty(logicalPath: string): boolean {
     this.requireIntegrationTestMode();
-    const document = [...this.documents].find(
-      (candidate) => candidate.logicalPath === logicalPath,
-    );
-    if (document === undefined) {
-      throw new Error("Inex integration document is not open");
-    }
+    const document = this.integrationDocument(logicalPath);
     return document.isDirty;
   }
 
   public markIntegrationDocumentDirty(logicalPath: string): void {
     this.requireIntegrationTestMode();
-    const document = [...this.documents].find(
-      (candidate) => candidate.logicalPath === logicalPath,
-    );
-    if (document === undefined) {
-      throw new Error("Inex integration document is not open");
-    }
+    const document = this.integrationDocument(logicalPath);
     const snapshot = document.snapshot();
     try {
       const content = `${snapshot.content.toString("utf8")}\n<!-- inex integration dirty -->\n`;
@@ -1423,12 +1431,7 @@ export class InexCustomEditorProvider
 
   public async backupIntegrationDocument(logicalPath: string, destination: string): Promise<string> {
     this.requireIntegrationTestMode();
-    const document = [...this.documents].find(
-      (candidate) => candidate.logicalPath === logicalPath,
-    );
-    if (document === undefined) {
-      throw new Error("Inex integration document is not open");
-    }
+    const document = this.integrationDocument(logicalPath);
     const cancellation = new vscode.CancellationTokenSource();
     try {
       await this.backupCustomDocument(
@@ -1448,12 +1451,7 @@ export class InexCustomEditorProvider
 
   public integrationContentSha256(logicalPath: string): string {
     this.requireIntegrationTestMode();
-    const document = [...this.documents].find(
-      (candidate) => candidate.logicalPath === logicalPath,
-    );
-    if (document === undefined) {
-      throw new Error("Inex integration document is not open");
-    }
+    const document = this.integrationDocument(logicalPath);
     const snapshot = document.snapshot();
     try {
       return createHash("sha256").update(snapshot.content).digest("hex");

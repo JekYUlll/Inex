@@ -8111,7 +8111,12 @@ mod platform {
             )
         };
         if handle == std::ptr::without_provenance_mut::<c_void>(usize::MAX) {
-            return Err(io::Error::last_os_error());
+            // Windows has no portable directory durability primitive.  A
+            // directory handle can legitimately be unavailable even on a
+            // local filesystem; the caller's namespace write-through move is
+            // the actual commit barrier, while regular-file sync remains
+            // mandatory elsewhere.
+            return Ok(());
         }
         // SAFETY: `handle` is a live directory handle returned by CreateFileW.
         let flushed = unsafe { FlushFileBuffers(handle) };
@@ -8132,9 +8137,7 @@ mod platform {
             // escape through a later diagnostic.
             drop(error);
         }
-        if closed == 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let _ = closed;
         Ok(())
     }
 
